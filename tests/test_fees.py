@@ -151,3 +151,24 @@ def test_every_account_in_the_tree_is_walked():
     http = FakeHttp({MASTER: [], SUB: []})
     realised_for_tree(http, [MASTER, SUB])
     assert [user for user, _ in http.calls] == [MASTER, SUB]
+
+
+def test_from_fills_is_what_both_screens_use():
+    """History and Progress must not total the same fills differently."""
+    from bulkdn.fees import Realised
+
+    rows = [fill(MASTER, SUB), fill(OUTSIDER, MASTER, amount=2.0)]
+    totals = Realised.from_fills(rows, {MASTER, SUB})
+
+    assert totals.fills == 2
+    assert totals.volume_usd == 300.0
+    assert totals.self_trade_volume_usd == 100.0
+    assert totals.qualifying_volume_usd == 200.0
+    assert totals.fees_usd == 0.1
+
+
+def test_from_fills_on_an_empty_page_is_zero():
+    from bulkdn.fees import Realised
+
+    empty = Realised.from_fills([], {MASTER})
+    assert (empty.fills, empty.volume_usd, empty.fees_usd) == (0, 0.0, 0.0)

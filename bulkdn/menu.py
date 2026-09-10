@@ -151,11 +151,14 @@ def _history(config: Config) -> None:
     Volume and fees are summed from the fills themselves rather than tracked
     separately, so the numbers cannot drift from what the exchange recorded.
     """
-    http = _http(config)
+    from .fees import Realised
 
-    grand_volume = 0.0
-    grand_fees = 0.0
-    for label, pubkey in _accounts(config):
+    http = _http(config)
+    accounts = _accounts(config)
+    tree = {pubkey for _, pubkey in accounts}
+    grand = Realised()
+
+    for label, pubkey in accounts:
         print(f"\n  {label} {short_pubkey(pubkey)}")
         try:
             page = http.get_fills_page(pubkey, limit=20)
@@ -175,15 +178,18 @@ def _history(config: Config) -> None:
                 f"    {fill.symbol:<10} {side:<5} {fill.amount:>12.6f} "
                 f"{fill.price:>12.3f} {fill.fee:>10.4f}"
             )
-        volume = sum(f.amount * f.price for f in rows)
-        fees = sum(f.fee for f in rows)
-        grand_volume += volume
-        grand_fees += fees
-        print(f"    -- {len(rows)} fills, volume ${volume:,.2f}, fees ${fees:,.4f}")
+        totals = Realised.from_fills(rows, tree)
+        grand = grand + totals
+        print(
+            f"    -- {totals.fills} fills, volume ${totals.volume_usd:,.2f}, "
+            f"fees ${totals.fees_usd:,.4f}"
+        )
 
-    print(f"\n  total volume ${grand_volume:,.2f}   total fees ${grand_fees:,.4f}")
-    print("  (last 20 fills per account; self-trades inside one master tree")
-    print("   do not count toward BULK's fee-tier volume)")
+    print(f"\n  volume      ${grand.volume_usd:,.2f}")
+    print(f"  self-trades ${grand.self_trade_volume_usd:,.2f}  (earn no tier credit)")
+    print(f"  qualifying  ${grand.qualifying_volume_usd:,.2f}")
+    print(f"  fees        ${grand.fees_usd:,.4f}")
+    print("\n  (last 20 fills per account -- Configuration -> Progress walks it all)")
     _pause()
 
 

@@ -8,6 +8,7 @@ state that is neither the old key nor the new one.
 Every test passes an explicit password, so nothing here can reach a prompt.
 """
 
+import base64
 import json
 
 import pytest
@@ -58,9 +59,9 @@ def test_kdf_parameters_travel_with_the_file():
 
 def test_tampering_is_detected():
     envelope = seal("hunter2")
-    raw = bytearray(keystore._unb64(envelope["box"]))
+    raw = bytearray(base64.b64decode(envelope["box"]))
     raw[-1] ^= 0x01
-    envelope["box"] = keystore._b64(bytes(raw))
+    envelope["box"] = base64.b64encode(bytes(raw)).decode()
     with pytest.raises(keystore.KeystoreError):
         keystore.decrypt(envelope, "hunter2")
 

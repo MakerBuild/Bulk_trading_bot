@@ -169,10 +169,9 @@ class RoutedWsClient(BulkWebSocketClient):
             return await asyncio.wait_for(
                 future, timeout=timeout if timeout is not None else self.default_timeout
             )
-        except asyncio.TimeoutError:
-            self.pending_requests.pop(request_id, None)
-            raise
         except Exception:
+            # Only the failure path cleans up: on success the SDK's message
+            # handler pops the entry when it resolves the future.
             self.pending_requests.pop(request_id, None)
             raise
 

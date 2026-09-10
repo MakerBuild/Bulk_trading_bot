@@ -139,6 +139,24 @@ class Realised:
         """Volume that counts toward the fee tier."""
         return self.volume_usd - self.self_trade_volume_usd
 
+    @classmethod
+    def from_fills(cls, rows, tree: set[str]) -> Realised:
+        """Total one page of fills, splitting out self-trades.
+
+        `tree` is every pubkey under the same master. A fill with both sides
+        inside it is real spend that earns no tier credit, which is why the two
+        are counted separately rather than netted.
+        """
+        total = cls()
+        for fill in rows:
+            notional = float(fill.amount) * float(fill.price)
+            total.fills += 1
+            total.fees_usd += float(fill.fee)
+            total.volume_usd += notional
+            if fill.maker in tree and fill.taker in tree:
+                total.self_trade_volume_usd += notional
+        return total
+
     def __add__(self, other: Realised) -> Realised:
         return Realised(
             fills=self.fills + other.fills,
@@ -168,13 +186,7 @@ def realised_for_account(
             else http.get_fills_page(user, limit=limit)
         )
         rows = list(getattr(page, "data", None) or [])
-        for fill in rows:
-            notional = float(fill.amount) * float(fill.price)
-            total.fills += 1
-            total.fees_usd += float(fill.fee)
-            total.volume_usd += notional
-            if fill.maker in tree and fill.taker in tree:
-                total.self_trade_volume_usd += notional
+        total = total + Realised.from_fills(rows, tree)
         cursor = getattr(getattr(page, "page", None), "next_cursor", None) or getattr(
             page, "next_cursor", None
         )
