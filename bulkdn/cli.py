@@ -239,6 +239,49 @@ async def cmd_check(config: Config) -> int:
     return 0
 
 
+async def cmd_transfer(
+    config: Config, to_pubkey: str, amount: float, from_pubkey: Optional[str]
+) -> int:
+    """Move margin between the master and one of its accounts.
+
+    The Python SDK has no signer for this action, so the wincode bytes are
+    built in bulkdn/subaccounts.py and verified there against bulk-keychain.
+
+    Defaults to sending from the master, which is the direction that matters:
+    a freshly created sub-account has zero margin and cannot open a position
+    until it is funded.
+    """
+    from bulk_api.common import SignatureDomain
+    from bulk_api.common.signer import TransactionSigner
+
+    from .subaccounts import submit_transfer
+
+    source = from_pubkey or TransactionSigner(config.private_key).public_key
+    print(
+        f"\ntransferring {amount} USDC\n"
+        f"  from {source}\n"
+        f"  to   {to_pubkey}\n"
+        f"  via  {config.http_url} ({config.network})\n"
+    )
+
+    result = submit_transfer(
+        http_url=config.http_url,
+        private_key=config.private_key,
+        domain=SignatureDomain[config.signature_domain_name],
+        from_pubkey=source,
+        to_pubkey=to_pubkey,
+        margin_amount=amount,
+    )
+
+    print(f"HTTP {result.response_status}")
+    print(result.response_json)
+    if not result.ok:
+        print("\ntransfer rejected -- balances unchanged")
+        return 1
+    print("\ntransfer accepted; confirm with `bulkdn status`")
+    return 0
+
+
 async def cmd_create_subaccount(
     config: Config, name: str, margin_amount: Optional[float]
 ) -> int:
@@ -333,6 +376,14 @@ def build_parser() -> argparse.ArgumentParser:
     faucet = sub.add_parser("faucet", help="request testnet funds for both accounts")
     faucet.add_argument("--amount", type=float, default=None)
 
+    xfer = sub.add_parser("transfer", help="move margin between master and sub-account")
+    xfer.add_argument("--to", dest="to_pubkey", required=True, help="destination pubkey")
+    xfer.add_argument("--amount", type=float, required=True, help="margin amount to move")
+    xfer.add_argument(
+        "--from", dest="from_pubkey", default=None,
+        help="source pubkey (default: the master, i.e. the signing key)",
+    )
+
     create_sub = sub.add_parser(
         "create-subaccount",
         help="create a sub-account (best-effort -- SDK has no signer for this action)",
@@ -356,7 +407,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             network_override=args.network,
             require_credentials=True,
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
-            require_sub1=args.command != "create-subaccount",
+            require_sub1=args.command not in ("create-subaccount", "transfer"),
         )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -381,6 +432,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return asyncio.run(cmd_check(config))
         if args.command == "faucet":
             return asyncio.run(cmd_faucet(config, args.amount))
+        if args.command == "transfer":
+            return asyncio.run(
+                cmd_transfer(config, args.to_pubkey, args.amount, args.from_pubkey)
+            )
         if args.command == "create-subaccount":
             return asyncio.run(
                 cmd_create_subaccount(config, args.name, args.margin_amount)

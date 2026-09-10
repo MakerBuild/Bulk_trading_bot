@@ -1,27 +1,32 @@
-"""`createSubAccount` transaction, hand-serialized.
+"""Account-management transactions, hand-serialized.
 
-The Python SDK does not sign this action -- `TransactionSigner.serialize_action`
-has no `createSubAccount` case -- so the wincode bytes are built here.
+The Python SDK signs neither of these -- `TransactionSigner.serialize_action`
+has no `createSubAccount` or `transfer` case -- so the wincode bytes are built
+here.
 
-The layout below matches a working implementation (`bulk-volume-bot`, in
-`adapter/signer_ext.py`) that successfully creates sub-accounts against the live
-API, so it is verified rather than guessed:
+Both layouts are verified byte-for-byte against the official `bulk-keychain`
+signing library rather than guessed, and `tests/test_subaccounts.py` pins the
+bytes so they cannot drift back into a rejected shape:
 
-    u32 ordinal (27) || string name || optional f64 margin_amount
+    createSubAccount: u32 ordinal (27) || string name || optional f64 margin
+    transfer:         u32 ordinal (29) || u32 kind || from[32] || to[32] || f64
 
-The trap worth recording: `marginSymbol` appears in the API reference's JSON
-schema for this action but is **not** part of the signed binary preimage.
-Including it -- as an earlier version of this file did, on the reasonable
-assumption that the docs described the wire format -- shifts every subsequent
-byte and the exchange rejects the transaction with `bad signature`. The Rust
-`CreateSubAccount` struct, which carries only `name` and `margin_amount`, is the
-accurate description of the signed bytes.
+**The trap both actions share**: `marginSymbol` appears in the API reference's
+JSON schema but is **not** part of the signed binary preimage. Including it --
+as an earlier version of this file did, on the reasonable assumption that the
+docs described the wire format -- shifts every subsequent byte and the exchange
+rejects the transaction with `bad signature`. The keychain `CreateSubAccount`
+and `Transfer` structs, which carry no margin symbol, describe the signed bytes
+accurately.
 
-A zero margin amount encodes as absent (`0x00`), not as `Some(0.0)`.
+Amounts are plain little-endian f64, **not** fixed-point scaled by 1e8 the way
+order prices and sizes are. For `createSubAccount` a zero margin encodes as
+absent (`0x00`), not as `Some(0.0)` -- the tag byte is signed, so the two are
+different transactions.
 
-Note that only the no-initial-margin path is confirmed working; the reference
-implementation's config also leaves the margin at zero, so the `Some(amount)`
-branch is untested against a live server.
+Confirmed live on testnet: `createSubAccount` with no initial margin, and an
+internal `transfer`. The `createSubAccount` `Some(amount)` branch is pinned by
+tests but has not been exercised against a live server.
 """
 
 from __future__ import annotations
@@ -36,15 +41,36 @@ import requests
 from bulk_api.common.signer import SignatureDomain, TransactionSigner
 
 CREATE_SUB_ACCOUNT_ORDINAL = 27
+TRANSFER_ORDINAL = 29
+
+# Wire values for the transfer `kind` discriminant, serialized as u32.
+TRANSFER_KINDS = {"internal": 0, "external": 1}
 
 
 def _write_u64(value: int) -> bytes:
     return struct.pack("<Q", value)
 
 
+def _write_u32(value: int) -> bytes:
+    return struct.pack("<I", value)
+
+
 def _write_string(value: str) -> bytes:
     encoded = value.encode("utf-8")
     return _write_u64(len(encoded)) + encoded
+
+
+def _write_pubkey(value: str) -> bytes:
+    """Raw 32 bytes, with no length prefix.
+
+    The length-prefixed form is exactly what the SDK's faucet action gets
+    wrong: it writes u64(32) ahead of the key, which shifts every following
+    byte and the exchange answers `bad signature`.
+    """
+    raw = base58.b58decode(value)
+    if len(raw) != 32:
+        raise ValueError(f"pubkey must decode to 32 bytes, got {len(raw)}")
+    return raw
 
 
 def _write_optional_f64(value: Optional[float]) -> bytes:
@@ -65,26 +91,114 @@ def serialize_create_sub_account(
     """Wincode bytes for one `createSubAccount` action.
 
     The signed payload is ordinal, name, optional margin amount -- and nothing
-    else. `marginSymbol` appears in the API reference's JSON schema but is NOT
-    part of the binary preimage; including it produces a `bad signature`
-    rejection. This matches the `CreateSubAccount` struct in the Rust SDK, which
-    has only `name` and `margin_amount`.
+    else. See the module docstring for why `marginSymbol` must stay out.
     """
     if not name or not (1 <= len(name) <= 32):
         raise ValueError("name must be 1-32 characters")
 
     return b"".join(
         [
-            struct.pack("<I", CREATE_SUB_ACCOUNT_ORDINAL),
+            _write_u32(CREATE_SUB_ACCOUNT_ORDINAL),
             _write_string(name),
             _write_optional_f64(margin_amount),
         ]
     )
 
 
+def serialize_transfer(
+    from_pubkey: str, to_pubkey: str, margin_amount: float, kind: str = "internal"
+) -> bytes:
+    """Wincode bytes for one `transfer` action.
+
+    Note `kind` is a u32 discriminant, not a single byte, and the amount is a
+    plain f64. See the module docstring for the `marginSymbol` trap.
+    """
+    if kind not in TRANSFER_KINDS:
+        raise ValueError(f"kind must be one of {sorted(TRANSFER_KINDS)}, got {kind!r}")
+    if margin_amount <= 0:
+        raise ValueError("margin_amount must be > 0")
+
+    return b"".join(
+        [
+            _write_u32(TRANSFER_ORDINAL),
+            _write_u32(TRANSFER_KINDS[kind]),
+            _write_pubkey(from_pubkey),
+            _write_pubkey(to_pubkey),
+            struct.pack("<d", float(margin_amount)),
+        ]
+    )
+
+
+def _sign_and_submit(
+    *,
+    http_url: str,
+    signer: TransactionSigner,
+    domain: SignatureDomain,
+    action_bytes: bytes,
+    action_json: dict,
+    nonce: int,
+) -> tuple[dict, int, dict]:
+    """Sign one action and POST it, returning (request, status, response).
+
+    Layout per the API spec: action count, action, nonce, account, domain byte
+    (mainnet 1, testnet 2, devnet 3). The domain byte is always present.
+
+    The signing account is always the signer's own key: both actions here are
+    authorised by the master acting on itself, not on a child.
+    """
+    preimage = b"".join(
+        [
+            _write_u64(1),  # one action in this transaction
+            action_bytes,
+            _write_u64(nonce),
+            base58.b58decode(signer.public_key),
+            bytes([domain.value]),
+        ]
+    )
+    signature = signer.signing_key.sign(preimage).signature
+
+    tx = {
+        "actions": [action_json],
+        "nonce": nonce,
+        "account": signer.public_key,
+        "signer": signer.public_key,
+        "signature": base58.b58encode(signature).decode(),
+    }
+
+    response = requests.post(f"{http_url}/order", json=tx, timeout=30)
+    try:
+        response_json = response.json()
+    except ValueError:
+        response_json = {"raw": response.text}
+    return tx, response.status_code, response_json
+
+
 @dataclass
 class CreateSubAccountResult:
     name: str
+    request_json: dict
+    response_status: int
+    response_json: dict
+
+    @property
+    def ok(self) -> bool:
+        return self.response_status == 200 and self.response_json.get("status") == "ok"
+
+    @property
+    def sub_pubkey(self) -> Optional[str]:
+        """The new sub-account's pubkey, if the exchange reported one."""
+        try:
+            statuses = self.response_json["response"]["data"]["statuses"]
+            return statuses[0]["createSubAccount"]["sub"]
+        except (KeyError, IndexError, TypeError):
+            return None
+
+
+@dataclass
+class TransferResult:
+    from_pubkey: str
+    to_pubkey: str
+    margin_amount: float
     request_json: dict
     response_status: int
     response_json: dict
@@ -112,44 +226,71 @@ def build_and_submit(
     signer = TransactionSigner(private_key)
     nonce = nonce if nonce is not None else int(time.time_ns())
 
-    action_bytes = serialize_create_sub_account(name, margin_amount)
-    # Layout per the API spec: action count, actions, nonce, account, domain
-    # byte (mainnet 1, testnet 2, devnet 3). The domain byte is always present.
-    preimage = b"".join(
-        [
-            _write_u64(1),  # one action in this transaction
-            action_bytes,
-            _write_u64(nonce),
-            base58.b58decode(signer.public_key),
-            bytes([domain.value]),
-        ]
-    )
-    signature = signer.signing_key.sign(preimage).signature
-
     # The JSON mirrors the signed bytes: name always, marginAmount only when
-    # non-zero, and marginSymbol never -- it is not in the preimage, so sending
-    # it would describe a transaction different from the one that was signed.
+    # non-zero, and marginSymbol never.
     action_json: dict = {"createSubAccount": {"name": name}}
     if margin_amount is not None and float(margin_amount) > 0:
         action_json["createSubAccount"]["marginAmount"] = float(margin_amount)
 
-    tx = {
-        "actions": [action_json],
-        "nonce": nonce,
-        "account": signer.public_key,
-        "signer": signer.public_key,
-        "signature": base58.b58encode(signature).decode(),
-    }
-
-    response = requests.post(f"{http_url}/order", json=tx, timeout=30)
-    try:
-        response_json = response.json()
-    except ValueError:
-        response_json = {"raw": response.text}
-
+    tx, status, response_json = _sign_and_submit(
+        http_url=http_url,
+        signer=signer,
+        domain=domain,
+        action_bytes=serialize_create_sub_account(name, margin_amount),
+        action_json=action_json,
+        nonce=nonce,
+    )
     return CreateSubAccountResult(
         name=name,
         request_json=tx,
-        response_status=response.status_code,
+        response_status=status,
+        response_json=response_json,
+    )
+
+
+def submit_transfer(
+    *,
+    http_url: str,
+    private_key: str,
+    domain: SignatureDomain,
+    from_pubkey: str,
+    to_pubkey: str,
+    margin_amount: float,
+    kind: str = "internal",
+    margin_symbol: str = "USDC",
+    nonce: Optional[int] = None,
+) -> TransferResult:
+    """Sign and submit a `transfer` transaction over HTTP.
+
+    `margin_symbol` goes into the JSON only. The API schema requires it, but it
+    contributes no signing bytes, so it cannot be recovered from the signature
+    and has to be stated separately.
+    """
+    signer = TransactionSigner(private_key)
+    nonce = nonce if nonce is not None else int(time.time_ns())
+
+    action_json = {
+        "transfer": {
+            "k": kind,
+            "from": from_pubkey,
+            "to": to_pubkey,
+            "marginSymbol": margin_symbol,
+            "marginAmount": float(margin_amount),
+        }
+    }
+    tx, status, response_json = _sign_and_submit(
+        http_url=http_url,
+        signer=signer,
+        domain=domain,
+        action_bytes=serialize_transfer(from_pubkey, to_pubkey, margin_amount, kind),
+        action_json=action_json,
+        nonce=nonce,
+    )
+    return TransferResult(
+        from_pubkey=from_pubkey,
+        to_pubkey=to_pubkey,
+        margin_amount=float(margin_amount),
+        request_json=tx,
+        response_status=status,
         response_json=response_json,
     )
