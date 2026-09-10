@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime state. Contains the bot's view of open positions and orders --
+# do not commit it, and do not delete it while positions are open.
+state/
+*.state.json
+
+# Local config may name real accounts.
+config.yaml
+config.*.yaml
+!config.example.yaml
+.env
+
+# The private key: read from BULK_PRIVATE_KEY, or from this local file as a
+# fallback. Never commit it.
+private_key.local

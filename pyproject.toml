@@ -1,0 +1,29 @@
+[project]
+name = "bulkdn"
+version = "0.1.0"
+description = "Delta-neutral trading bot for BULK, running a hedged BTC/SOL cycle across a master account and a sub-account"
+requires-python = ">=3.10"
+dependencies = [
+    "bulk-client>=0.1.2",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+bulkdn = "bulkdn.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bulkdn*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

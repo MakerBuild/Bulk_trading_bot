@@ -1,0 +1,316 @@
+"""Phase machine: role swapping, fill routing, and completion predicates.
+
+The role swap between OPEN and EXIT is what allows a single hedge rule to serve
+both directions of the cycle, so it is worth pinning down explicitly.
+"""
+
+from dataclasses import dataclass
+
+import pytest
+
+from bulk_api.common import Side, Topic
+
+from bulkdn.config import Config, LegConfig, RiskConfig
+from bulkdn.feed import Quote
+from bulkdn.hedger import Hedger
+from bulkdn.marketdata import MarketSpec
+from bulkdn.positions import PositionBook
+from bulkdn.state import Phase, StateStore, StrategyState
+from bulkdn.strategy import Strategy, build_hedge_ceilings
+
+MASTER = "master-pubkey"
+SUB1 = "sub1-pubkey"
+BTC = "BTC-USD"
+SOL = "SOL-USD"
+
+BTC_SPEC = MarketSpec(symbol=BTC, tick_size=0.5, lot_size=0.001, min_notional=10.0)
+SOL_SPEC = MarketSpec(symbol=SOL, tick_size=0.01, lot_size=0.1, min_notional=10.0)
+
+
+@dataclass
+class FakeFill:
+    symbol: str
+    size: float
+    side: object
+    price: float = 100_000.0
+
+
+class FakeSession:
+    def __init__(self, name, pubkey):
+        self.name = name
+        self.pubkey = pubkey
+        self.dry_run = True
+        self.reject_streak = 0
+        self.is_connected = True
+        self.last_message_age_s = 0.0
+        self.handlers = {}
+        self.orders = []
+        self.current_trade_id = None
+
+    def on(self, topic, handler):
+        self.handlers.setdefault(topic, []).append(handler)
+
+    async def market(self, symbol, is_buy, size, reduce_only=False):
+        self.orders.append((symbol, is_buy, size, reduce_only))
+        return []
+
+
+class FakeFeed:
+    def __init__(self):
+        self.specs = {BTC: BTC_SPEC, SOL: SOL_SPEC}
+
+    def quote(self, symbol):
+        return Quote(symbol, 100_000.0, 100_010.0, 100_005.0, age_s=0.0)
+
+    def reference_price(self, symbol):
+        return 100_000.0
+
+
+def make_config():
+    return Config(
+        network="testnet",
+        sub1_pubkey=SUB1,
+        btc=LegConfig(symbol=BTC, size=1.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=1.0),
+        sol=LegConfig(symbol=SOL, size=10.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=10.0),
+        hold_minutes=1.0,
+        risk=RiskConfig(),
+        private_key="x",
+    )
+
+
+def build(tmp_path, phase=Phase.OPEN):
+    config = make_config()
+    book = PositionBook(overlay_ttl_ms=5000)
+    master = FakeSession("master", MASTER)
+    sub1 = FakeSession("sub1", SUB1)
+    feed = FakeFeed()
+    hedger = Hedger(
+        book=book,
+        sessions={MASTER: master, SUB1: sub1},
+        specs=feed.specs,
+        max_hedge_size=build_hedge_ceilings(config),
+    )
+    strategy = Strategy(
+        config=config,
+        master=master,
+        sub1=sub1,
+        feed=feed,
+        book=book,
+        hedger=hedger,
+        chaser=None,
+        risk=None,
+        store=StateStore(str(tmp_path / "state.json")),
+        state=StrategyState(phase=phase),
+    )
+    return strategy, book, master, sub1
+
+
+# -- role assignment -------------------------------------------------------
+
+
+def test_open_roles_match_the_strategy(tmp_path):
+    strategy, *_ = build(tmp_path)
+    roles = {r.symbol: r for r in strategy.roles_for(Phase.OPEN)}
+
+    # Master rests the BTC buy; sub1 hedges it short.
+    assert roles[BTC].maker == MASTER
+    assert roles[BTC].taker == SUB1
+    assert roles[BTC].maker_is_buy is True
+    assert roles[BTC].reduce_only is False
+
+    # Sub1 rests the SOL buy; master hedges it short.
+    assert roles[SOL].maker == SUB1
+    assert roles[SOL].taker == MASTER
+
+
+def test_exit_roles_swap_and_are_reduce_only(tmp_path):
+    strategy, *_ = build(tmp_path)
+    roles = {r.symbol: r for r in strategy.roles_for(Phase.EXIT)}
+
+    # Sub1 covers its BTC short, so it becomes the maker; master now hedges.
+    assert roles[BTC].maker == SUB1
+    assert roles[BTC].taker == MASTER
+    # Closing a short means buying.
+    assert roles[BTC].maker_is_buy is True
+    assert roles[BTC].reduce_only is True
+
+    assert roles[SOL].maker == MASTER
+    assert roles[SOL].taker == SUB1
+    assert roles[SOL].reduce_only is True
+
+
+def test_hold_reuses_the_open_roles(tmp_path):
+    strategy, *_ = build(tmp_path)
+    assert strategy.roles_for(Phase.HOLD) == strategy.roles_for(Phase.OPEN)
+
+
+# -- fill handling ---------------------------------------------------------
+
+
+def test_maker_fill_updates_the_book_and_queues_a_hedge(tmp_path):
+    strategy, book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+
+    handler = master.handlers[Topic.FILL][0]
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+
+    assert book.effective(MASTER, BTC) == 0.1
+    assert strategy._hedge_queue.get_nowait() == BTC
+
+
+def test_taker_fill_retires_the_in_flight_reservation(tmp_path):
+    strategy, book, _master, sub1 = build(tmp_path)
+    strategy.install_handlers()
+    strategy.hedger.in_flight.add(BTC, -0.1)
+
+    fill_handler = sub1.handlers[Topic.FILL][0]
+    fill_handler(FakeFill(symbol=BTC, size=0.1, side=Side.SELL))
+
+    assert strategy.hedger.in_flight.total(BTC) == 0.0
+    assert book.effective(SUB1, BTC) == -0.1
+
+
+def test_fills_in_unrelated_symbols_are_ignored(tmp_path):
+    strategy, book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+
+    handler = master.handlers[Topic.FILL][0]
+    handler(FakeFill(symbol="ETH-USD", size=1.0, side=Side.BUY))
+
+    assert book.effective(MASTER, "ETH-USD") == 0.0
+    assert strategy._hedge_queue.empty()
+
+
+def test_zero_size_fill_is_ignored(tmp_path):
+    strategy, _book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+
+    handler = master.handlers[Topic.FILL][0]
+    handler(FakeFill(symbol=BTC, size=0.0, side=Side.BUY))
+
+    assert strategy._hedge_queue.empty()
+
+
+def test_replayed_fill_does_not_move_the_position_twice(tmp_path):
+    """A reconnect replay must not inflate the book -- v1.0.17 tradeId dedup."""
+    strategy, book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+    book.set_authoritative(MASTER, BTC, 0.0)
+
+    handler = master.handlers[Topic.FILL][0]
+    master.current_trade_id = "12000:3"
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    assert book.effective(MASTER, BTC) == 0.1
+
+    # Same execution delivered again after a reconnect.
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    assert book.effective(MASTER, BTC) == 0.1
+
+    # A genuinely new execution still applies.
+    master.current_trade_id = "12000:4"
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    assert book.effective(MASTER, BTC) == pytest.approx(0.2)
+
+
+def test_both_accounts_apply_a_trade_that_crossed_between_them(tmp_path):
+    """Maker and taker share a tradeId; both sides genuinely moved."""
+    strategy, book, master, sub1 = build(tmp_path)
+    strategy.install_handlers()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+
+    master.current_trade_id = "12000:9"
+    master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    sub1.current_trade_id = "12000:9"
+    sub1.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.SELL))
+
+    assert book.effective(MASTER, BTC) == 0.1
+    assert book.effective(SUB1, BTC) == -0.1
+
+
+def test_fills_without_a_trade_id_are_all_applied(tmp_path):
+    """Pre-v1.0.17 servers send no tradeId; fills must not be dropped."""
+    strategy, book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+    book.set_authoritative(MASTER, BTC, 0.0)
+
+    handler = master.handlers[Topic.FILL][0]
+    master.current_trade_id = None
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    assert book.effective(MASTER, BTC) == pytest.approx(0.2)
+
+
+# -- completion predicates -------------------------------------------------
+
+
+def test_neutral_only_when_both_symbols_are_flat_net(tmp_path):
+    strategy, book, *_ = build(tmp_path)
+    book.set_authoritative(MASTER, BTC, 1.0)
+    book.set_authoritative(SUB1, BTC, -1.0)
+    book.set_authoritative(SUB1, SOL, 10.0)
+    book.set_authoritative(MASTER, SOL, -10.0)
+    assert strategy._is_neutral() is True
+
+    book.set_authoritative(SUB1, BTC, -0.5)
+    assert strategy._is_neutral() is False
+
+
+def test_not_neutral_while_a_hedge_is_in_flight(tmp_path):
+    strategy, book, *_ = build(tmp_path)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    strategy.hedger.in_flight.add(BTC, -0.1)
+    assert strategy._is_neutral() is False
+
+
+def test_all_flat_requires_every_account_and_symbol_at_zero(tmp_path):
+    strategy, book, *_ = build(tmp_path)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    assert strategy._all_flat() is True
+
+    # A hedged pair is neutral but decidedly not flat.
+    book.set_authoritative(MASTER, BTC, 1.0)
+    book.set_authoritative(SUB1, BTC, -1.0)
+    assert strategy._is_neutral() is True
+    assert strategy._all_flat() is False
+
+
+# -- end-to-end hedge sequence --------------------------------------------
+
+
+async def test_full_cycle_keeps_the_pair_neutral(tmp_path):
+    """Walk the sequence from the strategy description and check net stays ~0."""
+    strategy, book, master, sub1 = build(tmp_path)
+    hedger = strategy.hedger
+    open_btc = {r.symbol: r for r in strategy.roles_for(Phase.OPEN)}[BTC]
+    exit_btc = {r.symbol: r for r in strategy.roles_for(Phase.EXIT)}[BTC]
+
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+
+    # Entry fills 0.10 then 0.05, each hedged as it happens.
+    for size in (0.10, 0.05):
+        book.apply_fill(MASTER, BTC, is_buy=True, size=size)
+        result = await hedger.hedge(open_btc, mark_price=100_000.0)
+        assert result.hedged_size == pytest.approx(size)
+        book.apply_fill(SUB1, BTC, is_buy=False, size=size)
+        hedger.note_taker_fill(BTC, -size)
+        assert book.net(MASTER, SUB1, BTC) == pytest.approx(0.0)
+
+    # Fully open: master long 0.15, sub1 short 0.15.
+    book.set_authoritative(MASTER, BTC, 0.15)
+    book.set_authoritative(SUB1, BTC, -0.15)
+
+    # Exit: sub1 buys back 0.05 of its short; master must sell 0.05.
+    book.apply_fill(SUB1, BTC, is_buy=True, size=0.05)
+    result = await hedger.hedge(exit_btc, mark_price=100_000.0)
+
+    assert result.hedged_size == pytest.approx(0.05)
+    assert master.orders[-1] == (BTC, False, 0.05, True)  # sell, reduce-only
+    book.apply_fill(MASTER, BTC, is_buy=False, size=0.05)
+    hedger.note_taker_fill(BTC, -0.05)
+    assert book.net(MASTER, SUB1, BTC) == pytest.approx(0.0)

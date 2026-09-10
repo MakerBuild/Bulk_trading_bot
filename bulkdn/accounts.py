@@ -1,0 +1,435 @@
+"""Account sessions and sub-account order routing.
+
+Two problems with the stock SDK have to be solved here.
+
+**Routing.** `BulkWebSocketClient.place_orders` hardcodes
+`account = self.signer.public_key`, so it can only ever trade the signing
+account. The wire protocol is more capable: `account` names the account being
+acted on and `signer` names who authorises it, and a master is allowed to sign
+for its own sub-accounts. `TransactionSigner.sign_transaction` reads both
+fields straight off the transaction dict, so overriding the builder is enough --
+the signing path itself is untouched.
+
+**State separation.** Account stream updates are not tagged with the account
+they belong to, so a single client subscribed to two accounts would merge
+Master's and Sub1's positions into one book. Each account therefore gets its own
+client, and handlers close over which one they belong to.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence
+
+from bulk_api import BulkWebSocketClient
+from bulk_api.api.bulk_http import BulkHttpClient
+from bulk_api.common import (
+    OrderStatus,
+    Side,
+    SignatureDomain,
+    TimeInForce,
+    Topic,
+    TransactionSigner,
+)
+from bulk_api.messages.trade import CancelAll, CancelOrder, LimitOrder, MarketOrder, OrderResponse
+
+Action = Any  # LimitOrder | MarketOrder | CancelOrder | CancelAll
+
+log = logging.getLogger(__name__)
+
+
+class OrderRejected(Exception):
+    """Raised when the exchange rejects an action inside a submitted batch."""
+
+    def __init__(self, message: str, responses: Sequence[OrderResponse] | None = None):
+        super().__init__(message)
+        self.responses = list(responses or [])
+
+
+class RoutedWsClient(BulkWebSocketClient):
+    """A WS client bound to one account, which may differ from the signer.
+
+    `account_pubkey` is the account being traded. For the master session it
+    equals the signer's pubkey; for a sub-account session it is the child's
+    pubkey and the master signs on its behalf.
+    """
+
+    def __init__(self, *args, account_pubkey: Optional[str] = None, dry_run: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.account_pubkey = account_pubkey or (self.signer.public_key if self.signer else None)
+        self.dry_run = dry_run
+        self.last_message_at: float = time.monotonic()
+        # Set for the duration of a fill dispatch; see `_handle_fill`.
+        self.current_trade_id: Optional[str] = None
+
+    # -- connection --------------------------------------------------------
+
+    async def connect(self) -> bool:
+        """Connect, subscribing to *this* client's account rather than the signer's.
+
+        The base implementation auto-subscribes to `signer.public_key`, which is
+        wrong for a sub-account session. Hiding the signer for the duration of
+        the call suppresses that branch; the account subscription is then issued
+        explicitly. On reconnect the stored subscription list is replayed
+        instead, so this only applies to the first connect.
+        """
+        had_subscriptions = bool(self.subscriptions)
+        saved_signer = self.signer
+        self.signer = None
+        try:
+            connected = await super().connect()
+        finally:
+            self.signer = saved_signer
+
+        if connected and not had_subscriptions and self.account_pubkey:
+            await self.subscribe_account(self.account_pubkey)
+        return connected
+
+    async def _handle_message(self, data: Dict) -> None:
+        # Liveness is tracked off raw traffic so the risk layer can tell a quiet
+        # market from a dead socket.
+        self.last_message_at = time.monotonic()
+        await super()._handle_message(data)
+
+    async def _handle_fill(self, data: Dict) -> None:
+        """Expose `tradeId`, which the SDK's `Fill` parser discards.
+
+        API v1.0.17 added a lossless `"<slot>:<event-sequence>"` trade id to
+        account fill updates, but `bulk_api.messages.trade.Fill` does not carry
+        the field, so it is lost by the time a handler sees the fill. Stashing
+        it here makes it readable for the duration of the dispatch: handlers run
+        inline inside this call, so a handler reading `current_trade_id` always
+        gets the id belonging to the fill it was handed.
+
+        Note the changelog's caveat -- maker, taker, and isolated-account views
+        of one execution share a trade id -- so it identifies an execution, not
+        an (account, execution) pair, and must be scoped by account when used
+        for deduplication.
+        """
+        self.current_trade_id = data.get("tradeId")
+        try:
+            await super()._handle_fill(data)
+        finally:
+            self.current_trade_id = None
+
+    # -- routed submission -------------------------------------------------
+
+    async def submit(
+        self,
+        actions: Sequence[Action],
+        timeout: Optional[float] = None,
+        nonce: Optional[int] = None,
+    ) -> List[OrderResponse]:
+        """Sign and submit a batch of actions against this client's account.
+
+        Mirrors the SDK's `place_orders` but sets `account` to the routed
+        account while leaving `signer` as the key that actually signs. Actions
+        also carry `pubkey`, which feeds the client-side order-ID hash -- it
+        must be the routed account or the computed IDs won't match the
+        exchange's.
+        """
+        if not self.signer:
+            raise RuntimeError("signer not configured")
+        if not self.account_pubkey:
+            raise RuntimeError("account_pubkey not configured")
+
+        account = self.account_pubkey
+        if nonce is None:
+            nonce = int(time.time_ns())
+
+        payload_actions = []
+        for index, action in enumerate(actions):
+            action.seqno = index
+            action.nonce = nonce
+            action.pubkey = account
+            payload_actions.append(action.to_api())
+
+        tx = {
+            "actions": payload_actions,
+            "nonce": f"{nonce}",
+            "account": account,
+            "signer": self.signer.public_key,
+        }
+
+        if self.dry_run:
+            log.info(
+                "[dry-run] would submit to %s: %s",
+                _short(account),
+                " | ".join(str(a) for a in actions),
+            )
+            return [
+                OrderResponse(
+                    order_id=_safe_order_id(action),
+                    status=OrderStatus.RESTING,
+                    message="dry-run",
+                    meta={"dry_run": True},
+                )
+                for action in actions
+            ]
+
+        if not self.is_connected:
+            raise RuntimeError("not connected to WebSocket")
+
+        tx = self.signer.sign_transaction(tx, self.signature_domain)
+
+        self.request_id += 1
+        request_id = self.request_id
+        request = {
+            "method": "post",
+            "request": {"type": "action", "payload": tx},
+            "id": request_id,
+        }
+
+        future: asyncio.Future = asyncio.Future()
+        self.pending_requests[request_id] = future
+        try:
+            await self.ws.send(json.dumps(request))
+            responses = await asyncio.wait_for(
+                future, timeout=timeout if timeout is not None else self.default_timeout
+            )
+            return responses
+        except asyncio.TimeoutError:
+            self.pending_requests.pop(request_id, None)
+            raise
+        except Exception:
+            self.pending_requests.pop(request_id, None)
+            raise
+
+
+@dataclass
+class AccountSession:
+    """One account: its WS client, its label, and its cached market specs."""
+
+    name: str
+    pubkey: str
+    client: RoutedWsClient
+    http: BulkHttpClient
+    dry_run: bool = False
+    reject_streak: int = 0
+
+    async def connect(self) -> None:
+        if not await self.client.connect():
+            raise RuntimeError(f"{self.name}: failed to connect to WebSocket")
+        log.info("%s connected (account=%s)", self.name, _short(self.pubkey))
+
+    async def disconnect(self) -> None:
+        try:
+            await self.client.disconnect()
+        except Exception as exc:  # pragma: no cover - shutdown best effort
+            log.warning("%s: error during disconnect: %s", self.name, exc)
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self.client.is_connected)
+
+    @property
+    def last_message_age_s(self) -> float:
+        return time.monotonic() - self.client.last_message_at
+
+    @property
+    def current_trade_id(self) -> Optional[str]:
+        """Trade id of the fill currently being dispatched, if any."""
+        return getattr(self.client, "current_trade_id", None)
+
+    def on(self, topic: Topic, handler: Callable) -> None:
+        self.client.on(topic, handler)
+
+    # -- order helpers -----------------------------------------------------
+
+    async def submit(
+        self, actions: Sequence[Action], count_rejects: bool = True, **kwargs
+    ) -> List[OrderResponse]:
+        """Submit a batch and raise if any action was rejected.
+
+        Rejection streaks are tracked here rather than at the call sites so the
+        risk layer has a single number to trip on. `count_rejects` exists for
+        cancels, where a rejection usually just means there was nothing to
+        cancel -- counting those would let routine cleanup trip the kill switch.
+        """
+        responses = await self.client.submit(actions, **kwargs)
+        rejected = [r for r in responses if r.is_error()]
+        if rejected:
+            if count_rejects:
+                self.reject_streak += 1
+            detail = "; ".join(f"{r.status}: {r.message}" for r in rejected)
+            raise OrderRejected(f"{self.name}: {detail}", responses)
+        if count_rejects:
+            self.reject_streak = 0
+        return responses
+
+    async def place_limit(
+        self,
+        symbol: str,
+        is_buy: bool,
+        price: float,
+        size: float,
+        reduce_only: bool = False,
+        cancel_oid: Optional[str] = None,
+    ) -> tuple[str, List[OrderResponse]]:
+        """Place a resting limit order, optionally replacing an existing one.
+
+        When `cancel_oid` is given the cancel and the placement go out in a
+        single transaction, which is the only way to reprice on BULK -- resting
+        orders cannot have their price modified.
+        """
+        order = LimitOrder(
+            symbol=symbol,
+            side=Side.BUY if is_buy else Side.SELL,
+            price=price,
+            size=size,
+            reduce_only=reduce_only,
+            time_in_force=TimeInForce.GTC,
+        )
+        actions: List[Action] = []
+        if cancel_oid:
+            actions.append(CancelOrder(symbol=symbol, oid=cancel_oid))
+        actions.append(order)
+
+        responses = await self.submit(actions)
+        # order_id() is a deterministic hash of the signed fields, so it is
+        # known once seqno/nonce/pubkey have been stamped on by submit().
+        return order.order_id(), responses
+
+    async def market(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        reduce_only: bool = False,
+    ) -> List[OrderResponse]:
+        return await self.submit(
+            [
+                MarketOrder(
+                    symbol=symbol,
+                    side=Side.BUY if is_buy else Side.SELL,
+                    size=size,
+                    reduce_only=reduce_only,
+                )
+            ]
+        )
+
+    async def cancel(self, symbol: str, oid: str) -> List[OrderResponse]:
+        # A cancel commonly loses a race with a fill; that is not a malfunction.
+        return await self.submit(
+            [CancelOrder(symbol=symbol, oid=oid)], count_rejects=False
+        )
+
+    async def cancel_all(self, symbols: Sequence[str]) -> List[OrderResponse]:
+        return await self.submit(
+            [CancelAll(symbols=list(symbols))], count_rejects=False
+        )
+
+    # -- state queries -----------------------------------------------------
+
+    def full_account(self) -> Dict:
+        """HTTP account snapshot, unwrapped.
+
+        Used at startup and during recovery, when the WS stream has not yet
+        delivered a snapshot or is not trusted.
+
+        The endpoint nests everything under a `fullAccount` key (and may wrap
+        the whole thing in a single-element list), so the payload is flattened
+        here. Reading the outer envelope instead silently yields no positions
+        and no sub-accounts -- which looks exactly like a flat account.
+        """
+        return unwrap_full_account(self.http.get_full_account(self.pubkey))
+
+    def open_orders(self) -> List[Dict]:
+        return self.http.get_open_orders(self.pubkey)
+
+
+def build_sessions(
+    *,
+    private_key: str,
+    sub1_pubkey: str,
+    ws_url: str,
+    http_url: str,
+    domain: SignatureDomain,
+    symbols: Sequence[str],
+    dry_run: bool,
+) -> tuple[AccountSession, AccountSession]:
+    """Construct the master and Sub1 sessions from a single signing key.
+
+    Both sessions share the master's key. They differ in `account_pubkey`,
+    which is what routes orders to the right account.
+    """
+    signer = TransactionSigner(private_key)
+    master_pubkey = signer.public_key
+
+    if sub1_pubkey == master_pubkey:
+        raise ValueError("sub1_pubkey must differ from the master account pubkey")
+
+    # Takes the raw key, not the signer, and names the endpoint `base_url`.
+    http = BulkHttpClient(
+        base_url=http_url, private_key=private_key, signature_domain=domain
+    )
+
+    def make(name: str, pubkey: str) -> AccountSession:
+        client = RoutedWsClient(
+            url=ws_url,
+            symbols=list(symbols),
+            signer=signer,
+            signature_domain=domain,
+            account_pubkey=pubkey,
+            dry_run=dry_run,
+        )
+        return AccountSession(
+            name=name, pubkey=pubkey, client=client, http=http, dry_run=dry_run
+        )
+
+    return make("master", master_pubkey), make("sub1", sub1_pubkey)
+
+
+def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:
+    """Fail fast unless Sub1 really is a child of the master.
+
+    Trading an unrelated account would still sign correctly if that account had
+    authorised the key, but the strategy's margin and risk assumptions only hold
+    for a true sub-account, so this is checked rather than assumed.
+    """
+    master_state = master.full_account()
+    children = {
+        entry.get("pubkey")
+        for entry in (master_state.get("subAccounts") or [])
+        if isinstance(entry, dict)
+    }
+    if sub1.pubkey not in children:
+        raise RuntimeError(
+            f"{sub1.pubkey} is not a sub-account of master {master.pubkey}. "
+            f"Known sub-accounts: {sorted(c for c in children if c) or 'none'}"
+        )
+    log.info("verified %s is a sub-account of %s", _short(sub1.pubkey), _short(master.pubkey))
+
+
+def unwrap_full_account(payload: Any) -> Dict:
+    """Flatten a `/account` response down to the account body.
+
+    Observed shapes: `{"fullAccount": {...}}`, `[{"fullAccount": {...}}]`, and
+    a bare `{...}`. All three are accepted so a change in envelope does not
+    silently turn a funded account into an apparently empty one.
+    """
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+    if not isinstance(payload, dict):
+        return {}
+    inner = payload.get("fullAccount")
+    if isinstance(inner, dict):
+        return inner
+    return payload
+
+
+def _short(pubkey: Optional[str]) -> str:
+    if not pubkey:
+        return "?"
+    return pubkey if len(pubkey) <= 12 else f"{pubkey[:6]}..{pubkey[-4:]}"
+
+
+def _safe_order_id(action: Action) -> Optional[str]:
+    try:
+        return action.order_id()
+    except Exception:
+        return None
