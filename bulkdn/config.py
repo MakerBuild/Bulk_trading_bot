@@ -171,8 +171,6 @@ class Config:
     def validate(self, require_credentials: bool = True, require_sub1: bool = True) -> None:
         """Validate the configuration.
 
-        `require_credentials` is relaxed for offline commands such as
-        `simulate`, which never touch an account and so need no signing key.
         `require_sub1` is relaxed for `create-subaccount`, which exists to
         produce that pubkey rather than assume it already exists.
         """

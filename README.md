@@ -166,19 +166,21 @@ Test in this order:
 .venv/Scripts/python -m pytest
 ```
 
-**2. Full-cycle simulation** — no network, no keys, no funds. This is the only way to watch a
-complete OPEN → HOLD → EXIT cycle. It pulls real tick/lot/notional rules and live prices from
-the public API when reachable, then runs the strategy against an in-process fake exchange.
+**2. Full cycle on testnet** — free, and the only honest rehearsal. Fund the master with
+`bulkdn faucet`, transfer margin to the sub, then run a complete OPEN → HOLD → EXIT cycle
+against the real matching engine.
 
 ```bash
-.venv/Scripts/python -m bulkdn.cli --config config.yaml simulate
+.venv/Scripts/python -m bulkdn.cli --config config.yaml --network testnet run --live
 ```
 
-Watch `worst |net|` — the largest directional exposure the pair carried, compared against the
-**unhedgeable floor**. A hedge smaller than a market's minimum notional cannot be submitted, so
-that floor (not zero) is the best neutrality achievable: ~$50 on SOL, ~$1 on BTC. It does not
-shrink by trading larger. The run also redelivers every 7th fill to exercise `tradeId` dedup;
-`duplicate fills seen` should be non-zero with positions unaffected.
+Watch net exposure against the **unhedgeable floor**. A hedge smaller than a market's minimum
+notional cannot be submitted, so that floor (not zero) is the best neutrality achievable: ~$50
+on SOL, ~$1 on BTC. It does not shrink by trading larger.
+
+Testnet also exercises what no simulation can: per-action signature correctness, rejections
+(`rejectedCrossing`, `cancelledReduceOnly`, `rejectedRiskLimit`), the 25 ms taker speed bump,
+the `minNotional` floor, and whether pre-computed order IDs match what the exchange assigns.
 
 **3. Read-only checks against the live API** — no signing, no orders.
 
@@ -187,8 +189,8 @@ shrink by trading larger. The run also redelivers every 7th fill to exercise `tr
 .venv/Scripts/python -m bulkdn.cli --config config.yaml status   # positions and open orders
 ```
 
-**4. Dry run against mainnet** — connects both account streams and logs every transaction it
-*would* send, submitting nothing. Note it cannot advance past OPEN, because nothing fills.
+**4. Dry run** — connects both account streams and logs every transaction it *would* send,
+submitting nothing. Note it cannot advance past OPEN, because nothing fills.
 
 ```bash
 .venv/Scripts/python -m bulkdn.cli --config config.yaml run
@@ -333,6 +335,9 @@ crash still recognisable on restart.
 - **Dry-run cannot advance past OPEN.** Nothing fills, so positions never move and the entry
   legs never complete. Dry-run verifies connection, subaccount routing, order-ID computation,
   chasing, and the risk checks — it cannot demonstrate a full cycle. Use testnet for that.
+- **No offline full-cycle rehearsal.** The in-process simulator was removed once testnet proved
+  reachable: it modelled no signatures, no rejections, no latency and no fees, so it agreed with
+  the bot's own assumptions rather than testing them. Unit tests cover the phase machine.
 - Sub-lot dust is left behind at the end of a cycle. Positions smaller than one lot cannot be
   traded, so a residual below `lotSize` on either account is expected and treated as flat.
 - The bot assumes it is the only thing trading these two symbols on both accounts. Entry

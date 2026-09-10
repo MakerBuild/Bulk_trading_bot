@@ -239,144 +239,6 @@ async def cmd_check(config: Config) -> int:
     return 0
 
 
-async def cmd_simulate(config: Config, fill_fraction: float, volatility_bps: float, seed: int) -> int:
-    """Run a full cycle against an in-process fake exchange.
-
-    No network, no keys, no funds. This is the only way to watch a complete
-    OPEN -> HOLD -> EXIT cycle, because BULK publishes no reachable testnet.
-    """
-    import random
-
-    from .chaser import Chaser
-    from .hedger import Hedger
-    from .risk import RiskMonitor
-    from .simulator import SimExchange, SimFeed, SimSession
-    from .state import StrategyState
-    from .strategy import Strategy, build_chase_params, build_hedge_ceilings
-
-    symbols = [config.btc.symbol, config.sol.symbol]
-    rng = random.Random(seed)
-
-    # Use the live exchange's real tick/lot/notional rules when reachable, so
-    # the simulation exercises the same rounding the real thing would.
-    specs, prices = _load_sim_specs(config, symbols)
-
-    # Redeliver every 7th fill, so the trade-id deduplication is under test on
-    # every simulation run rather than only when a real reconnect happens.
-    exchange = SimExchange(replay_every=7)
-    master = SimSession(exchange, "master", "SIM-MASTER", symbols)
-    sub1 = SimSession(exchange, "sub1", "SIM-SUB1", symbols)
-    sessions = {master.pubkey: master, sub1.pubkey: sub1}
-
-    book = PositionBook(overlay_ttl_ms=config.overlay_ttl_ms)
-    feed = SimFeed(specs, prices, volatility_bps=volatility_bps)
-
-    strategy = Strategy(
-        config=config,
-        master=master,
-        sub1=sub1,
-        feed=feed,
-        book=book,
-        hedger=Hedger(
-            book=book, sessions=sessions, specs=specs,
-            tolerance_lots=config.hedge_tolerance_lots,
-            max_hedge_size=build_hedge_ceilings(config),
-            in_flight_ttl_ms=config.overlay_ttl_ms,
-        ),
-        chaser=Chaser(
-            sessions=sessions, feed=feed, book=book,
-            params=build_chase_params(config),
-            price_stale_timeout_s=config.risk.price_stale_timeout_s,
-        ),
-        risk=RiskMonitor(
-            config=config.risk, book=book, feed=feed,
-            sessions=sessions, symbols=symbols,
-        ),
-        store=StateStore(config.state_file),
-        state=StrategyState(),
-    )
-
-    log.info("simulating %d cycle(s) -- no network, no funds at risk", config.cycles)
-    task = asyncio.create_task(strategy.run())
-
-    worst_net = {s: 0.0 for s in symbols}
-    accounts = [master.pubkey, sub1.pubkey]
-
-    while not task.done():
-        await asyncio.sleep(config.chase_interval_s / 2)
-        feed.step(rng)
-        for symbol in symbols:
-            worst_net[symbol] = max(worst_net[symbol], abs(exchange.net(accounts, symbol)))
-        # Fill a slice of each resting order, so limits fill partially the way
-        # they do in a real book.
-        for oid in list(exchange.orders):
-            order = exchange.orders.get(oid)
-            if order is None:
-                continue
-            spec = specs[order.symbol]
-            exchange.fill_resting(oid, max(order.size * fill_fraction, spec.lot_size), spec)
-
-    try:
-        await task
-    except Exception as exc:
-        print(f"\nsimulation ended with {type(exc).__name__}: {exc}")
-        return 2
-
-    print("\n" + "=" * 68)
-    print(f"final phase          : {strategy.state.phase.value}")
-    for symbol in symbols:
-        spec = specs[symbol]
-        price = feed.reference_price(symbol) or 0.0
-        m = exchange.position(master.pubkey, symbol)
-        s = exchange.position(sub1.pubkey, symbol)
-        residual = abs(m + s) * price
-        print(
-            f"\n{symbol}  (lot {spec.lot_size:g}, min notional ${spec.min_notional:g})"
-        )
-        print(
-            f"  final      master={m:+.8f}  sub1={s:+.8f}  net={m + s:+.8f} "
-            f"(${residual:.2f})"
-        )
-        # The exchange cannot hedge below its own minimum notional, so that is
-        # the floor on directional exposure -- not zero, and not the lot size.
-        worst_usd = worst_net[symbol] * price
-        verdict = "OK" if worst_usd <= spec.min_notional * 1.5 else "ABOVE FLOOR"
-        print(
-            f"  worst |net| {worst_net[symbol]:.8f} (${worst_usd:.2f}) "
-            f"vs ${spec.min_notional:g} unhedgeable floor -> {verdict}"
-        )
-    print(f"\nresting orders left  : {len(exchange.orders)}")
-    print(f"market hedges fired  : {len(exchange.market_orders)}")
-    print(f"duplicate fills seen : {exchange.replayed} (deduplicated by tradeId)")
-    print("=" * 68)
-    return 0
-
-
-def _load_sim_specs(config: Config, symbols):
-    """Real specs and prices from the public API, with an offline fallback."""
-    from .marketdata import MarketSpec
-
-    try:
-        import requests
-
-        info = requests.get(f"{config.http_url}/exchangeInfo", timeout=15).json()
-        by_symbol = {m["symbol"]: m for m in info if "symbol" in m}
-        specs, prices = {}, {}
-        for symbol in symbols:
-            specs[symbol] = MarketSpec.from_api(by_symbol[symbol])
-            ticker = requests.get(f"{config.http_url}/ticker/{symbol}", timeout=15).json()
-            prices[symbol] = float(ticker.get("markPrice") or ticker.get("lastPrice"))
-        log.info("simulating with live specs and prices from %s", config.http_url)
-        return specs, prices
-    except Exception as exc:
-        log.warning("could not fetch live specs (%s) -- using offline defaults", exc)
-        specs = {
-            s: MarketSpec(s, tick_size=0.001, lot_size=0.0001, min_notional=50.0)
-            for s in symbols
-        }
-        return specs, {s: 100.0 for s in symbols}
-
-
 async def cmd_create_subaccount(
     config: Config, name: str, margin_amount: Optional[float]
 ) -> int:
@@ -465,20 +327,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="print positions, orders, and persisted state")
     sub.add_parser("check", help="validate config and account wiring")
 
-    sim = sub.add_parser(
-        "simulate",
-        help="run a full cycle against a fake exchange (no network, no funds)",
-    )
-    sim.add_argument(
-        "--fill-fraction", type=float, default=0.3,
-        help="fraction of each resting order filled per tick (default 0.3)",
-    )
-    sim.add_argument(
-        "--volatility-bps", type=float, default=3.0,
-        help="per-tick price movement, which drives order chasing (default 3.0)",
-    )
-    sim.add_argument("--seed", type=int, default=1, help="RNG seed for repeatability")
-
     flat = sub.add_parser("flatten", help="cancel all orders and close all strategy positions")
     flat.add_argument("--live", action="store_true", help="actually submit the closing orders")
 
@@ -506,10 +354,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         config = load_config(
             args.config,
             network_override=args.network,
-            # `simulate` never touches an account, so it needs no key.
-            require_credentials=args.command != "simulate",
+            require_credentials=True,
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
-            require_sub1=args.command not in ("simulate", "create-subaccount"),
+            require_sub1=args.command != "create-subaccount",
         )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -532,10 +379,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             return asyncio.run(cmd_status(config))
         if args.command == "check":
             return asyncio.run(cmd_check(config))
-        if args.command == "simulate":
-            return asyncio.run(
-                cmd_simulate(config, args.fill_fraction, args.volatility_bps, args.seed)
-            )
         if args.command == "faucet":
             return asyncio.run(cmd_faucet(config, args.amount))
         if args.command == "create-subaccount":
