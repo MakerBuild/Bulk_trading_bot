@@ -261,6 +261,7 @@ Other commands:
 ```bash
 bulkdn            # interactive menu (same as `bulkdn menu`)
 bulkdn encrypt-key  # encrypt the key file, or change its password
+bulkdn license-show # this account's licence status
 bulkdn status     # positions, open orders, persisted phase
 bulkdn check      # validate config and account wiring
 bulkdn transfer --to <pubkey> --amount <n>   # fund a sub-account from the master
@@ -377,6 +378,58 @@ order's ID before its response arrives. That is what makes an order placed just 
 crash still recognisable on restart.
 
 ---
+
+## Licensing
+
+This build runs only for accounts the author has issued a licence to.
+
+**BULK publishes no referral data.** There is no `referral` field anywhere in
+the OpenAPI spec or in `bulk-client`, and the referral documentation puts
+referral activity on a page in the referrer's own dashboard. So the bot cannot
+ask the exchange who referred an account -- the answer has to come from whoever
+can see that page.
+
+### For the author, once
+
+```bash
+.venv/Scripts/python -m bulkdn.cli license-keygen
+```
+
+Keep the secret; put the public key in `AUTHOR_VERIFY_KEY` in
+`bulkdn/license.py` and ship that build. It is not a trading key and never
+needs to touch an account holding funds. Losing it means reissuing every
+licence under a new key and shipping a new build.
+
+### For each operator
+
+They send their master pubkey; you sign a licence for it:
+
+```bash
+BULK_LICENSE_KEY=<secret> .venv/Scripts/python -m bulkdn.cli license-issue --account <pubkey> --days 30
+```
+
+`--days 0` never expires. Send them the `license.json`; it goes beside their
+`config.yaml`. They can check it any time:
+
+```bash
+.venv/Scripts/python -m bulkdn.cli license-show
+```
+
+Every command that needs the signing key checks the licence first. Renewal is
+a new file; revocation is declining to send one, which is why a finite `--days`
+is worth more than a perpetual licence.
+
+The signature covers the account, the code, and both timestamps, so a licence
+cannot be re-pointed at another account or extended by editing it — the tests
+cover each of those. An unconfigured build (`AUTHOR_VERIFY_KEY` empty) refuses
+everything rather than allowing everything.
+
+### What this does not do
+
+The bot ships as Python source, so the gate is one function call somebody can
+delete. It stops a licence being passed around; it does not stop someone who
+edits the code. Raising that bar means shipping a binary, or moving something
+the bot cannot run without onto a server you control — neither is in here.
 
 ## The private key
 

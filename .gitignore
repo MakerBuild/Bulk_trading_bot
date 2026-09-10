@@ -19,3 +19,6 @@ config.*.yaml
 # The private key: read from BULK_PRIVATE_KEY, or from this local file as a
 # fallback. Never commit it.
 private_key.local
+
+# Per-operator licence, issued by the author. Not shared, not committed.
+license.json

@@ -355,6 +355,79 @@ async def cmd_transfer(
     return 0
 
 
+def cmd_license_keygen() -> int:
+    """Author tool: print a fresh licence-signing pair.
+
+    Nothing is written. The secret is printed once and is the author's to keep;
+    losing it means every future licence has to be reissued under a new key,
+    and a new build shipped.
+    """
+    from . import license as licensing
+
+    secret, public = licensing.keygen()
+    print("\nlicence signing key -- keep this, it is never needed by operators:")
+    print(f"  {secret}")
+    print("\npublic key -- compile this into bulkdn/license.py:")
+    print(f'  AUTHOR_VERIFY_KEY = "{public}"')
+    print("\nIssue licences with:")
+    print("  bulkdn license-issue --account <master pubkey> --days 30")
+    print("  (the signing key goes in BULK_LICENSE_KEY)")
+    return 0
+
+
+def cmd_license_issue(account: str, days: int, out: str) -> int:
+    """Author tool: sign a licence for one account."""
+    import json
+    import os
+
+    from . import license as licensing
+
+    signing_key = os.environ.get("BULK_LICENSE_KEY", "")
+    if not signing_key:
+        print("set BULK_LICENSE_KEY to the licence signing key first")
+        return 1
+
+    try:
+        envelope = licensing.issue(
+            account=account, signing_key=signing_key, days=days
+        )
+    except Exception as exc:  # noqa: BLE001 - report, do not traceback at a user
+        print(f"could not issue: {exc}")
+        return 1
+
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(envelope, handle, indent=2)
+        handle.write("\n")
+    horizon = "never expires" if days == 0 else f"{days} days"
+    print(f"\nwrote {out} for {account} ({horizon})")
+    print("Send that file to the operator; it goes next to their config.yaml.")
+    return 0
+
+
+def cmd_license_show(config: Config) -> int:
+    """Operator: what the licence in this directory says."""
+    from bulk_api.common.signer import TransactionSigner
+
+    from . import license as licensing
+
+    account = TransactionSigner(config.private_key).public_key
+    print(f"\naccount   : {account}")
+    try:
+        licence = licensing.enforce(account)
+    except licensing.LicenseError as exc:
+        print(f"licence   : NOT VALID -- {exc}")
+        return 1
+
+    remaining = licence.remaining_days()
+    print(f"licence   : valid, code {licence.code}")
+    print(
+        "expires   : never"
+        if remaining is None
+        else f"expires   : in {remaining:.1f} days"
+    )
+    return 0
+
+
 def cmd_encrypt_key(config: Config) -> int:
     """Encrypt the key file in place, or change its password.
 
@@ -487,6 +560,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("encrypt-key", help="encrypt the key file, or change its password")
+    sub.add_parser("license-show", help="show this account's licence status")
+    sub.add_parser("license-keygen", help="author: print a new licence signing pair")
+
+    issue = sub.add_parser("license-issue", help="author: sign a licence for an account")
+    issue.add_argument("--account", required=True, help="operator's master pubkey")
+    issue.add_argument("--days", type=int, default=30, help="validity; 0 never expires")
+    issue.add_argument("--out", default="license.json", help="file to write")
 
     create_sub = sub.add_parser(
         "create-subaccount",
@@ -501,9 +581,52 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Author tooling runs without a licence: minting one cannot require one, and
+# `license-show` has to be able to explain why a licence is refused.
+AUTHOR_COMMANDS = frozenset({"license-keygen", "license-issue", "license-show"})
+"""Commands that run without a valid licence.
+
+The first two are the author's and are handled before any config is read.
+`license-show` is the operator's and has to run precisely when the licence is
+refused, since explaining why is its whole job.
+"""
+
+
+def check_license(config: Config) -> int | None:
+    """None when the licence is good, otherwise an exit code.
+
+    BULK publishes no referral data, so this cannot be answered from the API --
+    see bulkdn/license.py. The licence is the author's statement that this
+    account is theirs to serve.
+    """
+    from bulk_api.common.signer import TransactionSigner
+
+    from . import license as licensing
+
+    account = TransactionSigner(config.private_key).public_key
+    try:
+        licence = licensing.enforce(account)
+    except licensing.LicenseError as exc:
+        print(f"\n  licence check failed: {exc}", file=sys.stderr)
+        print(f"  account: {account}", file=sys.stderr)
+        return 1
+
+    remaining = licence.remaining_days()
+    if remaining is not None and remaining < 7:
+        log.warning("licence expires in %.1f days", remaining)
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Minting a licence must not need a configured account, a key, or a
+    # sub-account -- the author has none of that on the machine they sign from.
+    if args.command == "license-keygen":
+        return cmd_license_keygen()
+    if args.command == "license-issue":
+        return cmd_license_issue(args.account, args.days, args.out)
 
     try:
         config = load_config(
@@ -511,11 +634,23 @@ def main(argv: list[str] | None = None) -> int:
             require_credentials=True,
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
             require_sub1=args.command
-            not in (None, "menu", "create-subaccount", "transfer", "encrypt-key"),
+            not in (
+                None,
+                "menu",
+                "create-subaccount",
+                "transfer",
+                "encrypt-key",
+                "license-show",
+            ),
         )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 1
+
+    if args.command not in AUTHOR_COMMANDS:
+        gate = check_license(config)
+        if gate is not None:
+            return gate
 
     configure_logging(args.log_level or config.log_level)
 
@@ -536,6 +671,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(cmd_status(config))
         if args.command == "check":
             return asyncio.run(cmd_check(config))
+        if args.command == "license-show":
+            return cmd_license_show(config)
         if args.command == "encrypt-key":
             return cmd_encrypt_key(config)
         if args.command == "transfer":
