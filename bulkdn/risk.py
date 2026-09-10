@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
+from collections.abc import Sequence
 
 from .accounts import AccountSession
 from .config import RiskConfig
@@ -42,7 +42,7 @@ class RiskMonitor:
         config: RiskConfig,
         book: PositionBook,
         feed: MarketFeed,
-        sessions: Dict[str, AccountSession],
+        sessions: dict[str, AccountSession],
         symbols: Sequence[str],
     ):
         self.config = config
@@ -63,9 +63,9 @@ class RiskMonitor:
         price = self.feed.reference_price(symbol) or 0.0
         return abs(net) * price
 
-    def check(self) -> List[Violation]:
+    def check(self) -> list[Violation]:
         """Return every breached limit. An empty list means it is safe to trade."""
-        violations: List[Violation] = []
+        violations: list[Violation] = []
 
         for symbol in self.symbols:
             price = self.feed.reference_price(symbol) or 0.0

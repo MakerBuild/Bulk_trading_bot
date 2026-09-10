@@ -31,7 +31,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 from .accounts import AccountSession
 from .marketdata import MarketSpec, round_notional, round_size
@@ -75,7 +74,7 @@ class HedgeResult:
     net_before: float
     hedged_size: float
     is_buy: bool
-    skipped_reason: Optional[str] = None
+    skipped_reason: str | None = None
 
     @property
     def acted(self) -> bool:
@@ -97,8 +96,8 @@ class InFlight:
 
     def __init__(self, ttl_ms: int = 2000):
         self.ttl_s = ttl_ms / 1000.0
-        self._value: Dict[str, float] = {}
-        self._expires: Dict[str, float] = {}
+        self._value: dict[str, float] = {}
+        self._expires: dict[str, float] = {}
 
     def add(self, symbol: str, delta: float) -> None:
         self._value[symbol] = self.total(symbol) + delta
@@ -126,7 +125,7 @@ class InFlight:
             return 0.0
         return self._value.get(symbol, 0.0)
 
-    def clear(self, symbol: Optional[str] = None) -> None:
+    def clear(self, symbol: str | None = None) -> None:
         if symbol is None:
             self._value.clear()
             self._expires.clear()
@@ -142,10 +141,10 @@ class Hedger:
         self,
         *,
         book: PositionBook,
-        sessions: Dict[str, AccountSession],
-        specs: Dict[str, MarketSpec],
+        sessions: dict[str, AccountSession],
+        specs: dict[str, MarketSpec],
         tolerance_lots: float = 1.0,
-        max_hedge_size: Optional[Dict[str, float]] = None,
+        max_hedge_size: dict[str, float] | None = None,
         in_flight_ttl_ms: int = 2000,
     ):
         self.book = book
@@ -157,7 +156,7 @@ class Hedger:
         # One lock per symbol. Fills arrive faster than orders round-trip, so
         # without this two triggers could both read the same non-zero net and
         # each fire a full-size hedge, overshooting into the opposite exposure.
-        self._locks: Dict[str, asyncio.Lock] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
     def _lock(self, symbol: str) -> asyncio.Lock:
         if symbol not in self._locks:
@@ -174,15 +173,11 @@ class Hedger:
             + self.in_flight.total(roles.symbol)
         )
 
-    def required_hedge(self, roles: LegRoles) -> float:
-        """Signed size the taker must trade to bring net exposure to zero."""
-        return -self.effective_net(roles)
-
     def note_taker_fill(self, symbol: str, signed_size: float) -> None:
         """Retire an in-flight reservation once its hedge fill lands."""
         self.in_flight.consume(symbol, signed_size)
 
-    def actionable_hedge(self, roles: LegRoles, mark_price: Optional[float] = None) -> float:
+    def actionable_hedge(self, roles: LegRoles, mark_price: float | None = None) -> float:
         """Hedge size that could actually be submitted right now.
 
         Returns 0 when the imbalance exists but cannot be traded -- below one
@@ -204,7 +199,7 @@ class Hedger:
             return 0.0
         return size
 
-    def untradeable_residual(self, roles: LegRoles, mark_price: Optional[float] = None) -> float:
+    def untradeable_residual(self, roles: LegRoles, mark_price: float | None = None) -> float:
         """Signed imbalance that exists but cannot be hedged. 0 when neutral."""
         net = self.effective_net(roles)
         if abs(net) < self.tolerance(roles.symbol):
@@ -213,7 +208,7 @@ class Hedger:
             return 0.0
         return net
 
-    async def hedge(self, roles: LegRoles, mark_price: Optional[float] = None) -> HedgeResult:
+    async def hedge(self, roles: LegRoles, mark_price: float | None = None) -> HedgeResult:
         """Bring `roles.symbol` back to neutral, if it has drifted.
 
         Safe to call redundantly -- it is a no-op when already neutral.

@@ -34,7 +34,6 @@ from __future__ import annotations
 import struct
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import base58
 import requests
@@ -73,7 +72,7 @@ def _write_pubkey(value: str) -> bytes:
     return raw
 
 
-def _write_optional_f64(value: Optional[float]) -> bytes:
+def _write_optional_f64(value: float | None) -> bytes:
     """Tag byte then, if present, an unscaled little-endian f64.
 
     A zero amount is encoded as *absent*, not as `Some(0.0)` -- that is what the
@@ -86,7 +85,7 @@ def _write_optional_f64(value: Optional[float]) -> bytes:
 
 
 def serialize_create_sub_account(
-    name: str, margin_amount: Optional[float] = None
+    name: str, margin_amount: float | None = None
 ) -> bytes:
     """Wincode bytes for one `createSubAccount` action.
 
@@ -185,7 +184,7 @@ class CreateSubAccountResult:
         return self.response_status == 200 and self.response_json.get("status") == "ok"
 
     @property
-    def sub_pubkey(self) -> Optional[str]:
+    def sub_pubkey(self) -> str | None:
         """The new sub-account's pubkey, if the exchange reported one."""
         try:
             statuses = self.response_json["response"]["data"]["statuses"]
@@ -214,8 +213,8 @@ def build_and_submit(
     private_key: str,
     domain: SignatureDomain,
     name: str,
-    margin_amount: Optional[float] = None,
-    nonce: Optional[int] = None,
+    margin_amount: float | None = None,
+    nonce: int | None = None,
 ) -> CreateSubAccountResult:
     """Sign and submit a `createSubAccount` transaction over HTTP.
 
@@ -258,7 +257,7 @@ def submit_transfer(
     margin_amount: float,
     kind: str = "internal",
     margin_symbol: str = "USDC",
-    nonce: Optional[int] = None,
+    nonce: int | None = None,
 ) -> TransferResult:
     """Sign and submit a `transfer` transaction over HTTP.
 

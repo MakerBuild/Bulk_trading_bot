@@ -7,8 +7,6 @@ terminates -- a menu that cannot be left is worse than one that is ugly.
 
 import builtins
 
-import pytest
-
 from bulkdn import menu
 
 
@@ -29,7 +27,7 @@ def feed(monkeypatch, answers):
 def test_box_renders_a_closed_frame():
     rendered = menu._box("TITLE", ["1. One", "2. Two"])
     lines = rendered.splitlines()
-    assert len(set(len(line) for line in lines)) == 1, "ragged frame"
+    assert len({len(line) for line in lines}) == 1, "ragged frame"
     assert lines[0].startswith("+") and lines[0].endswith("+")
     assert "TITLE" in lines[1]
     assert lines[-1] == lines[0]
@@ -83,7 +81,7 @@ def test_no_account_tree_is_reported_as_guidance(monkeypatch):
 def test_start_declined_does_not_run_the_strategy(monkeypatch):
     """`2` picks live, then anything but `yes` must abort before submitting."""
     calls = []
-    monkeypatch.setattr(menu.asyncio, "run", lambda coro: calls.append(coro))
+    monkeypatch.setattr(menu.asyncio, "run", calls.append)
 
     feed(monkeypatch, ["2", "n", ""])
     menu._start(StubConfig())

@@ -14,7 +14,6 @@ import argparse
 import asyncio
 import logging
 import sys
-from typing import List, Optional
 
 from bulk_api.common import SignatureDomain
 
@@ -241,7 +240,7 @@ async def cmd_check(config: Config) -> int:
 
 
 async def cmd_transfer(
-    config: Config, to_pubkey: str, amount: float, from_pubkey: Optional[str]
+    config: Config, to_pubkey: str, amount: float, from_pubkey: str | None
 ) -> int:
     """Move margin between the master and one of its accounts.
 
@@ -284,7 +283,7 @@ async def cmd_transfer(
 
 
 async def cmd_create_subaccount(
-    config: Config, name: str, margin_amount: Optional[float]
+    config: Config, name: str, margin_amount: float | None
 ) -> int:
     """Create a sub-account with a hand-serialized `createSubAccount` transaction.
 
@@ -312,17 +311,19 @@ async def cmd_create_subaccount(
     print(result.response_json)
 
     if result.ok:
-        print(
-            "\nlikely succeeded -- check `bulkdn status` or the BULK UI for the new "
-            "sub-account's pubkey, then add it as sub1_pubkey in your config."
-        )
+        pubkey = result.sub_pubkey
+        if pubkey:
+            print(f"\ncreated. Put this in config.yaml:\n\n  sub1_pubkey: \"{pubkey}\"")
+        else:
+            print(
+                "\naccepted, but the response carried no pubkey -- check `bulkdn status` "
+                "or the BULK UI, then add it as sub1_pubkey in your config."
+            )
         return 0
 
     print(
         "\nrejected. If the message is `bad signature`, the signed bytes disagree "
-        "with what the server expects -- the domain byte is pinned to mainnet "
-        "the domain byte is pinned to mainnet. Nothing was changed on "
-        "the account."
+        "with what the server expects. Nothing was changed on the account."
     )
     return 1
 
@@ -372,7 +373,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 

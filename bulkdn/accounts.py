@@ -23,7 +23,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any
+from collections.abc import Callable, Sequence
 
 from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
@@ -58,13 +59,11 @@ class RoutedWsClient(BulkWebSocketClient):
     pubkey and the master signs on its behalf.
     """
 
-    def __init__(self, *args, account_pubkey: Optional[str] = None, dry_run: bool = False, **kwargs):
+    def __init__(self, *args, account_pubkey: str | None = None, dry_run: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.account_pubkey = account_pubkey or (self.signer.public_key if self.signer else None)
         self.dry_run = dry_run
         self.last_message_at: float = time.monotonic()
-        # Set for the duration of a fill dispatch; see `_handle_fill`.
-        self.current_trade_id: Optional[str] = None
 
     # -- connection --------------------------------------------------------
 
@@ -89,41 +88,20 @@ class RoutedWsClient(BulkWebSocketClient):
             await self.subscribe_account(self.account_pubkey)
         return connected
 
-    async def _handle_message(self, data: Dict) -> None:
+    async def _handle_message(self, data: dict) -> None:
         # Liveness is tracked off raw traffic so the risk layer can tell a quiet
         # market from a dead socket.
         self.last_message_at = time.monotonic()
         await super()._handle_message(data)
-
-    async def _handle_fill(self, data: Dict) -> None:
-        """Expose `tradeId`, which the SDK's `Fill` parser discards.
-
-        API v1.0.17 added a lossless `"<slot>:<event-sequence>"` trade id to
-        account fill updates, but `bulk_api.messages.trade.Fill` does not carry
-        the field, so it is lost by the time a handler sees the fill. Stashing
-        it here makes it readable for the duration of the dispatch: handlers run
-        inline inside this call, so a handler reading `current_trade_id` always
-        gets the id belonging to the fill it was handed.
-
-        Note the changelog's caveat -- maker, taker, and isolated-account views
-        of one execution share a trade id -- so it identifies an execution, not
-        an (account, execution) pair, and must be scoped by account when used
-        for deduplication.
-        """
-        self.current_trade_id = data.get("tradeId")
-        try:
-            await super()._handle_fill(data)
-        finally:
-            self.current_trade_id = None
 
     # -- routed submission -------------------------------------------------
 
     async def submit(
         self,
         actions: Sequence[Action],
-        timeout: Optional[float] = None,
-        nonce: Optional[int] = None,
-    ) -> List[OrderResponse]:
+        timeout: float | None = None,
+        nonce: int | None = None,
+    ) -> list[OrderResponse]:
         """Sign and submit a batch of actions against this client's account.
 
         Mirrors the SDK's `place_orders` but sets `account` to the routed
@@ -188,10 +166,9 @@ class RoutedWsClient(BulkWebSocketClient):
         self.pending_requests[request_id] = future
         try:
             await self.ws.send(json.dumps(request))
-            responses = await asyncio.wait_for(
+            return await asyncio.wait_for(
                 future, timeout=timeout if timeout is not None else self.default_timeout
             )
-            return responses
         except asyncio.TimeoutError:
             self.pending_requests.pop(request_id, None)
             raise
@@ -230,11 +207,6 @@ class AccountSession:
     def last_message_age_s(self) -> float:
         return time.monotonic() - self.client.last_message_at
 
-    @property
-    def current_trade_id(self) -> Optional[str]:
-        """Trade id of the fill currently being dispatched, if any."""
-        return getattr(self.client, "current_trade_id", None)
-
     def on(self, topic: Topic, handler: Callable) -> None:
         self.client.on(topic, handler)
 
@@ -242,7 +214,7 @@ class AccountSession:
 
     async def submit(
         self, actions: Sequence[Action], count_rejects: bool = True, **kwargs
-    ) -> List[OrderResponse]:
+    ) -> list[OrderResponse]:
         """Submit a batch and raise if any action was rejected.
 
         Rejection streaks are tracked here rather than at the call sites so the
@@ -268,8 +240,8 @@ class AccountSession:
         price: float,
         size: float,
         reduce_only: bool = False,
-        cancel_oid: Optional[str] = None,
-    ) -> tuple[str, List[OrderResponse]]:
+        cancel_oid: str | None = None,
+    ) -> tuple[str, list[OrderResponse]]:
         """Place a resting limit order, optionally replacing an existing one.
 
         When `cancel_oid` is given the cancel and the placement go out in a
@@ -284,7 +256,7 @@ class AccountSession:
             reduce_only=reduce_only,
             time_in_force=TimeInForce.GTC,
         )
-        actions: List[Action] = []
+        actions: list[Action] = []
         if cancel_oid:
             actions.append(CancelOrder(symbol=symbol, oid=cancel_oid))
         actions.append(order)
@@ -300,7 +272,7 @@ class AccountSession:
         is_buy: bool,
         size: float,
         reduce_only: bool = False,
-    ) -> List[OrderResponse]:
+    ) -> list[OrderResponse]:
         return await self.submit(
             [
                 MarketOrder(
@@ -312,20 +284,20 @@ class AccountSession:
             ]
         )
 
-    async def cancel(self, symbol: str, oid: str) -> List[OrderResponse]:
+    async def cancel(self, symbol: str, oid: str) -> list[OrderResponse]:
         # A cancel commonly loses a race with a fill; that is not a malfunction.
         return await self.submit(
             [CancelOrder(symbol=symbol, oid=oid)], count_rejects=False
         )
 
-    async def cancel_all(self, symbols: Sequence[str]) -> List[OrderResponse]:
+    async def cancel_all(self, symbols: Sequence[str]) -> list[OrderResponse]:
         return await self.submit(
             [CancelAll(symbols=list(symbols))], count_rejects=False
         )
 
     # -- state queries -----------------------------------------------------
 
-    def full_account(self) -> Dict:
+    def full_account(self) -> dict:
         """HTTP account snapshot, unwrapped.
 
         Used at startup and during recovery, when the WS stream has not yet
@@ -338,7 +310,7 @@ class AccountSession:
         """
         return unwrap_full_account(self.http.get_full_account(self.pubkey))
 
-    def open_orders(self) -> List[Dict]:
+    def open_orders(self) -> list[dict]:
         return self.http.get_open_orders(self.pubkey)
 
 
@@ -405,7 +377,7 @@ def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:
     log.info("verified %s is a sub-account of %s", _short(sub1.pubkey), _short(master.pubkey))
 
 
-def unwrap_full_account(payload: Any) -> Dict:
+def unwrap_full_account(payload: Any) -> dict:
     """Flatten a `/account` response down to the account body.
 
     Observed shapes: `{"fullAccount": {...}}`, `[{"fullAccount": {...}}]`, and
@@ -422,13 +394,13 @@ def unwrap_full_account(payload: Any) -> Dict:
     return payload
 
 
-def _short(pubkey: Optional[str]) -> str:
+def _short(pubkey: str | None) -> str:
     if not pubkey:
         return "?"
     return pubkey if len(pubkey) <= 12 else f"{pubkey[:6]}..{pubkey[-4:]}"
 
 
-def _safe_order_id(action: Action) -> Optional[str]:
+def _safe_order_id(action: Action) -> str | None:
     try:
         return action.order_id()
     except Exception:

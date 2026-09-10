@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
-from typing import Any, Dict, Optional
+from typing import Any
 
 BPS = Decimal(10_000)
 
@@ -37,7 +37,7 @@ class MarketSpec:
     max_leverage: float = 1.0
 
     @classmethod
-    def from_api(cls, data: Dict[str, Any]) -> "MarketSpec":
+    def from_api(cls, data: dict[str, Any]) -> MarketSpec:
         return cls(
             symbol=data["symbol"],
             tick_size=float(data.get("tickSize", 0.01)),
@@ -103,13 +103,13 @@ def is_tradeable(size: float, price: float, spec: MarketSpec) -> bool:
 
 def chase_price(
     *,
-    best_bid: Optional[float],
-    best_ask: Optional[float],
-    mark_price: Optional[float],
+    best_bid: float | None,
+    best_ask: float | None,
+    mark_price: float | None,
     is_buy: bool,
     offset_bps: float,
     spec: MarketSpec,
-) -> Optional[float]:
+) -> float | None:
     """Target price for a resting order, `offset_bps` inside the touch.
 
     A buy rests below the best bid and a sell above the best ask, so the order

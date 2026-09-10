@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
 
 from bulk_api.common import Side, Topic
 
@@ -37,6 +36,7 @@ from .reconcile import (
 from .risk import RiskMonitor
 from .state import Phase, StateStore, StrategyState
 from .ws_compat import fill_trade_id
+import contextlib
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class Strategy:
         self.store = store
         self.state = state
 
-        self.sessions: Dict[str, AccountSession] = {
+        self.sessions: dict[str, AccountSession] = {
             master.pubkey: master,
             sub1.pubkey: sub1,
         }
@@ -79,11 +79,11 @@ class Strategy:
         self._seen_trades = SeenTrades()
         self._hedge_queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
-        self._halt_reason: Optional[str] = None
+        self._halt_reason: str | None = None
 
     # -- leg roles ---------------------------------------------------------
 
-    def roles_for(self, phase: Phase) -> List[LegRoles]:
+    def roles_for(self, phase: Phase) -> list[LegRoles]:
         """Which account makes and which hedges, for a given phase.
 
         The swap between OPEN and EXIT is what lets one hedge rule serve both.
@@ -108,7 +108,7 @@ class Strategy:
             LegRoles(sol, maker=sub1, taker=master, maker_is_buy=True, reduce_only=False),
         ]
 
-    def _roles_by_symbol(self, phase: Phase) -> Dict[str, LegRoles]:
+    def _roles_by_symbol(self, phase: Phase) -> dict[str, LegRoles]:
         return {roles.symbol: roles for roles in self.roles_for(phase)}
 
     # -- handlers (synchronous; see module docstring) ----------------------
@@ -136,7 +136,7 @@ class Strategy:
             # so the trigger is kept and only the bookkeeping is skipped.
             # Prefer the id attached during parsing; fall back to the client's
             # dispatch-scoped stash for fills parsed before the patch applied.
-            trade_id = fill_trade_id(fill) or session.current_trade_id
+            trade_id = fill_trade_id(fill)
             if not self._seen_trades.add_if_new(session.pubkey, trade_id):
                 log.debug(
                     "ignoring duplicate fill %s on %s", trade_id, session.name
@@ -464,10 +464,8 @@ class Strategy:
         finally:
             self._stop.set()
             worker.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await worker
-            except asyncio.CancelledError:
-                pass
 
     async def _recover(self) -> None:
         """Reconcile persisted intent against exchange truth before trading.
@@ -540,7 +538,7 @@ class Strategy:
         self.store.save(self.state)
 
 
-def build_chase_params(config: Config) -> Dict[str, ChaseParams]:
+def build_chase_params(config: Config) -> dict[str, ChaseParams]:
     return {
         leg.symbol: ChaseParams(
             offset_bps=leg.offset_bps,
@@ -551,7 +549,7 @@ def build_chase_params(config: Config) -> Dict[str, ChaseParams]:
     }
 
 
-def build_hedge_ceilings(config: Config) -> Dict[str, float]:
+def build_hedge_ceilings(config: Config) -> dict[str, float]:
     """Cap a single hedge at twice the leg's configured size.
 
     A required hedge larger than this means the position book and reality have

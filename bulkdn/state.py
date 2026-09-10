@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Dict, Optional
+import contextlib
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +43,9 @@ class LegState:
     """
 
     symbol: str
-    oid: Optional[str] = None
-    price: Optional[float] = None
-    size: Optional[float] = None
+    oid: str | None = None
+    price: float | None = None
+    size: float | None = None
     target_size: float = 0.0
     complete: bool = False
     # Order IDs that were replaced but whose cancels were never confirmed.
@@ -53,7 +53,7 @@ class LegState:
     # order resting alongside its replacement.
     stale_oids: list = field(default_factory=list)
 
-    def remember_stale(self, oid: Optional[str]) -> None:
+    def remember_stale(self, oid: str | None) -> None:
         if oid and oid != self.oid and oid not in self.stale_oids:
             self.stale_oids.append(oid)
 
@@ -64,8 +64,8 @@ class StrategyState:
     cycle_index: int = 0
     cycle_started_at: float = 0.0
     hold_until: float = 0.0
-    legs: Dict[str, LegState] = field(default_factory=dict)
-    halted_reason: Optional[str] = None
+    legs: dict[str, LegState] = field(default_factory=dict)
+    halted_reason: str | None = None
     updated_at: float = 0.0
 
     def leg(self, symbol: str) -> LegState:
@@ -73,7 +73,7 @@ class StrategyState:
             self.legs[symbol] = LegState(symbol=symbol)
         return self.legs[symbol]
 
-    def reset_legs(self, targets: Dict[str, float]) -> None:
+    def reset_legs(self, targets: dict[str, float]) -> None:
         """Start a fresh set of legs for a new phase."""
         self.legs = {
             symbol: LegState(symbol=symbol, target_size=size)
@@ -83,13 +83,13 @@ class StrategyState:
     def hold_remaining_s(self) -> float:
         return max(0.0, self.hold_until - time.time())
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         data = asdict(self)
         data["phase"] = self.phase.value
         return data
 
     @classmethod
-    def from_dict(cls, data: Dict) -> "StrategyState":
+    def from_dict(cls, data: dict) -> StrategyState:
         legs = {
             symbol: LegState(**leg_data)
             for symbol, leg_data in (data.get("legs") or {}).items()
@@ -121,7 +121,7 @@ class StateStore:
         if not os.path.exists(self.path):
             return StrategyState()
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
+            with open(self.path, encoding="utf-8") as handle:
                 return StrategyState.from_dict(json.load(handle))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(
@@ -144,8 +144,6 @@ class StateStore:
                 os.fsync(handle.fileno())
             os.replace(handle.name, self.path)
         except Exception:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(handle.name)
-            except OSError:
-                pass
             raise

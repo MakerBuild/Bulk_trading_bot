@@ -12,6 +12,7 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.16",
 ]
 
 [project.scripts]
@@ -30,3 +31,31 @@ testpaths = ["tests"]
 # Keeps .pytest_cache out of the project root. The suite is a few seconds, so
 # the cache only buys --lf/--ff, which is not worth a directory.
 addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "UP", "B", "SIM", "ARG", "RET", "C4", "PIE", "PL"]
+ignore = [
+    # Line length is left to judgement; the docstrings here carry protocol
+    # detail that reads worse when wrapped.
+    "E501",
+    # Long argument lists and branchy dispatchers are the shape of a CLI and a
+    # phase machine, not a defect.
+    "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917",
+    # Bare numbers in tests and byte layouts are the point.
+    "PLR2004",
+    # Imports inside functions break the cli <-> menu import cycle and keep the
+    # SDK out of the import path for commands that never touch it.
+    "PLC0415",
+    # The WebSocket compat shim patches the SDK process-wide, so its state is
+    # module-level by nature.
+    "PLW0603",
+    # Test stubs mirror an interface and must accept arguments they ignore.
+    "ARG001", "ARG002",
+    # StateStore writes atomically via NamedTemporaryFile(delete=False) with
+    # explicit cleanup, which this rule cannot recognise.
+    "SIM115",
+]

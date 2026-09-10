@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any
 
 import yaml
 
@@ -25,11 +25,11 @@ PRIVATE_KEY_FILE = "private_key.local"
 
 def _read_private_key_file(path: str) -> str:
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             for line in handle:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    return line
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    return stripped
     except FileNotFoundError:
         pass
     return ""
@@ -141,7 +141,7 @@ class Config:
         return SIGNATURE_DOMAIN_NAME
 
     @property
-    def legs(self) -> Dict[str, LegConfig]:
+    def legs(self) -> dict[str, LegConfig]:
         """Legs keyed by symbol, which is how the rest of the bot looks them up."""
         return {self.btc.symbol: self.btc, self.sol.symbol: self.sol}
 
@@ -159,9 +159,10 @@ class Config:
                 f"paste the master account's base58 key into {PRIVATE_KEY_FILE} "
                 "(git-ignored, one line, no quotes)"
             )
-        if require_sub1:
-            if not self.sub1_pubkey or self.sub1_pubkey.startswith("REPLACE"):
-                raise ConfigError("sub1_pubkey must be set to a real sub-account pubkey")
+        if require_sub1 and (
+            not self.sub1_pubkey or self.sub1_pubkey.startswith("REPLACE")
+        ):
+            raise ConfigError("sub1_pubkey must be set to a real sub-account pubkey")
         self.btc.validate("btc")
         self.sol.validate("sol")
         if self.btc.symbol == self.sol.symbol:
@@ -182,7 +183,7 @@ class Config:
         self.risk.validate()
 
 
-def _leg_from_dict(raw: Dict[str, Any], name: str) -> LegConfig:
+def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"legs.{name} must be a mapping")
     try:
@@ -204,7 +205,7 @@ def load_config(
 ) -> Config:
     """Load, merge, and validate configuration."""
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
     except FileNotFoundError as exc:
         raise ConfigError(f"config file not found: {path}") from exc

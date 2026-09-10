@@ -33,6 +33,8 @@ class FakeFill:
     size: float
     side: object
     price: float = 100_000.0
+    # ws_compat attaches this to every parsed fill; production reads it here.
+    trade_id: str | None = None
 
 
 class FakeSession:
@@ -45,7 +47,6 @@ class FakeSession:
         self.last_message_age_s = 0.0
         self.handlers = {}
         self.orders = []
-        self.current_trade_id = None
 
     def on(self, topic, handler):
         self.handlers.setdefault(topic, []).append(handler)
@@ -199,17 +200,15 @@ def test_replayed_fill_does_not_move_the_position_twice(tmp_path):
     book.set_authoritative(MASTER, BTC, 0.0)
 
     handler = master.handlers[Topic.FILL][0]
-    master.current_trade_id = "12000:3"
-    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY, trade_id="12000:3"))
     assert book.effective(MASTER, BTC) == 0.1
 
     # Same execution delivered again after a reconnect.
-    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY, trade_id="12000:3"))
     assert book.effective(MASTER, BTC) == 0.1
 
     # A genuinely new execution still applies.
-    master.current_trade_id = "12000:4"
-    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY, trade_id="12000:4"))
     assert book.effective(MASTER, BTC) == pytest.approx(0.2)
 
 
@@ -220,10 +219,12 @@ def test_both_accounts_apply_a_trade_that_crossed_between_them(tmp_path):
     book.set_authoritative(MASTER, BTC, 0.0)
     book.set_authoritative(SUB1, BTC, 0.0)
 
-    master.current_trade_id = "12000:9"
-    master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
-    sub1.current_trade_id = "12000:9"
-    sub1.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.SELL))
+    master.handlers[Topic.FILL][0](
+        FakeFill(symbol=BTC, size=0.1, side=Side.BUY, trade_id="12000:9")
+    )
+    sub1.handlers[Topic.FILL][0](
+        FakeFill(symbol=BTC, size=0.1, side=Side.SELL, trade_id="12000:9")
+    )
 
     assert book.effective(MASTER, BTC) == 0.1
     assert book.effective(SUB1, BTC) == -0.1
@@ -236,9 +237,8 @@ def test_fills_without_a_trade_id_are_all_applied(tmp_path):
     book.set_authoritative(MASTER, BTC, 0.0)
 
     handler = master.handlers[Topic.FILL][0]
-    master.current_trade_id = None
-    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
-    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY, trade_id=None))
+    handler(FakeFill(symbol=BTC, size=0.1, side=Side.BUY, trade_id=None))
     assert book.effective(MASTER, BTC) == pytest.approx(0.2)
 
 

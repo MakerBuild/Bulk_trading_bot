@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Sequence
+from collections.abc import Sequence
 
 from .accounts import AccountSession
 from .marketdata import MarketSpec
@@ -21,9 +21,9 @@ log = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class Quote:
     symbol: str
-    best_bid: Optional[float]
-    best_ask: Optional[float]
-    mark_price: Optional[float]
+    best_bid: float | None
+    best_ask: float | None
+    mark_price: float | None
     age_s: float
 
     @property
@@ -31,7 +31,7 @@ class Quote:
         return bool(self.mark_price or self.best_bid or self.best_ask)
 
     @property
-    def reference_price(self) -> Optional[float]:
+    def reference_price(self) -> float | None:
         """Best available price for notional maths."""
         if self.mark_price:
             return self.mark_price
@@ -46,9 +46,9 @@ class MarketFeed:
     def __init__(self, session: AccountSession, symbols: Sequence[str]):
         self.session = session
         self.symbols = list(symbols)
-        self.specs: Dict[str, MarketSpec] = {}
+        self.specs: dict[str, MarketSpec] = {}
 
-    def load_specs(self) -> Dict[str, MarketSpec]:
+    def load_specs(self) -> dict[str, MarketSpec]:
         """Fetch tick size, lot size, and min notional over HTTP.
 
         These are needed before the first order can be rounded correctly, so
@@ -130,5 +130,5 @@ class MarketFeed:
             age_s=age_s,
         )
 
-    def reference_price(self, symbol: str) -> Optional[float]:
+    def reference_price(self, symbol: str) -> float | None:
         return self.quote(symbol).reference_price

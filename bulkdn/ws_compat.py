@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import ssl
-from typing import Any, Optional
+from typing import Any
 
 from bulk_api.common import Side
 from bulk_api.messages.trade import Fill
@@ -136,6 +136,6 @@ def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = True) -> 
     log.debug("WebSocket compatibility patches applied")
 
 
-def fill_trade_id(fill: Any) -> Optional[str]:
+def fill_trade_id(fill: Any) -> str | None:
     """Read the trade id off a parsed fill, if the patch supplied one."""
     return getattr(fill, "trade_id", None)

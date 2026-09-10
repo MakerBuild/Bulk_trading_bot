@@ -10,7 +10,12 @@ import base58
 
 import pytest
 
-from bulkdn.subaccounts import CREATE_SUB_ACCOUNT_ORDINAL, serialize_create_sub_account
+from bulkdn.subaccounts import (
+    CREATE_SUB_ACCOUNT_ORDINAL,
+    TRANSFER_ORDINAL,
+    serialize_create_sub_account,
+    serialize_transfer,
+)
 
 
 def test_ordinal_is_first_four_bytes():
@@ -80,8 +85,6 @@ def test_name_is_length_prefixed_utf8():
 # signing library and compared byte-for-byte, so they are a reference rather
 # than a restatement of the implementation.
 # ---------------------------------------------------------------------------
-
-from bulkdn.subaccounts import TRANSFER_ORDINAL, serialize_transfer
 
 MASTER = "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"
 SUB = "3AbM7XE9ikZW82rPUwRNnDovs3DMgvWgfPdckFnATSTe"

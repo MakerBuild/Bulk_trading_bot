@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
 
 from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
@@ -44,8 +43,8 @@ class ChaseOutcome:
     symbol: str
     action: str  # placed | replaced | held | complete | waiting | skipped
     detail: str = ""
-    price: Optional[float] = None
-    size: Optional[float] = None
+    price: float | None = None
+    size: float | None = None
 
 
 class Chaser:
@@ -54,10 +53,10 @@ class Chaser:
     def __init__(
         self,
         *,
-        sessions: Dict[str, AccountSession],
+        sessions: dict[str, AccountSession],
         feed: MarketFeed,
         book: PositionBook,
-        params: Dict[str, ChaseParams],
+        params: dict[str, ChaseParams],
         price_stale_timeout_s: float = 15.0,
     ):
         self.sessions = sessions
@@ -65,7 +64,7 @@ class Chaser:
         self.book = book
         self.params = params
         self.price_stale_timeout_s = price_stale_timeout_s
-        self._placed_at: Dict[str, float] = {}
+        self._placed_at: dict[str, float] = {}
 
     # -- sizing ------------------------------------------------------------
 
@@ -173,7 +172,7 @@ class Chaser:
         leg: LegState,
         price: float,
         size: float,
-        replace_oid: Optional[str],
+        replace_oid: str | None,
         reason: str = "",
     ) -> ChaseOutcome:
         symbol = roles.symbol

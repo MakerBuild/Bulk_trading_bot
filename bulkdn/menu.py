@@ -12,9 +12,8 @@ a menu entry that silently does nothing is worse than one that admits it.
 from __future__ import annotations
 
 import asyncio
-import io
 import re
-from typing import Callable, List, Tuple
+from collections.abc import Callable
 
 import requests
 
@@ -31,7 +30,7 @@ class NoAccountTree(Exception):
 # -- rendering --------------------------------------------------------------
 
 
-def _box(title: str, lines: List[str]) -> str:
+def _box(title: str, lines: list[str]) -> str:
     top = "+" + "-" * (BOX_WIDTH - 2) + "+"
     out = [top, "|" + title.center(BOX_WIDTH - 2) + "|", top]
     for line in lines:
@@ -62,7 +61,7 @@ def _pause() -> None:
 # -- helpers ----------------------------------------------------------------
 
 
-def _accounts(config: Config) -> List[Tuple[str, str]]:
+def _accounts(config: Config) -> list[tuple[str, str]]:
     """(label, pubkey) for the master and every sub-account it owns.
 
     Read from the exchange rather than the config: the config names one sub,
@@ -194,7 +193,8 @@ def _create_subaccount(config: Config) -> None:
     name = _ask("\n  name (1-32 chars, A-Z a-z 0-9 - _): ")
     if not name:
         print("  aborted")
-        return _pause()
+        _pause()
+        return
     asyncio.run(cmd_create_subaccount(config, name, None))
     print("\n  put the returned pubkey into config.yaml as sub1_pubkey")
     _pause()
@@ -208,7 +208,8 @@ def _balance_subaccounts(config: Config) -> None:
     accounts = _accounts(config)
     if len(accounts) < 2:
         print("\n  the master owns no sub-accounts yet")
-        return _pause()
+        _pause()
+        return
 
     balances = [(label, pk, _transferable(config, pk)) for label, pk in accounts]
     total = sum(b for _, _, b in balances)
@@ -224,7 +225,8 @@ def _balance_subaccounts(config: Config) -> None:
     receivers = [(pk, target - bal) for _, pk, bal in balances if target - bal > 0.01]
     if not senders or not receivers:
         print("\n  already balanced")
-        return _pause()
+        _pause()
+        return
 
     moves = []
     si = ri = 0
@@ -246,7 +248,8 @@ def _balance_subaccounts(config: Config) -> None:
 
     if not _confirm(f"Submit {len(moves)} transfer(s)."):
         print("  aborted")
-        return _pause()
+        _pause()
+        return
 
     for src, dst, amount in moves:
         result = submit_transfer(
@@ -292,12 +295,14 @@ def _set_cycles(config: Config, config_path: str) -> None:
         print("  must be a non-negative integer")
         return
 
-    text = io.open(config_path, encoding="utf-8").read()
+    with open(config_path, encoding="utf-8") as handle:
+        text = handle.read()
     new_text, count = re.subn(r"(?m)^cycles:\s*\d+", f"cycles: {value}", text)
     if count != 1:
         print(f"  could not find a single `cycles:` line in {config_path}")
         return
-    io.open(config_path, "w", encoding="utf-8").write(new_text)
+    with open(config_path, "w", encoding="utf-8") as handle:
+        handle.write(new_text)
     config.cycles = value
     print(f"  cycles set to {value} in {config_path}")
 

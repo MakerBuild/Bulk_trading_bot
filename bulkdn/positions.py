@@ -21,9 +21,9 @@ from __future__ import annotations
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from collections.abc import Iterable
 
-Key = Tuple[str, str]  # (account pubkey, symbol)
+Key = tuple[str, str]  # (account pubkey, symbol)
 
 
 class SeenTrades:
@@ -45,9 +45,9 @@ class SeenTrades:
 
     def __init__(self, capacity: int = 20_000):
         self.capacity = capacity
-        self._seen: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+        self._seen: OrderedDict[tuple[str, str], None] = OrderedDict()
 
-    def add_if_new(self, account: str, trade_id: Optional[str]) -> bool:
+    def add_if_new(self, account: str, trade_id: str | None) -> bool:
         """Record a trade id. Returns False if it had already been seen.
 
         A missing trade id is always treated as new -- an exchange that has not
@@ -80,8 +80,8 @@ class PositionBook:
     """Per-(account, symbol) signed sizes with a short-lived optimistic layer."""
 
     overlay_ttl_ms: int = 2000
-    _authoritative: Dict[Key, float] = field(default_factory=dict)
-    _overlays: Dict[Key, List[_Overlay]] = field(default_factory=dict)
+    _authoritative: dict[Key, float] = field(default_factory=dict)
+    _overlays: dict[Key, list[_Overlay]] = field(default_factory=dict)
 
     # -- writes ------------------------------------------------------------
 
@@ -124,13 +124,6 @@ class PositionBook:
         """Overlay a fill. A buy moves the position up, a sell moves it down."""
         self.add_overlay(account, symbol, size if is_buy else -size, label)
 
-    def clear_overlays(self, account: str | None = None) -> None:
-        if account is None:
-            self._overlays.clear()
-            return
-        for key in [k for k in self._overlays if k[0] == account]:
-            self._overlays.pop(key, None)
-
     # -- reads -------------------------------------------------------------
 
     def authoritative(self, account: str, symbol: str) -> float:
@@ -152,30 +145,20 @@ class PositionBook:
         """Sum of unconfirmed deltas, for logging and diagnostics."""
         return sum(entry.delta for entry in self._prune((account, symbol)))
 
-    def has_pending(self, account: str, symbol: str) -> bool:
-        return bool(self._prune((account, symbol)))
-
     def net(self, account_a: str, account_b: str, symbol: str) -> float:
         """Combined signed exposure across both accounts. Zero means neutral."""
         return self.effective(account_a, symbol) + self.effective(account_b, symbol)
 
-    def authoritative_net(self, account_a: str, account_b: str, symbol: str) -> float:
-        """Combined exposure using only confirmed positions."""
-        return self.authoritative(account_a, symbol) + self.authoritative(account_b, symbol)
-
-    def symbols_for(self, account: str) -> List[str]:
-        return [key[1] for key in self._authoritative if key[0] == account]
-
-    def snapshot(self) -> Dict[str, Dict[str, float]]:
+    def snapshot(self) -> dict[str, dict[str, float]]:
         """Nested {account: {symbol: effective_size}}, for logs and status output."""
-        out: Dict[str, Dict[str, float]] = {}
+        out: dict[str, dict[str, float]] = {}
         for account, symbol in list(self._authoritative):
             out.setdefault(account, {})[symbol] = self.effective(account, symbol)
         return out
 
     # -- internals ---------------------------------------------------------
 
-    def _prune(self, key: Key) -> List[_Overlay]:
+    def _prune(self, key: Key) -> list[_Overlay]:
         overlays = self._overlays.get(key)
         if not overlays:
             return []

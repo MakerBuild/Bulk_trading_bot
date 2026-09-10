@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Dict, List, Sequence
+from collections.abc import Sequence
 
 from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
@@ -91,14 +91,14 @@ async def reconcile_net(
     hedger: Hedger,
     roles: Sequence[LegRoles],
     feed: MarketFeed,
-) -> List[str]:
+) -> list[str]:
     """Re-run the hedge rule for each leg, correcting any drift.
 
     This is the same operation the fill handler performs. Running it on a timer
     catches whatever the event path missed: a dropped frame, a hedge that was
     rejected, or exposure inherited from a previous process.
     """
-    corrections: List[str] = []
+    corrections: list[str] = []
     for leg in roles:
         result = await hedger.hedge(leg, mark_price=feed.reference_price(leg.symbol))
         if result.acted:
@@ -110,7 +110,7 @@ async def reconcile_net(
 
 
 async def flatten(
-    sessions: Dict[str, AccountSession],
+    sessions: dict[str, AccountSession],
     book: PositionBook,
     feed: MarketFeed,
     symbols: Sequence[str],

@@ -13,9 +13,18 @@
 # selector, and no rehearsal environment.
 sub1_pubkey: "REPLACE_WITH_SUB_ACCOUNT_PUBKEY"
 
-# Endpoint overrides, for when the derived host is wrong.
+# Endpoint overrides, for when the published hosts change.
 # http_url: "https://mainnet-api1.bulk.trade/api/v1"
 # ws_url: "wss://mainnet-ws1.bulk.trade"
+
+# TLS. The mainnet WebSocket currently serves an EXPIRED certificate while the
+# HTTP host verifies cleanly, so verification would fail and the account stream
+# would never open -- and a bot that cannot see its fills cannot hedge.
+# `ws_ssl_auto_bypass` keeps verification on but retries once without it, which
+# is why it defaults to true. Set it false to fail hard instead.
+# `ws_insecure_ssl` skips verification outright; prefer the retry.
+ws_ssl_auto_bypass: true
+ws_insecure_ssl: false
 
 # ---------------------------------------------------------------------------
 # Strategy legs.
