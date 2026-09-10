@@ -55,6 +55,18 @@ The maker/taker roles swap between OPEN and EXIT, which is what lets one rule se
 > (`mainnet=1`) that the API spec requires in the signature preimage,
 > and it has no `SignatureDomain` type at all. Signatures produced by the PyPI build will not
 > match what the exchange verifies. The GitHub source is correct.
+>
+> Use `--no-deps`. The package declares `bulk-keychain`, which it never imports and which
+> has no wheel for Python 3.13+:
+>
+> ```bash
+> .venv/Scripts/python -m pip install --no-deps >   "git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
+> ```
+>
+> Pin the commit. Older commits of the same `0.1.2` version parse the account stream's
+> margin with the wrong field names (`totalBalance` where the API sends `totalMargin`),
+> silently reporting a zero balance, and cap WebSocket frames at 16 MiB where the spec
+> allows 64 MiB.
 
 A second wrinkle: `bulk-client` declares a dependency on `bulk-keychain`, a Rust extension
 with no prebuilt wheel for recent Pythons. It is **never imported** anywhere in the SDK, so

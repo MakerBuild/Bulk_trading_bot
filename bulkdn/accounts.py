@@ -221,11 +221,18 @@ class AccountSession:
         risk layer has a single number to trip on. `count_rejects` exists for
         cancels, where a rejection usually just means there was nothing to
         cancel -- counting those would let routine cleanup trip the kill switch.
+
+        `rejectedCrossing` is excluded for the same reason. Resting orders are
+        ALO, so the exchange refuses one that would take instead of filling it;
+        that is the protection working, and it happens whenever the book moves
+        onto the target price between reading it and the order landing. Counting
+        it would let an active market trip the kill switch.
         """
         responses = await self.client.submit(actions, **kwargs)
         rejected = [r for r in responses if r.is_error()]
         if rejected:
-            if count_rejects:
+            faults = [r for r in rejected if r.status != OrderStatus.REJECTED_CROSSING]
+            if count_rejects and faults:
                 self.reject_streak += 1
             detail = "; ".join(f"{r.status}: {r.message}" for r in rejected)
             raise OrderRejected(f"{self.name}: {detail}", responses)
@@ -245,8 +252,17 @@ class AccountSession:
         """Place a resting limit order, optionally replacing an existing one.
 
         When `cancel_oid` is given the cancel and the placement go out in a
-        single transaction, which is the only way to reprice on BULK -- resting
-        orders cannot have their price modified.
+        single transaction, which is the only way to reprice on BULK -- `mod`
+        changes an order's size, never its price.
+
+        The order is ALO. Both legs rest inside the touch and are meant to earn
+        the maker side, and ALO is the only time-in-force that says so to the
+        exchange: per the taker speed bump, "Only ALO guarantees maker behavior
+        before execution", and it is the only order type scheduled immediately.
+        A GTC order is held for 25 ms even when it would rest, which on a chase
+        loop is 25 ms added to every reprice. The cost is that a price the
+        market has already reached is rejected rather than filled as a taker --
+        which is the behaviour this strategy wants.
         """
         order = LimitOrder(
             symbol=symbol,
@@ -254,7 +270,7 @@ class AccountSession:
             price=price,
             size=size,
             reduce_only=reduce_only,
-            time_in_force=TimeInForce.GTC,
+            time_in_force=TimeInForce.ALO,
         )
         actions: list[Action] = []
         if cancel_oid:

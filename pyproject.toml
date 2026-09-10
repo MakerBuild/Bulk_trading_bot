@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "Delta-neutral trading bot for BULK, running a hedged BTC/SOL cycle across a master account and a sub-account"
 requires-python = ">=3.10"
 dependencies = [
-    "bulk-client>=0.1.2",
+    # From git, not PyPI. The published 0.1.2 wheel omits the trailing
+    # signature-domain byte the API requires, so every signature it produces is
+    # rejected. Installing needs --no-deps: the package declares bulk-keychain,
+    # which it never imports and which has no wheel for Python 3.13+.
+    "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python",
     "PyYAML>=6.0",
 ]
 

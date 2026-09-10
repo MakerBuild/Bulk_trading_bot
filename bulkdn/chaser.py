@@ -188,6 +188,14 @@ class Chaser:
         except OrderRejected as exc:
             # A rejected replace can leave the original resting, so it stays on
             # the sweep list until it is confirmed gone.
+            #
+            # With ALO orders the common rejection is `rejectedCrossing`: the
+            # book reached the target between reading it and the order landing.
+            # The cancel in the same transaction may still have applied, so the
+            # leg can be left with nothing resting -- the next pass sees no
+            # order and places fresh, which bounds the gap at one chase
+            # interval. `mod` would avoid it by changing size in place, but the
+            # Python SDK has no message type for that action.
             if replace_oid:
                 leg.remember_stale(replace_oid)
             log.warning("%s: chase order rejected: %s", symbol, exc)
