@@ -1,7 +1,9 @@
 # Bulk delta-neutral bot configuration.
 #
-# The master private key is NEVER read from this file. Export it instead:
-#   export BULK_PRIVATE_KEY=<base58 seed>
+# This file is tracked in git and holds placeholders only. The master private
+# key is NEVER read from it -- put the base58 seed on a single line in
+# `private_key.local` (git-ignored), or export BULK_PRIVATE_KEY instead.
+#
 # The master pubkey is derived from that key. `sub1_pubkey` must be a
 # sub-account of that master; the bot verifies this on startup and refuses
 # to run if it isn't.

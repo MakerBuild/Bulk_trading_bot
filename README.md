@@ -93,7 +93,6 @@ export BULK_PRIVATE_KEY=<base58 seed>
 Then copy and edit the config:
 
 ```bash
-cp config.example.yaml config.yaml
 ```
 
 ### The sub-account must already exist
@@ -299,7 +298,7 @@ positions are open.
 
 ## Configuration
 
-See `config.example.yaml`. The parameters that shape execution:
+See `config.yaml`. The parameters that shape execution:
 
 | Key | Effect |
 |---|---|

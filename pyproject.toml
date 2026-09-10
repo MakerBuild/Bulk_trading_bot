@@ -27,3 +27,6 @@ include = ["bulkdn*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Keeps .pytest_cache out of the project root. The suite is a few seconds, so
+# the cache only buys --lf/--ff, which is not worth a directory.
+addopts = "-p no:cacheprovider"

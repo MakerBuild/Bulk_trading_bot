@@ -6,13 +6,13 @@ __pycache__/
 
 # Runtime state. Contains the bot's view of open positions and orders --
 # do not commit it, and do not delete it while positions are open.
-state/
+state/*
+!state/.gitkeep
 *.state.json
 
-# Local config may name real accounts.
-config.yaml
+# config.yaml is tracked and holds placeholders only -- the private key never
+# goes in it. Local variants (config.mine.yaml, config.prod.yaml) stay ignored.
 config.*.yaml
-!config.example.yaml
 .env
 
 # The private key: read from BULK_PRIVATE_KEY, or from this local file as a
