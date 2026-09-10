@@ -12,7 +12,6 @@ a menu entry that silently does nothing is worse than one that admits it.
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Callable
 
 import requests
@@ -281,55 +280,162 @@ def _accounts_menu(config: Config) -> None:
             return
 
 
-def _set_cycles(config: Config, config_path: str) -> None:
-    """Edit `cycles:` in place, preserving the file's comments."""
-    print(f"\n  current: {config.cycles}  (0 means run forever)")
+def _render_number(value: float) -> str:
+    """YAML-safe decimal.
+
+    Never scientific notation: YAML 1.1 does not reliably read `1e+06` as a
+    number, and a target silently parsed as a string would disable the limit it
+    was meant to set.
+    """
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.8f}".rstrip("0").rstrip(".")
+
+
+TARGET_BLOCK_HEADER = (
+    "# Execution target: whichever limit is reached first ends the run.\n"
+    "# 0 disables a limit. burn_usd and volume_usd are measured from the\n"
+    "# exchange's own fill records, so they survive a restart.\n"
+    "execution_target:\n"
+)
+
+
+def _write_target(config_path: str, key: str, value: float, defaults) -> bool:
+    """Set one key under `execution_target`, keeping the file's comments.
+
+    Walks lines rather than matching a pattern: the block is two levels deep
+    and YAML numbers come in several shapes, both of which a regex handles
+    badly. Writes the whole block when the file predates execution targets.
+    """
+    with open(config_path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    header = next(
+        (i for i, line in enumerate(lines) if line.strip() == "execution_target:"), None
+    )
+    if header is None:
+        block = TARGET_BLOCK_HEADER
+        for name in ("cycles", "burn_usd", "volume_usd"):
+            chosen = value if name == key else getattr(defaults, name)
+            block += f"  {name}: {_render_number(chosen)}\n"
+        text = "\n".join(lines).rstrip("\n") + "\n\n" + block
+        with open(config_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return True
+
+    for i in range(header + 1, len(lines)):
+        line = lines[i]
+        # The block ends at the first line that is not indented.
+        if line.strip() and not line.startswith((" ", "\t")):
+            break
+        if line.strip().startswith(f"{key}:"):
+            indent = line[: len(line) - len(line.lstrip())]
+            comment = ""
+            if "#" in line:
+                comment = "  " + line[line.index("#") :]
+            lines[i] = f"{indent}{key}: {_render_number(value)}{comment}"
+            with open(config_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            return True
+
+    # The block exists but lacks this key; append it inside the block.
+    lines.insert(header + 1, f"  {key}: {_render_number(value)}")
+    with open(config_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return True
+
+
+def _edit_target(config: Config, config_path: str, key: str, label: str) -> None:
+    """Prompt for one execution-target value and persist it."""
+    current = getattr(config.target, key)
+    print(f"\n  current {label}: {_render_number(float(current))}  (0 disables it)")
     raw = _ask("  new value: ")
     if not raw:
         return
     try:
-        value = int(raw)
+        value = float(raw)
         if value < 0:
             raise ValueError
     except ValueError:
-        print("  must be a non-negative integer")
+        print("  must be a non-negative number")
         return
 
-    with open(config_path, encoding="utf-8") as handle:
-        text = handle.read()
-    new_text, count = re.subn(r"(?m)^cycles:\s*\d+", f"cycles: {value}", text)
-    if count != 1:
-        print(f"  could not find a single `cycles:` line in {config_path}")
-        return
-    with open(config_path, "w", encoding="utf-8") as handle:
-        handle.write(new_text)
-    config.cycles = value
-    print(f"  cycles set to {value} in {config_path}")
+    _write_target(config_path, key, value, config.target)
+    setattr(config.target, key, int(value) if key == "cycles" else value)
+    if key == "cycles":
+        config.cycles = int(value)
+    print(f"  {label} set to {_render_number(value)} in {config_path}")
+
+
+def _target_progress(config: Config) -> None:
+    """Realised spend and volume against the configured targets."""
+    from bulk_api.api.bulk_http import BulkHttpClient
+    from bulk_api.common import SignatureDomain
+
+    from .fees import account_fee_tier, fee_state, realised_for_tree
+
+    accounts = [pk for _, pk in _accounts(config)]
+    http = BulkHttpClient(
+        base_url=config.http_url,
+        private_key=config.private_key,
+        signature_domain=SignatureDomain[config.signature_domain_name],
+    )
+    totals = realised_for_tree(http, accounts)
+
+    print(f"\n  fills {totals.fills}")
+    print(f"  fees            ${totals.fees_usd:,.4f}", end="")
+    if config.target.burn_usd > 0:
+        print(f"  of ${config.target.burn_usd:,.2f}")
+    else:
+        print("  (no burn target)")
+    print(f"  volume          ${totals.volume_usd:,.2f}")
+    print(f"  self-trades     ${totals.self_trade_volume_usd:,.2f}  (earn no tier credit)")
+    print(f"  qualifying      ${totals.qualifying_volume_usd:,.2f}", end="")
+    if config.target.volume_usd > 0:
+        print(f"  of ${config.target.volume_usd:,.2f}")
+    else:
+        print("  (no volume target)")
+
+    quote = account_fee_tier(config.http_url, accounts[0])
+    if quote:
+        print(
+            f"\n  master tier {quote.tier_index} in the {quote.window_days}-day window: "
+            f"maker {quote.maker_bps} bps, taker {quote.taker_bps} bps"
+        )
+    else:
+        schedule = fee_state(config.http_url).get("global")
+        if schedule:
+            tier = schedule.tier_for(0.0)
+            print(
+                f"\n  no tier quote yet; the {schedule.window_days}-day schedule starts at "
+                f"maker {tier.maker_bps} bps, taker {tier.taker_bps} bps"
+            )
+    _pause()
 
 
 def _configuration(config: Config, config_path: str) -> None:
     while True:
+        target = config.target
         print("\n" + _box("CONFIGURATION", [
             "Execution Target:",
+            "  whichever is reached first; 0 disables",
             "",
-            f"1. Number of Cycles      [{config.cycles}]",
-            "2. Total Amount to Burn   (not wired)",
-            "3. Total Trading Volume   (not wired)",
-            "4. Back",
+            f"1. Number of Cycles      [{target.cycles or 'unlimited'}]",
+            f"2. Total Amount to Burn  [${target.burn_usd:,.2f}]",
+            f"3. Total Trading Volume  [${target.volume_usd:,.2f}]",
+            "4. Progress",
+            "5. Back",
         ]))
         choice = _ask("\n  > ")
         if choice == "1":
-            _set_cycles(config, config_path)
-        elif choice in ("2", "3"):
-            # Storing a stop target the run loop does not read would be worse
-            # than refusing: the bot would keep trading past a limit the
-            # operator believes is in force.
-            print("\n  Not implemented. The cycle only stops on `cycles`, so a")
-            print("  burn or volume target set here would never be enforced and")
-            print("  the bot would trade straight past it. History (menu item 3)")
-            print("  reports realised volume and fees in the meantime.")
-            _pause()
-        elif choice in ("4", "0"):
+            _edit_target(config, config_path, "cycles", "cycle count")
+        elif choice == "2":
+            _edit_target(config, config_path, "burn_usd", "burn target (USD of fees)")
+        elif choice == "3":
+            _edit_target(config, config_path, "volume_usd", "volume target (USD, qualifying)")
+        elif choice == "4":
+            _target_progress(config)
+        elif choice in ("5", "0"):
             return
 
 

@@ -23,6 +23,7 @@ from .accounts import AccountSession
 from .chaser import ChaseParams, Chaser
 from .config import Config
 from .feed import MarketFeed
+from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
 from .marketdata import round_notional
 from .positions import PositionBook, SeenTrades
@@ -430,6 +431,10 @@ class Strategy:
 
             cycle = 0
             while self.config.cycles == 0 or cycle < self.config.cycles:
+                reached = self._target_reached()
+                if reached:
+                    log.info("execution target reached: %s", reached)
+                    break
                 cycle += 1
                 self.state.cycle_index += 1
                 self.state.cycle_started_at = time.time()
@@ -466,6 +471,54 @@ class Strategy:
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
+
+    def _target_reached(self) -> str | None:
+        """Whether a spend or volume target has been met, as a reason string.
+
+        Checked between cycles only. A target reached halfway through an open
+        position is not a reason to abandon it -- the exit has to run, or the
+        pair is left directional.
+
+        Totals come from the exchange's fill history rather than a local
+        counter, so a restart resumes against the real figure. A failure to
+        read it is logged and treated as "not reached": refusing to trade
+        because a read-only endpoint is down would be worse than overshooting
+        a soft goal by one cycle.
+        """
+        target = self.config.target
+        if not target.measures_fills:
+            return None
+
+        try:
+            totals = realised_for_tree(
+                self.master.http, [self.master.pubkey, self.sub1.pubkey]
+            )
+        except Exception as exc:  # noqa: BLE001 - never block trading on this
+            log.warning("could not read fill history for the execution target: %s", exc)
+            return None
+
+        if target.burn_usd > 0 and totals.fees_usd >= target.burn_usd:
+            return (
+                f"burned ${totals.fees_usd:,.4f} of ${target.burn_usd:,.2f}"
+            )
+        if target.volume_usd > 0 and totals.qualifying_volume_usd >= target.volume_usd:
+            return (
+                f"qualifying volume ${totals.qualifying_volume_usd:,.2f} "
+                f"of ${target.volume_usd:,.2f}"
+            )
+
+        if target.burn_usd > 0:
+            log.info(
+                "burn progress: $%.4f / $%.2f", totals.fees_usd, target.burn_usd
+            )
+        if target.volume_usd > 0:
+            log.info(
+                "volume progress: $%.2f / $%.2f qualifying (self-trades $%.2f excluded)",
+                totals.qualifying_volume_usd,
+                target.volume_usd,
+                totals.self_trade_volume_usd,
+            )
+        return None
 
     async def _recover(self) -> None:
         """Reconcile persisted intent against exchange truth before trading.

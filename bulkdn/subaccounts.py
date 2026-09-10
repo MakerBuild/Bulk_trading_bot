@@ -32,12 +32,12 @@ is pinned by tests but has not been exercised against a live server.
 from __future__ import annotations
 
 import struct
-import time
 from dataclasses import dataclass
 
 import base58
-import requests
-from bulk_api.common.signer import SignatureDomain, TransactionSigner
+from bulk_api.common.signer import SignatureDomain
+
+from .tx import accepted, sign_and_submit
 
 CREATE_SUB_ACCOUNT_ORDINAL = 27
 TRANSFER_ORDINAL = 29
@@ -128,50 +128,6 @@ def serialize_transfer(
     )
 
 
-def _sign_and_submit(
-    *,
-    http_url: str,
-    signer: TransactionSigner,
-    domain: SignatureDomain,
-    action_bytes: bytes,
-    action_json: dict,
-    nonce: int,
-) -> tuple[dict, int, dict]:
-    """Sign one action and POST it, returning (request, status, response).
-
-    Layout per the API spec: action count, action, nonce, account, domain byte
-    (mainnet = 1). The domain byte is always present.
-
-    The signing account is always the signer's own key: both actions here are
-    authorised by the master acting on itself, not on a child.
-    """
-    preimage = b"".join(
-        [
-            _write_u64(1),  # one action in this transaction
-            action_bytes,
-            _write_u64(nonce),
-            base58.b58decode(signer.public_key),
-            bytes([domain.value]),
-        ]
-    )
-    signature = signer.signing_key.sign(preimage).signature
-
-    tx = {
-        "actions": [action_json],
-        "nonce": nonce,
-        "account": signer.public_key,
-        "signer": signer.public_key,
-        "signature": base58.b58encode(signature).decode(),
-    }
-
-    response = requests.post(f"{http_url}/order", json=tx, timeout=30)
-    try:
-        response_json = response.json()
-    except ValueError:
-        response_json = {"raw": response.text}
-    return tx, response.status_code, response_json
-
-
 @dataclass
 class CreateSubAccountResult:
     name: str
@@ -181,7 +137,7 @@ class CreateSubAccountResult:
 
     @property
     def ok(self) -> bool:
-        return self.response_status == 200 and self.response_json.get("status") == "ok"
+        return accepted(self.response_status, self.response_json)
 
     @property
     def sub_pubkey(self) -> str | None:
@@ -204,7 +160,7 @@ class TransferResult:
 
     @property
     def ok(self) -> bool:
-        return self.response_status == 200 and self.response_json.get("status") == "ok"
+        return accepted(self.response_status, self.response_json)
 
 
 def build_and_submit(
@@ -222,18 +178,15 @@ def build_and_submit(
     since a sub-account is created under the signing master, not under the
     child being created.
     """
-    signer = TransactionSigner(private_key)
-    nonce = nonce if nonce is not None else int(time.time_ns())
-
     # The JSON mirrors the signed bytes: name always, marginAmount only when
     # non-zero, and marginSymbol never.
     action_json: dict = {"createSubAccount": {"name": name}}
     if margin_amount is not None and float(margin_amount) > 0:
         action_json["createSubAccount"]["marginAmount"] = float(margin_amount)
 
-    tx, status, response_json = _sign_and_submit(
+    tx, status, response_json = sign_and_submit(
         http_url=http_url,
-        signer=signer,
+        private_key=private_key,
         domain=domain,
         action_bytes=serialize_create_sub_account(name, margin_amount),
         action_json=action_json,
@@ -265,9 +218,6 @@ def submit_transfer(
     contributes no signing bytes, so it cannot be recovered from the signature
     and has to be stated separately.
     """
-    signer = TransactionSigner(private_key)
-    nonce = nonce if nonce is not None else int(time.time_ns())
-
     action_json = {
         "transfer": {
             "k": kind,
@@ -277,9 +227,9 @@ def submit_transfer(
             "marginAmount": float(margin_amount),
         }
     }
-    tx, status, response_json = _sign_and_submit(
+    tx, status, response_json = sign_and_submit(
         http_url=http_url,
-        signer=signer,
+        private_key=private_key,
         domain=domain,
         action_bytes=serialize_transfer(from_pubkey, to_pubkey, margin_amount, kind),
         action_json=action_json,

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 from .accounts import AccountSession
 from .marketdata import MarketSpec, round_notional, round_size
+from .impact import ImpactBook
 from .positions import PositionBook
 
 log = logging.getLogger(__name__)
@@ -137,6 +138,19 @@ class InFlight:
 class Hedger:
     """Restores delta neutrality for one symbol at a time."""
 
+    def _expected_impact_bps(
+        self, symbol: str, size: float, is_buy: bool
+    ) -> float | None:
+        """Slippage the published curve predicts for this hedge, if any.
+
+        Returns None when no curve has been published for the market, which is
+        the case for every mainnet market at the time of writing. A guard with
+        no data does not fire.
+        """
+        if self.impact is None:
+            return None
+        return self.impact.bps_for(symbol, size, is_buy)
+
     def __init__(
         self,
         *,
@@ -146,9 +160,13 @@ class Hedger:
         tolerance_lots: float = 1.0,
         max_hedge_size: dict[str, float] | None = None,
         in_flight_ttl_ms: int = 2000,
+        impact: ImpactBook | None = None,
+        max_impact_bps: float = 0.0,
     ):
         self.book = book
         self.sessions = sessions
+        self.impact = impact
+        self.max_impact_bps = max_impact_bps
         self.specs = specs
         self.tolerance_lots = tolerance_lots
         self.max_hedge_size = max_hedge_size or {}
@@ -245,6 +263,21 @@ class Hedger:
                 # position is closed outright.
                 return HedgeResult(symbol, net, 0.0, is_buy, "below min notional")
 
+            expected_bps = self._expected_impact_bps(symbol, size, is_buy)
+            if (
+                self.max_impact_bps > 0
+                and expected_bps is not None
+                and expected_bps > self.max_impact_bps
+            ):
+                # A market this thin is a reason to stop, not to trade through:
+                # the hedge cannot be shrunk without leaving the pair
+                # directional, so the choice is to pay the slippage or halt.
+                raise HedgeLimitExceeded(
+                    f"{symbol}: hedging {size:.8f} would cost about "
+                    f"{expected_bps:.1f} bps, over the "
+                    f"{self.max_impact_bps:.1f} bps ceiling"
+                )
+
             session = self.sessions[roles.taker]
             log.info(
                 "hedge %s: net=%+.8f -> %s %.8f on %s%s",
@@ -271,6 +304,9 @@ class Hedger:
 
             if price > 0:
                 log.debug(
-                    "hedged %s notional=$%s", symbol, round_notional(size * price)
+                    "hedged %s notional=$%s%s",
+                    symbol,
+                    round_notional(size * price),
+                    f" impact~{expected_bps:.1f}bps" if expected_bps is not None else "",
                 )
             return HedgeResult(symbol, net, size, is_buy)

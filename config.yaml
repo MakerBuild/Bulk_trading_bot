@@ -48,6 +48,9 @@ legs:
     offset_bps: 2.0       # rest this far inside the touch (2 bps below best bid)
     max_distance_bps: 5.0 # replace the order once it drifts this far from target
     max_order_size: 0.001 # cap on any single resting order
+    # leverage: 10          # optional; omit to keep whatever the account has.
+                            # Checked against the market's own maximum from
+                            # /exchangeInfo before anything is sent.
   sol:
     symbol: SOL-USD
     size: 2.0
@@ -61,7 +64,7 @@ legs:
 hold_minutes: 5.0         # how long to stay fully open before exiting
 chase_interval_s: 1.0     # how often the chaser re-evaluates resting orders
 reconcile_interval_s: 5.0 # how often positions are reconciled against truth
-cycles: 1                 # number of full cycles to run; 0 = run forever
+# `cycles` now lives under execution_target at the end of this file.
 
 # ---------------------------------------------------------------------------
 # Hedging
@@ -81,9 +84,24 @@ overlay_ttl_ms: 2000
 risk:
   max_net_exposure_usd: 500.0   # hard cap on uncorrected directional exposure
   max_position_usd: 5000.0      # per-account, per-symbol notional ceiling
-  max_reject_streak: 5          # consecutive order rejections before halting
+  max_reject_streak: 5
+
+  # Refuse a hedge whose expected slippage, read off the market's published
+  # impact curve (GET /impact), exceeds this. A hedge cannot be shrunk without
+  # leaving the pair directional, so the choice is to pay or to stop.
+  # 0 disables the check, which is also what happens for a market with no
+  # curve published -- and at the time of writing no mainnet market has one.
+  max_hedge_impact_bps: 0          # consecutive order rejections before halting
   ws_stale_timeout_s: 30.0      # no WS traffic for this long => halt
   price_stale_timeout_s: 15.0   # refuse to chase on a ticker older than this
 
 state_file: "./state/strategy_state.json"
 log_level: INFO
+
+# Execution target: whichever limit is reached first ends the run.
+# 0 disables a limit. burn_usd and volume_usd are measured from the
+# exchange's own fill records, so they survive a restart.
+execution_target:
+  cycles: 1
+  burn_usd: 0
+  volume_usd: 0

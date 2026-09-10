@@ -22,10 +22,12 @@ from .chaser import Chaser
 from .config import Config, ConfigError, load_config
 from .menu import run_menu
 from .feed import MarketFeed
+from .impact import ImpactBook
 from .hedger import Hedger
 from .positions import PositionBook
 from .reconcile import cancel_all_orders, flatten, sync_positions_http
 from .risk import RiskMonitor
+from .settings import current_leverage, set_leverage
 from .state import Phase, StateStore
 from .ws_compat import apply_ws_compat
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
@@ -70,6 +72,7 @@ class Runtime:
         )
         self.sessions = {self.master.pubkey: self.master, self.sub1.pubkey: self.sub1}
         self.book = PositionBook(overlay_ttl_ms=config.overlay_ttl_ms)
+        self.impact = ImpactBook(config.http_url)
         self.feed = MarketFeed(self.master, self.symbols)
         self.store = StateStore(config.state_file)
 
@@ -84,6 +87,21 @@ class Runtime:
         if verify:
             verify_sub_account(self.master, self.sub1)
 
+        # Curves are executor-published and change slowly, so they are read
+        # once here rather than per hedge.
+        if self.config.risk.max_hedge_impact_bps > 0:
+            self.impact.refresh(self.symbols)
+            missing = [s for s in self.symbols if not self.impact.has(s)]
+            if missing:
+                log.warning(
+                    "no impact curve published for %s -- the hedge slippage "
+                    "ceiling cannot be enforced there",
+                    ", ".join(missing),
+                )
+
+        if not self.dry_run:
+            self.apply_leverage()
+
         await self.master.connect()
         await self.sub1.connect()
         await self.feed.subscribe()
@@ -95,6 +113,59 @@ class Runtime:
         await self.master.disconnect()
         await self.sub1.disconnect()
 
+    def apply_leverage(self) -> None:
+        """Set each leg's configured leverage on both accounts.
+
+        Sub-accounts copy the master's settings at creation and are independent
+        afterwards, so each account is set explicitly rather than assuming the
+        child inherited anything.
+
+        Only what differs is sent, and the exchange's own per-market ceiling
+        from /exchangeInfo is checked first -- asking for more than a market
+        allows is a config error, not something to discover from a rejection.
+        """
+        wanted = {
+            leg.symbol: leg.leverage
+            for leg in (self.config.btc, self.config.sol)
+            if leg.leverage is not None
+        }
+        if not wanted:
+            return
+
+        for symbol, value in wanted.items():
+            ceiling = self.feed.specs[symbol].max_leverage
+            if ceiling and value > ceiling:
+                raise ConfigError(
+                    f"legs leverage {value} exceeds {symbol}'s maximum of {ceiling}"
+                )
+
+        for session in (self.master, self.sub1):
+            current = current_leverage(session.full_account())
+            for symbol, value in wanted.items():
+                if current.get(symbol) == value:
+                    continue
+                result = set_leverage(
+                    http_url=self.config.http_url,
+                    private_key=self.config.private_key,
+                    domain=SignatureDomain[self.config.signature_domain_name],
+                    symbol=symbol,
+                    leverage=value,
+                    account=session.pubkey,
+                )
+                if result.ok:
+                    log.info(
+                        "%s: %s leverage %s -> %s",
+                        session.name,
+                        symbol,
+                        current.get(symbol, "unset"),
+                        value,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"{session.name}: could not set {symbol} leverage to "
+                        f"{value}: {result.response_json}"
+                    )
+
     def build_strategy(self) -> Strategy:
         hedger = Hedger(
             book=self.book,
@@ -103,6 +174,8 @@ class Runtime:
             tolerance_lots=self.config.hedge_tolerance_lots,
             max_hedge_size=build_hedge_ceilings(self.config),
             in_flight_ttl_ms=self.config.overlay_ttl_ms,
+            impact=self.impact,
+            max_impact_bps=self.config.risk.max_hedge_impact_bps,
         )
         chaser = Chaser(
             sessions=self.sessions,

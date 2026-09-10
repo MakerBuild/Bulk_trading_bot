@@ -314,6 +314,11 @@ See `config.yaml`. The parameters that shape execution:
 
 | Key | Effect |
 |---|---|
+| `execution_target.cycles` | Cycles to run; 0 is unlimited |
+| `execution_target.burn_usd` | Stop once this much has been paid in fees; 0 disables |
+| `execution_target.volume_usd` | Stop once this much **qualifying** volume is done; 0 disables |
+| `legs.*.leverage` | Max leverage for that market; omit to keep the account's own |
+| `risk.max_hedge_impact_bps` | Refuse a hedge whose predicted slippage exceeds this; 0 disables |
 | `legs.*.size` | Total base size the cycle accumulates |
 | `legs.*.offset_bps` | How far inside the touch the resting order sits |
 | `legs.*.max_distance_bps` | Drift that triggers a cancel+replace |
@@ -371,6 +376,52 @@ order's ID before its response arrives. That is what makes an order placed just 
 crash still recognisable on restart.
 
 ---
+
+## Execution targets
+
+Whichever of the three limits is reached first ends the run. They are checked
+**between cycles**, never inside one: a target met halfway through an open
+position is not a reason to abandon it, or the pair is left directional.
+
+`burn_usd` and `volume_usd` are measured by walking the account tree's fill
+history (`POST /account {"type": "fills"}`) and summing what the exchange
+recorded, so they survive a restart and cannot drift from what was actually
+charged. If that read fails the run continues -- refusing to trade because a
+read-only endpoint is down would be worse than overshooting a soft goal by one
+cycle.
+
+**`volume_usd` counts qualifying volume only.** The fee documentation states
+that "Self-trades between accounts under the same main account do not create
+qualifying volume", and this strategy hedges between a master and its own
+sub-account, so some fills do cross between them. Those are real spend but earn
+no tier credit; a fill whose maker and taker are both inside the tree is
+counted toward `burn_usd` and excluded from `volume_usd`. Menu item 5 →
+Progress shows the split.
+
+## Leverage
+
+`legs.*.leverage` is applied at startup with `updateUserSettings`, to the
+master and to the sub-account separately -- sub-accounts copy the master's
+settings when created and are independent afterwards. Only what differs is
+sent, and the market's own ceiling from `/exchangeInfo` is checked first.
+
+One symbol per transaction, deliberately: the signed bytes are the map's
+entries in iteration order, and a multi-entry map has no order the sender and
+receiver are guaranteed to agree on. Note the SDK's own `update_leverage`
+sends `m` as a list of pairs where the reference client declares a map, so it
+is not used.
+
+## Hedge slippage
+
+`risk.max_hedge_impact_bps` prices a hedge against the market's published
+impact curve (`GET /impact`) before sending it, and halts rather than trading
+through a market that has become too thin. The hedge size is dictated by the
+fill it answers -- shrinking it would leave the pair directional -- so the only
+choices are to pay the slippage or to stop.
+
+**The endpoint answers 404 until a curve is published, and no mainnet market
+has one at the time of writing.** With no curve there is nothing to check and
+the guard does not fire; startup logs which markets are unguarded.
 
 ## Known gaps
 

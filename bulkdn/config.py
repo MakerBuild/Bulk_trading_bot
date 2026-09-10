@@ -69,6 +69,9 @@ class LegConfig:
     offset_bps: float
     max_distance_bps: float
     max_order_size: float
+    # None leaves whatever the account already has. The exchange's own ceiling
+    # for the market is checked at startup, since it differs per symbol.
+    leverage: float | None = None
 
     def validate(self, name: str) -> None:
         if not self.symbol:
@@ -81,6 +84,8 @@ class LegConfig:
             raise ConfigError(f"legs.{name}.offset_bps must be >= 0")
         if self.max_distance_bps <= 0:
             raise ConfigError(f"legs.{name}.max_distance_bps must be > 0")
+        if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
+            raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
 
 
 @dataclass
@@ -90,6 +95,10 @@ class RiskConfig:
     max_reject_streak: int = 5
     ws_stale_timeout_s: float = 30.0
     price_stale_timeout_s: float = 15.0
+    # Expected slippage ceiling for a hedge, read off the published impact
+    # curve. 0 disables the check, which is also what happens for a market
+    # with no curve published.
+    max_hedge_impact_bps: float = 0.0
 
     def validate(self) -> None:
         if self.max_net_exposure_usd <= 0:
@@ -98,6 +107,40 @@ class RiskConfig:
             raise ConfigError("risk.max_position_usd must be > 0")
         if self.max_reject_streak < 1:
             raise ConfigError("risk.max_reject_streak must be >= 1")
+        if self.max_hedge_impact_bps < 0:
+            raise ConfigError("risk.max_hedge_impact_bps must be >= 0")
+
+
+@dataclass
+class ExecutionTarget:
+    """When to stop starting new cycles.
+
+    Whichever limit is reached first ends the run; `0` disables one. `cycles`
+    is checked against the counter the bot keeps, while the other two are
+    measured from the exchange's own fill records, so they survive a restart
+    and cannot drift from what was actually charged.
+
+    `volume_usd` counts qualifying volume only. Fills that crossed between the
+    master and its own sub-account are real spend but earn no tier credit, so
+    counting them would overstate progress toward a volume goal.
+    """
+
+    cycles: int = 1
+    burn_usd: float = 0.0
+    volume_usd: float = 0.0
+
+    def validate(self) -> None:
+        if self.cycles < 0:
+            raise ConfigError("execution_target.cycles must be >= 0 (0 = unlimited)")
+        if self.burn_usd < 0:
+            raise ConfigError("execution_target.burn_usd must be >= 0")
+        if self.volume_usd < 0:
+            raise ConfigError("execution_target.volume_usd must be >= 0")
+
+    @property
+    def measures_fills(self) -> bool:
+        """Whether anything here needs the fill history read."""
+        return self.burn_usd > 0 or self.volume_usd > 0
 
 
 @dataclass
@@ -112,6 +155,7 @@ class Config:
     hedge_tolerance_lots: float = 1.0
     overlay_ttl_ms: int = 2000
     risk: RiskConfig = field(default_factory=RiskConfig)
+    target: ExecutionTarget = field(default_factory=ExecutionTarget)
     state_file: str = "./state/strategy_state.json"
     log_level: str = "INFO"
 
@@ -163,6 +207,7 @@ class Config:
             not self.sub1_pubkey or self.sub1_pubkey.startswith("REPLACE")
         ):
             raise ConfigError("sub1_pubkey must be set to a real sub-account pubkey")
+        self.target.validate()
         self.btc.validate("btc")
         self.sol.validate("sol")
         if self.btc.symbol == self.sol.symbol:
@@ -193,6 +238,9 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             offset_bps=float(raw.get("offset_bps", 0.0)),
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
             max_order_size=float(raw.get("max_order_size", raw["size"])),
+            leverage=(
+                float(raw["leverage"]) if raw.get("leverage") is not None else None
+            ),
         )
     except KeyError as exc:
         raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
@@ -218,6 +266,17 @@ def load_config(
     if not isinstance(risk_raw, dict):
         raise ConfigError("risk must be a mapping")
 
+    target_raw = raw.get("execution_target") or {}
+    if not isinstance(target_raw, dict):
+        raise ConfigError("execution_target must be a mapping")
+    # `cycles` was a top-level key before execution targets existed; the
+    # top-level spelling still works and the nested one wins.
+    target = ExecutionTarget(
+        cycles=int(target_raw.get("cycles", raw.get("cycles", 1))),
+        burn_usd=float(target_raw.get("burn_usd", 0.0)),
+        volume_usd=float(target_raw.get("volume_usd", 0.0)),
+    )
+
     config = Config(
         sub1_pubkey=raw.get("sub1_pubkey", ""),
         btc=_leg_from_dict(legs["btc"], "btc"),
@@ -225,13 +284,15 @@ def load_config(
         hold_minutes=float(raw.get("hold_minutes", 5.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),
         reconcile_interval_s=float(raw.get("reconcile_interval_s", 5.0)),
-        cycles=int(raw.get("cycles", 1)),
+        cycles=target.cycles,
+        target=target,
         hedge_tolerance_lots=float(raw.get("hedge_tolerance_lots", 1.0)),
         overlay_ttl_ms=int(raw.get("overlay_ttl_ms", 2000)),
         risk=RiskConfig(
             max_net_exposure_usd=float(risk_raw.get("max_net_exposure_usd", 500.0)),
             max_position_usd=float(risk_raw.get("max_position_usd", 5000.0)),
             max_reject_streak=int(risk_raw.get("max_reject_streak", 5)),
+            max_hedge_impact_bps=float(risk_raw.get("max_hedge_impact_bps", 0.0)),
             ws_stale_timeout_s=float(risk_raw.get("ws_stale_timeout_s", 30.0)),
             price_stale_timeout_s=float(risk_raw.get("price_stale_timeout_s", 15.0)),
         ),
