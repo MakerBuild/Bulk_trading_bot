@@ -216,8 +216,11 @@ terminal.
 Running it with no subcommand opens the menu, which is the intended way in:
 
 ```bash
-.venv/Scripts/python -m bulkdn.cli
+.venv\Scripts\python main.py
 ```
+
+`main.py` is a launcher over `bulkdn.cli`; `python -m bulkdn.cli` and the
+`bulkdn` console script reach the same entry point, so use whichever suits.
 
 ```text
 +--------------------------------------------+
