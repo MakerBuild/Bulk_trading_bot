@@ -260,6 +260,7 @@ Other commands:
 
 ```bash
 bulkdn            # interactive menu (same as `bulkdn menu`)
+bulkdn encrypt-key  # encrypt the key file, or change its password
 bulkdn status     # positions, open orders, persisted phase
 bulkdn check      # validate config and account wiring
 bulkdn transfer --to <pubkey> --amount <n>   # fund a sub-account from the master
@@ -376,6 +377,43 @@ order's ID before its response arrives. That is what makes an order placed just 
 crash still recognisable on restart.
 
 ---
+
+## The private key
+
+`private_key.local` is git-ignored and holds either a bare base58 seed or an
+encrypted envelope. Encrypt it once:
+
+```bash
+.venv/Scripts/python -m bulkdn.cli encrypt-key
+```
+
+```text
+Enter password to encrypt privatekeys (empty for default):
+Repeat:
+```
+
+Argon2id derives a key from the password and XSalsa20-Poly1305 encrypts the
+seed under it, both from PyNaCl -- the same library the SDK signs with, so this
+adds no dependency. The KDF parameters are stored in the file, so one written
+today still opens after they are raised. Poly1305 authenticates the ciphertext,
+which is why a wrong password is reported as wrong instead of returning a
+plausible-looking key.
+
+The file is written to a temporary name and moved into place, and the envelope
+is opened again before the old file is replaced, so an interrupted write cannot
+leave a key that is neither the old one nor the new one.
+
+Afterwards every command that needs to sign asks for the password once at
+startup. Set `BULK_KEY_PASSWORD` to run unattended; `BULK_PRIVATE_KEY` still
+bypasses the file entirely.
+
+> **An empty password uses a constant published in `keystore.py`.** It keeps the
+> key off the screen and out of a casual backup. It stops nothing else: anyone
+> with the file and this repository can open it. The prompt says so, and so
+> does the menu.
+
+Encrypting does not erase the plaintext that was there — it may survive in
+backups, editor swap files, or shell history. Rotate the key if that matters.
 
 ## Execution targets
 

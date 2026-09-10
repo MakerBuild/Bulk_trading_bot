@@ -1,8 +1,9 @@
 """Configuration loading and validation.
 
 The master private key is deliberately never sourced from the config file --
-only from the BULK_PRIVATE_KEY environment variable -- so a config can be
-committed or shared without leaking signing authority.
+only from the BULK_PRIVATE_KEY environment variable, or from a key file the
+keystore reads -- so a config can be committed or shared without leaking
+signing authority.
 """
 
 from __future__ import annotations
@@ -13,26 +14,16 @@ from typing import Any
 
 import yaml
 
+from . import keystore
+
 PRIVATE_KEY_ENV = "BULK_PRIVATE_KEY"
 
 # Fallback for when exporting an environment variable is inconvenient. Read
 # relative to the current working directory, same as `config.yaml` itself.
-# The file is git-ignored; see .gitignore. Lines starting with `#` and blank
-# lines are skipped, so a file that only has its explanatory header comment is
-# correctly treated as "no key set" rather than as a key containing a `#`.
+# The file is git-ignored; see .gitignore. It holds either an encrypted
+# envelope or a bare base58 line -- `bulkdn.keystore` reads both and prompts
+# for a password when the file is encrypted.
 PRIVATE_KEY_FILE = "private_key.local"
-
-
-def _read_private_key_file(path: str) -> str:
-    try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    return stripped
-    except FileNotFoundError:
-        pass
-    return ""
 
 # Mainnet endpoints, as published in the BULK OpenAPI spec (v3.0.10).
 #
@@ -200,8 +191,9 @@ class Config:
         if require_credentials and not self.private_key:
             raise ConfigError(
                 f"no private key found -- either export {PRIVATE_KEY_ENV}, or "
-                f"paste the master account's base58 key into {PRIVATE_KEY_FILE} "
-                "(git-ignored, one line, no quotes)"
+                f"put the master account's base58 key in {PRIVATE_KEY_FILE} "
+                "(git-ignored, one line, no quotes) and encrypt it with "
+                "`bulkdn encrypt-key`"
             )
         if require_sub1 and (
             not self.sub1_pubkey or self.sub1_pubkey.startswith("REPLACE")
@@ -244,6 +236,22 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
         )
     except KeyError as exc:
         raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
+
+
+def _load_private_key(required: bool) -> str:
+    """The signing key, from the environment or the key file.
+
+    The environment wins so an unattended run needs no password prompt. When
+    credentials are not required the key file is skipped entirely, which keeps
+    read-only commands from asking for a password they will not use.
+    """
+    from_env = os.environ.get(PRIVATE_KEY_ENV, "")
+    if from_env or not required:
+        return from_env
+    try:
+        return keystore.load(PRIVATE_KEY_FILE)
+    except keystore.KeystoreError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def load_config(
@@ -302,10 +310,7 @@ def load_config(
         ws_url_override=raw.get("ws_url", ""),
         ws_insecure_ssl=bool(raw.get("ws_insecure_ssl", False)),
         ws_ssl_auto_bypass=bool(raw.get("ws_ssl_auto_bypass", True)),
-        private_key=(
-            os.environ.get(PRIVATE_KEY_ENV, "")
-            or _read_private_key_file(PRIVATE_KEY_FILE)
-        ),
+        private_key=_load_private_key(require_credentials),
     )
     config.validate(require_credentials=require_credentials, require_sub1=require_sub1)
     return config

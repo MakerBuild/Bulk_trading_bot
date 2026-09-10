@@ -355,6 +355,59 @@ async def cmd_transfer(
     return 0
 
 
+def cmd_encrypt_key(config: Config) -> int:
+    """Encrypt the key file in place, or change its password.
+
+    The key is taken from whatever `load_config` already resolved, so this
+    works on a plaintext file, on an already-encrypted one (re-encrypting it
+    under a new password), and on a key supplied through the environment.
+    """
+    import getpass
+    import sys
+
+    from . import keystore
+    from .config import PRIVATE_KEY_FILE
+
+    if not config.private_key:
+        print("no key to encrypt")
+        return 1
+
+    if not sys.stdin.isatty():
+        # getpass would fall back to an echoing read, which puts the password
+        # on screen and into the scrollback.
+        print("this needs a terminal to type the password into")
+        return 1
+
+    was_encrypted = keystore.is_encrypted(PRIVATE_KEY_FILE)
+    print(
+        f"\n{PRIVATE_KEY_FILE} is currently "
+        f"{'encrypted' if was_encrypted else 'PLAINTEXT'}."
+    )
+    print("An empty password uses a default that is published in the source:")
+    print("it keeps the key off the screen and out of a backup, nothing more.\n")
+
+    first = getpass.getpass("Enter password to encrypt privatekeys (empty for default): ")
+    second = getpass.getpass("Repeat: ")
+    if first != second:
+        print("passwords do not match -- nothing was written")
+        return 1
+    password = first or keystore.DEFAULT_PASSWORD
+    if not first:
+        print("\nusing the default password")
+
+    try:
+        keystore.save(PRIVATE_KEY_FILE, config.private_key, password)
+    except keystore.KeystoreError as exc:
+        print(f"failed: {exc}")
+        return 1
+
+    print(f"\n{PRIVATE_KEY_FILE} written encrypted (argon2id + xsalsa20-poly1305).")
+    if not was_encrypted:
+        print("The plaintext it replaced may still exist in backups or in your")
+        print("shell history -- rotate the key if that matters.")
+    return 0
+
+
 async def cmd_create_subaccount(
     config: Config, name: str, margin_amount: float | None
 ) -> int:
@@ -433,6 +486,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="source pubkey (default: the master, i.e. the signing key)",
     )
 
+    sub.add_parser("encrypt-key", help="encrypt the key file, or change its password")
+
     create_sub = sub.add_parser(
         "create-subaccount",
         help="create a sub-account (best-effort -- SDK has no signer for this action)",
@@ -456,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
             require_credentials=True,
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
             require_sub1=args.command
-            not in (None, "menu", "create-subaccount", "transfer"),
+            not in (None, "menu", "create-subaccount", "transfer", "encrypt-key"),
         )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -481,6 +536,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(cmd_status(config))
         if args.command == "check":
             return asyncio.run(cmd_check(config))
+        if args.command == "encrypt-key":
+            return cmd_encrypt_key(config)
         if args.command == "transfer":
             return asyncio.run(
                 cmd_transfer(config, args.to_pubkey, args.amount, args.from_pubkey)

@@ -265,19 +265,33 @@ def _balance_subaccounts(config: Config) -> None:
     _pause()
 
 
+def _encrypt_key(config: Config) -> None:
+    from .cli import cmd_encrypt_key
+
+    cmd_encrypt_key(config)
+    _pause()
+
+
 def _accounts_menu(config: Config) -> None:
+    from . import keystore
+    from .config import PRIVATE_KEY_FILE
+
     while True:
+        state = "encrypted" if keystore.is_encrypted(PRIVATE_KEY_FILE) else "PLAINTEXT"
         print("\n" + _box("ACCOUNTS MANAGEMENT", [
             "1. Create New Subaccount",
             "2. Balance All Subaccounts",
-            "3. Back",
+            f"3. Encrypt Private Key   [{state}]",
+            "4. Back",
         ]))
         choice = _ask("\n  > ")
         if choice == "1":
             _create_subaccount(config)
         elif choice == "2":
             _balance_subaccounts(config)
-        elif choice in ("3", "0"):
+        elif choice == "3":
+            _encrypt_key(config)
+        elif choice in ("4", "0"):
             return
 
 
