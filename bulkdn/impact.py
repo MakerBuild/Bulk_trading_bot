@@ -25,9 +25,6 @@ from dataclasses import dataclass
 
 import requests
 
-KNOTS = 250
-
-
 @dataclass
 class ImpactCurve:
     """One side of the curve: impact in bps across log-uniform size knots."""

@@ -136,7 +136,7 @@ class RoutedWsClient(BulkWebSocketClient):
         if self.dry_run:
             log.info(
                 "[dry-run] would submit to %s: %s",
-                _short(account),
+                short_pubkey(account),
                 " | ".join(str(a) for a in actions),
             )
             return [
@@ -191,7 +191,7 @@ class AccountSession:
     async def connect(self) -> None:
         if not await self.client.connect():
             raise RuntimeError(f"{self.name}: failed to connect to WebSocket")
-        log.info("%s connected (account=%s)", self.name, _short(self.pubkey))
+        log.info("%s connected (account=%s)", self.name, short_pubkey(self.pubkey))
 
     async def disconnect(self) -> None:
         try:
@@ -390,7 +390,7 @@ def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:
             f"{sub1.pubkey} is not a sub-account of master {master.pubkey}. "
             f"Known sub-accounts: {sorted(c for c in children if c) or 'none'}"
         )
-    log.info("verified %s is a sub-account of %s", _short(sub1.pubkey), _short(master.pubkey))
+    log.info("verified %s is a sub-account of %s", short_pubkey(sub1.pubkey), short_pubkey(master.pubkey))
 
 
 def unwrap_full_account(payload: Any) -> dict:
@@ -410,7 +410,8 @@ def unwrap_full_account(payload: Any) -> dict:
     return payload
 
 
-def _short(pubkey: str | None) -> str:
+def short_pubkey(pubkey: str | None) -> str:
+    """`AAAAAA..BBBB`, for logs and menus. Shared so both render keys alike."""
     if not pubkey:
         return "?"
     return pubkey if len(pubkey) <= 12 else f"{pubkey[:6]}..{pubkey[-4:]}"

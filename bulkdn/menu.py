@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 import requests
 
-from .accounts import unwrap_full_account
+from .accounts import short_pubkey, unwrap_full_account
 from .config import Config, ConfigError
 
 BOX_WIDTH = 46
@@ -77,7 +77,7 @@ def _accounts(config: Config) -> list[tuple[str, str]]:
     if body.status_code == 404:
         # The usual case for a fresh key, and the raw 404 explains none of it.
         raise NoAccountTree(
-            f"no account exists on mainnet for master {_short(master)}.\n"
+            f"no account exists on mainnet for master {short_pubkey(master)}.\n"
             "  A BULK account is created by an on-chain USDC deposit into the\n"
             "  Solana vault -- this bot cannot do that. Deposit first, then\n"
             "  Accounts Management -> Create New Subaccount."
@@ -105,8 +105,16 @@ def _transferable(config: Config, pubkey: str) -> float:
     return float(margin.get("transferableBalance") or 0.0)
 
 
-def _short(pubkey: str) -> str:
-    return pubkey if len(pubkey) <= 16 else f"{pubkey[:6]}..{pubkey[-4:]}"
+def _http(config: Config):
+    """An authenticated HTTP client for read paths that need one."""
+    from bulk_api.api.bulk_http import BulkHttpClient
+    from bulk_api.common import SignatureDomain
+
+    return BulkHttpClient(
+        base_url=config.http_url,
+        private_key=config.private_key,
+        signature_domain=SignatureDomain[config.signature_domain_name],
+    )
 
 
 # -- menu items -------------------------------------------------------------
@@ -143,19 +151,12 @@ def _history(config: Config) -> None:
     Volume and fees are summed from the fills themselves rather than tracked
     separately, so the numbers cannot drift from what the exchange recorded.
     """
-    from bulk_api.api.bulk_http import BulkHttpClient
-    from bulk_api.common import SignatureDomain
-
-    http = BulkHttpClient(
-        base_url=config.http_url,
-        private_key=config.private_key,
-        signature_domain=SignatureDomain[config.signature_domain_name],
-    )
+    http = _http(config)
 
     grand_volume = 0.0
     grand_fees = 0.0
     for label, pubkey in _accounts(config):
-        print(f"\n  {label} {_short(pubkey)}")
+        print(f"\n  {label} {short_pubkey(pubkey)}")
         try:
             page = http.get_fills_page(pubkey, limit=20)
         except Exception as exc:
@@ -216,7 +217,7 @@ def _balance_subaccounts(config: Config) -> None:
 
     print(f"\n  {'account':<22} {'transferable':>14} {'delta':>12}")
     for label, pk, bal in balances:
-        print(f"  {label + ' ' + _short(pk):<22} {bal:>14.2f} {bal - target:>12.2f}")
+        print(f"  {label + ' ' + short_pubkey(pk):<22} {bal:>14.2f} {bal - target:>12.2f}")
     print(f"\n  total {total:,.2f} across {len(balances)} accounts -> {target:,.2f} each")
 
     # Anything below a cent is noise; moving it costs a transaction for nothing.
@@ -243,7 +244,7 @@ def _balance_subaccounts(config: Config) -> None:
 
     print("\n  planned transfers:")
     for src, dst, amount in moves:
-        print(f"    {_short(src)} -> {_short(dst)}  {amount:,.2f}")
+        print(f"    {short_pubkey(src)} -> {short_pubkey(dst)}  {amount:,.2f}")
 
     if not _confirm(f"Submit {len(moves)} transfer(s)."):
         print("  aborted")
@@ -260,7 +261,7 @@ def _balance_subaccounts(config: Config) -> None:
             margin_amount=amount,
         )
         state = "ok" if result.ok else f"FAILED {result.response_json}"
-        print(f"    {_short(src)} -> {_short(dst)} {amount:,.2f}: {state}")
+        print(f"    {short_pubkey(src)} -> {short_pubkey(dst)} {amount:,.2f}: {state}")
     _pause()
 
 
@@ -292,15 +293,14 @@ def _render_number(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
-TARGET_BLOCK_HEADER = (
+TARGET_BLOCK_COMMENT = (
     "# Execution target: whichever limit is reached first ends the run.\n"
     "# 0 disables a limit. burn_usd and volume_usd are measured from the\n"
-    "# exchange's own fill records, so they survive a restart.\n"
-    "execution_target:\n"
+    "# exchange's own fill records, so they survive a restart."
 )
 
 
-def _write_target(config_path: str, key: str, value: float, defaults) -> bool:
+def _write_target(config_path: str, key: str, value: float, defaults) -> None:
     """Set one key under `execution_target`, keeping the file's comments.
 
     Walks lines rather than matching a pattern: the block is two levels deep
@@ -313,36 +313,40 @@ def _write_target(config_path: str, key: str, value: float, defaults) -> bool:
     header = next(
         (i for i, line in enumerate(lines) if line.strip() == "execution_target:"), None
     )
+
     if header is None:
-        block = TARGET_BLOCK_HEADER
+        block = [TARGET_BLOCK_COMMENT, "execution_target:"]
         for name in ("cycles", "burn_usd", "volume_usd"):
             chosen = value if name == key else getattr(defaults, name)
-            block += f"  {name}: {_render_number(chosen)}\n"
-        text = "\n".join(lines).rstrip("\n") + "\n\n" + block
-        with open(config_path, "w", encoding="utf-8") as handle:
-            handle.write(text)
-        return True
-
-    for i in range(header + 1, len(lines)):
-        line = lines[i]
-        # The block ends at the first line that is not indented.
-        if line.strip() and not line.startswith((" ", "\t")):
-            break
-        if line.strip().startswith(f"{key}:"):
+            block.append(f"  {name}: {_render_number(chosen)}")
+        lines = [*lines, "", *block]
+    else:
+        end = next(
+            (
+                i
+                for i in range(header + 1, len(lines))
+                if lines[i].strip() and not lines[i].startswith((" ", "\t"))
+            ),
+            len(lines),
+        )
+        at = next(
+            (
+                i
+                for i in range(header + 1, end)
+                if lines[i].strip().startswith(f"{key}:")
+            ),
+            None,
+        )
+        if at is None:
+            lines.insert(header + 1, f"  {key}: {_render_number(value)}")
+        else:
+            line = lines[at]
             indent = line[: len(line) - len(line.lstrip())]
-            comment = ""
-            if "#" in line:
-                comment = "  " + line[line.index("#") :]
-            lines[i] = f"{indent}{key}: {_render_number(value)}{comment}"
-            with open(config_path, "w", encoding="utf-8") as handle:
-                handle.write("\n".join(lines) + "\n")
-            return True
+            trailing = "  " + line[line.index("#") :] if "#" in line else ""
+            lines[at] = f"{indent}{key}: {_render_number(value)}{trailing}"
 
-    # The block exists but lacks this key; append it inside the block.
-    lines.insert(header + 1, f"  {key}: {_render_number(value)}")
     with open(config_path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-    return True
+        handle.write("\n".join(lines).rstrip("\n") + "\n")
 
 
 def _edit_target(config: Config, config_path: str, key: str, label: str) -> None:
@@ -369,17 +373,10 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
 
 def _target_progress(config: Config) -> None:
     """Realised spend and volume against the configured targets."""
-    from bulk_api.api.bulk_http import BulkHttpClient
-    from bulk_api.common import SignatureDomain
-
     from .fees import account_fee_tier, fee_state, realised_for_tree
 
     accounts = [pk for _, pk in _accounts(config)]
-    http = BulkHttpClient(
-        base_url=config.http_url,
-        private_key=config.private_key,
-        signature_domain=SignatureDomain[config.signature_domain_name],
-    )
+    http = _http(config)
     totals = realised_for_tree(http, accounts)
 
     print(f"\n  fills {totals.fills}")

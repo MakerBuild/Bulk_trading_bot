@@ -16,6 +16,7 @@ differ when a master acts on one of its sub-accounts.
 
 from __future__ import annotations
 
+import struct
 import time
 
 import base58
@@ -24,9 +25,11 @@ from bulk_api.common.signer import SignatureDomain, TransactionSigner
 
 
 def write_u64(value: int) -> bytes:
-    import struct
-
     return struct.pack("<Q", value)
+
+
+def write_u32(value: int) -> bytes:
+    return struct.pack("<I", value)
 
 
 def sign_and_submit(

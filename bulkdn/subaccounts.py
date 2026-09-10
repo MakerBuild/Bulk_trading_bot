@@ -37,7 +37,7 @@ from dataclasses import dataclass
 import base58
 from bulk_api.common.signer import SignatureDomain
 
-from .tx import accepted, sign_and_submit
+from .tx import accepted, sign_and_submit, write_u32, write_u64
 
 CREATE_SUB_ACCOUNT_ORDINAL = 27
 TRANSFER_ORDINAL = 29
@@ -46,17 +46,9 @@ TRANSFER_ORDINAL = 29
 TRANSFER_KINDS = {"internal": 0, "external": 1}
 
 
-def _write_u64(value: int) -> bytes:
-    return struct.pack("<Q", value)
-
-
-def _write_u32(value: int) -> bytes:
-    return struct.pack("<I", value)
-
-
 def _write_string(value: str) -> bytes:
     encoded = value.encode("utf-8")
-    return _write_u64(len(encoded)) + encoded
+    return write_u64(len(encoded)) + encoded
 
 
 def _write_pubkey(value: str) -> bytes:
@@ -97,7 +89,7 @@ def serialize_create_sub_account(
 
     return b"".join(
         [
-            _write_u32(CREATE_SUB_ACCOUNT_ORDINAL),
+            write_u32(CREATE_SUB_ACCOUNT_ORDINAL),
             _write_string(name),
             _write_optional_f64(margin_amount),
         ]
@@ -119,8 +111,8 @@ def serialize_transfer(
 
     return b"".join(
         [
-            _write_u32(TRANSFER_ORDINAL),
-            _write_u32(TRANSFER_KINDS[kind]),
+            write_u32(TRANSFER_ORDINAL),
+            write_u32(TRANSFER_KINDS[kind]),
             _write_pubkey(from_pubkey),
             _write_pubkey(to_pubkey),
             struct.pack("<d", float(margin_amount)),

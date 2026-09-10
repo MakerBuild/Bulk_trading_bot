@@ -102,12 +102,12 @@ def test_transfer_preimage_matches_keychain_reference():
     from bulk_api.common.signer import SignatureDomain
 
     from bulkdn.config import SIGNATURE_DOMAIN_NAME
-    from bulkdn.subaccounts import _write_u64
+    from bulkdn.tx import write_u64
 
     preimage = (
-        _write_u64(1)
+        write_u64(1)
         + serialize_transfer(MASTER, SUB, 250.0)
-        + _write_u64(1704067200000)
+        + write_u64(1704067200000)
         + base58.b58decode(MASTER)
         + bytes([SignatureDomain[SIGNATURE_DOMAIN_NAME].value])  # mainnet
     )

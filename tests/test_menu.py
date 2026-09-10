@@ -88,7 +88,10 @@ def test_start_declined_does_not_run_the_strategy(monkeypatch):
     assert calls == [], "a declined confirmation must not start a cycle"
 
 
-def test_short_leaves_small_keys_alone():
-    assert menu._short("abc") == "abc"
+def test_short_pubkey_leaves_small_keys_alone():
+    from bulkdn.accounts import short_pubkey
+
+    assert short_pubkey("abc") == "abc"
+    assert short_pubkey(None) == "?"
     long = "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"
-    assert menu._short(long) == "BR4SV1..edB8"
+    assert short_pubkey(long) == "BR4SV1..edB8"
