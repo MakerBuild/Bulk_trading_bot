@@ -202,6 +202,38 @@ terminal.
 
 ## Running
 
+Running it with no subcommand opens the menu, which is the intended way in:
+
+```bash
+.venv/Scripts/python -m bulkdn.cli
+```
+
+```text
++--------------------------------------------+
+|             DELTA-NEUTRAL BOT              |
++--------------------------------------------+
+| 1. Start                                   |
+| 2. Active Strategy                         |
+| 3. History                                 |
+| 4. Accounts Management                     |
+| 5. Configuration                           |
+| 6. Close All Positions                     |
+| 0. Exit                                    |
++--------------------------------------------+
+```
+
+The menu is a front end over the subcommands below, not a second implementation.
+Every item that spends money asks for a typed `yes` first — `y` and a bare Enter
+both abort — because the bot is mainnet-only and there is no harmless mistake.
+
+Two entries under **Configuration** are deliberately inert. `Total Amount to Burn`
+and `Total Trading Volume` are stop conditions the run loop does not read, so the
+menu refuses to store them rather than let you set a limit that would never fire.
+`History` reports realised volume and fees from the exchange's own fill records in
+the meantime.
+
+The subcommands stay available for scripting.
+
 **Orders are not submitted unless you pass `--live`.** Without it the bot connects,
 subscribes, runs the full phase machine, and logs every transaction it *would* send.
 
@@ -216,6 +248,7 @@ subscribes, runs the full phase machine, and logs every transaction it *would* s
 Other commands:
 
 ```bash
+bulkdn            # interactive menu (same as `bulkdn menu`)
 bulkdn status     # positions, open orders, persisted phase
 bulkdn check      # validate config and account wiring
 bulkdn transfer --to <pubkey> --amount <n>   # fund a sub-account from the master

@@ -21,6 +21,7 @@ from bulk_api.common import SignatureDomain
 from .accounts import build_sessions, verify_sub_account
 from .chaser import Chaser
 from .config import Config, ConfigError, load_config
+from .menu import run_menu
 from .feed import MarketFeed
 from .hedger import Hedger
 from .positions import PositionBook
@@ -334,7 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config.yaml", help="path to the config file")
     parser.add_argument("--log-level", help="override the log level in the config file")
 
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=False)
+    sub.add_parser("menu", help="interactive menu (default with no subcommand)")
 
     run = sub.add_parser("run", help="run the strategy")
     run.add_argument(
@@ -379,7 +381,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.config,
             require_credentials=True,
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
-            require_sub1=args.command not in ("create-subaccount", "transfer"),
+            require_sub1=args.command
+            not in (None, "menu", "create-subaccount", "transfer"),
         )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
@@ -394,6 +397,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.warning("=" * 70)
 
     try:
+        if args.command in (None, "menu"):
+            return run_menu(config, args.config)
         if args.command == "run":
             return asyncio.run(cmd_run(config, dry_run))
         if args.command == "flatten":
