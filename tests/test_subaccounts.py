@@ -96,6 +96,9 @@ def test_transfer_preimage_matches_keychain_reference():
     opaque literal on purpose, because splitting it by hand is how you
     introduce an off-by-one nibble.
     """
+    from bulk_api.common.signer import SignatureDomain
+
+    from bulkdn.config import SIGNATURE_DOMAIN_NAME
     from bulkdn.subaccounts import _write_u64
 
     preimage = (
@@ -103,11 +106,11 @@ def test_transfer_preimage_matches_keychain_reference():
         + serialize_transfer(MASTER, SUB, 250.0)
         + _write_u64(1704067200000)
         + base58.b58decode(MASTER)
-        + bytes([2])  # testnet domain
+        + bytes([SignatureDomain[SIGNATURE_DOMAIN_NAME].value])  # mainnet
     )
     assert len(preimage) == 129
     assert preimage.hex() == (
-        "01000000000000001d000000000000009abeb294657ae1831c3c2b47735c4e782be01ba20dd2d43aadd71d1660ed3723202c6fe8d738dec5935736ebef6e9095ea9cb3120584bfd4f0a14e3cf260774d0000000000406f4000f451c28c0100009abeb294657ae1831c3c2b47735c4e782be01ba20dd2d43aadd71d1660ed372302"
+        "01000000000000001d000000000000009abeb294657ae1831c3c2b47735c4e782be01ba20dd2d43aadd71d1660ed3723202c6fe8d738dec5935736ebef6e9095ea9cb3120584bfd4f0a14e3cf260774d0000000000406f4000f451c28c0100009abeb294657ae1831c3c2b47735c4e782be01ba20dd2d43aadd71d1660ed372301"
     )
 
 

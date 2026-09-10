@@ -6,12 +6,9 @@
 # sub-account of that master; the bot verifies this on startup and refuses
 # to run if it isn't.
 
-# MAINNET -- `run --live` here trades real funds. This also selects the
-# signature domain byte (mainnet = 1, testnet = 2, devnet/staging = 3), so it
-# must stay accurate: signing for the wrong network fails with `bad signature`.
-# `testnet` (exchange-api / exchange-ws1) is live and fundable via the faucet,
-# so a full cycle can be rehearsed there for free first.
-network: mainnet          # mainnet | testnet | staging
+# This bot is MAINNET-ONLY -- `run --live` trades real funds. The endpoints and
+# the signature domain byte are pinned in bulkdn/config.py; there is no network
+# selector, and no rehearsal environment.
 sub1_pubkey: "REPLACE_WITH_SUB_ACCOUNT_PUBKEY"
 
 # Endpoint overrides, for when the derived host is wrong.

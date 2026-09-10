@@ -52,7 +52,7 @@ The maker/taker roles swap between OPEN and EXIT, which is what lets one rule se
 
 > **Install the SDK from GitHub, not PyPI.** The published `bulk-client` 0.1.2 wheel is
 > behind the repository: its signer omits the trailing signature-domain byte
-> (`mainnet=1, testnet=2, devnet=3`) that the API spec requires in the signature preimage,
+> (`mainnet=1`) that the API spec requires in the signature preimage,
 > and it has no `SignatureDomain` type at all. Signatures produced by the PyPI build will not
 > match what the exchange verifies. The GitHub source is correct.
 
@@ -117,7 +117,7 @@ The bot refuses to run otherwise.
 
 Checked against the OpenAPI spec (v3.0.10):
 
-**1. Network-bound signatures.** The domain byte (mainnet 1, testnet 2, devnet 3) is appended to
+**1. Network-bound signatures.** The domain byte (mainnet = 1) is appended to
 the signing preimage after `nonce || account`. It is trusted client configuration — never a JSON
 field or header — and comes from `network:` in the config, via `SignatureDomain`. The staged
 rollout of this byte is long finished: `bulk_client` 0.1.2 always appends it and rejects a
@@ -146,13 +146,12 @@ process is dead.
 
 ## Testing it
 
-**Mainnet is live and is the default.** `mainnet-api1.bulk.trade` / `mainnet-ws1.bulk.trade`
-serve 20 markets, so `run --live` with no other flags trades real money — `--live` is the only
-interlock.
+**This bot is mainnet-only.** `mainnet-api1.bulk.trade` / `mainnet-ws1.bulk.trade` are pinned
+in `bulkdn/config.py` together with the signature domain byte, and there is no network selector.
+Every `run --live` trades real money, and `--live` is the only interlock.
 
-**Testnet is reachable** at `exchange-api.bulk.trade` / `exchange-ws1.bulk.trade` and is fundable
-with `bulkdn faucet`, so a full cycle can be rehearsed for free with `--network testnet`. The
-host name carries no network qualifier, which has caused it to be mistaken for mainnet before.
+**There is no rehearsal environment.** Dry-run (`run` without `--live`) is the only way to
+exercise the bot without spending, and it cannot advance past OPEN because nothing fills.
 
 **The mainnet WebSocket serves an expired certificate.** Verification fails; the HTTP host is
 clean. `ws_ssl_auto_bypass` (on by default) retries without verification, which is what keeps the
@@ -166,21 +165,22 @@ Test in this order:
 .venv/Scripts/python -m pytest
 ```
 
-**2. Full cycle on testnet** — free, and the only honest rehearsal. Fund the master with
-`bulkdn faucet`, transfer margin to the sub, then run a complete OPEN → HOLD → EXIT cycle
-against the real matching engine.
+**2. Full cycle, live, minimum size** — there is no free equivalent. Fund the master on-chain,
+`bulkdn transfer` margin to the sub, then run a complete OPEN -> HOLD -> EXIT cycle against the
+real matching engine with the smallest sizes that clear each market's minimum notional.
 
 ```bash
-.venv/Scripts/python -m bulkdn.cli --config config.yaml --network testnet run --live
+.venv/Scripts/python -m bulkdn.cli --config config.yaml run --live
 ```
 
 Watch net exposure against the **unhedgeable floor**. A hedge smaller than a market's minimum
 notional cannot be submitted, so that floor (not zero) is the best neutrality achievable: ~$50
 on SOL, ~$1 on BTC. It does not shrink by trading larger.
 
-Testnet also exercises what no simulation can: per-action signature correctness, rejections
+This is also the only thing that exercises per-action signature correctness, rejections
 (`rejectedCrossing`, `cancelledReduceOnly`, `rejectedRiskLimit`), the 25 ms taker speed bump,
 the `minNotional` floor, and whether pre-computed order IDs match what the exchange assigns.
+Keep `bulkdn flatten --live` ready in a second terminal.
 
 **3. Read-only checks against the live API** — no signing, no orders.
 
@@ -209,10 +209,7 @@ subscribes, runs the full phase machine, and logs every transaction it *would* s
 # dry run on mainnet — connects and logs, submits nothing
 .venv/Scripts/python -m bulkdn.cli --config config.yaml run
 
-# live on testnet — free rehearsal, fund with `bulkdn faucet` first
-.venv/Scripts/python -m bulkdn.cli --config config.yaml --network testnet run --live
-
-# live on mainnet — REAL FUNDS (config already defaults to mainnet)
+# live — REAL FUNDS, no confirmation prompt
 .venv/Scripts/python -m bulkdn.cli --config config.yaml run --live
 ```
 
@@ -221,7 +218,7 @@ Other commands:
 ```bash
 bulkdn status     # positions, open orders, persisted phase
 bulkdn check      # validate config and account wiring
-bulkdn faucet     # request testnet funds for both accounts
+bulkdn transfer --to <pubkey> --amount <n>   # fund a sub-account from the master
 bulkdn flatten --live   # cancel everything and close all strategy positions
 ```
 
@@ -282,9 +279,9 @@ See `config.example.yaml`. The parameters that shape execution:
 | `hedge_tolerance_lots` | Net exposure tolerated before hedging (must be ≥ 1 lot) |
 | `overlay_ttl_ms` | How long an unconfirmed fill is trusted before falling back to exchange truth |
 
-The mainnet and testnet URLs both come from the OpenAPI spec's Base URLs. The `staging` entry is
-undocumented — note it signs on the **devnet** domain byte despite its host name. Override any of
-them with `http_url` / `ws_url` in the config if they differ.
+The mainnet URLs come from the OpenAPI spec's Base URLs and are pinned in `bulkdn/config.py`
+alongside the domain byte, so the two cannot drift apart. Override them with `http_url` /
+`ws_url` in the config only if the published hosts change.
 
 ---
 
@@ -300,9 +297,10 @@ needs no network.
 
 Before going live, also run through:
 
-1. `run` (dry-run) on testnet — confirms routing, order-ID computation, and the phase machine.
-2. `run --live` on testnet with small sizes and `hold_minutes: 2` — watch a full cycle and
-   check net exposure stays within tolerance across partial fills.
+1. `run` (dry-run) — confirms routing, order-ID computation, and the phase machine.
+2. `run --live` with the smallest sizes that clear each market's minimum notional and
+   `hold_minutes: 2` — watch a full cycle and check net exposure stays within tolerance
+   across partial fills. This spends real money; there is no free equivalent.
 3. Kill the process mid-OPEN with a partial fill, restart, confirm it reconciles to ~0.
 4. Set `max_net_exposure_usd` very low and confirm it halts and flattens.
 
@@ -334,10 +332,12 @@ crash still recognisable on restart.
 
 - **Dry-run cannot advance past OPEN.** Nothing fills, so positions never move and the entry
   legs never complete. Dry-run verifies connection, subaccount routing, order-ID computation,
-  chasing, and the risk checks — it cannot demonstrate a full cycle. Use testnet for that.
-- **No offline full-cycle rehearsal.** The in-process simulator was removed once testnet proved
-  reachable: it modelled no signatures, no rejections, no latency and no fees, so it agreed with
-  the bot's own assumptions rather than testing them. Unit tests cover the phase machine.
+  chasing, and the risk checks — it cannot demonstrate a full cycle.
+- **No rehearsal environment at all.** The in-process simulator was removed because it modelled
+  no signatures, no rejections, no latency and no fees, so it agreed with the bot's own
+  assumptions rather than testing them. The bot is now mainnet-only as well, so the first full
+  cycle it ever completes will be with real funds. Unit tests cover the phase machine; use the
+  smallest sizes that clear minimum notional for the first live run.
 - Sub-lot dust is left behind at the end of a cycle. Positions smaller than one lot cannot be
   traded, so a residual below `lotSize` on either account is expected and treated as flat.
 - The bot assumes it is the only thing trading these two symbols on both accounts. Entry

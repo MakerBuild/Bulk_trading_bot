@@ -16,7 +16,7 @@ replayed fills. `Fill` has no such field upstream, so it is attached
 dynamically; the dataclass has no `__slots__`, so this is safe.
 
 **3. TLS verification fails against the live endpoints.** Observed on
-`exchange-ws1.bulk.trade`, not just staging. Without a fallback the socket never
+`mainnet-ws1.bulk.trade`, whose certificate is expired. Without a fallback the socket never
 connects and the bot runs blind on HTTP polling alone.
 """
 

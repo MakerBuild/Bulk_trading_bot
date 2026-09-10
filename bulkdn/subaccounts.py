@@ -24,9 +24,9 @@ order prices and sizes are. For `createSubAccount` a zero margin encodes as
 absent (`0x00`), not as `Some(0.0)` -- the tag byte is signed, so the two are
 different transactions.
 
-Confirmed live on testnet: `createSubAccount` with no initial margin, and an
-internal `transfer`. The `createSubAccount` `Some(amount)` branch is pinned by
-tests but has not been exercised against a live server.
+Both were confirmed against a live endpoint: `createSubAccount` with no initial
+margin, and an internal `transfer`. The `createSubAccount` `Some(amount)` branch
+is pinned by tests but has not been exercised against a live server.
 """
 
 from __future__ import annotations
@@ -141,7 +141,7 @@ def _sign_and_submit(
     """Sign one action and POST it, returning (request, status, response).
 
     Layout per the API spec: action count, action, nonce, account, domain byte
-    (mainnet 1, testnet 2, devnet 3). The domain byte is always present.
+    (mainnet = 1). The domain byte is always present.
 
     The signing account is always the signer's own key: both actions here are
     authorised by the master acting on itself, not on a child.

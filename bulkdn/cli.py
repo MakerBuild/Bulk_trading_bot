@@ -3,9 +3,9 @@
 Trading is off by default: `run` will not submit a single order unless `--live`
 is passed, so a config file alone cannot start trading.
 
-Note that `--live` is the ONLY interlock. The config now defaults to mainnet,
-so `run --live` with no other flags trades real funds -- the mainnet banner is
-a warning, not a confirmation prompt. Pass `--network testnet` to rehearse.
+This bot is mainnet-only, so `--live` is the ONLY interlock and it always
+spends real funds. The mainnet banner is a warning, not a confirmation prompt,
+and there is no rehearsal network to fall back to.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from bulk_api.common import SignatureDomain
 
 from .accounts import build_sessions, verify_sub_account
 from .chaser import Chaser
-from .config import Config, ConfigError, NETWORKS, load_config
+from .config import Config, ConfigError, load_config
 from .feed import MarketFeed
 from .hedger import Hedger
 from .positions import PositionBook
@@ -75,8 +75,7 @@ class Runtime:
 
     async def start(self, verify: bool = True) -> None:
         log.info(
-            "network=%s mode=%s master=%s sub1=%s",
-            self.config.network,
+            "mainnet mode=%s master=%s sub1=%s",
             "DRY-RUN" if self.dry_run else "LIVE",
             self.master.pubkey,
             self.sub1.pubkey,
@@ -182,7 +181,7 @@ async def cmd_status(config: Config) -> int:
     sync_positions_http([runtime.master, runtime.sub1], runtime.book)
     state = runtime.store.load()
 
-    print(f"network      : {config.network}")
+    print(f"endpoint     : {config.http_url}")
     print(f"master       : {runtime.master.pubkey}")
     print(f"sub1         : {runtime.sub1.pubkey}")
     print(f"phase        : {state.phase.value}")
@@ -231,9 +230,10 @@ async def cmd_check(config: Config) -> int:
     except Exception as exc:
         print(f"sub-account check FAILED: {exc}")
         print(
-            "\nThis bot does not create sub-accounts: the Python SDK cannot sign a "
-            "createSubAccount action. Create it in the BULK UI or with the Rust "
-            "`bulk-cli`, fund it, then put its pubkey in the config."
+            "\nIf the account does not exist yet, the master itself has to be "
+            "created first by an on-chain deposit -- this bot cannot do that. "
+            "Once the master is funded, run `bulkdn create-subaccount --name "
+            "<name>`, then put the returned pubkey in the config."
         )
         return 1
     return 0
@@ -261,7 +261,7 @@ async def cmd_transfer(
         f"\ntransferring {amount} USDC\n"
         f"  from {source}\n"
         f"  to   {to_pubkey}\n"
-        f"  via  {config.http_url} ({config.network})\n"
+        f"  via  {config.http_url}\n"
     )
 
     result = submit_transfer(
@@ -296,8 +296,7 @@ async def cmd_create_subaccount(
 
     print(
         f"\nsubmitting createSubAccount(name={name!r}) to {config.http_url}\n"
-        f"network: {config.network} (domain byte "
-        f"{SignatureDomain[config.signature_domain_name].value})\n"
+        f"mainnet, domain byte {SignatureDomain[config.signature_domain_name].value}\n"
     )
 
     result = build_and_submit(
@@ -320,29 +319,11 @@ async def cmd_create_subaccount(
 
     print(
         "\nrejected. If the message is `bad signature`, the signed bytes disagree "
-        "with what the server expects -- check that `network:` matches the endpoint "
-        "(staging signs on the devnet domain, not mainnet). Nothing was changed on "
+        "with what the server expects -- the domain byte is pinned to mainnet "
+        "the domain byte is pinned to mainnet. Nothing was changed on "
         "the account."
     )
     return 1
-
-
-async def cmd_faucet(config: Config, amount: Optional[float]) -> int:
-    """Request testnet funds for both accounts."""
-    if config.network == "mainnet":
-        print("faucet is not available on mainnet")
-        return 1
-    runtime = Runtime(config, dry_run=False)
-    for session in (runtime.master, runtime.sub1):
-        try:
-            result = session.http.request_faucet(user=session.pubkey, amount=amount)
-            print(f"{session.name}: {result}")
-        except Exception as exc:
-            print(f"{session.name}: faucet failed ({exc})")
-    return 0
-
-
-# -- argument parsing ------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -351,11 +332,6 @@ def build_parser() -> argparse.ArgumentParser:
         description="Delta-neutral BTC/SOL bot across a BULK master account and sub-account",
     )
     parser.add_argument("--config", default="config.yaml", help="path to the config file")
-    parser.add_argument(
-        "--network",
-        choices=sorted(NETWORKS),
-        help="override the network in the config file",
-    )
     parser.add_argument("--log-level", help="override the log level in the config file")
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -372,9 +348,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     flat = sub.add_parser("flatten", help="cancel all orders and close all strategy positions")
     flat.add_argument("--live", action="store_true", help="actually submit the closing orders")
-
-    faucet = sub.add_parser("faucet", help="request testnet funds for both accounts")
-    faucet.add_argument("--amount", type=float, default=None)
 
     xfer = sub.add_parser("transfer", help="move margin between master and sub-account")
     xfer.add_argument("--to", dest="to_pubkey", required=True, help="destination pubkey")
@@ -404,7 +377,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         config = load_config(
             args.config,
-            network_override=args.network,
             require_credentials=True,
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
             require_sub1=args.command not in ("create-subaccount", "transfer"),
@@ -416,7 +388,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     configure_logging(args.log_level or config.log_level)
 
     dry_run = not getattr(args, "live", False)
-    if config.network == "mainnet" and not dry_run:
+    if not dry_run:
         log.warning("=" * 70)
         log.warning("LIVE TRADING ON MAINNET -- real funds are at risk")
         log.warning("=" * 70)
@@ -430,8 +402,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             return asyncio.run(cmd_status(config))
         if args.command == "check":
             return asyncio.run(cmd_check(config))
-        if args.command == "faucet":
-            return asyncio.run(cmd_faucet(config, args.amount))
         if args.command == "transfer":
             return asyncio.run(
                 cmd_transfer(config, args.to_pubkey, args.amount, args.from_pubkey)

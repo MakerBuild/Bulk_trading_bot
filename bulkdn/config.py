@@ -34,43 +34,21 @@ def _read_private_key_file(path: str) -> str:
         pass
     return ""
 
-# Endpoints per network, as published in the BULK OpenAPI spec (v3.0.10).
-# The signature domain byte is part of the signed payload, so it must match the
-# network the transaction is sent to or the exchange rejects the signature --
-# and the domain cannot be inferred from the URL, so each entry pins the
-# pairing explicitly.
-NETWORKS: Dict[str, Dict[str, str]] = {
-    # Primary mainnet. Real funds.
-    #
-    # Note the WS host currently serves an EXPIRED certificate while the HTTP
-    # host verifies cleanly, so `ws_ssl_auto_bypass` (on by default) is what
-    # keeps the account stream connectable. Verified live at the time of
-    # writing: /exchangeInfo lists 20 markets and the ticker stream flows.
-    "mainnet": {
-        "http": "https://mainnet-api1.bulk.trade/api/v1",
-        "ws": "wss://mainnet-ws1.bulk.trade",
-        "domain": "MAINNET",
-    },
-    # Testnet. `exchange-api` carries no network qualifier in its name, which
-    # has caused it to be mistaken for mainnet before -- the spec lists it under
-    # "Testnet", and mainnet now has its own `mainnet-api1` host above.
-    # Fundable with the `faucet` action.
-    "testnet": {
-        "http": "https://exchange-api.bulk.trade/api/v1",
-        "ws": "wss://exchange-ws1.bulk.trade",
-        "domain": "TESTNET",
-    },
-    # Staging is undocumented but live, and is what the working `bulk-volume-bot`
-    # trades against. Note the mismatch that makes this worth a named entry:
-    # the host says "staging" but it signs on the DEVNET domain byte (3). The
-    # domain is not derivable from the URL, so getting this pairing wrong is an
-    # instant `bad signature`.
-    "staging": {
-        "http": "https://staging-api.bulk.trade/api/v1",
-        "ws": "wss://staging-ws.bulk.trade",
-        "domain": "DEVNET",
-    },
-}
+# Mainnet endpoints, as published in the BULK OpenAPI spec (v3.0.10).
+#
+# This bot is mainnet-only. There is no network selector: the signature domain
+# byte is part of the signed payload, and a mismatch between it and the host
+# being posted to is rejected as `bad signature`, so pinning both together in
+# one place removes the whole class of mistake.
+#
+# Note the WebSocket host currently serves an EXPIRED certificate while the
+# HTTP host verifies cleanly, so `ws_ssl_auto_bypass` (on by default) is what
+# keeps the account stream connectable.
+MAINNET_HTTP_URL = "https://mainnet-api1.bulk.trade/api/v1"
+MAINNET_WS_URL = "wss://mainnet-ws1.bulk.trade"
+
+# Domain byte 1. Trusted client configuration, never a JSON field or header.
+SIGNATURE_DOMAIN_NAME = "MAINNET"
 
 
 class ConfigError(Exception):
@@ -124,7 +102,6 @@ class RiskConfig:
 
 @dataclass
 class Config:
-    network: str
     sub1_pubkey: str
     btc: LegConfig
     sol: LegConfig
@@ -153,15 +130,15 @@ class Config:
 
     @property
     def http_url(self) -> str:
-        return self.http_url_override or NETWORKS[self.network]["http"]
+        return self.http_url_override or MAINNET_HTTP_URL
 
     @property
     def ws_url(self) -> str:
-        return self.ws_url_override or NETWORKS[self.network]["ws"]
+        return self.ws_url_override or MAINNET_WS_URL
 
     @property
     def signature_domain_name(self) -> str:
-        return NETWORKS[self.network]["domain"]
+        return SIGNATURE_DOMAIN_NAME
 
     @property
     def legs(self) -> Dict[str, LegConfig]:
@@ -174,24 +151,8 @@ class Config:
         `require_sub1` is relaxed for `create-subaccount`, which exists to
         produce that pubkey rather than assume it already exists.
         """
-        if self.network not in NETWORKS:
-            raise ConfigError(
-                f"network must be one of {sorted(NETWORKS)}, got {self.network!r}"
-            )
         if not self.http_url or not self.ws_url:
-            raise ConfigError(
-                f"no endpoint known for network {self.network!r} -- "
-                "set http_url and ws_url explicitly"
-            )
-        # An overridden endpoint keeps the domain byte of whatever `network`
-        # names, which is easy to get wrong: pointing at staging while `network`
-        # still says mainnet signs with domain 1 against a server expecting 3.
-        if self.http_url_override and "staging" in self.http_url_override:
-            if self.signature_domain_name != "DEVNET":
-                raise ConfigError(
-                    "http_url points at staging, which signs on the devnet domain "
-                    f"-- set `network: staging` (currently {self.network!r})"
-                )
+            raise ConfigError("http_url and ws_url must not be empty")
         if require_credentials and not self.private_key:
             raise ConfigError(
                 f"no private key found -- either export {PRIVATE_KEY_ENV}, or "
@@ -238,15 +199,10 @@ def _leg_from_dict(raw: Dict[str, Any], name: str) -> LegConfig:
 
 def load_config(
     path: str,
-    network_override: str | None = None,
     require_credentials: bool = True,
     require_sub1: bool = True,
 ) -> Config:
-    """Load, merge, and validate configuration.
-
-    `network_override` lets the CLI flag win over the file, so that pointing a
-    testnet-shaped config at mainnet is an explicit act.
-    """
+    """Load, merge, and validate configuration."""
     try:
         with open(path, "r", encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
@@ -262,7 +218,6 @@ def load_config(
         raise ConfigError("risk must be a mapping")
 
     config = Config(
-        network=network_override or raw.get("network", "mainnet"),
         sub1_pubkey=raw.get("sub1_pubkey", ""),
         btc=_leg_from_dict(legs["btc"], "btc"),
         sol=_leg_from_dict(legs["sol"], "sol"),
