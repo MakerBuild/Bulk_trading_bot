@@ -66,7 +66,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem pip checks consistency after this step and reports bulk-keychain and
+rem solders as missing, in red, with the word ERROR. Both are declared by
+rem bulk-client and imported by nothing in it -- checked against the installed
+rem package -- so the message is noise. Said here rather than hidden, because
+rem suppressing pip's output would hide a real failure too.
 echo   Installing dependencies...
+echo   ^(pip will report bulk-keychain and solders as missing. That is expected:
+echo    the SDK declares them and never imports them. The signing check at the
+echo    end is what tells you the install works.^)
 "%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML
 if errorlevel 1 (
     echo   Dependency install failed -- see the error above.
