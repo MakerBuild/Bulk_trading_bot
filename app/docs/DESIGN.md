@@ -525,6 +525,37 @@ The bot refuses to start unless the master account signed up through the
 owner — by referral code or by redeemed invite, both of which are checked,
 because on the wallet this was built for roughly two thirds arrived by invite.
 
+### What the public index actually carries
+
+Measured against live records, not assumed. This is the limit the gate runs
+into, and it is worth stating before the mechanism:
+
+| account | `referred_by_wallet` | `access.invited_by_wallet` | gate |
+|---|---|---|---|
+| pre-deposit era | set | — | passes |
+| invited by a wallet | — | set, `inviter_kind: user` | passes |
+| created on mainnet | **null** | **null**, `inviter_kind: admin` | **refused** |
+
+A mainnet account comes back from `/v1/aura/wallet/<pubkey>` with every
+attribution field null, while app.bulk.trade shows "You were referred by
+&lt;code&gt;" for that same wallet. The site reads a different table:
+
+```
+GET /v1/aura/mainnet/referrals/<pubkey>  -> 401 missing x-aura-referral-api-key
+GET /v1/aura/referrals/traders/<pubkey>  -> 401
+GET /v1/aura/access/codes/<pubkey>       -> 401
+```
+
+So without a key the gate cannot see a mainnet referral at all, and refuses
+accounts that did sign up through the owner. `REFERRAL_API_KEY` in
+`referral.py` closes this: when set, a wallet whose public record says nothing
+is looked up there before being refused.
+
+One further trap: `access.invited_by_code_id` is an internal id
+(`INV-3-031806`), not the `BULK-XXX-XXX` code an owner can see and share, so
+the `invite_codes` list can never be populated from what the owner holds.
+Match on the inviter's wallet.
+
 The allow-list is compiled into `app/bulkdn/referral.py` as sha256 digests, not
 read from `settings.yaml`. When `SEALED_WALLETS` is non-empty the build is
 *sealed*: the `access` block in the config is ignored in full, and `check_access`

@@ -51,7 +51,9 @@ INVITED = {
     "referred_by_code": None,
     "access": {
         "has_access": True,
-        "invited_by_code_id": "BULK-EDA-QQF",
+        # An internal id, which is what the live API returns here -- not
+        # the BULK-XXX-XXX code the inviter sees and shares.
+        "invited_by_code_id": "INV-3-031806",
         "invited_by_wallet": REFERRER,
     },
 }
@@ -198,17 +200,33 @@ def test_invited_wallet_is_denied_for_a_different_inviter(monkeypatch):
         WALLET, AccessConfig(require_referral=True, wallets=["SomeoneElse"])
     )
     assert not decision.allowed
-    assert "invite code BULK-EDA-QQF" in decision.reason
+    assert "invite code INV-3-031806" in decision.reason
 
 
 def test_an_explicit_invite_code_is_accepted(monkeypatch):
+    """Matched against `invited_by_code_id`, which is an INTERNAL id.
+
+    Not the BULK-XXX-XXX code the inviter holds -- so this route only works for
+    someone who can read the ids out of the API, which the owner cannot. The
+    wallet route above is the usable one.
+    """
     _serve(monkeypatch, FakeResponse(200, INVITED))
     decision = check_access(
         WALLET,
-        AccessConfig(require_referral=True, invite_codes=["bulk-eda-qqf"]),
+        AccessConfig(require_referral=True, invite_codes=["inv-3-031806"]),
     )
     assert decision.allowed
     assert "invited by code" in decision.reason
+
+
+def test_the_shareable_code_does_not_match_the_internal_id(monkeypatch):
+    """The trap this documents: listing the codes you actually have matches nothing."""
+    _serve(monkeypatch, FakeResponse(200, INVITED))
+    decision = check_access(
+        WALLET,
+        AccessConfig(require_referral=True, invite_codes=["BULK-EDA-QQF"]),
+    )
+    assert not decision.allowed
 
 
 def test_missing_access_block_is_not_an_error(monkeypatch):

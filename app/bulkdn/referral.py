@@ -85,8 +85,12 @@ class AccessConfig:
     # one address covers everyone who arrived by either route, and keeps
     # covering them as invite codes are consumed and reissued.
     wallets: list[str] = field(default_factory=list)
-    # Individual invite codes. Supported, but they are single-use and reissued
-    # weekly, so a list of them goes stale -- prefer `wallets`.
+    # Individual invite codes, compared against `access.invited_by_code_id`.
+    #
+    # Almost certainly not what you want. That field holds an internal id
+    # (`INV-3-031806` on the records checked), not the `BULK-XXX-XXX` code an
+    # owner can see and share, so listing the codes you have will silently
+    # match nothing. Use `wallets`, which matches the inviter.
     invite_codes: list[str] = field(default_factory=list)
     # Accounts that may run regardless of who referred them.
     #
@@ -238,13 +242,15 @@ class ReferralStatus:
     **Referral code** -- `referred_by_*`, the shareable code someone
     typed when signing up.
 
-    **Invite code** -- `access.invited_by_*`, a single-use code
-    (`BULK-EDA-QQF`) issued from a limited weekly allowance.
+    **Invite code** -- `access.invited_by_*`, a single-use code from a limited
+    weekly allowance.
 
-    A wallet can arrive by either, so both are read. Matching on the inviter's
-    *wallet* rather than the code is what keeps this maintainable: codes are
-    consumed and reissued every week, while the wallet that issued them does
-    not change.
+    A wallet can arrive by either, so both are read. Match on the inviter's
+    *wallet*, not the code. Two reasons, and the second is the one that bites:
+    codes are consumed and reissued weekly, and `invited_by_code_id` is NOT the
+    shareable code the owner holds. The owner sees `BULK-EDA-QQF`; the API
+    returns an internal id -- `INV-3-031806` on the live records checked. A
+    list of the codes an owner actually has can therefore never match.
     """
 
     wallet: str
