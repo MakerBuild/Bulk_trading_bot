@@ -96,6 +96,21 @@ Verify the signer is the domain-aware one before trading:
 
 If that import fails, you are on the PyPI build and **must not** trade with it.
 
+### Starting it
+
+On Windows, use the launcher — it picks the project's interpreter for you:
+
+```
+run.bat              opens the menu
+run.bat status       any CLI subcommand works
+run.bat run --live
+```
+
+Plain `python main.py` is the usual first mistake: it takes whichever Python is first on
+PATH, and a global install carrying an older `bulk_api` fails with a missing
+`SignatureDomain`. `main.py` detects that and prints the interpreter to use, but the
+launcher avoids the choice entirely.
+
 The master private key comes from the environment, never from the config file:
 
 ```bash
