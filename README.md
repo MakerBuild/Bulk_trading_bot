@@ -19,7 +19,7 @@ pair stays close to market-neutral while it trades.
 3. **Double-click `install.bat`.** It builds a local environment, installs
    everything, and checks that transaction signing works. Safe to re-run.
 
-Never done this before? **[app/docs/INSTALL.md](app/docs/INSTALL.md)** walks through it
+Never done this before? **[ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md](ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md)** walks through it
 step by step, in Russian, including what to do when something fails.
 
 ---
@@ -138,6 +138,7 @@ its owner's referral or invite.
 
 | | |
 |---|---|
+| `ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md` | start here: every step, in Russian |
 | `install.bat` | one-time setup |
 | `run.bat` | start the bot |
 | `settings.yaml` | everything you can change |

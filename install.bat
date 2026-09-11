@@ -5,6 +5,12 @@ rem Safe to re-run; it upgrades an existing install in place.
 setlocal
 cd /d "%~dp0"
 
+rem This file stays pure ASCII. cmd reads a .bat through the console's
+rem codepage, and on a Russian Windows that is 866, where UTF-8 Cyrillic
+rem desynchronises the parser -- it does not merely render wrong, it splits
+rem commands apart and the install fails. So the guide is described here
+rem rather than named, because its name is Cyrillic.
+
 rem Both prerequisites are checked before anything is downloaded. Finding out
 rem git is missing halfway through a 200MB install is a poor way to learn it.
 where python >nul 2>&1
@@ -15,7 +21,7 @@ if errorlevel 1 (
     echo   Get it from https://www.python.org/downloads/ and TICK THE BOX
     echo   "Add python.exe to PATH" at the bottom of the installer.
     echo.
-    echo   Full walkthrough: app\docs\INSTALL.md
+    echo   Full walkthrough: the step-by-step guide in this folder
     echo.
     pause
     exit /b 1
@@ -30,7 +36,7 @@ if errorlevel 1 (
     echo   Then CLOSE THIS WINDOW and run install.bat again -- an open console
     echo   does not pick up a newly installed program.
     echo.
-    echo   Full walkthrough: app\docs\INSTALL.md
+    echo   Full walkthrough: the step-by-step guide in this folder
     echo.
     pause
     exit /b 1
