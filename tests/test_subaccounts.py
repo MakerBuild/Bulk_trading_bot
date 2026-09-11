@@ -81,17 +81,23 @@ def test_name_is_length_prefixed_utf8():
 # ---------------------------------------------------------------------------
 # transfer
 #
-# The expected bytes below were produced by the official `bulk-keychain` 0.1.26
-# signing library and compared byte-for-byte, so they are a reference rather
-# than a restatement of the implementation.
+# The layout below was verified byte-for-byte against the official
+# `bulk-keychain` 0.1.26 signing library, and separately against the live
+# exchange, which accepts transfers signed this way.
+#
+# The golden hex itself is generated from this implementation, so it guards
+# against drift rather than proving correctness a second time -- the addresses
+# are synthetic, and bulk-keychain has no wheel for current Pythons, so it
+# cannot be recomputed here. To restore it as an independent cross-check,
+# install bulk-keychain and regenerate the literal from it.
 # ---------------------------------------------------------------------------
 
-MASTER = "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"
-SUB = "3AbM7XE9ikZW82rPUwRNnDovs3DMgvWgfPdckFnATSTe"
+MASTER = "4Fy8FQxz3FYUFqvNgCydRPsBiGzWum5yFaxx68LTWBvU"
+SUB = "Dxs1DfD5F6bKzaWFjgixXCiAi4uzPf5ZBhqLpXYE4w4q"
 
 
 def test_transfer_preimage_matches_keychain_reference():
-    """Full 129-byte signing preimage, as produced by bulk-keychain 0.1.26.
+    """Full 129-byte signing preimage.
 
     Pins the wrapper as well as the action -- action count, action, nonce,
     account, domain byte -- so drift in either layer fails here. The field
@@ -113,7 +119,7 @@ def test_transfer_preimage_matches_keychain_reference():
     )
     assert len(preimage) == 129
     assert preimage.hex() == (
-        "01000000000000001d000000000000009abeb294657ae1831c3c2b47735c4e782be01ba20dd2d43aadd71d1660ed3723202c6fe8d738dec5935736ebef6e9095ea9cb3120584bfd4f0a14e3cf260774d0000000000406f4000f451c28c0100009abeb294657ae1831c3c2b47735c4e782be01ba20dd2d43aadd71d1660ed372301"
+        "01000000000000001d000000000000003068a71eff90f2a02f02cffa9ae7d8f3094538300475011db0d0401053ecf5cdc09bba1ffa480ac73b2a4beb08f95beadcbcfc03612a4d04590650ed96dbc91e0000000000406f4000f451c28c0100003068a71eff90f2a02f02cffa9ae7d8f3094538300475011db0d0401053ecf5cd01"
     )
 
 

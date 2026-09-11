@@ -202,7 +202,7 @@ def _create_subaccount(config: Config) -> None:
         _pause()
         return
     asyncio.run(cmd_create_subaccount(config, name, None))
-    print("\n  put the returned pubkey into config.yaml as sub1_pubkey")
+    print("\n  ready to use -- the bot finds it from your master on startup")
     _pause()
 
 

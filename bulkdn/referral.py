@@ -6,10 +6,10 @@ routes that must both be checked:
     GET https://indexer.bulk.trade/v1/aura/wallet/<pubkey>
     -> {
          "referred_by_code":   "MAKER",        # shareable referral code
-         "referred_by_wallet": "2xW5fXY7...",
+         "referred_by_wallet": "3JcDtH4L...",
          "access": {
            "invited_by_code_id": "...",        # single-use invite code
-           "invited_by_wallet":  "2xW5fXY7...",
+           "invited_by_wallet":  "3JcDtH4L...",
          },
        }
 

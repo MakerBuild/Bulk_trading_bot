@@ -5,17 +5,17 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Runtime state. Contains the bot's view of open positions and orders --
-# do not commit it, and do not delete it while positions are open.
+# Runtime state: the bot's view of open positions and orders.
+# Do not commit it, and do not delete it while positions are open.
 state/*
 !state/.gitkeep
-*.state.json
 
-# config.yaml is tracked and holds placeholders only -- the private key never
-# goes in it. Local variants (config.mine.yaml, config.prod.yaml) stay ignored.
-config.*.yaml
-.env
-
-# The private key: read from BULK_PRIVATE_KEY, or from this local file as a
+# The private key. Read from BULK_PRIVATE_KEY, or from this file as a
 # fallback. Never commit it.
 private_key.local
+.env
+
+# settings.yaml is tracked and holds safe defaults. Personal variants
+# (settings.mine.yaml, settings.prod.yaml) stay out of git.
+settings.*.yaml
+!settings.yaml

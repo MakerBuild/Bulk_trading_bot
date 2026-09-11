@@ -93,5 +93,5 @@ def test_short_pubkey_leaves_small_keys_alone():
 
     assert short_pubkey("abc") == "abc"
     assert short_pubkey(None) == "?"
-    long = "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"
-    assert short_pubkey(long) == "BR4SV1..edB8"
+    long = "4Fy8FQxz3FYUFqvNgCydRPsBiGzWum5yFaxx68LTWBvU"
+    assert short_pubkey(long) == "4Fy8FQ..WBvU"

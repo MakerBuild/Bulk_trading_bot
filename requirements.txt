@@ -1,0 +1,27 @@
+# Runtime dependencies. Install with install.bat, which handles the two
+# quirks below; plain `pip install -r requirements.txt` will not.
+#
+# 1. bulk-client must come from GitHub, not PyPI. The published wheel omits the
+#    trailing signature-domain byte the API requires, so every signature it
+#    produces is rejected as "bad signature".
+# 2. It must be installed with --no-deps. The package declares bulk-keychain,
+#    which it never imports and which has no prebuilt wheel for current
+#    Pythons, so pip tries to build it from Rust source and fails.
+#
+# The commit is pinned: signing is byte-exact against the exchange, and an
+# unpinned client that changes the preimage breaks every order silently.
+bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python
+
+# Dependencies of bulk-client, listed here because --no-deps skips them.
+pandas>=2.2.0
+numpy>=2.2.0
+numba>=0.60.0
+websockets>=14.0
+pynacl>=1.2.0
+base58>=2.1.0
+sortedcontainers>=2.4.0
+aiohttp>=3.11
+requests>=2.31.0
+
+# This bot's own.
+PyYAML>=6.0

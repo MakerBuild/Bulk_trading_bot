@@ -17,7 +17,7 @@ import sys
 
 from bulk_api.common import SignatureDomain
 
-from .accounts import build_sessions, verify_sub_account
+from .accounts import build_sessions, discover_sub_account, verify_sub_account
 from .chaser import Chaser
 from .config import Config, ConfigError, load_config
 from .menu import run_menu
@@ -65,9 +65,16 @@ class Runtime:
             auto_bypass=config.ws_ssl_auto_bypass,
         )
 
+        # Read off the master rather than configured: a sub-account has no key
+        # of its own, so its pubkey is a fact about the master, not a choice
+        # the operator should have to copy by hand.
+        sub1_pubkey = config.sub1_pubkey or discover_sub_account(
+            private_key=config.private_key, http_url=config.http_url
+        )
+
         self.master, self.sub1 = build_sessions(
             private_key=config.private_key,
-            sub1_pubkey=config.sub1_pubkey,
+            sub1_pubkey=sub1_pubkey,
             ws_url=config.ws_url,
             http_url=config.http_url,
             domain=SignatureDomain[config.signature_domain_name],
@@ -477,7 +484,9 @@ async def cmd_create_subaccount(
     if result.ok:
         pubkey = result.sub_pubkey
         if pubkey:
-            print(f"\ncreated. Put this in config.yaml:\n\n  sub1_pubkey: \"{pubkey}\"")
+            # Nothing to copy anywhere: Runtime reads the master's own record
+            # to find this at startup.
+            print(f"\ncreated: {pubkey}")
         else:
             print(
                 "\naccepted, but the response carried no pubkey -- check `bulkdn status` "
@@ -497,7 +506,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bulkdn",
         description="Delta-neutral BTC/SOL bot across a BULK master account and sub-account",
     )
-    parser.add_argument("--config", default="config.yaml", help="path to the config file")
+    parser.add_argument("--config", default="settings.yaml", help="path to the settings file")
     parser.add_argument("--log-level", help="override the log level in the config file")
 
     sub = parser.add_subparsers(dest="command", required=False)

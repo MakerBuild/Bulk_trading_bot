@@ -41,7 +41,7 @@ class FakeClient:
 def session(responses):
     return AccountSession(
         name="master",
-        pubkey="BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8",
+        pubkey="4Fy8FQxz3FYUFqvNgCydRPsBiGzWum5yFaxx68LTWBvU",
         client=FakeClient(responses),
         http=None,
     )

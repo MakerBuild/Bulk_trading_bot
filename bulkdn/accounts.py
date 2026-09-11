@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 from collections.abc import Callable, Sequence
 
+import requests
 from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
 from bulk_api.common import (
@@ -369,6 +370,58 @@ def build_sessions(
         )
 
     return make("master", master_pubkey), make("sub1", sub1_pubkey)
+
+
+class NoSubAccount(Exception):
+    """The master has no sub-account to trade against."""
+
+
+def discover_sub_account(
+    *, private_key: str, http_url: str, timeout: int = 25
+) -> str:
+    """Find the master's sub-account, so it need not be configured by hand.
+
+    A sub-account has no private key of its own -- it is created by, and signed
+    for by, the master. Asking the operator to paste its pubkey is therefore
+    busywork: the master's own account record already lists it, and that record
+    is the authority. Reading it also means a config can never name a
+    sub-account that does not belong to the key in use.
+
+    The first child is taken when several exist. The strategy trades exactly
+    one, and picking the first keeps repeat runs on the same account rather
+    than moving positions around between them.
+    """
+    master_pubkey = TransactionSigner(private_key).public_key
+    response = requests.post(
+        f"{http_url}/account",
+        json={"type": "fullAccount", "user": master_pubkey},
+        timeout=timeout,
+    )
+    if response.status_code == 404:
+        raise NoSubAccount(
+            f"no BULK account exists for master {short_pubkey(master_pubkey)}. "
+            "An account is created by depositing USDC on BULK; do that first."
+        )
+    response.raise_for_status()
+
+    children = [
+        entry["pubkey"]
+        for entry in (unwrap_full_account(response.json()).get("subAccounts") or [])
+        if isinstance(entry, dict) and entry.get("pubkey")
+    ]
+    if not children:
+        raise NoSubAccount(
+            f"master {short_pubkey(master_pubkey)} has no sub-account. "
+            "Create one from the menu: Accounts Management -> Create New Subaccount."
+        )
+
+    if len(children) > 1:
+        log.info(
+            "master has %d sub-accounts; trading the first (%s)",
+            len(children),
+            short_pubkey(children[0]),
+        )
+    return children[0]
 
 
 def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:

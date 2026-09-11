@@ -21,7 +21,7 @@ from .referral import AccessConfig
 PRIVATE_KEY_ENV = "BULK_PRIVATE_KEY"
 
 # Fallback for when exporting an environment variable is inconvenient. Read
-# relative to the current working directory, same as `config.yaml` itself.
+# relative to the current working directory, same as `settings.yaml` itself.
 # The file is git-ignored; see .gitignore. It holds either an encrypted
 # envelope or a bare base58 line -- `bulkdn.keystore` reads both and prompts
 # for a password when the file is encrypted.
@@ -138,7 +138,6 @@ class ExecutionTarget:
 
 @dataclass
 class Config:
-    sub1_pubkey: str
     btc: LegConfig
     sol: LegConfig
     hold_minutes: float = 5.0
@@ -147,6 +146,9 @@ class Config:
     cycles: int = 1
     hedge_tolerance_lots: float = 1.0
     overlay_ttl_ms: int = 2000
+    # Normally discovered from the master at startup; set only to pin one
+    # specific sub-account when the master has several.
+    sub1_pubkey: str = ""
     risk: RiskConfig = field(default_factory=RiskConfig)
     target: ExecutionTarget = field(default_factory=ExecutionTarget)
     state_file: str = "./state/strategy_state.json"
@@ -206,10 +208,6 @@ class Config:
                 "(git-ignored, one line, no quotes) and encrypt it with "
                 "`bulkdn encrypt-key`"
             )
-        if require_sub1 and (
-            not self.sub1_pubkey or self.sub1_pubkey.startswith("REPLACE")
-        ):
-            raise ConfigError("sub1_pubkey must be set to a real sub-account pubkey")
         self.target.validate()
         self.btc.validate("btc")
         self.sol.validate("sol")

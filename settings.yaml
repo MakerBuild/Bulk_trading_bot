@@ -1,0 +1,162 @@
+# ===========================================================================
+#  BULK delta-neutral bot -- settings
+#
+#  Everything you normally change is in the first half of this file.
+#  The second half is plumbing you can usually leave alone.
+#
+#  Your private key does NOT go here. Put it on one line in
+#  `private_key.local`, then encrypt it from the menu (Accounts Management).
+#
+#  MAINNET ONLY. `run --live` trades real funds. There is no test network.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+#  WHAT TO TRADE
+#
+#  Two legs, opposite directions, so the pair nets out to roughly zero:
+#    OPEN  master buys BTC   |  sub-account buys SOL
+#    EXIT  both are closed, each fill hedged on the other account
+#
+#  `size` is the total you accumulate per cycle, in the base coin
+#  (0.001 BTC, 2 SOL). Both legs run at the same time.
+# ---------------------------------------------------------------------------
+legs:
+  btc:
+    symbol: BTC-USD
+    size: 0.001             # total BTC per cycle
+    leverage: 10            # 1-50, capped by the market's own maximum
+    offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
+    max_distance_bps: 5.0   # re-price the order once it drifts this far
+    max_order_size: 0.001   # cap on any single resting order
+
+  sol:
+    symbol: SOL-USD
+    size: 2.0               # total SOL per cycle
+    leverage: 10
+    offset_bps: 3.0
+    max_distance_bps: 8.0
+    max_order_size: 2.0
+
+
+# ---------------------------------------------------------------------------
+#  HOW LONG TO HOLD
+# ---------------------------------------------------------------------------
+hold_minutes: 5.0           # time fully open before the exit phase starts
+
+
+# ---------------------------------------------------------------------------
+#  WHEN TO STOP
+#
+#  Whichever limit is hit first ends the run. 0 disables that limit.
+#  Spend and volume are read from the exchange's own fill records, so they
+#  survive a restart and match what you were actually charged.
+# ---------------------------------------------------------------------------
+execution_target:
+  cycles: 0                 # number of open/hold/exit cycles; 0 = unlimited
+  burn_usd: 100             # stop once this much has gone to fees
+  volume_usd: 0             # stop once this much qualifying volume is done
+
+
+# ---------------------------------------------------------------------------
+#  SAFETY LIMITS
+#
+#  Breaching any of these cancels every order, closes both accounts, and
+#  stops the bot. They are hard stops, not warnings.
+#
+#  Note on minimum order size: BTC-USD will not accept an order under $1 and
+#  SOL-USD under $50. A hedge smaller than that floor cannot be sent at all,
+#  so the pair can carry up to about $50 of one-sided SOL exposure that no
+#  hedge can remove. Keep max_net_exposure_usd comfortably above it.
+# ---------------------------------------------------------------------------
+risk:
+  max_net_exposure_usd: 500.0   # one-sided exposure the pair may carry
+  max_position_usd: 5000.0      # per account, per symbol
+  max_reject_streak: 5          # consecutive rejected orders before stopping
+  max_hedge_impact_bps: 0       # refuse a hedge whose slippage exceeds this;
+                                # 0 = off, and off is also what happens for a
+                                # market with no impact curve published
+  ws_stale_timeout_s: 30.0      # no market data for this long => stop
+  price_stale_timeout_s: 15.0   # refuse to re-price on a stale quote
+
+
+# ---------------------------------------------------------------------------
+#  NOTIFICATIONS (optional)
+#
+#  The bot runs unattended and can stop itself on a safety limit. Without
+#  this, that only appears in a console nobody is watching.
+#  Get a token from @BotFather; get your numeric id from @userinfobot.
+# ---------------------------------------------------------------------------
+telegram:
+  bot_token: ""             # e.g. "12345:AAE..."; empty disables notifications
+  user_ids: []              # e.g. [21957123]
+
+
+# ===========================================================================
+#  Below here is plumbing. You can usually leave it alone.
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+#  Access control (for whoever distributes this build)
+#
+#  Restricts the bot to accounts that signed up through a given owner.
+#  `wallets` is matched against BOTH the referrer and the inviter, so one
+#  address covers people who used a referral code and people who redeemed an
+#  invite code.
+#
+#  `owner_wallets` is not optional once this is on: the check asks who
+#  referred an account, and a referrer was not referred by themselves, so
+#  without it the gate refuses its own owner.
+# ---------------------------------------------------------------------------
+access:
+  require_referral: false
+  wallets: []               # referrer/inviter wallet(s)
+  codes: []                 # referral code(s), case-insensitive
+  invite_codes: []          # individual BULK-XXX-XXX codes; these expire, so
+                            # prefer `wallets`
+  owner_wallets: []         # allowed unconditionally, no referral needed
+  allow_on_error: false     # run anyway if the referral index is unreachable
+
+
+# ---------------------------------------------------------------------------
+#  Execution timing
+# ---------------------------------------------------------------------------
+chase_interval_s: 1.0       # how often resting orders are re-evaluated
+reconcile_interval_s: 5.0   # how often positions are re-read from the exchange
+hedge_tolerance_lots: 1.0   # imbalance tolerated before hedging, in lots
+overlay_ttl_ms: 2000        # how long an unconfirmed fill is trusted
+
+
+# ---------------------------------------------------------------------------
+#  Sub-account
+#
+#  Normally discovered from your master account at startup -- a sub-account
+#  has no private key of its own, so its address is a fact about the master
+#  rather than something to configure. Set this only to pin one specific
+#  sub-account when the master has several.
+# ---------------------------------------------------------------------------
+sub1_pubkey: ""
+
+
+# ---------------------------------------------------------------------------
+#  Connection
+#
+#  The mainnet WebSocket currently serves an expired certificate while the
+#  HTTP host verifies cleanly. `ws_ssl_auto_bypass` keeps verification on but
+#  retries once without it, which is what keeps the account stream open -- and
+#  a bot that cannot see its fills cannot hedge. Set false to fail hard.
+# ---------------------------------------------------------------------------
+ws_ssl_auto_bypass: true
+ws_insecure_ssl: false      # skip verification outright; prefer the retry
+
+# Endpoint overrides, for when the published hosts change.
+# http_url: "https://mainnet-api1.bulk.trade/api/v1"
+# ws_url: "wss://mainnet-ws1.bulk.trade"
+
+
+# ---------------------------------------------------------------------------
+#  Housekeeping
+# ---------------------------------------------------------------------------
+state_file: "./state/strategy_state.json"
+log_level: INFO             # INFO, or DEBUG when diagnosing something

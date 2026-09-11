@@ -1,0 +1,13 @@
+# Rename this file to `private_key.local`, then paste your BULK master
+# account's base58 private key on the line below -- one line, no quotes,
+# nothing else.
+#
+# `private_key.local` is git-ignored and never leaves your machine. Once the
+# key is in, encrypt it from the menu: Accounts Management -> Encrypt Private
+# Key. The file is then replaced by an encrypted envelope and the bot asks for
+# your password at startup.
+#
+# A sub-account has no key of its own. It is created by, and signed for by,
+# the master -- so this one key is all the bot needs, and the bot finds your
+# sub-account by itself.
+
