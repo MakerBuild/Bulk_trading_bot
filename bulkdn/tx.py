@@ -20,8 +20,9 @@ import struct
 import time
 
 import base58
-import requests
 from bulk_api.common.signer import SignatureDomain, TransactionSigner
+
+from .retry import post_with_retry
 
 
 def write_u64(value: int) -> bytes:
@@ -71,7 +72,9 @@ def sign_and_submit(
         "signature": base58.b58encode(signature).decode(),
     }
 
-    response = requests.post(f"{http_url}/order", json=tx, timeout=timeout)
+    # Retried as the same bytes, so a lost response is replayed under the same
+    # nonce rather than becoming a second transaction. See bulkdn.retry.
+    response = post_with_retry(f"{http_url}/order", json=tx, timeout=timeout)
     try:
         body = response.json()
     except ValueError:

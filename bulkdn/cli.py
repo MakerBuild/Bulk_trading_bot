@@ -22,6 +22,10 @@ from .chaser import Chaser
 from .config import Config, ConfigError, load_config
 from .menu import run_menu
 from .feed import MarketFeed
+from .notify import Notifier
+from .referral import AccessDenied
+from .referral import check_access as check_referral_access
+from .window import WindowTitle
 from .impact import ImpactBook
 from .hedger import Hedger
 from .positions import PositionBook
@@ -71,6 +75,8 @@ class Runtime:
             dry_run=dry_run,
         )
         self.sessions = {self.master.pubkey: self.master, self.sub1.pubkey: self.sub1}
+        self.notifier = Notifier(config.telegram)
+        self.title = WindowTitle(cycles=config.cycles)
         self.book = PositionBook(overlay_ttl_ms=config.overlay_ttl_ms)
         self.impact = ImpactBook(config.http_url)
         self.feed = MarketFeed(self.master, self.symbols)
@@ -83,6 +89,10 @@ class Runtime:
             self.master.pubkey,
             self.sub1.pubkey,
         )
+        # Before anything is placed. A gate that tripped later would abandon
+        # open positions and leave the pair directional.
+        self.check_access()
+
         self.feed.load_specs()
         if verify:
             verify_sub_account(self.master, self.sub1)
@@ -108,6 +118,20 @@ class Runtime:
         # Let the initial account snapshots and book updates land before any
         # decision is made on them.
         await asyncio.sleep(2.0)
+
+    def check_access(self) -> None:
+        """Refuse to start unless the master signed up under an allowed referral.
+
+        The master is what gets checked, not the sub-account: a sub is created
+        by the master and has no referral record of its own.
+        """
+        if not self.config.access.enabled:
+            return
+
+        decision = check_referral_access(self.master.pubkey, self.config.access)
+        if not decision.allowed:
+            raise AccessDenied(decision.reason)
+        log.info("access granted: %s", decision.reason)
 
     async def stop(self) -> None:
         await self.master.disconnect()
@@ -202,6 +226,8 @@ class Runtime:
             risk=risk,
             store=self.store,
             state=self.store.load(),
+            notifier=self.notifier,
+            title=self.title,
         )
 
 
@@ -212,11 +238,23 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
     runtime = Runtime(config, dry_run)
     await runtime.start()
     strategy = runtime.build_strategy()
+    await runtime.notifier.run_started(
+        endpoint=config.http_url,
+        master=runtime.master.pubkey,
+        sub1=runtime.sub1.pubkey,
+        dry_run=dry_run,
+    )
     try:
         await strategy.run()
         log.info("all cycles complete")
+        runtime.title.set_phase("done")
+        await runtime.notifier.run_finished(
+            cycles=strategy.state.cycle_index, detail=strategy._progress_detail()
+        )
         return 0
     except Halted as exc:
+        # The halt itself was already reported from _trigger_halt, which fires
+        # before the flatten so the alert does not wait on it.
         log.critical("halted: %s", exc)
         return 2
     except KeyboardInterrupt:
@@ -546,6 +584,16 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(
                 cmd_create_subaccount(config, args.name, args.margin_amount)
             )
+    except AccessDenied as exc:
+        # A refusal is an expected outcome, not a crash -- say so plainly
+        # rather than unwinding a traceback over it.
+        print(f"\naccess denied: {exc}", file=sys.stderr)
+        print(
+            "This build runs only for accounts signed up under the owner's "
+            "referral code.",
+            file=sys.stderr,
+        )
+        return 3
     except KeyboardInterrupt:
         log.warning("interrupted")
         return 130

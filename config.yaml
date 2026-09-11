@@ -99,6 +99,27 @@ risk:
 state_file: "./state/strategy_state.json"
 log_level: INFO
 
+# Telegram notifications: run start, each cycle, halts, and the final summary.
+# A halt cancels orders and flattens both accounts, so it is the one event
+# worth knowing about immediately -- without this it only reaches the console.
+# Leave bot_token empty to disable. Setting a token without user_ids is an
+# error rather than a silent no-op.
+telegram:
+  bot_token: ""             # from @BotFather, looks like "12345:AAE..."
+  user_ids: []              # e.g. [21957123] -- your numeric Telegram id
+
+# Referral gating: run only for accounts that signed up under your code.
+# Checked once at startup against BULK's public indexer, never mid-cycle --
+# a gate that tripped mid-run would abandon open positions.
+#
+# Note this is a speed bump, not enforcement: it runs on the user's machine
+# in source they can edit. It stops the bot being passed around casually.
+access:
+  require_referral: false
+  codes: []                 # e.g. ["VAULT"] -- matched case-insensitively
+  wallets: []               # your referrer wallet(s); stronger than a code
+  allow_on_error: false     # true = run anyway if the indexer is unreachable
+
 # Execution target: whichever limit is reached first ends the run.
 # 0 disables a limit. burn_usd and volume_usd are measured from the
 # exchange's own fill records, so they survive a restart.

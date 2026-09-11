@@ -15,6 +15,8 @@ from typing import Any
 import yaml
 
 from . import keystore
+from .notify import TelegramConfig
+from .referral import AccessConfig
 
 PRIVATE_KEY_ENV = "BULK_PRIVATE_KEY"
 
@@ -150,6 +152,15 @@ class Config:
     state_file: str = "./state/strategy_state.json"
     log_level: str = "INFO"
 
+    # Telegram reporting. Off unless both a token and at least one recipient
+    # are set -- the bot runs unattended, so a halt that only reaches the
+    # console reaches nobody.
+    telegram: TelegramConfig = field(default_factory=TelegramConfig)
+
+    # Referral gating, checked once at startup. See bulkdn/referral.py for what
+    # a client-side gate does and does not actually prevent.
+    access: AccessConfig = field(default_factory=AccessConfig)
+
     # The live WebSocket endpoints have been observed serving certificates that
     # fail verification. Retrying once without checks keeps the account stream
     # available; set `ws_ssl_auto_bypass: false` to fail hard instead.
@@ -254,6 +265,55 @@ def _load_private_key(required: bool) -> str:
         raise ConfigError(str(exc)) from exc
 
 
+def _telegram_from_dict(raw: Any) -> TelegramConfig:
+    """Read Telegram settings, tolerating a single id given unwrapped."""
+    if not isinstance(raw, dict):
+        raise ConfigError("telegram must be a mapping")
+
+    user_ids = raw.get("user_ids", raw.get("user_id", []))
+    if isinstance(user_ids, (int, str)):
+        user_ids = [user_ids]
+    try:
+        parsed_ids = [int(uid) for uid in user_ids]
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"telegram.user_ids must be integers: {exc}") from exc
+
+    token = str(raw.get("bot_token", "") or "")
+    if token and not parsed_ids:
+        raise ConfigError(
+            "telegram.bot_token is set but telegram.user_ids is empty -- "
+            "notifications would go nowhere"
+        )
+    return TelegramConfig(bot_token=token, user_ids=parsed_ids)
+
+
+def _access_from_dict(raw: Any) -> AccessConfig:
+    """Read referral-gating settings, tolerating a single code given unwrapped."""
+    if not isinstance(raw, dict):
+        raise ConfigError("access must be a mapping")
+
+    def as_list(value) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            return [str(item) for item in value]
+        raise ConfigError("access.codes and access.wallets must be strings or lists")
+
+    access = AccessConfig(
+        require_referral=bool(raw.get("require_referral", False)),
+        codes=as_list(raw.get("codes", raw.get("code"))),
+        wallets=as_list(raw.get("wallets", raw.get("wallet"))),
+        allow_on_error=bool(raw.get("allow_on_error", False)),
+    )
+    try:
+        access.validate()
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    return access
+
+
 def load_config(
     path: str,
     require_credentials: bool = True,
@@ -310,6 +370,8 @@ def load_config(
         ws_url_override=raw.get("ws_url", ""),
         ws_insecure_ssl=bool(raw.get("ws_insecure_ssl", False)),
         ws_ssl_auto_bypass=bool(raw.get("ws_ssl_auto_bypass", True)),
+        telegram=_telegram_from_dict(raw.get("telegram") or {}),
+        access=_access_from_dict(raw.get("access") or {}),
         private_key=_load_private_key(require_credentials),
     )
     config.validate(require_credentials=require_credentials, require_sub1=require_sub1)

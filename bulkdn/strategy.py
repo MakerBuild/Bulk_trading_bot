@@ -26,6 +26,7 @@ from .feed import MarketFeed
 from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
 from .marketdata import round_notional
+from .notify import Notifier
 from .positions import PositionBook, SeenTrades
 from .reconcile import (
     cancel_all_orders,
@@ -36,6 +37,7 @@ from .reconcile import (
 )
 from .risk import RiskMonitor
 from .state import Phase, StateStore, StrategyState
+from .window import WindowTitle
 from .ws_compat import fill_trade_id
 import contextlib
 
@@ -60,8 +62,14 @@ class Strategy:
         risk: RiskMonitor,
         store: StateStore,
         state: StrategyState,
+        notifier: Notifier | None = None,
+        title: WindowTitle | None = None,
     ):
         self.config = config
+        # Both default to inert objects rather than None, so every call site
+        # can use them unconditionally instead of guarding each one.
+        self.notifier = notifier or Notifier()
+        self.title = title or WindowTitle(cycles=config.cycles)
         self.master = master
         self.sub1 = sub1
         self.feed = feed
@@ -212,6 +220,10 @@ class Strategy:
         if self._halt_reason is None:
             log.critical("HALT: %s", reason)
             self._halt_reason = reason
+            self.title.halted(reason)
+            # Fire-and-forget: the halt path has orders to cancel and positions
+            # to flatten, and must not wait on Telegram to do it.
+            self.notifier.send_soon(self.notifier.halted(reason))
             self._stop.set()
 
     # -- phase driver ------------------------------------------------------
@@ -356,6 +368,7 @@ class Strategy:
             for r in self.roles_for(Phase.OPEN)
         ))
         self.state.phase = Phase.OPEN
+        self.title.set_phase("OPEN")
         self.state.reset_legs(
             {
                 self.config.btc.symbol: self.config.btc.size,
@@ -374,6 +387,7 @@ class Strategy:
         if not self.state.hold_until:
             self.state.hold_until = time.time() + self.config.hold_minutes * 60
         self.state.phase = Phase.HOLD
+        self.title.set_phase("HOLD")
         self.store.save(self.state)
 
         remaining = self.state.hold_remaining_s()
@@ -392,6 +406,7 @@ class Strategy:
         await self._cancel_strategy_orders(Phase.OPEN)
 
         self.state.phase = Phase.EXIT
+        self.title.set_phase("EXIT")
         # Exit targets are whatever is actually held, not the configured size --
         # the entry may have filled only partially.
         self.state.reset_legs(
@@ -438,6 +453,7 @@ class Strategy:
                 cycle += 1
                 self.state.cycle_index += 1
                 self.state.cycle_started_at = time.time()
+                self.title.set_cycle(self.state.cycle_index)
                 log.info(
                     "=== cycle %d%s ===",
                     self.state.cycle_index,
@@ -458,6 +474,11 @@ class Strategy:
                 self.state.hold_until = 0.0
                 self.store.save(self.state)
                 log.info("=== cycle %d complete ===", self.state.cycle_index)
+                await self.notifier.cycle_complete(
+                    cycle=self.state.cycle_index,
+                    of=self.config.cycles or None,
+                    detail=self._progress_detail(),
+                )
 
         except Halted as exc:
             await self._emergency_stop(str(exc))
@@ -471,6 +492,36 @@ class Strategy:
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
+
+    def _progress_detail(self) -> str:
+        """Spend and volume so far, for a notification and the window title.
+
+        Reads the same fill history the execution target uses. A failure is not
+        worth surfacing -- this is a progress line, not a control input -- so it
+        degrades to an empty string and the cycle notification simply omits it.
+        """
+        target = self.config.target
+        if not target.measures_fills:
+            return ""
+        try:
+            totals = realised_for_tree(
+                self.master.http, [self.master.pubkey, self.sub1.pubkey]
+            )
+        except Exception as exc:  # noqa: BLE001 - cosmetic
+            log.debug("could not read totals for the progress line: %s", exc)
+            return ""
+
+        parts = []
+        if target.burn_usd > 0:
+            parts.append(f"burn ${totals.fees_usd:,.4f} / ${target.burn_usd:,.2f}")
+        if target.volume_usd > 0:
+            parts.append(
+                f"volume ${totals.qualifying_volume_usd:,.2f} / ${target.volume_usd:,.2f}"
+            )
+        detail = "  ".join(parts)
+        if detail:
+            self.title.set_note(detail)
+        return detail
 
     def _target_reached(self) -> str | None:
         """Whether a spend or volume target has been met, as a reason string.
