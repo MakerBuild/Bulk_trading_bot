@@ -55,8 +55,8 @@ echo   Updating pip...
 
 rem --no-deps is required: bulk-client declares bulk-keychain, which it never
 rem imports and which has no wheel for current Pythons, so pip would try to
-rem build it from Rust source and fail. Its real dependencies are installed
-rem from requirements.txt in the next step.
+rem build it from Rust source and fail. Its real dependencies are installed in
+rem the next step.
 echo   Installing the BULK SDK (from GitHub -- the PyPI build cannot sign)...
 "%VENV_PY%" -m pip install --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
 if errorlevel 1 (
@@ -74,8 +74,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo   Installing the bot...
-"%VENV_PY%" -m pip install --quiet --no-deps -e .
+rem The bot is started as `python -m bulkdn` from this directory, so the
+rem package is already importable and needs no install of its own. Skipping it
+rem also keeps a bulkdn.egg-info folder out of the way.
+
+rem Create the key file on first run, so there is one obvious place to put the
+rem key rather than a template to notice and rename.
+if not exist "private_key.local" (
+    > private_key.local echo # Paste your BULK master account's base58 private key on the line
+    >> private_key.local echo # below -- one line, no quotes, nothing else.
+    >> private_key.local echo #
+    >> private_key.local echo # This file never leaves your machine. Once the key is in, encrypt it
+    >> private_key.local echo # from the menu: Accounts Management -^> Encrypt Private Key.
+    >> private_key.local echo #
+    >> private_key.local echo # A sub-account has no key of its own -- it is created by, and signed
+    >> private_key.local echo # for by, the master -- so this one key is all the bot needs.
+    >> private_key.local echo.
+    echo   Created private_key.local for your key.
+)
 
 echo.
 "%VENV_PY%" -c "from bulk_api.common import SignatureDomain; print('  Signing check: OK')" 2>nul

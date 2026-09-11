@@ -113,12 +113,15 @@ risk:
 #  without it the gate refuses its own owner.
 # ---------------------------------------------------------------------------
 access:
-  require_referral: false
-  wallets: []               # referrer/inviter wallet(s)
-  codes: []                 # referral code(s), case-insensitive
+  require_referral: true
+  wallets:                  # matched against BOTH referrer and inviter
+    - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"
+  codes: ["MAKER"]          # referral code, case-insensitive
   invite_codes: []          # individual BULK-XXX-XXX codes; these expire, so
                             # prefer `wallets`
-  owner_wallets: []         # allowed unconditionally, no referral needed
+  owner_wallets:            # allowed unconditionally, no referral needed
+    - "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"  # trading master
+    - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"  # referral wallet
   allow_on_error: false     # run anyway if the referral index is unreachable
 
 

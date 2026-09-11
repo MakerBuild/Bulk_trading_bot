@@ -27,7 +27,7 @@ step by step, in Russian, including what to do when something fails.
 
 **1. Your private key**
 
-Rename `private_key.example` to `private_key.local` and paste your BULK master
+`install.bat` creates `private_key.local`. Open it and paste your BULK master
 account's base58 key on the last line — one line, nothing else.
 
 The file never leaves your machine. Once the bot starts, encrypt it from
@@ -135,9 +135,10 @@ its owner's referral or invite.
 | `install.bat` | one-time setup |
 | `run.bat` | start the bot |
 | `settings.yaml` | everything you can change |
-| `private_key.local` | your key (create it from `private_key.example`) |
+| `private_key.local` | your key |
 | `docs/DESIGN.md` | how it works internally |
 
-`bulkdn/` is the code, `tests/` the test suite, and `state/` is where the bot
-records what it has open — do not delete anything in `state/` while a cycle is
-running.
+Everything else is in folders you can ignore: `bulkdn/` is the code, `tests/`
+the test suite, `dev/` the lint and test settings, `docs/` the longer guides,
+and `state/` is where the bot records what it has open — do not delete anything
+in `state/` while a cycle is running.
