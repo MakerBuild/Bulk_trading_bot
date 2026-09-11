@@ -32,6 +32,7 @@ from .positions import PositionBook
 from .reconcile import cancel_all_orders, flatten, sync_positions_http
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
+from .sizing import plan_sizes
 from .state import Phase, StateStore
 from .ws_compat import apply_ws_compat
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
@@ -116,6 +117,8 @@ class Runtime:
                     ", ".join(missing),
                 )
 
+        self.apply_sizing()
+
         if not self.dry_run:
             self.apply_leverage()
 
@@ -143,6 +146,47 @@ class Runtime:
     async def stop(self) -> None:
         await self.master.disconnect()
         await self.sub1.disconnect()
+
+    def apply_sizing(self) -> None:
+        """Fit the configured sizes to the margin both accounts actually hold.
+
+        Runs in dry-run too, so a rehearsal shows the sizes a live run would
+        really use rather than the ones written in the file.
+
+        The legs are mutated in place because everything downstream -- the
+        chaser's targets, the hedge ceilings, the exit sizes -- reads them from
+        the config, and a second source of truth for size is how the two end up
+        disagreeing.
+        """
+        legs = [self.config.master_account, self.config.sub_account]
+        # Priced over HTTP, not from the feed: this runs before the WebSocket
+        # is connected, so the ticker cache is still empty and every price
+        # would read as zero.
+        prices = {s: self.feed.http_price(s) for s in self.symbols}
+        margin = {}
+        for session in (self.master, self.sub1):
+            account = session.full_account().get("margin") or {}
+            margin[session.name] = float(account.get("availableMargin") or 0.0)
+
+        plan = plan_sizes(
+            legs=legs,
+            specs=self.feed.specs,
+            prices=prices,
+            available_margin=margin,
+            max_margin_fraction=self.config.max_margin_fraction,
+        )
+
+        for leg, sized in zip(legs, plan.legs, strict=True):
+            leg.size = sized.actual
+            # The per-order cap must come down with the leg, or it stops
+            # capping anything.
+            leg.max_order_size = min(leg.max_order_size, sized.actual)
+
+        log.info(
+            "sizing: %s  (margin available: %s)",
+            plan.describe(),
+            ", ".join(f"{name} ${value:,.2f}" for name, value in margin.items()),
+        )
 
     def apply_leverage(self) -> None:
         """Set each leg's configured leverage on both accounts.

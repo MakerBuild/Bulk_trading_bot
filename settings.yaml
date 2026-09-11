@@ -25,6 +25,13 @@
 #
 #  Any market the exchange lists works -- the names below are just which
 #  account trades what, not a coin the bot is tied to.
+#
+#  SIZES ARE IN THE BASE COIN, so they do not carry across a symbol change:
+#  `size: 2.0` is $200 of SOL but $5,200 of ETH. Set the dollar amount you
+#  want, not the number you had before.
+#
+#  If the sizes below need more margin than the accounts hold, every leg is
+#  scaled down together to fit -- see max_margin_fraction near the bottom.
 # ---------------------------------------------------------------------------
 legs:
   master_account:
@@ -36,12 +43,14 @@ legs:
     max_order_size: 0.001   # cap on any single resting order
 
   sub_account:
-    symbol: SOL-USD
-    size: 2.0               # total per cycle, in SOL
-    leverage: 10
+    symbol: ETH-USD
+    size: 0.03              # total per cycle, in ETH -- about $79, matching
+                            # the BTC leg above. Sizes are in the base coin,
+                            # so this does NOT follow a change of `symbol`.
+    leverage: 10            # ETH-USD allows up to 25
     offset_bps: 3.0
     max_distance_bps: 8.0
-    max_order_size: 2.0
+    max_order_size: 0.03
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +129,12 @@ chase_interval_s: 1.0       # how often resting orders are re-evaluated
 reconcile_interval_s: 5.0   # how often positions are re-read from the exchange
 hedge_tolerance_lots: 1.0   # imbalance tolerated before hedging, in lots
 overlay_ttl_ms: 2000        # how long an unconfirmed fill is trusted
+
+# When the configured sizes need more margin than the accounts hold, every leg
+# is scaled down together until the cycle fits inside this share of the SMALLER
+# account's available margin. Sizes that already fit are used exactly as
+# written -- this is a fallback, not a permanent cap.
+max_margin_fraction: 0.25
 
 
 # ---------------------------------------------------------------------------

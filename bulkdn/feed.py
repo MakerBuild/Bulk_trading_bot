@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import logging
 import time
+
+import requests
 from dataclasses import dataclass
 from collections.abc import Sequence
 
@@ -132,3 +134,21 @@ class MarketFeed:
 
     def reference_price(self, symbol: str) -> float | None:
         return self.quote(symbol).reference_price
+
+    def http_price(self, symbol: str) -> float:
+        """Mark price over HTTP, for decisions made before the socket is up.
+
+        The streamed quote is the one to use once running; this exists for
+        startup, where the ticker cache is still empty and a zero price would
+        be read as "could not price" rather than "not connected yet".
+        """
+        try:
+            body = requests.get(
+                f"{self.session.http.base_url}/ticker/{symbol}", timeout=20
+            )
+            body.raise_for_status()
+            data = body.json()
+        except Exception as exc:
+            log.warning("could not read a price for %s over HTTP: %s", symbol, exc)
+            return 0.0
+        return float(data.get("markPrice") or data.get("lastPrice") or 0.0)

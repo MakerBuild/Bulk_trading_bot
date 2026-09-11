@@ -149,6 +149,11 @@ class Config:
     cycles: int = 1
     hedge_tolerance_lots: float = 1.0
     overlay_ttl_ms: int = 2000
+    # Fallback when the configured sizes need more margin than the accounts
+    # hold: every leg is scaled so the cycle fits inside this share of the
+    # smaller account's available margin. Sizes that already fit are used
+    # as written.
+    max_margin_fraction: float = 0.25
     # Normally discovered from the master at startup; set only to pin one
     # specific sub-account when the master has several.
     sub1_pubkey: str = ""
@@ -219,6 +224,11 @@ class Config:
         self.sub_account.validate("sub_account")
         if self.master_account.symbol == self.sub_account.symbol:
             raise ConfigError("the two legs must use different symbols")
+        if not 0.0 < self.max_margin_fraction <= 1.0:
+            raise ConfigError(
+                "max_margin_fraction must be between 0 and 1 "
+                f"(0.25 = a quarter of available margin), got {self.max_margin_fraction}"
+            )
         if self.hold_minutes < 0:
             raise ConfigError("hold_minutes must be >= 0")
         if self.chase_interval_s <= 0:
@@ -374,6 +384,7 @@ def load_config(
         target=target,
         hedge_tolerance_lots=float(raw.get("hedge_tolerance_lots", 1.0)),
         overlay_ttl_ms=int(raw.get("overlay_ttl_ms", 2000)),
+        max_margin_fraction=float(raw.get("max_margin_fraction", 0.25)),
         risk=RiskConfig(
             max_net_exposure_usd=float(risk_raw.get("max_net_exposure_usd", 500.0)),
             max_position_usd=float(risk_raw.get("max_position_usd", 5000.0)),
