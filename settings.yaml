@@ -49,19 +49,19 @@
 legs:
   master_account:
     symbol: BTC-USD
-    notional_usd: 40        # total per cycle, in dollars
+    notional_usd: 100       # total per cycle, in dollars
     leverage: 10            # 1-50, capped by the market's own maximum
     offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
     max_distance_bps: 5.0   # re-price the order once it drifts this far
-    max_order_notional_usd: 80   # cap on any single resting order, in dollars
+    max_order_notional_usd: 100  # cap on any single resting order, in dollars
 
   sub_account:
     symbol: ETH-USD
-    notional_usd: 40        # matching the leg above, so the pair is balanced
+    notional_usd: 100       # matching the leg above, so the pair is balanced
     leverage: 10            # ETH-USD allows up to 25
     offset_bps: 3.0
     max_distance_bps: 8.0
-    max_order_notional_usd: 80
+    max_order_notional_usd: 100
 
 
 # ---------------------------------------------------------------------------

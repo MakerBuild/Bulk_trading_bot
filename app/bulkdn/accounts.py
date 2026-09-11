@@ -187,6 +187,10 @@ class AccountSession:
     http: BulkHttpClient
     dry_run: bool = False
     reject_streak: int = 0
+    # What the exchange said about the most recent counted rejection. The
+    # streak alone says a kill switch fired; this says why, which is the part
+    # anyone reading the halt an hour later actually needs.
+    last_reject: str = ""
 
     async def connect(self) -> None:
         if not await self.client.connect():
@@ -232,12 +236,19 @@ class AccountSession:
         rejected = [r for r in responses if r.is_error()]
         if rejected:
             faults = [r for r in rejected if r.status != OrderStatus.REJECTED_CROSSING]
+            detail = "; ".join(f"{r.status}: {r.message}" for r in rejected)
             if count_rejects and faults:
                 self.reject_streak += 1
-            detail = "; ".join(f"{r.status}: {r.message}" for r in rejected)
+                # Only the counted ones. A crossing rejection is the ALO
+                # protection working, and recording it as the cause of a halt
+                # it did not contribute to would point at the wrong thing.
+                self.last_reject = "; ".join(
+                    f"{r.status}: {r.message}" for r in faults
+                )
             raise OrderRejected(f"{self.name}: {detail}", responses)
         if count_rejects:
             self.reject_streak = 0
+            self.last_reject = ""
         return responses
 
     async def place_limit(

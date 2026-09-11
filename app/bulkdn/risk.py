@@ -94,11 +94,19 @@ class RiskMonitor:
 
         for session in self.sessions.values():
             if session.reject_streak >= self.config.max_reject_streak:
+                # The reason travels with the violation because this is what
+                # gets written into the state file, and that file is read long
+                # after the console it was logged to has closed.
+                cause = (
+                    f" -- last was {session.last_reject}"
+                    if session.last_reject
+                    else ""
+                )
                 violations.append(
                     Violation(
                         "reject_streak",
                         f"{session.name} has {session.reject_streak} consecutive "
-                        "rejected transactions",
+                        f"rejected transactions{cause}",
                     )
                 )
 

@@ -95,3 +95,53 @@ def test_count_rejects_false_leaves_the_streak_alone():
     with pytest.raises(OrderRejected):
         asyncio.run(s.submit([object()], count_rejects=False))
     assert s.reject_streak == 2
+
+
+# -- what the halt record will say ------------------------------------------
+#
+# The streak says a kill switch fired; `last_reject` says why. It is the only
+# copy that outlives the run: the console it was logged to is gone by the time
+# anyone reads the state file.
+
+
+def test_a_counted_rejection_records_what_the_exchange_said():
+    s = session([FakeResponse(OrderStatus.REJECTED_RISKLIMIT, "over the cap")])
+    with pytest.raises(OrderRejected):
+        asyncio.run(s.submit([]))
+    assert "over the cap" in s.last_reject
+    assert str(OrderStatus.REJECTED_RISKLIMIT) in s.last_reject
+
+
+def test_a_crossing_rejection_alone_records_nothing():
+    """It did not raise the streak, so naming it as the cause would mislead."""
+    s = session([FakeResponse(OrderStatus.REJECTED_CROSSING, "would take")])
+    with pytest.raises(OrderRejected):
+        asyncio.run(s.submit([]))
+    assert s.last_reject == ""
+
+
+def test_only_the_counted_rejections_are_recorded():
+    s = session([
+        FakeResponse(OrderStatus.REJECTED_CROSSING, "would take"),
+        FakeResponse(OrderStatus.REJECTED_INVALID, "bad tick"),
+    ])
+    with pytest.raises(OrderRejected):
+        asyncio.run(s.submit([]))
+    assert "bad tick" in s.last_reject
+    assert "would take" not in s.last_reject
+
+
+def test_a_clean_submit_clears_the_recorded_reason():
+    s = session([FakeResponse(OrderStatus.RESTING, order_id="abc")])
+    s.reject_streak = 3
+    s.last_reject = "something from before"
+    asyncio.run(s.submit([]))
+    assert (s.reject_streak, s.last_reject) == (0, "")
+
+
+def test_a_cancel_rejection_records_nothing():
+    """Cancels pass count_rejects=False: nothing to cancel is not a fault."""
+    s = session([FakeResponse(OrderStatus.REJECTED_INVALID, "unknown order")])
+    with pytest.raises(OrderRejected):
+        asyncio.run(s.submit([], count_rejects=False))
+    assert s.last_reject == ""
