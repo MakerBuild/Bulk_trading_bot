@@ -12,7 +12,7 @@ rem opens.
 setlocal
 cd /d "%~dp0"
 
-set "VENV_PY=%~dp0.venv\Scripts\python.exe"
+set "VENV_PY=%~dp0app\.venv\Scripts\python.exe"
 
 if not exist "%VENV_PY%" (
     echo.
@@ -21,6 +21,9 @@ if not exist "%VENV_PY%" (
     pause
     exit /b 1
 )
+
+rem The package lives in app\, which is not where Python looks by default.
+set "PYTHONPATH=%~dp0app"
 
 "%VENV_PY%" -m bulkdn %*
 exit /b %ERRORLEVEL%

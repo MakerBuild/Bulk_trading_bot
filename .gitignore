@@ -7,8 +7,8 @@ __pycache__/
 
 # Runtime state: the bot's view of open positions and orders.
 # Do not commit it, and do not delete it while positions are open.
-state/*
-!state/.gitkeep
+app/state/*
+!app/state/.gitkeep
 
 # The private key. Read from BULK_PRIVATE_KEY, or from this file as a
 # fallback. Never commit it.

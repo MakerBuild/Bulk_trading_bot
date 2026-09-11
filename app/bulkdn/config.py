@@ -159,7 +159,7 @@ class Config:
     sub1_pubkey: str = ""
     risk: RiskConfig = field(default_factory=RiskConfig)
     target: ExecutionTarget = field(default_factory=ExecutionTarget)
-    state_file: str = "./state/strategy_state.json"
+    state_file: str = "./app/state/strategy_state.json"
     log_level: str = "INFO"
 
     # Telegram reporting. Off unless both a token and at least one recipient
@@ -393,7 +393,7 @@ def load_config(
             ws_stale_timeout_s=float(risk_raw.get("ws_stale_timeout_s", 30.0)),
             price_stale_timeout_s=float(risk_raw.get("price_stale_timeout_s", 15.0)),
         ),
-        state_file=raw.get("state_file", "./state/strategy_state.json"),
+        state_file=raw.get("state_file", "./app/state/strategy_state.json"),
         log_level=raw.get("log_level", "INFO"),
         http_url_override=raw.get("http_url", ""),
         ws_url_override=raw.get("ws_url", ""),

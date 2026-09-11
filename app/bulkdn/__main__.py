@@ -12,9 +12,11 @@ same as the console script. With no arguments the interactive menu opens.
 import os
 import sys
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# app/, which holds the virtualenv alongside this package. Not the project
+# root -- that is one level further up, and holds run.bat and settings.yaml.
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VENV_PYTHON = os.path.join(
-    _PROJECT_ROOT,
+    _APP_DIR,
     ".venv",
     "Scripts" if os.name == "nt" else "bin",
     "python.exe" if os.name == "nt" else "python",

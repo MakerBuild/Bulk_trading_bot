@@ -170,5 +170,5 @@ ws_insecure_ssl: false      # skip verification outright; prefer the retry
 # ---------------------------------------------------------------------------
 #  Housekeeping
 # ---------------------------------------------------------------------------
-state_file: "./state/strategy_state.json"
+state_file: "./app/state/strategy_state.json"
 log_level: INFO             # INFO, or DEBUG when diagnosing something

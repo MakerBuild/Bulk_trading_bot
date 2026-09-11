@@ -3,6 +3,11 @@
 How the bot works and why, for whoever maintains it.
 For installing and running it, see the README in the project root.
 
+Everything that is not operator-facing lives under `app/`: the package in `app/bulkdn`,
+the suite in `app/tests`, tool settings in `app/dev`, these notes in `app/docs`, the
+virtualenv in `app/.venv`, and runtime state in `app/state`. The root holds only
+`run.bat`, `install.bat`, `settings.yaml`, `private_key.local` and the README.
+
 Runs a hedged BTC/SOL cycle across a BULK **master account** and one **sub-account**.
 Every fill on a resting limit order is immediately offset by a market order on the other
 account, so combined exposure stays close to zero throughout entry and exit.
@@ -63,7 +68,7 @@ The maker/taker roles swap between OPEN and EXIT, which is what lets one rule se
 > has no wheel for Python 3.13+:
 >
 > ```bash
-> .venv/Scripts/python -m pip install --no-deps >   "git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
+> app/.venv/Scripts/python -m pip install --no-deps >   "git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
 > ```
 >
 > Pin the commit. Older commits of the same `0.1.2` version parse the account stream's
@@ -76,26 +81,26 @@ with no prebuilt wheel for recent Pythons. It is **never imported** anywhere in 
 it is skipped with `--no-deps`. Building it would otherwise require MSVC build tools.
 
 ```bash
-python -m venv --system-site-packages .venv
+python -m venv --system-site-packages app/.venv
 
 # SDK from source, without the unused Rust dependency
-.venv/Scripts/python -m pip install --no-deps \
+app/.venv/Scripts/python -m pip install --no-deps \
   "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git#subdirectory=crates/api-python"
 
 # the SDK's real runtime dependencies
-.venv/Scripts/python -m pip install \
+app/.venv/Scripts/python -m pip install \
   pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests
 
-# this project
-.venv/Scripts/python -m pip install --no-deps -e .
-.venv/Scripts/python -m pip install pytest pytest-asyncio pyyaml
+# test and config tooling; the bot itself is not installed -- run.bat puts
+# app/ on PYTHONPATH, so `python -m bulkdn` finds the package where it lies
+app/.venv/Scripts/python -m pip install pytest pytest-asyncio pyyaml ruff
 ```
 
 Verify the signer is the domain-aware one before trading:
 
 ```bash
 run.bat --help  # or, for a raw check:
-.venv/Scripts/python -c "from bulk_api.common import SignatureDomain; print(list(SignatureDomain))"
+app/.venv/Scripts/python -c "from bulk_api.common import SignatureDomain; print(list(SignatureDomain))"
 ```
 
 If that import fails, you are on the PyPI build and **must not** trade with it.
@@ -110,9 +115,9 @@ run.bat status       any CLI subcommand works
 run.bat run --live
 ```
 
-Plain `run.bat` is the usual first mistake: it takes whichever Python is first on
+Plain `python -m bulkdn` is the usual first mistake: it takes whichever Python is first on
 PATH, and a global install carrying an older `bulk_api` fails with a missing
-`SignatureDomain`. `bulkdn/__main__.py` detects that and prints the interpreter to use, but the
+`SignatureDomain`. `app/bulkdn/__main__.py` detects that and prints the interpreter to use, but the
 launcher avoids the choice entirely.
 
 The master private key comes from the environment, never from the config file:
@@ -156,7 +161,7 @@ signature dialect. Verify the SDK with:
 
 ```bash
 run.bat --help  # or, for a raw check:
-.venv/Scripts/python -c "from bulk_api.common import SignatureDomain; print(list(SignatureDomain))"
+app/.venv/Scripts/python -c "from bulk_api.common import SignatureDomain; print(list(SignatureDomain))"
 ```
 
 **2. Bounded pagination on `POST /account`.** Not applicable — the bot uses only current-state
@@ -178,7 +183,7 @@ process is dead.
 ## Testing it
 
 **This bot is mainnet-only.** `mainnet-api1.bulk.trade` / `mainnet-ws1.bulk.trade` are pinned
-in `bulkdn/config.py` together with the signature domain byte, and there is no network selector.
+in `app/bulkdn/config.py` together with the signature domain byte, and there is no network selector.
 Every `run --live` trades real money, and `--live` is the only interlock.
 
 **There is no rehearsal environment.** Dry-run (`run` without `--live`) is the only way to
@@ -193,7 +198,8 @@ Test in this order:
 **1. Unit tests** — no network, no keys.
 
 ```bash
-testsun-tests.bat
+tests
+un-tests.bat
 ```
 
 **2. Full cycle, live, minimum size** — there is no free equivalent. Fund the master on-chain,
@@ -236,11 +242,12 @@ terminal.
 Running it with no subcommand opens the menu, which is the intended way in:
 
 ```bash
-.venv\Scripts\run.bat
+run.bat
 ```
 
-`bulkdn/__main__.py` is a launcher over `bulkdn.cli`; `python -m bulkdn.cli` and the
-`bulkdn` console script reach the same entry point, so use whichever suits.
+`app/bulkdn/__main__.py` is a launcher over `bulkdn.cli`; `python -m bulkdn` and
+`python -m bulkdn.cli` reach the same entry point. Both need `app/` on `PYTHONPATH`,
+which is what `run.bat` sets.
 
 ```text
 +--------------------------------------------+
@@ -352,7 +359,7 @@ See `settings.yaml`. The parameters that shape execution:
 | `hedge_tolerance_lots` | Net exposure tolerated before hedging (must be ≥ 1 lot) |
 | `overlay_ttl_ms` | How long an unconfirmed fill is trusted before falling back to exchange truth |
 
-The mainnet URLs come from the OpenAPI spec's Base URLs and are pinned in `bulkdn/config.py`
+The mainnet URLs come from the OpenAPI spec's Base URLs and are pinned in `app/bulkdn/config.py`
 alongside the domain byte, so the two cannot drift apart. Override them with `http_url` /
 `ws_url` in the config only if the published hosts change.
 
@@ -361,7 +368,8 @@ alongside the domain byte, so the two cannot drift apart. Override them with `ht
 ## Testing
 
 ```bash
-testsun-tests.bat
+tests
+un-tests.bat
 ```
 
 The suite covers the pure logic — hedge sizing across partial fills and phase role swaps,
@@ -386,7 +394,7 @@ Two things about the SDK shaped this code:
 **Sub-account routing.** `BulkWebSocketClient.place_orders` hardcodes
 `account = signer.public_key`, so it can only trade the signing account. The wire protocol
 is more capable — `account` is who is acted on, `signer` is who authorises, and a master may
-sign for its sub-accounts. `RoutedWsClient.submit` in `bulkdn/accounts.py` rebuilds the
+sign for its sub-accounts. `RoutedWsClient.submit` in `app/bulkdn/accounts.py` rebuilds the
 transaction with both fields set correctly; the signing path itself is untouched.
 
 **Handlers run inside the receive loop.** The SDK awaits event handlers inline in its

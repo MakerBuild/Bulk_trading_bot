@@ -15,7 +15,7 @@ if errorlevel 1 (
     echo   Get it from https://www.python.org/downloads/ and TICK THE BOX
     echo   "Add python.exe to PATH" at the bottom of the installer.
     echo.
-    echo   Full walkthrough: docs\INSTALL.md
+    echo   Full walkthrough: app\docs\INSTALL.md
     echo.
     pause
     exit /b 1
@@ -30,24 +30,24 @@ if errorlevel 1 (
     echo   Then CLOSE THIS WINDOW and run install.bat again -- an open console
     echo   does not pick up a newly installed program.
     echo.
-    echo   Full walkthrough: docs\INSTALL.md
+    echo   Full walkthrough: app\docs\INSTALL.md
     echo.
     pause
     exit /b 1
 )
 
-if not exist ".venv\Scripts\python.exe" (
+if not exist "app\.venv\Scripts\python.exe" (
     echo.
     echo   Creating the virtualenv...
-    python -m venv .venv
+    python -m venv app\.venv
     if errorlevel 1 (
-        echo   Could not create .venv -- see the error above.
+        echo   Could not create app\.venv -- see the error above.
         pause
         exit /b 1
     )
 )
 
-set "VENV_PY=.venv\Scripts\python.exe"
+set "VENV_PY=app\.venv\Scripts\python.exe"
 
 echo.
 echo   Updating pip...

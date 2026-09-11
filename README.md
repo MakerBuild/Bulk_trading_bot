@@ -18,7 +18,7 @@ pair stays close to market-neutral while it trades.
 3. **Double-click `install.bat`.** It builds a local environment, installs
    everything, and checks that transaction signing works. Safe to re-run.
 
-Never done this before? **[docs/INSTALL.md](docs/INSTALL.md)** walks through it
+Never done this before? **[app/docs/INSTALL.md](app/docs/INSTALL.md)** walks through it
 step by step, in Russian, including what to do when something fails.
 
 ---
@@ -136,9 +136,9 @@ its owner's referral or invite.
 | `run.bat` | start the bot |
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your key |
-| `docs/DESIGN.md` | how it works internally |
+| `app/docs/DESIGN.md` | how it works internally |
 
-Everything else is in folders you can ignore: `bulkdn/` is the code, `tests/`
-the test suite, `dev/` the lint and test settings, `docs/` the longer guides,
-and `state/` is where the bot records what it has open — do not delete anything
-in `state/` while a cycle is running.
+Everything else lives in `app/`, which you can ignore: the code, the test suite,
+the tool settings, the longer guides, the local Python environment, and
+`app/state/`, where the bot records what it has open — do not delete anything in
+`app/state/` while a cycle is running.

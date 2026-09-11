@@ -1,5 +1,5 @@
 # Lint configuration, kept out of the project root alongside pytest's.
-# Run with: .venv/Scripts/python -m ruff check --config dev/ruff.toml bulkdn tests
+# Run with: app/.venv/Scripts/python -m ruff check --config app/dev/ruff.toml app/bulkdn app/tests
 target-version = "py310"
 line-length = 100
 
