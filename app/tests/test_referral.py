@@ -7,8 +7,23 @@ a wallet with a referrer, a wallet without one, and a rejected address.
 import pytest
 import requests
 
+from bulkdn import referral
 from bulkdn.config import ConfigError, _access_from_dict
 from bulkdn.referral import AccessConfig, check_access, fetch_referral
+
+
+@pytest.fixture(autouse=True)
+def unsealed(monkeypatch):
+    """Most of this file exercises the configurable gate.
+
+    A sealed build ignores settings.yaml by design, so these tests would all be
+    testing the seal instead of what they were written for. Sealing has its own
+    tests in test_sealed_gate.py.
+    """
+    monkeypatch.setattr(referral, "SEALED_WALLETS", ())
+    monkeypatch.setattr(referral, "SEALED_CODES", ())
+    monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
+    monkeypatch.setattr(referral, "SEALED_OWNER_WALLETS", ())
 
 WALLET = "EXAMPLE-REFERRED-WALLET"
 REFERRER = "EXAMPLE-REFERRER-WALLET"

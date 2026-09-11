@@ -123,31 +123,25 @@ risk:
 
 
 # ---------------------------------------------------------------------------
-#  Access control (for whoever distributes this build)
+#  Access control
 #
-#  Restricts the bot to accounts that signed up through a given owner.
-#  `wallets` is matched against BOTH the referrer and the inviter, so one
-#  address covers people who used a referral code and people who redeemed an
-#  invite code.
+#  This build runs only for accounts that signed up through its owner. The
+#  allow-list is not here: it is compiled into the bot, as digests rather than
+#  addresses, so this file cannot widen it, narrow it, or switch it off.
 #
-#  `owner_wallets` is not optional once this is on: the check asks who
-#  referred an account, and a referrer was not referred by themselves, so
-#  without it the gate refuses its own owner.
+#  That is deliberate. Every field this block used to have was a way around
+#  the check -- adding a wallet, replacing one, granting an unconditional pass,
+#  turning the requirement off, or allowing everything when the referral index
+#  is unreachable. A gate its own config file can open is not a gate.
+#
+#  Nothing to configure here. If you forked this for your own use, empty
+#  SEALED_WALLETS in app/bulkdn/referral.py and this block works again:
+#
+#    access:
+#      require_referral: true
+#      wallets: ["<your referrer wallet>"]
+#      owner_wallets: ["<the account you run from>"]
 # ---------------------------------------------------------------------------
-access:
-  require_referral: true
-  wallets:                  # matched against BOTH referrer and inviter
-    - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"
-  codes: ["MAKER"]          # referral code, case-insensitive
-  invite_codes: []          # individual BULK-XXX-XXX codes; these expire, so
-                            # prefer `wallets`
-  owner_wallets:            # allowed unconditionally, no referral needed
-    - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"  # referral wallet
-    # A trading account is not its own referrer, so whichever account you run
-    # the bot from belongs here too. Put yours in a private copy of this file
-    # rather than here -- `settings.*.yaml` is git-ignored, and this one ships:
-    #   run.bat --config settings.mine.yaml
-  allow_on_error: false     # run anyway if the referral index is unreachable
 
 
 # ---------------------------------------------------------------------------

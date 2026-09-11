@@ -5,7 +5,7 @@ routes that must both be checked:
 
     GET https://indexer.bulk.trade/v1/aura/wallet/<pubkey>
     -> {
-         "referred_by_code":   "MAKER",        # shareable referral code
+         "referred_by_code":   "EXAMPLE",      # shareable referral code
          "referred_by_wallet": "3JcDtH4L...",
          "access": {
            "invited_by_code_id": "...",        # single-use invite code
@@ -13,10 +13,10 @@ routes that must both be checked:
          },
        }
 
-Accounts arrive by either, and in practice most arrive by invite: for the
-owner's own wallet the split was 15 referrals against 32 redeemed invites. A
-gate that only read `referred_by_*` would therefore refuse most of the people
-it was meant to admit.
+Accounts arrive by either, and in practice most arrive by invite -- on the
+wallet this was built for, roughly two thirds did. A gate that only read
+`referred_by_*` would therefore refuse most of the people it was meant to
+admit.
 
 Matching is on the *wallet* rather than the code wherever possible. Invite
 codes are single-use and reissued from a weekly allowance, so any list of them
@@ -44,6 +44,7 @@ once, before anything is placed.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 
@@ -101,13 +102,105 @@ class AccessConfig:
             )
 
 
+# -- the sealed part of the gate --------------------------------------------
+#
+# Two changes from reading these out of settings.yaml.
+#
+# They are sha256 digests, not addresses, so the source does not hand a reader
+# the value to substitute. And they live in code, so deleting a line in the
+# config cannot widen who may run.
+#
+# When SEALED_WALLETS is non-empty the build is sealed and the whole `access`
+# block in settings.yaml is ignored -- every field of it. Each one is a bypass
+# otherwise: `wallets` and `codes` add allowed referrers, `owner_wallets` is an
+# unconditional pass, `require_referral: false` switches the gate off, and
+# `allow_on_error: true` turns a pulled network cable into a pass. A gate whose
+# own config file can disable it is a gate with a documented bypass.
+#
+# WHAT THIS IS NOT: protection against someone editing the source. It is
+# Python; the check is one `return True` away from gone, whatever it is hashed
+# with, and freezing it into an executable moves that edit without preventing
+# it. This raises the cost from "change a line in a config file" to "read and
+# patch the program", which is the whole of what a client-side gate can do.
+# See docs/DESIGN.md.
+SEALED_WALLETS: tuple[str, ...] = (
+    "e87f0b26a48973d7ec3318929d8516debfa7d92dc2ca6d4557d7368f37c7041c",
+)
+SEALED_CODES: tuple[str, ...] = (
+    "8682907b1f0aef20dbac2739e6a985d3152241b15268965d72cda4554864dacb",
+)
+SEALED_INVITE_CODES: tuple[str, ...] = ()
+# Accounts that run regardless of who referred them -- the owner's own trading
+# account. Deliberately empty in the published build: an address here is public
+# the moment the source is, and it is an unconditional pass, so it cannot be
+# read from the config instead. To fill it in the build you run yourself:
+#   python -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" <address>
+SEALED_OWNER_WALLETS: tuple[str, ...] = ()
+
+
+def wallet_digest(value: str) -> str:
+    """How a wallet is compared. Addresses are case-sensitive base58."""
+    return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
+
+
+def code_digest(value: str) -> str:
+    """How a code is compared. People type these by hand, so case is folded."""
+    return hashlib.sha256(value.strip().upper().encode("utf-8")).hexdigest()
+
+
+def is_sealed() -> bool:
+    """Whether this build carries its own allow-list."""
+    return bool(SEALED_WALLETS or SEALED_CODES or SEALED_INVITE_CODES)
+
+
+@dataclass(frozen=True)
+class _Allowed:
+    """What the gate matches against, as digests."""
+
+    wallets: frozenset[str]
+    codes: frozenset[str]
+    invite_codes: frozenset[str]
+    owner_wallets: frozenset[str]
+    allow_on_error: bool
+    enabled: bool
+    sealed: bool
+
+
+def _allowed(config: AccessConfig) -> _Allowed:
+    """The sealed values, or the config's when the build is not sealed.
+
+    A sealed build ignores the config rather than merging with it. Merging
+    would let the config add an allowed wallet, and there is no useful
+    difference between adding one and replacing the list.
+    """
+    if is_sealed():
+        return _Allowed(
+            wallets=frozenset(SEALED_WALLETS),
+            codes=frozenset(SEALED_CODES),
+            invite_codes=frozenset(SEALED_INVITE_CODES),
+            owner_wallets=frozenset(SEALED_OWNER_WALLETS),
+            allow_on_error=False,
+            enabled=True,
+            sealed=True,
+        )
+    return _Allowed(
+        wallets=frozenset(wallet_digest(w) for w in config.wallets if w.strip()),
+        codes=frozenset(code_digest(c) for c in config.codes if c.strip()),
+        invite_codes=frozenset(code_digest(c) for c in config.invite_codes if c.strip()),
+        owner_wallets=frozenset(wallet_digest(w) for w in config.owner_wallets if w.strip()),
+        allow_on_error=config.allow_on_error,
+        enabled=config.require_referral,
+        sealed=False,
+    )
+
+
 @dataclass(frozen=True)
 class ReferralStatus:
     """How a wallet came to be on BULK.
 
     Two independent routes, which the API keeps separate and so does this:
 
-    **Referral code** -- `referred_by_*`, the shareable code (`MAKER`) someone
+    **Referral code** -- `referred_by_*`, the shareable code someone
     typed when signing up.
 
     **Invite code** -- `access.invited_by_*`, a single-use code
@@ -225,18 +318,19 @@ def check_access(
     exact for wallets (base58 is case-sensitive and a near-match is a different
     key, not a typo to be forgiven).
     """
-    if not config.enabled:
+    allowed = _allowed(config)
+    if not allowed.enabled:
         return AccessDecision(True, "referral gating is off")
 
     # Before the network call: the owner should not be locked out by their own
     # gate, nor by an indexer outage.
-    if wallet in set(config.owner_wallets):
+    if wallet_digest(wallet) in allowed.owner_wallets:
         return AccessDecision(True, "owner wallet")
 
     try:
         status = fetch_referral(wallet, base_url=base_url)
     except Exception as exc:  # noqa: BLE001 - every failure mode lands here
-        if config.allow_on_error:
+        if allowed.allow_on_error:
             log.warning(
                 "could not verify referral for %s (%s) -- allowing, because "
                 "access.allow_on_error is set",
@@ -254,18 +348,16 @@ def check_access(
 
     # Wallets are matched against both routes: one address, whether it referred
     # the account or invited it.
-    owner_wallets = set(config.wallets)
-    if status.referred_by_wallet and status.referred_by_wallet in owner_wallets:
+    if status.referred_by_wallet and wallet_digest(status.referred_by_wallet) in allowed.wallets:
         return AccessDecision(
             True, f"referred by wallet {status.referred_by_wallet}", status
         )
-    if status.invited_by_wallet and status.invited_by_wallet in owner_wallets:
+    if status.invited_by_wallet and wallet_digest(status.invited_by_wallet) in allowed.wallets:
         return AccessDecision(
             True, f"invited by wallet {status.invited_by_wallet}", status
         )
 
-    wanted_codes = {code.strip().upper() for code in config.codes if code.strip()}
-    if status.referred_by_code and status.referred_by_code.strip().upper() in wanted_codes:
+    if status.referred_by_code and code_digest(status.referred_by_code) in allowed.codes:
         return AccessDecision(
             True, f"referred by code {status.referred_by_code}", status
         )
@@ -273,8 +365,7 @@ def check_access(
     # Listing individual invite codes is supported but is the fragile option:
     # they are single-use and reissued weekly, so the list goes stale. Prefer
     # the inviter wallet above.
-    wanted_invites = {code.strip().upper() for code in config.invite_codes if code.strip()}
-    if status.invited_by_code and status.invited_by_code.strip().upper() in wanted_invites:
+    if status.invited_by_code and code_digest(status.invited_by_code) in allowed.invite_codes:
         return AccessDecision(
             True, f"invited by code {status.invited_by_code}", status
         )

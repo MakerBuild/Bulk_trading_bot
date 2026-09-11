@@ -516,3 +516,51 @@ the guard does not fire; startup logs which markets are unguarded.
 - The OpenAPI spec documents no rate limits. The chase loop is throttled conservatively.
 - Funding costs are not modelled. A delta-neutral pair still pays or receives funding on
   both legs, which is P&L this bot does not account for.
+
+---
+
+## The referral gate, and what it is worth
+
+The bot refuses to start unless the master account signed up through the
+owner — by referral code or by redeemed invite, both of which are checked,
+because on the wallet this was built for roughly two thirds arrived by invite.
+
+The allow-list is compiled into `app/bulkdn/referral.py` as sha256 digests, not
+read from `settings.yaml`. When `SEALED_WALLETS` is non-empty the build is
+*sealed*: the `access` block in the config is ignored in full, and `check_access`
+is called unconditionally rather than behind a config flag.
+
+Every field that block used to have was a way around the check:
+
+| field | the bypass |
+|---|---|
+| `wallets`, `codes` | add an allowed referrer |
+| `invite_codes` | the same, by code |
+| `owner_wallets` | an unconditional pass, checked before the indexer |
+| `require_referral: false` | switch the gate off |
+| `allow_on_error: true` | set it, then unplug the network |
+
+A gate its own config file can open is not a gate, so a sealed build reads none
+of them. A fork that empties `SEALED_WALLETS` gets the configurable gate back.
+
+### What it does not do
+
+**It does not stop anyone who edits the source.** This ships as Python. The
+check is one `return True` from gone, and no amount of hashing changes that —
+the digests are compared by code the same person can rewrite. Freezing it into
+an executable moves that edit rather than preventing it.
+
+**The digests hide the address from a reader, not from a search.** sha256 of an
+address is irreversible in general, but the set of BULK accounts is small and
+largely enumerable, so someone willing to hash every known account can match
+one. What hashing buys is that the value is not sitting in the file for anyone
+who opens it.
+
+So the honest claim is narrow: it raises the cost of bypassing from *editing a
+line in a config file* to *reading and patching the program*. That is the
+ceiling for any check that runs on the machine it is meant to restrict.
+
+Enforcement would have to be server-side, and it would have to gate something
+the bot cannot compute for itself. This bot signs with the operator's own key
+and talks straight to BULK, so there is nothing in its path to withhold — which
+is why the gate is where it is, and why it claims no more than it does.

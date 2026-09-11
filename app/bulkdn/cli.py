@@ -135,9 +135,11 @@ class Runtime:
         The master is what gets checked, not the sub-account: a sub is created
         by the master and has no referral record of its own.
         """
-        if not self.config.access.enabled:
-            return
-
+        # Not guarded by config.access.enabled: a sealed build decides that
+        # for itself, and a config flag that skips the call is the same bypass
+        # as a config flag that empties the allow-list. check_access returns
+        # "gating is off" on its own when the build is unsealed and the config
+        # says so.
         decision = check_referral_access(self.master.pubkey, self.config.access)
         if not decision.allowed:
             raise AccessDenied(decision.reason)
