@@ -1,12 +1,20 @@
-"""Scaling leg sizes down to the margin actually available.
+"""Turning configured sizes into sizes the accounts can actually carry.
 
-Sizes are configured in the base coin -- `0.001` BTC, `2.0` SOL -- which makes
-them a trap the moment a symbol changes. Swapping `SOL-USD` for `ETH-USD` and
-leaving `size: 2.0` asks for 2 ETH, and at $2,600 that is a $5,200 position
-where the old one was $200. The exchange answers with a rejection that says
-nothing about the cause.
+Two steps, in order.
 
-So the configured size is treated as a ceiling rather than an instruction. When
+**Dollars into coins.** A leg written as `notional_usd: 100` has no size until
+there is a price, so `resolve_notionals` converts it at startup and writes the
+result into `leg.size`. Everything downstream reads `size` and never learns
+which way the leg was written.
+
+This is why dollars are the better unit. A size in the base coin is a trap the
+moment a symbol changes: swapping `SOL-USD` for `ETH-USD` and leaving
+`size: 2.0` asks for 2 ETH, and at $2,600 that is a $5,200 position where the
+old one was $200. The exchange answers with a rejection that says nothing about
+the cause. `notional_usd: 200` means the same thing in either market.
+
+**Coins into what fits.** The configured size is then treated as a ceiling
+rather than an instruction. When
 both accounts can carry it, it is used exactly as written. When they cannot,
 every leg is scaled by the same factor until the whole cycle fits inside
 `max_margin_fraction` of the smaller account's available margin.
@@ -32,8 +40,16 @@ from .marketdata import MarketSpec, round_size
 log = logging.getLogger(__name__)
 
 
-class InsufficientMargin(Exception):
+class SizingError(Exception):
+    """The cycle cannot be sized as configured."""
+
+
+class InsufficientMargin(SizingError):
     """Even the scaled-down size cannot be traded."""
+
+
+class Unpriceable(SizingError):
+    """A dollar size cannot be turned into a quantity without a price."""
 
 
 @dataclass(frozen=True)
@@ -103,6 +119,56 @@ def _why_it_did_not_fit(leg, legs, prices: dict[str, float], budget: float, spec
         f"${spec.min_notional:g} minimum. Fund the accounts, raise leverage, or "
         f"trade a market with a lower minimum."
     )
+
+
+def resolve_notionals(
+    *,
+    legs: list,
+    specs: dict[str, MarketSpec],
+    prices: dict[str, float],
+) -> None:
+    """Convert every dollar-denominated leg into a base-coin size, in place.
+
+    Legs already written in the base coin are left untouched, so a config
+    mixing the two units works and an old config behaves exactly as before.
+
+    In place, because everything downstream -- the chaser's targets, the hedge
+    ceilings, the exit sizes -- reads `leg.size` from the config, and a second
+    source of truth for size is how the two end up disagreeing.
+    """
+    for leg in legs:
+        if not leg.priced_in_usd:
+            continue
+
+        price = prices.get(leg.symbol) or 0.0
+        if price <= 0:
+            raise Unpriceable(
+                f"{leg.symbol}: no price available, so a dollar size cannot be "
+                f"converted into a quantity. Check the market is listed and "
+                f"the symbol is spelled as the exchange spells it."
+            )
+
+        spec = specs[leg.symbol]
+
+        if leg.notional_usd > 0:
+            leg.size = round_size(leg.notional_usd / price, spec)
+            if leg.size < spec.lot_size:
+                raise InsufficientMargin(
+                    f"{leg.symbol}: ${leg.notional_usd:,.2f} is under one lot "
+                    f"({spec.lot_size:g} = ${spec.lot_size * price:,.2f} at "
+                    f"${price:,.2f}). Raise notional_usd for this leg."
+                )
+            log.info(
+                "%s: $%s -> %g at $%s",
+                leg.symbol, f"{leg.notional_usd:,.2f}", leg.size, f"{price:,.2f}",
+            )
+
+        if leg.max_order_notional_usd > 0:
+            # A cap rounded down to nothing would stop every order, so it
+            # floors at one lot -- the smallest order the market accepts.
+            leg.max_order_size = max(
+                round_size(leg.max_order_notional_usd / price, spec), spec.lot_size
+            )
 
 
 def plan_sizes(

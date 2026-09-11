@@ -32,7 +32,7 @@ from .positions import PositionBook
 from .reconcile import cancel_all_orders, flatten, sync_positions_http
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
-from .sizing import plan_sizes
+from .sizing import plan_sizes, resolve_notionals
 from .state import Phase, StateStore
 from .ws_compat import apply_ws_compat
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
@@ -148,7 +148,10 @@ class Runtime:
         await self.sub1.disconnect()
 
     def apply_sizing(self) -> None:
-        """Fit the configured sizes to the margin both accounts actually hold.
+        """Turn the configured sizes into sizes both accounts can carry.
+
+        Dollar amounts are converted to quantities first, then every leg is
+        weighed against the margin actually held.
 
         Runs in dry-run too, so a rehearsal shows the sizes a live run would
         really use rather than the ones written in the file.
@@ -163,6 +166,11 @@ class Runtime:
         # is connected, so the ticker cache is still empty and every price
         # would read as zero.
         prices = {s: self.feed.http_price(s) for s in self.symbols}
+
+        # Dollar-denominated legs become base-coin sizes here, before anything
+        # weighs them against margin. After this every leg has a `size`.
+        resolve_notionals(legs=legs, specs=self.feed.specs, prices=prices)
+
         margin = {}
         for session in (self.master, self.sub1):
             account = session.full_account().get("margin") or {}

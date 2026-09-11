@@ -53,27 +53,72 @@ class ConfigError(Exception):
 class LegConfig:
     """One symbol's worth of strategy parameters.
 
-    `size` is the total base quantity the cycle accumulates. `offset_bps`
-    places the resting order inside the touch; `max_distance_bps` is the drift
-    that triggers a cancel+replace.
+    How much to trade is written **either** in dollars or in the base coin:
+
+        notional_usd: 100      $100 of whatever `symbol` names
+        size: 0.001            0.001 of the base coin
+
+    `notional_usd` is the one to prefer, because it does not change meaning
+    when `symbol` does. `size: 2.0` is $200 of SOL and $5,200 of ETH, so
+    switching the symbol and leaving the number silently resizes the cycle by
+    a factor of twenty-six. A dollar amount says the same thing in any market.
+
+    A dollar amount has no size until there is a price, so `size` stays 0 until
+    `sizing.resolve_notionals` fills it in at startup. Everything downstream
+    reads `size` and never needs to know which way the leg was written.
+
+    `offset_bps` places the resting order inside the touch; `max_distance_bps`
+    is the drift that triggers a cancel+replace.
     """
 
     symbol: str
-    size: float
-    offset_bps: float
-    max_distance_bps: float
-    max_order_size: float
+    # Exactly one of these two carries the leg's size. See the class docstring.
+    size: float = 0.0
+    notional_usd: float = 0.0
+    offset_bps: float = 0.0
+    max_distance_bps: float = 5.0
+    # The per-order cap, in whichever unit suits; it defaults to the whole leg.
+    max_order_size: float = 0.0
+    max_order_notional_usd: float = 0.0
     # None leaves whatever the account already has. The exchange's own ceiling
     # for the market is checked at startup, since it differs per symbol.
     leverage: float | None = None
 
+    @property
+    def priced_in_usd(self) -> bool:
+        """Whether this leg still needs a price before it has a size."""
+        return self.notional_usd > 0 or self.max_order_notional_usd > 0
+
     def validate(self, name: str) -> None:
         if not self.symbol:
             raise ConfigError(f"legs.{name}.symbol is required")
-        if self.size <= 0:
-            raise ConfigError(f"legs.{name}.size must be > 0")
-        if self.max_order_size <= 0:
+
+        if self.size < 0 or self.notional_usd < 0:
+            raise ConfigError(f"legs.{name}: size and notional_usd must be >= 0")
+        if self.size > 0 and self.notional_usd > 0:
+            raise ConfigError(
+                f"legs.{name} sets both `size` and `notional_usd` -- use one. "
+                f"`notional_usd` is in dollars and keeps its meaning when you "
+                f"change `symbol`; `size` is in the base coin and does not."
+            )
+        if self.size <= 0 and self.notional_usd <= 0:
+            raise ConfigError(
+                f"legs.{name} has no size: set `notional_usd: 100` for $100 of "
+                f"{self.symbol}, or `size` for an amount of the base coin."
+            )
+
+        if self.max_order_size < 0 or self.max_order_notional_usd < 0:
+            raise ConfigError(f"legs.{name}: the max_order_* caps must be >= 0")
+        if self.max_order_size > 0 and self.max_order_notional_usd > 0:
+            raise ConfigError(
+                f"legs.{name} sets both `max_order_size` and "
+                f"`max_order_notional_usd` -- use one."
+            )
+        # Both may be zero: the cap then defaults to the whole leg, which is
+        # applied once the leg has a size.
+        if self.notional_usd <= 0 and self.max_order_notional_usd <= 0 and self.max_order_size <= 0:
             raise ConfigError(f"legs.{name}.max_order_size must be > 0")
+
         if self.offset_bps < 0:
             raise ConfigError(f"legs.{name}.offset_bps must be >= 0")
         if self.max_distance_bps <= 0:
@@ -338,13 +383,26 @@ class Config:
 def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"legs.{name} must be a mapping")
+    size = float(raw.get("size") or 0.0)
+    notional_usd = float(raw.get("notional_usd") or 0.0)
+    cap_size = float(raw.get("max_order_size") or 0.0)
+    cap_usd = float(raw.get("max_order_notional_usd") or 0.0)
+
+    # An unset cap means "the whole leg", expressed in the unit the leg used.
+    # Resolving it here keeps `size` and its cap in step when a dollar leg is
+    # later converted.
+    if cap_size <= 0 and cap_usd <= 0:
+        cap_size, cap_usd = size, notional_usd
+
     try:
         return LegConfig(
             symbol=raw["symbol"],
-            size=float(raw["size"]),
+            size=size,
+            notional_usd=notional_usd,
             offset_bps=float(raw.get("offset_bps", 0.0)),
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
-            max_order_size=float(raw.get("max_order_size", raw["size"])),
+            max_order_size=cap_size,
+            max_order_notional_usd=cap_usd,
             leverage=(
                 float(raw["leverage"]) if raw.get("leverage") is not None else None
             ),

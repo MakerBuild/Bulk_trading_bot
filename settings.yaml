@@ -21,14 +21,27 @@
 #    sub_account      the sub-account buys this, the master shorts it
 #
 #  Both run at the same time, and each fill is hedged on the other account.
-#  `size` is the total you accumulate per cycle, in the base coin.
-#
 #  Any market the exchange lists works -- the names below are just which
 #  account trades what, not a coin the bot is tied to.
 #
-#  SIZES ARE IN THE BASE COIN, so they do not carry across a symbol change:
-#  `size: 2.0` is $200 of SOL but $5,200 of ETH. Set the dollar amount you
-#  want, not the number you had before.
+#  HOW MUCH: write it in dollars.
+#
+#    notional_usd: 100     $100 of whatever `symbol` names, per cycle
+#
+#  Dollars do not change meaning when you change `symbol`, which is the whole
+#  point: the bot converts to a quantity at the current price when it starts.
+#
+#  The old way still works, one leg at a time, if you want an exact quantity:
+#
+#    size: 0.001           0.001 of the base coin, per cycle
+#
+#  But `size` is tied to one coin's price. `size: 2.0` is $200 of SOL and
+#  $5,200 of ETH -- change the symbol and leave the number, and the cycle is
+#  twenty-six times larger without a word of warning. Set one or the other per
+#  leg, never both.
+#
+#  Keep the two legs close in dollar terms. They are scaled together when
+#  margin is short, so a lopsided pair starves the smaller leg first.
 #
 #  If the sizes below need more margin than the accounts hold, every leg is
 #  scaled down together to fit -- see max_margin_fraction near the bottom.
@@ -36,21 +49,19 @@
 legs:
   master_account:
     symbol: BTC-USD
-    size: 0.001             # total per cycle, in BTC
+    notional_usd: 80        # total per cycle, in dollars
     leverage: 10            # 1-50, capped by the market's own maximum
     offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
     max_distance_bps: 5.0   # re-price the order once it drifts this far
-    max_order_size: 0.001   # cap on any single resting order
+    max_order_notional_usd: 80   # cap on any single resting order, in dollars
 
   sub_account:
     symbol: ETH-USD
-    size: 0.03              # total per cycle, in ETH -- about $79, matching
-                            # the BTC leg above. Sizes are in the base coin,
-                            # so this does NOT follow a change of `symbol`.
+    notional_usd: 80        # matching the leg above, so the pair is balanced
     leverage: 10            # ETH-USD allows up to 25
     offset_bps: 3.0
     max_distance_bps: 8.0
-    max_order_size: 0.03
+    max_order_notional_usd: 80
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +100,10 @@ execution_target:
 #  Breaching any of these cancels every order, closes both accounts, and
 #  stops the bot. They are hard stops, not warnings.
 #
-#  Note on minimum order size: BTC-USD will not accept an order under $1 and
-#  SOL-USD under $50. A hedge smaller than that floor cannot be sent at all,
-#  so the pair can carry up to about $50 of one-sided SOL exposure that no
-#  hedge can remove. Keep max_net_exposure_usd comfortably above it.
+#  Note on minimum order size: every market sets a floor -- $1 on BTC-USD, $50
+#  on ETH-USD and SOL-USD. A hedge smaller than the floor cannot be sent at
+#  all, so the pair can carry up to that much one-sided exposure that no hedge
+#  can remove. Keep max_net_exposure_usd comfortably above the larger floor.
 # ---------------------------------------------------------------------------
 risk:
   max_net_exposure_usd: 500.0   # one-sided exposure the pair may carry

@@ -350,11 +350,13 @@ See `settings.yaml`. The parameters that shape execution:
 | `execution_target.volume_usd` | Stop once this much **qualifying** volume is done; 0 disables |
 | `legs.*.leverage` | Max leverage for that market; omit to keep the account's own |
 | `risk.max_hedge_impact_bps` | Refuse a hedge whose predicted slippage exceeds this; 0 disables |
-| `legs.*.size` | Total base size the cycle accumulates |
+| `legs.*.notional_usd` | Dollars the cycle accumulates; converted to a quantity at startup |
+| `legs.*.size` | The same, as a base quantity. One or the other per leg, never both |
 | `legs.*.offset_bps` | How far inside the touch the resting order sits |
 | `legs.*.max_distance_bps` | Drift that triggers a cancel+replace |
-| `legs.*.max_order_size` | Cap on any single resting order |
-| `hold_minutes` | Time fully open before exiting |
+| `legs.*.max_order_notional_usd` | Cap on any single resting order, in dollars |
+| `legs.*.max_order_size` | The same cap, as a base quantity |
+| `hold_minutes` | Time fully open before exiting; a number or a `low-high` range drawn per cycle |
 | `chase_interval_s` | How often resting orders are re-evaluated |
 | `hedge_tolerance_lots` | Net exposure tolerated before hedging (must be ≥ 1 lot) |
 | `overlay_ttl_ms` | How long an unconfirmed fill is trusted before falling back to exchange truth |
