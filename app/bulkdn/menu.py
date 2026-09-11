@@ -552,10 +552,7 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
         return
     try:
         value = float(raw)
-        # cycles and volume have no meaning below zero; a burn target does --
-        # it is a fee total, and a maker earning more than they pay reaches it
-        # from underneath.
-        if value < 0 and key != "burn_usd":
+        if value < 0:
             raise ValueError
     except ValueError:
         print("  must be a non-negative number")
@@ -578,7 +575,7 @@ def _target_progress(config: Config) -> None:
 
     print(f"\n  fills {totals.fills}")
     print(f"  fees            ${totals.fees_usd:,.4f}", end="")
-    if config.target.burn_usd != 0:
+    if config.target.burn_usd > 0:
         print(f"  of ${config.target.burn_usd:,.2f}")
     else:
         print("  (no burn target)")
