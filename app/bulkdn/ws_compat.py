@@ -40,6 +40,11 @@ _bypass_latched = False
 # The SDK's default is short enough that a cold connection can miss it.
 _OPEN_TIMEOUT = 30
 
+# How often to ping, and how long to wait for the pong before calling the
+# socket dead. See _connect_with_ssl_fallback.
+_PING_INTERVAL = 20.0
+_PING_TIMEOUT = 60.0
+
 
 def set_ssl_options(*, insecure: bool = False, auto_bypass: bool = True) -> None:
     """Configure TLS behaviour before connecting.
@@ -72,6 +77,14 @@ async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
     """
     global _bypass_latched
     kwargs.setdefault("open_timeout", _OPEN_TIMEOUT)
+
+    # The library defaults to dropping a socket when a pong is more than 20s
+    # late, and BULK's account stream is late that often -- observed killing a
+    # live cycle twice with "keepalive ping timeout; no close frame received".
+    # A longer timeout still notices a genuinely dead peer, and the risk layer
+    # watches for a silent-but-open socket separately via ws_stale_timeout_s.
+    kwargs.setdefault("ping_interval", _PING_INTERVAL)
+    kwargs.setdefault("ping_timeout", _PING_TIMEOUT)
 
     if _insecure_ssl or _bypass_latched:
         kwargs["ssl"] = _insecure_context()

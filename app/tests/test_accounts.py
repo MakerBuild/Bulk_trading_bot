@@ -145,3 +145,36 @@ def test_a_cancel_rejection_records_nothing():
     with pytest.raises(OrderRejected):
         asyncio.run(s.submit([], count_rejects=False))
     assert s.last_reject == ""
+
+
+# -- the signer during a reconnect ------------------------------------------
+#
+# `connect` hides the signer from the base class to suppress its auto-subscribe
+# to the signer's own pubkey. Anything submitted inside that window used to
+# fail with "signer not configured" -- seen live, when an emergency stop tried
+# to cancel the master's orders while the socket was being re-established.
+
+
+def test_a_hidden_signer_still_signs():
+    from bulkdn.accounts import RoutedWsClient
+
+    client = RoutedWsClient.__new__(RoutedWsClient)
+    client.signer = "the-key"
+    client._hidden_signer = None
+    assert client._signing_key == "the-key"
+
+    # What connect() does for the duration of the base call.
+    client._hidden_signer, client.signer = client.signer, None
+    assert client._signing_key == "the-key", "a submission here would have failed"
+
+    client.signer, client._hidden_signer = client._hidden_signer, None
+    assert client._signing_key == "the-key"
+
+
+def test_no_signer_at_all_is_still_refused():
+    from bulkdn.accounts import RoutedWsClient
+
+    client = RoutedWsClient.__new__(RoutedWsClient)
+    client.signer = None
+    client._hidden_signer = None
+    assert client._signing_key is None

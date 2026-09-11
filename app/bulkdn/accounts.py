@@ -19,6 +19,7 @@ client, and handlers close over which one they belong to.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -65,6 +66,8 @@ class RoutedWsClient(BulkWebSocketClient):
         self.account_pubkey = account_pubkey or (self.signer.public_key if self.signer else None)
         self.dry_run = dry_run
         self.last_message_at: float = time.monotonic()
+        # Set only while `connect` has the signer hidden from the base class.
+        self._hidden_signer = None
 
     # -- connection --------------------------------------------------------
 
@@ -78,12 +81,17 @@ class RoutedWsClient(BulkWebSocketClient):
         instead, so this only applies to the first connect.
         """
         had_subscriptions = bool(self.subscriptions)
-        saved_signer = self.signer
+        # Hidden, not discarded: `_signing_key` still sees it, so a submission
+        # that lands inside this window signs normally instead of failing with
+        # "signer not configured". A live run hit exactly that while the
+        # emergency stop tried to cancel orders during a reconnect.
+        self._hidden_signer = self.signer
         self.signer = None
         try:
             connected = await super().connect()
         finally:
-            self.signer = saved_signer
+            self.signer = self._hidden_signer
+            self._hidden_signer = None
 
         if connected and not had_subscriptions and self.account_pubkey:
             await self.subscribe_account(self.account_pubkey)
@@ -96,6 +104,11 @@ class RoutedWsClient(BulkWebSocketClient):
         await super()._handle_message(data)
 
     # -- routed submission -------------------------------------------------
+
+    @property
+    def _signing_key(self):
+        """The key that signs, whether or not `connect` is hiding it."""
+        return self.signer or self._hidden_signer
 
     async def submit(
         self,
@@ -111,7 +124,8 @@ class RoutedWsClient(BulkWebSocketClient):
         must be the routed account or the computed IDs won't match the
         exchange's.
         """
-        if not self.signer:
+        signer = self._signing_key
+        if not signer:
             raise RuntimeError("signer not configured")
         if not self.account_pubkey:
             raise RuntimeError("account_pubkey not configured")
@@ -131,7 +145,7 @@ class RoutedWsClient(BulkWebSocketClient):
             "actions": payload_actions,
             "nonce": f"{nonce}",
             "account": account,
-            "signer": self.signer.public_key,
+            "signer": signer.public_key,
         }
 
         if self.dry_run:
@@ -153,7 +167,7 @@ class RoutedWsClient(BulkWebSocketClient):
         if not self.is_connected:
             raise RuntimeError("not connected to WebSocket")
 
-        tx = self.signer.sign_transaction(tx, self.signature_domain)
+        tx = signer.sign_transaction(tx, self.signature_domain)
 
         self.request_id += 1
         request_id = self.request_id
@@ -196,6 +210,35 @@ class AccountSession:
         if not await self.client.connect():
             raise RuntimeError(f"{self.name}: failed to connect to WebSocket")
         log.info("%s connected (account=%s)", self.name, short_pubkey(self.pubkey))
+
+    async def reconnect(self, attempts: int = 3, delay: float = 2.0) -> bool:
+        """Try to restore a dropped socket. True if the stream is back.
+
+        Safe to call mid-cycle because nothing here depends on the socket
+        having been continuous: subscriptions are replayed by `connect`,
+        positions are re-read from HTTP by the reconciler, and the hedge rule
+        is derived from those positions rather than from the fills it missed.
+        A fill that landed while the socket was down therefore shows up as a
+        position difference and is corrected once, not twice.
+        """
+        for attempt in range(1, attempts + 1):
+            # Closing a socket that is already broken is expected to fail.
+            with contextlib.suppress(Exception):
+                await self.client.disconnect()
+            try:
+                if await self.client.connect():
+                    log.warning(
+                        "%s: WebSocket reconnected on attempt %d", self.name, attempt
+                    )
+                    return True
+            except Exception as exc:  # noqa: BLE001 - every failure is the same here
+                log.warning(
+                    "%s: reconnect attempt %d/%d failed: %s",
+                    self.name, attempt, attempts, exc,
+                )
+            if attempt < attempts:
+                await asyncio.sleep(delay)
+        return False
 
     async def disconnect(self) -> None:
         try:

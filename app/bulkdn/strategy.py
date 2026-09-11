@@ -300,6 +300,46 @@ class Strategy:
             self.notifier.send_soon(self.notifier.halted(reason))
             self._stop.set()
 
+    # -- connection recovery -----------------------------------------------
+
+    async def _healed(self, violations) -> bool:
+        """Try to reconnect a dropped socket. True if anything was restored.
+
+        A dropped socket was treated as fatal, which made a cycle only as long
+        as the exchange's least reliable minute -- two live runs ended this way
+        mid-cycle, having done nothing wrong. It is a transient condition and
+        deserves a retry before the kill switch.
+
+        Only `disconnected` is retried. Every other violation -- exposure over
+        the cap, a position too large, a streak of rejections -- says the
+        strategy itself is misbehaving, and reconnecting would not address any
+        of them.
+
+        Halting is still the outcome when the retry fails: an unattended bot
+        that cannot see its fills must not keep resting orders on the book.
+        """
+        dropped = [v for v in violations if v.kind == "disconnected"]
+        if not dropped or len(dropped) != len(violations):
+            return False
+
+        restored = False
+        for session in (self.master, self.sub1):
+            if session.dry_run or session.is_connected:
+                continue
+            log.warning("%s: WebSocket dropped -- trying to reconnect", session.name)
+            if await session.reconnect():
+                restored = True
+            else:
+                log.error("%s: could not reconnect", session.name)
+
+        if restored:
+            # The socket missed whatever happened while it was down, so the
+            # next decision must be made on exchange truth rather than on a
+            # book that stopped being updated. Read over HTTP, which did not
+            # drop, rather than waiting for the stream to refill the book.
+            sync_positions_http([self.master, self.sub1], self.book)
+        return restored
+
     # -- phase driver ------------------------------------------------------
 
     async def _drive(self, phase: Phase, is_done, label: str) -> None:
@@ -309,6 +349,8 @@ class Strategy:
 
         while not self._stop.is_set():
             violations = self.risk.check()
+            if violations and await self._healed(violations):
+                violations = self.risk.check()
             if violations:
                 self._trigger_halt("; ".join(str(v) for v in violations))
                 break
