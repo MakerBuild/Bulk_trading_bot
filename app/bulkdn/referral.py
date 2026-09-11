@@ -151,6 +151,11 @@ SEALED_OWNER_WALLETS: tuple[str, ...] = (
     # indexer reports it as having arrived by no referral at all -- so
     # without this entry the gate refuses the person who built it.
     "3fd0f416f9ebfe2f03c0d8a0d1b77e96ae71b6fef87e330e3ac2372ef2d5074f",
+    # The referral wallet itself. It is the referrer, so the indexer reports it
+    # as having been referred by nobody -- the same shape as any origin
+    # account. It was in the config's owner_wallets before sealing; leaving it
+    # out here locked the owner out of their own second wallet.
+    "e87f0b26a48973d7ec3318929d8516debfa7d92dc2ca6d4557d7368f37c7041c",
 )
 
 
