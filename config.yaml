@@ -104,5 +104,5 @@ log_level: INFO
 # exchange's own fill records, so they survive a restart.
 execution_target:
   cycles: 1
-  burn_usd: 0
+  burn_usd: 100
   volume_usd: 0
