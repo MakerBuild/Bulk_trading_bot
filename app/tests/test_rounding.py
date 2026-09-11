@@ -4,7 +4,6 @@ from bulkdn.marketdata import (
     MarketSpec,
     chase_price,
     distance_bps,
-    is_tradeable,
     round_price,
     round_price_down,
     round_price_up,
@@ -65,12 +64,6 @@ def test_float_error_does_not_leak_into_prices():
     spec = MarketSpec(symbol="X", tick_size=0.1, lot_size=0.1, min_notional=0.0)
     assert round_price_down(0.1 + 0.2, spec) == 0.3
     assert round_size(0.1 + 0.2, spec) == 0.3
-
-
-def test_tradeable_requires_lot_and_notional():
-    assert is_tradeable(0.001, 100_000.0, BTC) is True
-    assert is_tradeable(0.0001, 100_000.0, BTC) is False  # below lot
-    assert is_tradeable(0.001, 100.0, BTC) is False  # below min notional
 
 
 def test_chase_price_rests_inside_the_touch():

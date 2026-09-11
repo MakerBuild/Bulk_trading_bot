@@ -93,14 +93,6 @@ def round_size(size: float, spec: MarketSpec) -> float:
     return _quantize(abs(size), spec.lot_size, ROUND_DOWN)
 
 
-def is_tradeable(size: float, price: float, spec: MarketSpec) -> bool:
-    """Whether a rounded size clears both the lot floor and the notional floor."""
-    rounded = round_size(size, spec)
-    if rounded < spec.lot_size:
-        return False
-    return rounded * price >= spec.min_notional
-
-
 def chase_price(
     *,
     best_bid: float | None,

@@ -213,6 +213,11 @@ class Hedger:
         size = round_size(abs(net), spec)
         if size < spec.lot_size:
             return 0.0
+        # Deliberately not a shared "is this tradeable" helper. With no price
+        # the hedge still goes: refusing to correct a known imbalance because a
+        # ticker is missing leaves the pair directional, which is the worse of
+        # the two failures. A helper that folded the two checks together would
+        # have to pick one answer for both callers.
         if mark_price and mark_price > 0 and size * mark_price < spec.min_notional:
             return 0.0
         return size
