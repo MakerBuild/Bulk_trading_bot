@@ -15,7 +15,7 @@ import pytest
 
 from bulkdn import keystore
 
-SEED = "4XmiBPzjsmugYJtYFmgh8GWYKQEjt2CtT1MqfZKi8pm4tevpthqRePiACfNoUz4DWtxsxtVYHzBYD8PR7qHC21Kc"
+SEED = "EXAMPLE-SEED-NOT-A-REAL-KEY"
 
 # Argon2id at the shipped parameters takes most of a second per call, which
 # would dominate the suite. These are only ever used to exercise the envelope.

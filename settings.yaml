@@ -142,8 +142,11 @@ access:
   invite_codes: []          # individual BULK-XXX-XXX codes; these expire, so
                             # prefer `wallets`
   owner_wallets:            # allowed unconditionally, no referral needed
-    - "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"  # trading master
     - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"  # referral wallet
+    # A trading account is not its own referrer, so whichever account you run
+    # the bot from belongs here too. Put yours in a private copy of this file
+    # rather than here -- `settings.*.yaml` is git-ignored, and this one ships:
+    #   run.bat --config settings.mine.yaml
   allow_on_error: false     # run anyway if the referral index is unreachable
 
 

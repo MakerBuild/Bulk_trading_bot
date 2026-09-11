@@ -57,7 +57,7 @@ class FakeClient:
 def session_that_rejects(message):
     return AccountSession(
         name="sub1",
-        pubkey="4Fy8FQxz3FYUFqvNgCydRPsBiGzWum5yFaxx68LTWBvU",
+        pubkey="EXAMPLE-MASTER-ACCOUNT-PUBKEY",
         client=FakeClient([FakeResponse(OrderStatus.REJECTED_INVALID, message)]),
         http=None,
         dry_run=True,

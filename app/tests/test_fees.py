@@ -17,9 +17,9 @@ from bulkdn.fees import (
     realised_for_tree,
 )
 
-MASTER = "4Fy8FQxz3FYUFqvNgCydRPsBiGzWum5yFaxx68LTWBvU"
-SUB = "Dxs1DfD5F6bKzaWFjgixXCiAi4uzPf5ZBhqLpXYE4w4q"
-OUTSIDER = "9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt"
+MASTER = "EXAMPLE-MASTER-ACCOUNT-PUBKEY"
+SUB = "EXAMPLE-SUBACCOUNT-PUBKEY"
+OUTSIDER = "EXAMPLE-UNRELATED-PUBKEY"
 
 
 def fill(maker, taker, amount=1.0, price=100.0, fee=0.05):

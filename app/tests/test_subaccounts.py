@@ -90,10 +90,18 @@ def test_name_is_length_prefixed_utf8():
 # are synthetic, and bulk-keychain has no wheel for current Pythons, so it
 # cannot be recomputed here. To restore it as an independent cross-check,
 # install bulk-keychain and regenerate the literal from it.
+#
+# The literal embeds MASTER twice, so changing either address changes it.
+# That is a regeneration, not a failure -- recompute it rather than reverting
+# the address, and keep the field assertions below as the real check.
 # ---------------------------------------------------------------------------
 
-MASTER = "4Fy8FQxz3FYUFqvNgCydRPsBiGzWum5yFaxx68LTWBvU"
-SUB = "Dxs1DfD5F6bKzaWFjgixXCiAi4uzPf5ZBhqLpXYE4w4q"
+# These two are decoded to raw 32 bytes below, so they have to be real
+# base58 rather than a readable placeholder. They are sha256 of the labels
+# "bulkdn-example-master" and "bulkdn-example-subaccount" -- reproducible,
+# and nobody's account.
+MASTER = "DqciofFTMjwbGhwi3ox2kqN1F2P3HLYECDSC5hRytcUo"
+SUB = "5GyLKfzb9xWjeLbF1PL9ygZZtNF3Hw3khYHxqD3VzM83"
 
 
 def test_transfer_preimage_matches_keychain_reference():
@@ -119,7 +127,7 @@ def test_transfer_preimage_matches_keychain_reference():
     )
     assert len(preimage) == 129
     assert preimage.hex() == (
-        "01000000000000001d000000000000003068a71eff90f2a02f02cffa9ae7d8f3094538300475011db0d0401053ecf5cdc09bba1ffa480ac73b2a4beb08f95beadcbcfc03612a4d04590650ed96dbc91e0000000000406f4000f451c28c0100003068a71eff90f2a02f02cffa9ae7d8f3094538300475011db0d0401053ecf5cd01"
+        "01000000000000001d00000000000000bec082f50bafed7094483093b03d66afe20be01242768e954ac30a895fdf5bb03f8627ea8803900cb63dd1abb234009c3379c48e971abed23f11592f34ef9a500000000000406f4000f451c28c010000bec082f50bafed7094483093b03d66afe20be01242768e954ac30a895fdf5bb001"
     )
 
 

@@ -10,14 +10,14 @@ import requests
 from bulkdn.config import ConfigError, _access_from_dict
 from bulkdn.referral import AccessConfig, check_access, fetch_referral
 
-WALLET = "C5RhFpsbsgvFpNJPLTbywMjfgejeHLg17e4VH7h7JgNx"
-REFERRER = "GDMm3PDx6ZMY5gUUKuSAGeVpWw4YL22ZxRaPMDVSrNUv"
+WALLET = "EXAMPLE-REFERRED-WALLET"
+REFERRER = "EXAMPLE-REFERRER-WALLET"
 
 REFERRED = {
     "wallet": WALLET,
-    "referral_code": "DISCORD",
+    "referral_code": "EXAMPLE-OWN-CODE",
     "referred_by_wallet": REFERRER,
-    "referred_by_code": "VAULT",
+    "referred_by_code": "EXAMPLE-REFERRER-CODE",
     "referred_qualified": True,
 }
 NO_REFERRER = {
@@ -66,9 +66,9 @@ def _serve(monkeypatch, response):
 def test_fetch_parses_a_referred_wallet(monkeypatch):
     _serve(monkeypatch, FakeResponse(200, REFERRED))
     status = fetch_referral(WALLET)
-    assert status.referred_by_code == "VAULT"
+    assert status.referred_by_code == "EXAMPLE-REFERRER-CODE"
     assert status.referred_by_wallet == REFERRER
-    assert status.own_code == "DISCORD"
+    assert status.own_code == "EXAMPLE-OWN-CODE"
     assert status.has_referrer
 
 
@@ -108,17 +108,17 @@ def test_disabled_gate_allows_everything():
 def test_allows_a_matching_code(monkeypatch):
     _serve(monkeypatch, FakeResponse(200, REFERRED))
     decision = check_access(
-        WALLET, AccessConfig(require_referral=True, codes=["VAULT"])
+        WALLET, AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"])
     )
     assert decision.allowed
-    assert "VAULT" in decision.reason
+    assert "EXAMPLE-REFERRER-CODE" in decision.reason
 
 
 def test_code_match_is_case_insensitive(monkeypatch):
     """People type these by hand."""
     _serve(monkeypatch, FakeResponse(200, REFERRED))
     decision = check_access(
-        WALLET, AccessConfig(require_referral=True, codes=["  vault "])
+        WALLET, AccessConfig(require_referral=True, codes=["  example-referrer-code "])
     )
     assert decision.allowed
 
@@ -152,7 +152,7 @@ def test_denies_a_different_code(monkeypatch):
 def test_denies_a_wallet_with_no_referrer(monkeypatch):
     _serve(monkeypatch, FakeResponse(200, NO_REFERRER))
     decision = check_access(
-        WALLET, AccessConfig(require_referral=True, codes=["VAULT"])
+        WALLET, AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"])
     )
     assert not decision.allowed
     assert "did not sign up" in decision.reason
@@ -222,7 +222,7 @@ def test_owner_wallet_runs_without_a_referral(monkeypatch):
     _serve(monkeypatch, FakeResponse(200, NO_REFERRER))
     decision = check_access(
         WALLET,
-        AccessConfig(require_referral=True, codes=["VAULT"], owner_wallets=[WALLET]),
+        AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"], owner_wallets=[WALLET]),
     )
     assert decision.allowed
     assert decision.reason == "owner wallet"
@@ -255,7 +255,7 @@ def test_indexer_outage_denies_by_default(monkeypatch):
     monkeypatch.setattr("bulkdn.retry.time.sleep", lambda _: None)
 
     decision = check_access(
-        WALLET, AccessConfig(require_referral=True, codes=["VAULT"])
+        WALLET, AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"])
     )
     assert not decision.allowed
     assert "could not verify" in decision.reason
@@ -270,7 +270,7 @@ def test_indexer_outage_can_be_configured_to_allow(monkeypatch):
 
     decision = check_access(
         WALLET,
-        AccessConfig(require_referral=True, codes=["VAULT"], allow_on_error=True),
+        AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"], allow_on_error=True),
     )
     assert decision.allowed
 
@@ -283,8 +283,8 @@ def test_config_off_by_default():
 
 
 def test_config_accepts_a_single_unwrapped_code():
-    cfg = _access_from_dict({"require_referral": True, "code": "VAULT"})
-    assert cfg.codes == ["VAULT"]
+    cfg = _access_from_dict({"require_referral": True, "code": "EXAMPLE-REFERRER-CODE"})
+    assert cfg.codes == ["EXAMPLE-REFERRER-CODE"]
 
 
 def test_enabled_with_no_allowlist_is_an_error():
