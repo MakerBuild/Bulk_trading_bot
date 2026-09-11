@@ -8,6 +8,7 @@ terminates -- a menu that cannot be left is worse than one that is ugly.
 import builtins
 
 from bulkdn import menu
+from bulkdn.config import HoldTime
 
 
 class StubConfig:
@@ -15,7 +16,7 @@ class StubConfig:
 
     http_url = "https://mainnet-api1.bulk.trade/api/v1"
     cycles = 1
-    hold_minutes = 5.0
+    hold_minutes = HoldTime(5.0, 5.0)
 
 
 def feed(monkeypatch, answers):

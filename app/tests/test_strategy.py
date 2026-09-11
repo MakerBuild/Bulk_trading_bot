@@ -4,13 +4,14 @@ The role swap between OPEN and EXIT is what allows a single hedge rule to serve
 both directions of the cycle, so it is worth pinning down explicitly.
 """
 
+import time
 from dataclasses import dataclass
 
 import pytest
 
 from bulk_api.common import Side, Topic
 
-from bulkdn.config import Config, LegConfig, RiskConfig
+from bulkdn.config import Config, HoldTime, LegConfig, RiskConfig
 from bulkdn.feed import Quote
 from bulkdn.hedger import Hedger
 from bulkdn.marketdata import MarketSpec
@@ -142,6 +143,41 @@ def test_exit_roles_swap_and_are_reduce_only(tmp_path):
 def test_hold_reuses_the_open_roles(tmp_path):
     strategy, *_ = build(tmp_path)
     assert strategy.roles_for(Phase.HOLD) == strategy.roles_for(Phase.OPEN)
+
+
+# -- hold length -----------------------------------------------------------
+
+
+async def _hold_without_waiting(strategy) -> None:
+    """Run _phase_hold for its bookkeeping, skipping the wait it then does."""
+
+    async def no_wait(*_args, **_kwargs):
+        return None
+
+    strategy._drive = no_wait
+    await strategy._phase_hold()
+
+
+async def test_the_hold_deadline_is_drawn_from_the_configured_range(tmp_path):
+    strategy, *_ = build(tmp_path, phase=Phase.HOLD)
+    strategy.config.hold_minutes = HoldTime(0.5, 1.0)
+
+    started = time.time()
+    await _hold_without_waiting(strategy)
+
+    # A deadline, not a duration, so the wait survives a restart.
+    assert started + 30 <= strategy.state.hold_until <= started + 60 + 1
+
+
+async def test_a_restart_finishes_the_hold_it_was_serving(tmp_path):
+    """Re-rolling on restart would let a crash loop extend the hold forever."""
+    strategy, *_ = build(tmp_path, phase=Phase.HOLD)
+    strategy.config.hold_minutes = HoldTime(0.5, 1.0)
+    strategy.state.hold_until = 1_700_000_000.0
+
+    await _hold_without_waiting(strategy)
+
+    assert strategy.state.hold_until == 1_700_000_000.0
 
 
 # -- fill handling ---------------------------------------------------------

@@ -9,6 +9,7 @@ signing authority.
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -136,6 +137,91 @@ class ExecutionTarget:
         return self.burn_usd > 0 or self.volume_usd > 0
 
 
+@dataclass(frozen=True)
+class HoldTime:
+    """How long to stay fully open, drawn fresh at the start of every hold.
+
+    A fixed hold gives every cycle the same length, which is a shape anyone
+    reading the fill history can see. A range removes it at no cost, so the
+    config accepts both and a plain number is simply a range of zero width:
+
+        hold_minutes: 0.5          exactly 30 seconds, every cycle
+        hold_minutes: 0.5-1        somewhere between 30 and 60 seconds
+        hold_minutes: [0.5, 1]     the same thing, spelled as a list
+
+    The draw happens once per cycle and is then stored as an absolute deadline
+    in the state file, so a restart mid-hold resumes the hold it was serving
+    rather than rolling a new one.
+    """
+
+    low: float
+    high: float
+
+    @classmethod
+    def parse(cls, value: Any) -> HoldTime:
+        """Read a number, a `low-high` string, or a two-item list."""
+        if isinstance(value, HoldTime):
+            return value
+
+        if isinstance(value, bool):
+            # bool is an int subclass, and `hold_minutes: yes` is a mistake
+            # rather than a one-minute hold.
+            raise ConfigError(f"hold_minutes must be a number or a range, got {value!r}")
+
+        if isinstance(value, (int, float)):
+            return cls._checked(value, value, value)
+
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2:
+                raise ConfigError(
+                    f"hold_minutes as a list must hold exactly two values, got {list(value)!r}"
+                )
+            return cls._checked(value[0], value[1], value)
+
+        if isinstance(value, str):
+            text = value.strip()
+            # YAML reads `0.5-1` as a string, which is the spelling the
+            # settings file documents, so it is the one that must work.
+            low, sep, high = text.partition("-")
+            if not sep:
+                return cls._checked(text, text, value)
+            return cls._checked(low, high, value)
+
+        raise ConfigError(f"hold_minutes must be a number or a range, got {value!r}")
+
+    @classmethod
+    def _checked(cls, low: Any, high: Any, original: Any) -> HoldTime:
+        try:
+            lo, hi = float(str(low).strip()), float(str(high).strip())
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"hold_minutes must be a number or a range like 0.5-1, got {original!r}"
+            ) from exc
+        if lo < 0:
+            raise ConfigError(f"hold_minutes must be >= 0, got {original!r}")
+        if hi < lo:
+            raise ConfigError(
+                f"hold_minutes range runs backwards -- write the smaller number "
+                f"first, got {original!r}"
+            )
+        return cls(lo, hi)
+
+    def pick(self) -> float:
+        """Minutes to hold for one cycle."""
+        if self.high == self.low:
+            return self.low
+        return random.uniform(self.low, self.high)
+
+    @property
+    def is_range(self) -> bool:
+        return self.high != self.low
+
+    def __str__(self) -> str:
+        if self.is_range:
+            return f"{self.low:g}-{self.high:g}"
+        return f"{self.low:g}"
+
+
 @dataclass
 class Config:
     # Named for the account that OPENS each leg, not for a coin: the symbols
@@ -143,7 +229,7 @@ class Config:
     # trades something else.
     master_account: LegConfig
     sub_account: LegConfig
-    hold_minutes: float = 5.0
+    hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(5.0, 5.0))
     chase_interval_s: float = 1.0
     reconcile_interval_s: float = 5.0
     cycles: int = 1
@@ -204,6 +290,12 @@ class Config:
             self.sub_account.symbol: self.sub_account,
         }
 
+    def __post_init__(self) -> None:
+        # Callers that build a Config directly pass a plain number; the
+        # YAML path passes a HoldTime. Normalise so the rest of the code
+        # only ever sees the range.
+        self.hold_minutes = HoldTime.parse(self.hold_minutes)
+
     def validate(self, require_credentials: bool = True, require_sub1: bool = True) -> None:
         """Validate the configuration.
 
@@ -229,8 +321,6 @@ class Config:
                 "max_margin_fraction must be between 0 and 1 "
                 f"(0.25 = a quarter of available margin), got {self.max_margin_fraction}"
             )
-        if self.hold_minutes < 0:
-            raise ConfigError("hold_minutes must be >= 0")
         if self.chase_interval_s <= 0:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
@@ -377,7 +467,7 @@ def load_config(
         sub1_pubkey=raw.get("sub1_pubkey", ""),
         master_account=_leg_from_dict(legs["master_account"], "master_account"),
         sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
-        hold_minutes=float(raw.get("hold_minutes", 5.0)),
+        hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),
         reconcile_interval_s=float(raw.get("reconcile_interval_s", 5.0)),
         cycles=target.cycles,

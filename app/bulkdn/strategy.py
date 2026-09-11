@@ -465,7 +465,9 @@ class Strategy:
 
     async def _phase_hold(self) -> None:
         if not self.state.hold_until:
-            self.state.hold_until = time.time() + self.config.hold_minutes * 60
+            # Drawn once and stored as a deadline, so a restart mid-hold
+            # resumes this hold rather than rolling a fresh one.
+            self.state.hold_until = time.time() + self.config.hold_minutes.pick() * 60
         self.state.phase = Phase.HOLD
         self.title.set_phase("HOLD")
         self.store.save(self.state)

@@ -131,7 +131,7 @@ def _start(config: Config) -> None:
         asyncio.run(cmd_run(config, dry_run=True))
     elif choice == "2":
         if _confirm(f"Start a live cycle: {config.cycles or 'unlimited'} cycle(s), "
-                    f"{config.hold_minutes:g} min hold."):
+                    f"{config.hold_minutes} min hold."):
             asyncio.run(cmd_run(config, dry_run=False))
         else:
             print("  aborted")

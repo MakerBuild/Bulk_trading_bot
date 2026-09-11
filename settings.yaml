@@ -55,8 +55,19 @@ legs:
 
 # ---------------------------------------------------------------------------
 #  HOW LONG TO HOLD
+#
+#  Time fully open before the exit phase starts. Either a fixed number of
+#  minutes, or a range the bot draws from at the start of every cycle:
+#
+#    hold_minutes: 0.5       exactly 30 seconds, every cycle
+#    hold_minutes: 0.5-1     somewhere between 30 and 60 seconds
+#
+#  A range is worth preferring: a fixed hold makes every cycle the same
+#  length, which is a pattern in the fill history. The draw is made once per
+#  cycle and then held as a deadline, so a restart mid-hold finishes the hold
+#  it was already serving.
 # ---------------------------------------------------------------------------
-hold_minutes: 0.5           # time fully open before the exit phase starts
+hold_minutes: 0.5-1
 
 
 # ---------------------------------------------------------------------------
