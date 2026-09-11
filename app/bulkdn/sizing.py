@@ -93,13 +93,27 @@ class SizingPlan:
 _LOPSIDED_RATIO = 3.0
 
 
-def _why_it_did_not_fit(leg, legs, prices: dict[str, float], budget: float, spec) -> str:
-    """Explain the actual cause, which is one of two quite different things."""
+def _why_it_did_not_fit(
+    leg, legs, prices: dict[str, float], budget: float, spec, scale: float
+) -> str:
+    """Explain the actual cause, which is one of three quite different things."""
     def notional(other) -> float:
         return (prices.get(other.symbol) or 0.0) * other.size
 
     biggest = max(legs, key=notional)
     mine = notional(leg)
+
+    if scale >= 1.0:
+        # Nothing was scaled: the accounts could afford exactly what was asked
+        # for, and what was asked for is below the market's own floor. Money is
+        # not the problem, and saying it is sends the operator to deposit funds
+        # that will change nothing.
+        return (
+            f" Nothing was scaled down -- the accounts can afford this cycle. "
+            f"The configured size is simply under the market's floor: raise this "
+            f"leg to at least ${spec.min_notional:g}, or trade a market with a "
+            f"lower minimum."
+        )
 
     if mine > 0 and notional(biggest) / mine >= _LOPSIDED_RATIO:
         # Scaling is proportional, so a lopsided pair starves the smaller leg
@@ -239,7 +253,7 @@ def plan_sizes(
             raise InsufficientMargin(
                 f"{leg.symbol}: the affordable size {size:g} is ${notional:,.2f}, "
                 f"under the ${spec.min_notional:g} minimum the market accepts."
-                + _why_it_did_not_fit(leg, legs, prices, budget, spec)
+                + _why_it_did_not_fit(leg, legs, prices, budget, spec, scale)
             )
         planned.append(
             LegSizing(

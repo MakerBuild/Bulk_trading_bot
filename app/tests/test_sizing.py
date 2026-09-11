@@ -174,3 +174,22 @@ def test_comparable_legs_blame_the_budget_not_the_ratio():
     legs = [leg(BTC, 0.01), leg(ETH, 0.3)]  # $800 vs $780 -- comparable
     with pytest.raises(InsufficientMargin, match="already comparable"):
         plan(legs, {"master": 24.51, "sub1": 23.94})
+
+
+def test_an_affordable_leg_under_the_floor_does_not_blame_the_budget():
+    """Nothing was scaled, so money is not the problem and saying so misleads.
+
+    $40 a leg needs $8 of margin against $240 available -- the sizes are used
+    exactly as written. The refusal is the market's own $50 floor, and telling
+    the operator to deposit funds sends them to fix something that is not wrong.
+    """
+    legs = [leg(BTC, 40 / PRICES[BTC]), leg(ETH, 40 / PRICES[ETH])]
+    with pytest.raises(InsufficientMargin) as caught:
+        plan(legs, {"master": 240.0, "sub1": 240.0})
+
+    message = str(caught.value)
+    assert "Nothing was scaled down" in message
+    assert f"at least ${SPECS[ETH].min_notional:g}" in message
+    # The two explanations that would be wrong here.
+    assert "Fund the accounts" not in message
+    assert "apart in dollar terms" not in message
