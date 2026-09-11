@@ -12,6 +12,8 @@ a menu entry that silently does nothing is worse than one that admits it.
 from __future__ import annotations
 
 import asyncio
+import pathlib
+import shutil
 from collections.abc import Callable
 
 import requests
@@ -280,6 +282,163 @@ def _encrypt_key(config: Config) -> None:
     _pause()
 
 
+def _human_size(total: float) -> str:
+    for unit in ("B", "KB", "MB"):
+        if total < 1024 or unit == "MB":
+            return f"{total:,.0f} {unit}" if unit == "B" else f"{total:,.1f} {unit}"
+        total /= 1024.0
+    return f"{total:,.1f} MB"
+
+
+def _size_of(path: pathlib.Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def _cache_dirs(root: pathlib.Path) -> list[pathlib.Path]:
+    """Compiled bytecode and lint caches.
+
+    Worth offering because a .pyc embeds the absolute path of the source it was
+    compiled from, so these carry the operator's username off the machine if the
+    folder is ever shared. They regenerate on the next run, which is what makes
+    them safe to remove -- unlike .venv, which is the install itself and is
+    deliberately not listed here.
+    """
+    found = [d for d in root.rglob("__pycache__") if ".venv" not in d.parts]
+    found += [d for d in root.rglob(".ruff_cache") if ".venv" not in d.parts]
+    return sorted(found)
+
+
+def _shown(path: pathlib.Path) -> str:
+    """Relative to the project folder where possible.
+
+    An absolute path in a delete list reads as another machine's file,
+    which is alarming at exactly the wrong moment."""
+    try:
+        return str(path.relative_to(pathlib.Path.cwd()))
+    except ValueError:
+        return str(path)
+
+
+def _delete(path: pathlib.Path) -> str:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    except OSError as exc:
+        return f"  FAILED  {_shown(path)}  ({exc})"
+    return f"  deleted {_shown(path)}"
+
+
+def _live_cycle_warning(state_file: pathlib.Path) -> str | None:
+    """Whether the state file says a cycle may still be open on the exchange.
+
+    Read from disk rather than from the exchange: this runs without connecting,
+    and a file that says OPEN is exactly the case worth warning about.
+    """
+    from .state import Phase, StateStore
+
+    try:
+        state = StateStore(str(state_file)).load()
+    except Exception:  # noqa: BLE001 - an unreadable file warns about nothing
+        return None
+    if state.phase in (Phase.IDLE, Phase.COMPLETE):
+        return None
+    return (
+        f"the state file records phase {state.phase.value}. If that is still "
+        f"true on the exchange, deleting it leaves the bot unable to find those "
+        f"positions on the next run. Close All Positions first."
+    )
+
+
+def _erase_targets(config: Config) -> list[tuple[str, str, list[pathlib.Path], str]]:
+    from .config import PRIVATE_KEY_FILE
+
+    return [
+        ("1", "Trading state", [pathlib.Path(config.state_file)],
+         "what the bot has open, and any recorded halt"),
+        ("2", "Private key", [pathlib.Path(PRIVATE_KEY_FILE)],
+         "the key this bot signs with"),
+        ("3", "Build caches", _cache_dirs(pathlib.Path.cwd()),
+         "bytecode and lint caches -- these hold your username"),
+    ]
+
+
+def _erase_data(config: Config) -> None:
+    """Delete what this machine has stored. Nothing here reaches the exchange."""
+    from .config import PRIVATE_KEY_FILE
+
+    state_file = pathlib.Path(config.state_file)
+    key_file = pathlib.Path(PRIVATE_KEY_FILE)
+
+    # _box does not wrap, so these lines are fitted to BOX_WIDTH by hand.
+    # test_erase fails the screen if one of them grows past it.
+    print("\n" + _box("ERASE LOCAL DATA", [
+        "Deletes only what this computer stores.",
+        "Your BULK account, positions and funds are",
+        "untouched. Nothing reaches the exchange.",
+    ]))
+
+    entries = _erase_targets(config)
+    print()
+    for key, label, paths, note in entries:
+        present = [p for p in paths if p.exists()]
+        if not present:
+            print(f"  {key}. {label:14}  nothing to delete")
+            continue
+        size = _human_size(sum(_size_of(p) for p in present))
+        where = _shown(present[0]) if len(present) == 1 else f"{len(present)} folders"
+        print(f"  {key}. {label:14}  {where:34} {size:>10}")
+        print(f"      {note}")
+    print("  9. All of the above")
+    print("  0. back")
+
+    choice = _ask("\n  > ")
+    if choice not in ("1", "2", "3", "9"):
+        return
+
+    wanted = entries if choice == "9" else [e for e in entries if e[0] == choice]
+    targets = [p for _k, _l, paths, _n in wanted for p in paths if p.exists()]
+    if not targets:
+        print("\n  Nothing to delete.")
+        _pause()
+        return
+
+    print("\n  About to delete:")
+    for path in targets:
+        print(f"    {_shown(path)}")
+
+    if state_file in targets:
+        warning = _live_cycle_warning(state_file)
+        if warning:
+            print(f"\n  !!  {warning}")
+
+    if key_file in targets:
+        # Not the usual confirmation. Losing the only copy of a signing key
+        # loses the account itself -- from every tool, not just this one -- and
+        # there is no amount of care afterwards that recovers it.
+        print("\n  !!  THE PRIVATE KEY IS THE ONLY WAY TO SIGN FOR THIS ACCOUNT.")
+        print("      Without another copy, you will not be able to trade or")
+        print("      withdraw from it again -- from anywhere, not just here.")
+        print("      Make sure it is written down somewhere else first.")
+        print("\n      Type 'DELETE KEY' to confirm, anything else aborts.")
+        if _ask("      > ") != "DELETE KEY":
+            print("  aborted")
+            _pause()
+            return
+    elif not _confirm(f"Delete {len(targets)} item(s) from this computer."):
+        print("  aborted")
+        _pause()
+        return
+
+    print()
+    for path in targets:
+        print(_delete(path))
+    _pause()
+
+
 def _accounts_menu(config: Config) -> None:
     from . import keystore
     from .config import PRIVATE_KEY_FILE
@@ -290,7 +449,8 @@ def _accounts_menu(config: Config) -> None:
             "1. Create New Subaccount",
             "2. Balance All Subaccounts",
             f"3. Encrypt Private Key   [{state}]",
-            "4. Back",
+            "4. Erase Local Data",
+            "5. Back",
         ]))
         choice = _ask("\n  > ")
         if choice == "1":
@@ -299,7 +459,9 @@ def _accounts_menu(config: Config) -> None:
             _balance_subaccounts(config)
         elif choice == "3":
             _encrypt_key(config)
-        elif choice in ("4", "0"):
+        elif choice == "4":
+            _erase_data(config)
+        elif choice in ("5", "0"):
             return
 
 
