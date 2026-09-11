@@ -146,7 +146,12 @@ SEALED_INVITE_CODES: tuple[str, ...] = ()
 # the moment the source is, and it is an unconditional pass, so it cannot be
 # read from the config instead. To fill it in the build you run yourself:
 #   python -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" <address>
-SEALED_OWNER_WALLETS: tuple[str, ...] = ()
+SEALED_OWNER_WALLETS: tuple[str, ...] = (
+    # The owner's own trading account. It is not its own referrer -- the
+    # indexer reports it as having arrived by no referral at all -- so
+    # without this entry the gate refuses the person who built it.
+    "3fd0f416f9ebfe2f03c0d8a0d1b77e96ae71b6fef87e330e3ac2372ef2d5074f",
+)
 
 
 def wallet_digest(value: str) -> str:

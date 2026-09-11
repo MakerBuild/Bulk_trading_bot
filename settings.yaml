@@ -90,7 +90,7 @@ hold_minutes: 0.5-1
 # ---------------------------------------------------------------------------
 execution_target:
   cycles: 0                 # number of open/hold/exit cycles; 0 = unlimited
-  burn_usd: 20  # stop once this much has gone to fees
+  burn_usd: 3  # stop once this much has gone to fees
   volume_usd: 0             # stop once this much qualifying volume is done
 
 
