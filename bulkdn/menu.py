@@ -151,7 +151,7 @@ def _history(config: Config) -> None:
     Volume and fees are summed from the fills themselves rather than tracked
     separately, so the numbers cannot drift from what the exchange recorded.
     """
-    from .fees import Realised
+    from .fees import Realised, _fills_page
 
     http = _http(config)
     accounts = _accounts(config)
@@ -161,22 +161,24 @@ def _history(config: Config) -> None:
     for label, pubkey in accounts:
         print(f"\n  {label} {short_pubkey(pubkey)}")
         try:
-            page = http.get_fills_page(pubkey, limit=20)
+            # Raw dicts, not the SDK's parsed model -- see fees._fills_page.
+            rows, _ = _fills_page(http, pubkey, limit=20, cursor=None)
         except Exception as exc:
             print(f"    query failed: {exc}")
             continue
 
-        rows = list(getattr(page, "data", None) or [])
         if not rows:
             print("    no fills")
             continue
 
         print(f"    {'symbol':<10} {'side':<5} {'size':>12} {'price':>12} {'fee':>10}")
         for fill in rows:
-            side = "buy" if fill.is_buy else "sell"
+            side = "buy" if fill.get("isBuy") else "sell"
             print(
-                f"    {fill.symbol:<10} {side:<5} {fill.amount:>12.6f} "
-                f"{fill.price:>12.3f} {fill.fee:>10.4f}"
+                f"    {str(fill.get('symbol', '?')):<10} {side:<5} "
+                f"{float(fill.get('amount') or 0):>12.6f} "
+                f"{float(fill.get('price') or 0):>12.3f} "
+                f"{float(fill.get('fee') or 0):>10.4f}"
             )
         totals = Realised.from_fills(rows, tree)
         grand = grand + totals

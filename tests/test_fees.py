@@ -23,21 +23,58 @@ OUTSIDER = "9J8TUdEWrrcADK913r1Cs7DdqX63VdVU88imfDzT1ypt"
 
 
 def fill(maker, taker, amount=1.0, price=100.0, fee=0.05):
-    return SimpleNamespace(
-        maker=maker, taker=taker, amount=amount, price=price, fee=fee, symbol="SOL-USD"
-    )
+    """One row in the shape the API actually returns.
+
+    A plain dict, and with no `tradeId`: mainnet sends `slot` and `sequence`
+    separately, which is what made the SDK's strict history parser reject the
+    whole page. Nothing here reads either field.
+    """
+    return {
+        "maker": maker,
+        "taker": taker,
+        "amount": amount,
+        "price": price,
+        "fee": fee,
+        "symbol": "SOL-USD",
+        "isBuy": True,
+        "slot": 112226064,
+        "sequence": 14,
+    }
 
 
 class FakeHttp:
-    """Serves one page per account, then stops."""
+    """Serves one page per account, then stops.
+
+    Answers the raw `/account` POST rather than the SDK's `get_fills_page`,
+    because that is what `_fills_page` calls.
+    """
+
+    base_url = "https://example.test/api/v1"
 
     def __init__(self, pages):
         self.pages = pages
         self.calls = []
 
-    def get_fills_page(self, user, **kwargs):
-        self.calls.append((user, kwargs))
-        return SimpleNamespace(data=self.pages.get(user, []), page=None, next_cursor=None)
+    def install(self, monkeypatch):
+        """Answer `_fills_page`'s POST from `self.pages`."""
+
+        class Response:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"data": self._rows, "page": {"nextCursor": None}}
+
+        def fake_post(url, json, timeout):
+            user = json["user"]
+            self.calls.append((user, json))
+            return Response(self.pages.get(user, []))
+
+        monkeypatch.setattr("bulkdn.fees.requests.post", fake_post)
+        return self
 
 
 # -- schedule ---------------------------------------------------------------
@@ -106,9 +143,9 @@ def test_account_fee_tier_returns_none_on_404(monkeypatch):
 # -- realised ---------------------------------------------------------------
 
 
-def test_self_trades_are_excluded_from_qualifying_volume():
+def test_self_trades_are_excluded_from_qualifying_volume(monkeypatch):
     """Both sides inside the tree: real spend, no tier credit."""
-    http = FakeHttp({MASTER: [fill(MASTER, SUB)], SUB: [fill(MASTER, SUB)]})
+    http = FakeHttp({MASTER: [fill(MASTER, SUB)], SUB: [fill(MASTER, SUB)]}).install(monkeypatch)
     totals = realised_for_tree(http, [MASTER, SUB])
 
     assert totals.fills == 2
@@ -119,24 +156,60 @@ def test_self_trades_are_excluded_from_qualifying_volume():
     assert totals.fees_usd == 0.1
 
 
-def test_external_counterparty_counts_toward_qualifying_volume():
-    http = FakeHttp({MASTER: [fill(MASTER, OUTSIDER)], SUB: []})
+def test_external_counterparty_counts_toward_qualifying_volume(monkeypatch):
+    http = FakeHttp({MASTER: [fill(MASTER, OUTSIDER)], SUB: []}).install(monkeypatch)
     totals = realised_for_tree(http, [MASTER, SUB])
 
     assert totals.self_trade_volume_usd == 0.0
     assert totals.qualifying_volume_usd == 100.0
 
 
-def test_a_mixed_history_splits_correctly():
+def test_a_mixed_history_splits_correctly(monkeypatch):
     http = FakeHttp({
         MASTER: [fill(MASTER, SUB), fill(OUTSIDER, MASTER, amount=2.0)],
         SUB: [],
-    })
+    }).install(monkeypatch)
     totals = realised_for_tree(http, [MASTER, SUB])
 
     assert totals.volume_usd == 300.0
     assert totals.self_trade_volume_usd == 100.0
     assert totals.qualifying_volume_usd == 200.0
+
+
+def test_fills_without_a_trade_id_are_counted(monkeypatch):
+    """The regression that emptied History and Progress.
+
+    Mainnet sends `slot` and `sequence` separately and no `tradeId` at all.
+    The SDK's history parser raises `tradeId must be <slot>:<sequence>` on
+    that, which took out the whole page -- so fills are read as raw dicts and
+    the id is never touched.
+    """
+    row = fill(MASTER, OUTSIDER)
+    assert "tradeId" not in row
+
+    http = FakeHttp({MASTER: [row], SUB: []}).install(monkeypatch)
+    totals = realised_for_tree(http, [MASTER, SUB])
+
+    assert totals.fills == 1
+    assert totals.volume_usd == 100.0
+
+
+def test_a_page_returned_as_a_bare_list_is_accepted(monkeypatch):
+    """History queries answer {data, page}; a shape change should degrade to
+    no rows rather than an exception."""
+    from bulkdn.fees import _fills_page
+
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return [fill(MASTER, OUTSIDER)]
+
+    monkeypatch.setattr("bulkdn.fees.requests.post", lambda url, json, timeout: Response())
+    rows, cursor = _fills_page(FakeHttp({}), MASTER, limit=20, cursor=None)
+    assert len(rows) == 1
+    assert cursor is None
 
 
 def test_totals_add():
@@ -147,8 +220,8 @@ def test_totals_add():
     assert total.qualifying_volume_usd == 25.0
 
 
-def test_every_account_in_the_tree_is_walked():
-    http = FakeHttp({MASTER: [], SUB: []})
+def test_every_account_in_the_tree_is_walked(monkeypatch):
+    http = FakeHttp({MASTER: [], SUB: []}).install(monkeypatch)
     realised_for_tree(http, [MASTER, SUB])
     assert [user for user, _ in http.calls] == [MASTER, SUB]
 

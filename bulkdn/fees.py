@@ -146,14 +146,17 @@ class Realised:
         `tree` is every pubkey under the same master. A fill with both sides
         inside it is real spend that earns no tier credit, which is why the two
         are counted separately rather than netted.
+
+        Rows are plain dicts straight from the API. See `_fills_page` for why
+        they are not the SDK's parsed model.
         """
         total = cls()
         for fill in rows:
-            notional = float(fill.amount) * float(fill.price)
+            notional = float(fill.get("amount") or 0.0) * float(fill.get("price") or 0.0)
             total.fills += 1
-            total.fees_usd += float(fill.fee)
+            total.fees_usd += float(fill.get("fee") or 0.0)
             total.volume_usd += notional
-            if fill.maker in tree and fill.taker in tree:
+            if fill.get("maker") in tree and fill.get("taker") in tree:
                 total.self_trade_volume_usd += notional
         return total
 
@@ -164,6 +167,40 @@ class Realised:
             volume_usd=self.volume_usd + other.volume_usd,
             self_trade_volume_usd=self.self_trade_volume_usd + other.self_trade_volume_usd,
         )
+
+
+def _fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[dict], str | None]:
+    """Fetch one page of fills as raw dicts.
+
+    Deliberately not `http.get_fills_page`. The SDK parses every row into
+    `HistoryFill`, whose `TradeId.from_api` raises
+
+        ValueError: tradeId must be <slot>:<sequence>
+
+    when the field is absent -- and mainnet does not send it. The API returns
+    `slot` and `sequence` as separate integers instead, so the SDK's strict
+    parser rejects a perfectly good response and takes the whole history with
+    it. Nothing here needs a trade id; only amount, price, fee and the two
+    sides are read.
+    """
+    payload: dict = {"type": "fills", "user": user, "limit": limit}
+    if cursor:
+        payload["cursor"] = cursor
+
+    response = requests.post(f"{http.base_url}/account", json=payload, timeout=30)
+    response.raise_for_status()
+    body = response.json()
+
+    # A history query answers with {data, page}; a current-state query answers
+    # with a bare list. Both are accepted so a shape change degrades to "no
+    # rows" rather than an exception.
+    if isinstance(body, list):
+        return [row for row in body if isinstance(row, dict)], None
+
+    rows = [row for row in (body.get("data") or []) if isinstance(row, dict)]
+    page = body.get("page") or {}
+    next_cursor = page.get("nextCursor") or page.get("next_cursor")
+    return rows, next_cursor
 
 
 def realised_for_account(
@@ -180,16 +217,8 @@ def realised_for_account(
     total = Realised()
     cursor = None
     for _ in range(max_pages):
-        page = (
-            http.get_fills_page(user, limit=limit, cursor=cursor)
-            if cursor
-            else http.get_fills_page(user, limit=limit)
-        )
-        rows = list(getattr(page, "data", None) or [])
+        rows, cursor = _fills_page(http, user, limit, cursor)
         total = total + Realised.from_fills(rows, tree)
-        cursor = getattr(getattr(page, "page", None), "next_cursor", None) or getattr(
-            page, "next_cursor", None
-        )
         if not cursor or not rows:
             break
     return total
