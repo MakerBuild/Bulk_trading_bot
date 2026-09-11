@@ -306,6 +306,7 @@ def _access_from_dict(raw: Any) -> AccessConfig:
         codes=as_list(raw.get("codes", raw.get("code"))),
         wallets=as_list(raw.get("wallets", raw.get("wallet"))),
         owner_wallets=as_list(raw.get("owner_wallets", raw.get("owner_wallet"))),
+        invite_codes=as_list(raw.get("invite_codes", raw.get("invite_code"))),
         allow_on_error=bool(raw.get("allow_on_error", False)),
     )
     try:

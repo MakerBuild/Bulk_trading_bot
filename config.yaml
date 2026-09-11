@@ -108,21 +108,28 @@ telegram:
   bot_token: ""             # from @BotFather, looks like "12345:AAE..."
   user_ids: []              # e.g. [21957123] -- your numeric Telegram id
 
-# Referral gating: run only for accounts that signed up under your code.
+# Referral gating: run only for accounts that came in through you.
 # Checked once at startup against BULK's public indexer, never mid-cycle --
 # a gate that tripped mid-run would abandon open positions.
 #
 # Note this is a speed bump, not enforcement: it runs on the user's machine
 # in source they can edit. It stops the bot being passed around casually.
 #
+# People arrive by two separate routes, and `wallets` covers BOTH: it is
+# matched against referred_by_wallet AND access.invited_by_wallet. That one
+# address admits everyone you referred (15) and everyone who redeemed one of
+# your invites (32), and keeps working as invite codes are reissued weekly --
+# which is why listing individual invite codes is not the way to do this.
+#
 # owner_wallets is not optional in practice: the check asks who referred a
 # wallet, and a referrer was not referred by themselves -- so without it the
-# gate refuses its own author. Your trading master belongs here.
+# gate refuses its own author. Your own wallets belong here.
 access:
   require_referral: false   # flip to true for a build you hand out
-  codes: ["MAKER"]          # your code, matched case-insensitively
-  wallets:                  # your referrer wallet; stronger than a code
+  wallets:                  # matched against referrers AND inviters
     - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"
+  codes: ["MAKER"]          # referral code, matched case-insensitively
+  invite_codes: []          # individual BULK-XXX-XXX codes; goes stale, prefer wallets
   owner_wallets:            # run unconditionally, no referral record needed
     - "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"  # trading master
     - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"  # referral wallet

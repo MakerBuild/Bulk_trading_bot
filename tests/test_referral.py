@@ -27,6 +27,19 @@ NO_REFERRER = {
     "referred_by_code": None,
     "referred_qualified": None,
 }
+# Arrived by invite rather than referral: referred_by_* stay null and the
+# origin lives under `access`. Most accounts look like this.
+INVITED = {
+    "wallet": WALLET,
+    "referral_code": None,
+    "referred_by_wallet": None,
+    "referred_by_code": None,
+    "access": {
+        "has_access": True,
+        "invited_by_code_id": "BULK-EDA-QQF",
+        "invited_by_wallet": REFERRER,
+    },
+}
 
 
 class FakeResponse:
@@ -145,6 +158,61 @@ def test_denies_a_wallet_with_no_referrer(monkeypatch):
     assert "did not sign up" in decision.reason
 
 
+def test_one_wallet_admits_both_referred_and_invited(monkeypatch):
+    """The point of matching on wallet: two routes, one configured address.
+
+    Most accounts arrive by invite, not referral -- for the owner's wallet the
+    split was 15 referred against 32 invited -- so a gate reading only
+    referred_by_* would refuse most of the people it should admit.
+    """
+    config = AccessConfig(require_referral=True, wallets=[REFERRER])
+
+    _serve(monkeypatch, FakeResponse(200, REFERRED))
+    referred = check_access(WALLET, config)
+
+    _serve(monkeypatch, FakeResponse(200, INVITED))
+    invited = check_access(WALLET, config)
+
+    assert referred.allowed and "referred by wallet" in referred.reason
+    assert invited.allowed and "invited by wallet" in invited.reason
+
+
+def test_invited_wallet_is_denied_for_a_different_inviter(monkeypatch):
+    _serve(monkeypatch, FakeResponse(200, INVITED))
+    decision = check_access(
+        WALLET, AccessConfig(require_referral=True, wallets=["SomeoneElse"])
+    )
+    assert not decision.allowed
+    assert "invite code BULK-EDA-QQF" in decision.reason
+
+
+def test_an_explicit_invite_code_is_accepted(monkeypatch):
+    _serve(monkeypatch, FakeResponse(200, INVITED))
+    decision = check_access(
+        WALLET,
+        AccessConfig(require_referral=True, invite_codes=["bulk-eda-qqf"]),
+    )
+    assert decision.allowed
+    assert "invited by code" in decision.reason
+
+
+def test_missing_access_block_is_not_an_error(monkeypatch):
+    """Older records have no `access` key at all."""
+    _serve(monkeypatch, FakeResponse(200, REFERRED))
+    status = fetch_referral(WALLET)
+    assert status.invited_by_wallet is None
+    assert status.has_referrer
+
+
+def test_neither_route_is_denied_with_a_clear_reason(monkeypatch):
+    _serve(monkeypatch, FakeResponse(200, NO_REFERRER))
+    decision = check_access(
+        WALLET, AccessConfig(require_referral=True, wallets=[REFERRER])
+    )
+    assert not decision.allowed
+    assert "referral or invite" in decision.reason
+
+
 def test_owner_wallet_runs_without_a_referral(monkeypatch):
     """The gate must not lock out its own author.
 
@@ -221,7 +289,7 @@ def test_config_accepts_a_single_unwrapped_code():
 
 def test_enabled_with_no_allowlist_is_an_error():
     """Would refuse every account, including the owner's."""
-    with pytest.raises(ConfigError, match="no codes, wallets, or owner_wallets"):
+    with pytest.raises(ConfigError, match="no codes, wallets, invite_codes"):
         _access_from_dict({"require_referral": True})
 
 
