@@ -156,6 +156,10 @@ SEALED_OWNER_WALLETS: tuple[str, ...] = (
     # account. It was in the config's owner_wallets before sealing; leaving it
     # out here locked the owner out of their own second wallet.
     "e87f0b26a48973d7ec3318929d8516debfa7d92dc2ca6d4557d7368f37c7041c",
+    # A third account of the owner's. Like the trading one, the indexer reports
+    # it as `source: redeemed, inviter_kind: admin` -- admitted by BULK rather
+    # than by a wallet -- so there is nothing public for the gate to match on.
+    "0bdac4b3d7aec10a53660957141834076f528e9d1a40b8a933299981455b6b6c",
 )
 
 
