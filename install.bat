@@ -5,11 +5,32 @@ rem Safe to re-run; it upgrades an existing install in place.
 setlocal
 cd /d "%~dp0"
 
+rem Both prerequisites are checked before anything is downloaded. Finding out
+rem git is missing halfway through a 200MB install is a poor way to learn it.
 where python >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo   Python is not on PATH. Install Python 3.10 or newer from
-    echo   https://www.python.org/downloads/ and tick "Add Python to PATH".
+    echo   Python is not installed, or was installed without "Add to PATH".
+    echo.
+    echo   Get it from https://www.python.org/downloads/ and TICK THE BOX
+    echo   "Add python.exe to PATH" at the bottom of the installer.
+    echo.
+    echo   Full walkthrough: docs\INSTALL.md
+    echo.
+    pause
+    exit /b 1
+)
+
+where git >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   git is not installed. It is needed to fetch the BULK library.
+    echo.
+    echo   Get it from https://git-scm.com/downloads and keep every default.
+    echo   Then CLOSE THIS WINDOW and run install.bat again -- an open console
+    echo   does not pick up a newly installed program.
+    echo.
+    echo   Full walkthrough: docs\INSTALL.md
     echo.
     pause
     exit /b 1

@@ -12,11 +12,14 @@ pair stays close to market-neutral while it trades.
 ## Install
 
 1. **Install Python 3.10 or newer** from [python.org](https://www.python.org/downloads/).
-   Tick **"Add Python to PATH"** in the installer.
-2. **Install git** from [git-scm.com](https://git-scm.com/downloads) — the SDK is
-   fetched from GitHub.
-3. **Double-click `install.bat`.** It builds a local environment and installs
-   everything. Safe to re-run.
+   Tick **"Add python.exe to PATH"** in the installer — without it nothing else works.
+2. **Install git** from [git-scm.com](https://git-scm.com/downloads), keeping every
+   default. The BULK library is fetched from GitHub.
+3. **Double-click `install.bat`.** It builds a local environment, installs
+   everything, and checks that transaction signing works. Safe to re-run.
+
+Never done this before? **[docs/INSTALL.md](docs/INSTALL.md)** walks through it
+step by step, in Russian, including what to do when something fails.
 
 ---
 
