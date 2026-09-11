@@ -1,7 +1,8 @@
 # BULK delta-neutral bot
 
-Runs a hedged BTC/SOL cycle across your BULK master account and one of its
-sub-accounts. Every fill on one side is immediately offset on the other, so the
+Runs a hedged two-market cycle across your BULK master account and one of its
+sub-accounts. Which two markets is up to you; the defaults are BTC-USD and
+ETH-USD. Every fill on one side is immediately offset on the other, so the
 pair stays close to market-neutral while it trades.
 
 > **Mainnet only. This trades real money.** There is no test network to
@@ -43,6 +44,10 @@ Open `settings.yaml`. Everything you normally change is in the first half:
 which pairs, how much per cycle, leverage, how long to hold, when to stop, and
 the safety limits. Each option says what it does.
 
+Sizes are in dollars -- `notional_usd: 100` is $100 of whatever `symbol` names,
+converted to a quantity at the current price when the bot starts. The hold can
+be a range, `hold_minutes: 0.5-1`, drawn fresh each cycle.
+
 **3. An account with money in it**
 
 A BULK account is created by depositing USDC on BULK itself — the bot cannot do
@@ -60,7 +65,7 @@ that for you. Once the master has a balance, create a sub-account from
 1. Start                  begin trading
 2. Active Strategy        what is open right now
 3. History                past fills
-4. Accounts Management    sub-accounts, balances, key encryption
+4. Accounts Management    sub-accounts, balances, key, erase local data
 5. Configuration          targets and progress
 6. Close All Positions    cancel everything and flatten
 ```
@@ -81,7 +86,7 @@ closes both accounts.
 ## What it does
 
 ```
-OPEN    master buys BTC        sub-account buys SOL
+OPEN    master buys the first   sub-account buys the second
         each fill is hedged on the other account as it happens
 
 HOLD    stays open for hold_minutes, keeping the pair balanced
@@ -96,10 +101,11 @@ The bot stops itself and closes everything if a safety limit in `risk` is
 breached: too much one-sided exposure, a position that grew too large, repeated
 rejected orders, or a dead market-data connection.
 
-**One thing worth knowing:** BULK will not accept a SOL order under $50 or a BTC
-order under $1. A hedge smaller than that cannot be sent at all, so the pair can
-carry up to about $50 of one-sided SOL exposure that no hedge can remove. That
-is a floor set by the exchange, not something the bot can tune away.
+**One thing worth knowing:** every market sets a minimum order -- $1 on BTC-USD,
+$50 on ETH-USD and SOL-USD. A hedge smaller than the floor cannot be sent at
+all, so a pair can carry up to that much one-sided exposure that no hedge will
+remove. That is set by the exchange, not something the bot can tune away, which
+is why a market with a low floor makes a calmer second leg.
 
 ---
 

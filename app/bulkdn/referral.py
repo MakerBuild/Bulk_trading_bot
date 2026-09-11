@@ -89,9 +89,20 @@ class AccessConfig:
 
     @property
     def enabled(self) -> bool:
+        """Whether THIS CONFIG asks for gating. Not whether gating happens.
+
+        A sealed build gates regardless of what the config says, so nothing
+        outside `check_access` should branch on this -- guarding the call with
+        it is the same bypass as emptying the allow-list.
+        """
         return self.require_referral
 
     def validate(self) -> None:
+        # Skipped when the build is sealed: the allow-list is compiled in, so
+        # an empty config block is the normal case rather than a mistake that
+        # would refuse everyone.
+        if is_sealed():
+            return
         if self.require_referral and not (
             self.codes or self.wallets or self.owner_wallets or self.invite_codes
         ):
@@ -163,7 +174,6 @@ class _Allowed:
     owner_wallets: frozenset[str]
     allow_on_error: bool
     enabled: bool
-    sealed: bool
 
 
 def _allowed(config: AccessConfig) -> _Allowed:
@@ -181,7 +191,6 @@ def _allowed(config: AccessConfig) -> _Allowed:
             owner_wallets=frozenset(SEALED_OWNER_WALLETS),
             allow_on_error=False,
             enabled=True,
-            sealed=True,
         )
     return _Allowed(
         wallets=frozenset(wallet_digest(w) for w in config.wallets if w.strip()),
@@ -190,7 +199,6 @@ def _allowed(config: AccessConfig) -> _Allowed:
         owner_wallets=frozenset(wallet_digest(w) for w in config.owner_wallets if w.strip()),
         allow_on_error=config.allow_on_error,
         enabled=config.require_referral,
-        sealed=False,
     )
 
 
