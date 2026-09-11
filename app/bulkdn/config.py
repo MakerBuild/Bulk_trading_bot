@@ -181,21 +181,26 @@ class ExecutionTarget:
     """
 
     cycles: int = 1
+    # Target for the fee total. Positive stops once that much has been paid;
+    # negative stops once that much has been earned, which is the shape of a
+    # maker-heavy cycle where rebates outweigh taker fees. 0 disables it.
     burn_usd: float = 0.0
     volume_usd: float = 0.0
 
     def validate(self) -> None:
         if self.cycles < 0:
             raise ConfigError("execution_target.cycles must be >= 0 (0 = unlimited)")
-        if self.burn_usd < 0:
-            raise ConfigError("execution_target.burn_usd must be >= 0")
+        # Deliberately unsigned-checked. `burn_usd` is a target for the fee
+        # TOTAL, and a maker whose rebates exceed their taker fees has a
+        # negative total -- for them the goal is -3, not 3, and refusing it
+        # would leave them with a target that can never be reached.
         if self.volume_usd < 0:
             raise ConfigError("execution_target.volume_usd must be >= 0")
 
     @property
     def measures_fills(self) -> bool:
         """Whether anything here needs the fill history read."""
-        return self.burn_usd > 0 or self.volume_usd > 0
+        return self.burn_usd != 0 or self.volume_usd > 0
 
 
 @dataclass(frozen=True)

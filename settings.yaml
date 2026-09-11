@@ -87,10 +87,21 @@ hold_minutes: 0.5-1
 #  Whichever limit is hit first ends the run. 0 disables that limit.
 #  Spend and volume are read from the exchange's own fill records, so they
 #  survive a restart and match what you were actually charged.
+#
+#  burn_usd is a target for the fee TOTAL, and it carries a sign:
+#
+#    burn_usd: 3     stop once $3 has been PAID in fees
+#    burn_usd: -3    stop once $3 has been EARNED
+#
+#  Which one you want depends on the cycle. The resting side of each leg earns
+#  a maker rebate and the hedge pays a taker fee, so a pair that fills mostly
+#  on the resting side runs a negative total -- and a positive target would
+#  then never be reached, because the number is moving the other way. Check the
+#  sign of `burn progress` in the log and match it.
 # ---------------------------------------------------------------------------
 execution_target:
   cycles: 0                 # number of open/hold/exit cycles; 0 = unlimited
-  burn_usd: 3  # stop once this much has gone to fees
+  burn_usd: -3              # stop once $3 has been earned in fees
   volume_usd: 0             # stop once this much qualifying volume is done
 
 

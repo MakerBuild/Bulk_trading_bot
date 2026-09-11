@@ -639,7 +639,7 @@ class Strategy:
             return ""
 
         parts = []
-        if target.burn_usd > 0:
+        if target.burn_usd != 0:
             parts.append(f"burn ${totals.fees_usd:,.4f} / ${target.burn_usd:,.2f}")
         if target.volume_usd > 0:
             parts.append(
@@ -675,7 +675,12 @@ class Strategy:
             log.warning("could not read fill history for the execution target: %s", exc)
             return None
 
-        if target.burn_usd > 0 and totals.fees_usd >= target.burn_usd:
+        # Reached from whichever side the target sits on: paying up to +3, or
+        # earning down to -3. One comparison cannot serve both.
+        burn_reached = (
+            target.burn_usd > 0 and totals.fees_usd >= target.burn_usd
+        ) or (target.burn_usd < 0 and totals.fees_usd <= target.burn_usd)
+        if burn_reached:
             return (
                 f"burned ${totals.fees_usd:,.4f} of ${target.burn_usd:,.2f}"
             )
@@ -685,7 +690,7 @@ class Strategy:
                 f"of ${target.volume_usd:,.2f}"
             )
 
-        if target.burn_usd > 0:
+        if target.burn_usd != 0:
             log.info(
                 "burn progress: $%.4f / $%.2f", totals.fees_usd, target.burn_usd
             )
