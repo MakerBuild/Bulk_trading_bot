@@ -1,3 +1,10 @@
+# This file is marked hidden on Windows, so an operator browsing the folder
+# sees only the files they actually use -- the same reason .git is hidden.
+#
+# Windows refuses a truncating write to a hidden file, so to edit it:
+#   attrib -h .gitignore   edit   attrib +h .gitignore
+# git reads it either way; the attribute is invisible to it.
+
 .venv/
 __pycache__/
 *.py[cod]

@@ -93,6 +93,11 @@ if not exist "private_key.local" (
     echo   Created private_key.local for your key.
 )
 
+rem Hide the repo's own bookkeeping, so the folder shows only the four files
+rem an operator uses. git reads .gitignore regardless of the attribute, the
+rem same way it hides .git itself.
+if exist ".gitignore" attrib +h ".gitignore" >nul 2>&1
+
 echo.
 "%VENV_PY%" -c "from bulk_api.common import SignatureDomain; print('  Signing check: OK')" 2>nul
 if errorlevel 1 (

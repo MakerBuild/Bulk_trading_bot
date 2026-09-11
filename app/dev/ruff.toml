@@ -3,6 +3,11 @@
 target-version = "py310"
 line-length = 100
 
+# Kept out of the project root, where an operator would see it and wonder.
+# Everything they do not touch lives under app/, and a lint cache is not an
+# exception.
+cache-dir = "app/dev/.ruff_cache"
+
 [lint]
 select = ["F", "E", "W", "UP", "B", "SIM", "ARG", "RET", "C4", "PIE", "PL"]
 ignore = [
