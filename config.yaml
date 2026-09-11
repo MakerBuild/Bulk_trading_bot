@@ -114,16 +114,24 @@ telegram:
 #
 # Note this is a speed bump, not enforcement: it runs on the user's machine
 # in source they can edit. It stops the bot being passed around casually.
+#
+# owner_wallets is not optional in practice: the check asks who referred a
+# wallet, and a referrer was not referred by themselves -- so without it the
+# gate refuses its own author. Your trading master belongs here.
 access:
-  require_referral: false
-  codes: []                 # e.g. ["VAULT"] -- matched case-insensitively
-  wallets: []               # your referrer wallet(s); stronger than a code
+  require_referral: false   # flip to true for a build you hand out
+  codes: ["MAKER"]          # your code, matched case-insensitively
+  wallets:                  # your referrer wallet; stronger than a code
+    - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"
+  owner_wallets:            # run unconditionally, no referral record needed
+    - "BR4SV1CRKygGWCsb1zF3g38Xc68b31WkEagdk8hVedB8"  # trading master
+    - "2xW5fXY766e9FbSen855Z8cPnJVWEsPorbShj7Hhhfd1"  # referral wallet
   allow_on_error: false     # true = run anyway if the indexer is unreachable
 
 # Execution target: whichever limit is reached first ends the run.
 # 0 disables a limit. burn_usd and volume_usd are measured from the
 # exchange's own fill records, so they survive a restart.
 execution_target:
-  cycles: 1
+  cycles: 0
   burn_usd: 100
   volume_usd: 0

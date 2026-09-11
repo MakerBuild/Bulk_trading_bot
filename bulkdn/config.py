@@ -305,6 +305,7 @@ def _access_from_dict(raw: Any) -> AccessConfig:
         require_referral=bool(raw.get("require_referral", False)),
         codes=as_list(raw.get("codes", raw.get("code"))),
         wallets=as_list(raw.get("wallets", raw.get("wallet"))),
+        owner_wallets=as_list(raw.get("owner_wallets", raw.get("owner_wallet"))),
         allow_on_error=bool(raw.get("allow_on_error", False)),
     )
     try:

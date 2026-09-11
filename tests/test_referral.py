@@ -145,6 +145,39 @@ def test_denies_a_wallet_with_no_referrer(monkeypatch):
     assert "did not sign up" in decision.reason
 
 
+def test_owner_wallet_runs_without_a_referral(monkeypatch):
+    """The gate must not lock out its own author.
+
+    A referrer was not referred by themselves, so the owner's wallet has a null
+    referrer and every code check fails for it.
+    """
+    _serve(monkeypatch, FakeResponse(200, NO_REFERRER))
+    decision = check_access(
+        WALLET,
+        AccessConfig(require_referral=True, codes=["VAULT"], owner_wallets=[WALLET]),
+    )
+    assert decision.allowed
+    assert decision.reason == "owner wallet"
+
+
+def test_owner_wallet_skips_the_indexer_entirely(monkeypatch):
+    """So the owner can still run while the indexer is down."""
+    def boom(url, timeout):
+        raise AssertionError("the indexer must not be contacted for an owner wallet")
+
+    monkeypatch.setattr(requests, "get", boom)
+    decision = check_access(
+        WALLET, AccessConfig(require_referral=True, owner_wallets=[WALLET])
+    )
+    assert decision.allowed
+
+
+def test_owner_list_alone_satisfies_validation():
+    """An owner-only build is a legitimate configuration, not an empty allowlist."""
+    cfg = _access_from_dict({"require_referral": True, "owner_wallet": WALLET})
+    assert cfg.owner_wallets == [WALLET]
+
+
 def test_indexer_outage_denies_by_default(monkeypatch):
     """Fail closed: the gate only blocks startup, so it cannot strand positions."""
     def boom(url, timeout):
@@ -188,7 +221,7 @@ def test_config_accepts_a_single_unwrapped_code():
 
 def test_enabled_with_no_allowlist_is_an_error():
     """Would refuse every account, including the owner's."""
-    with pytest.raises(ConfigError, match="no codes or wallets"):
+    with pytest.raises(ConfigError, match="no codes, wallets, or owner_wallets"):
         _access_from_dict({"require_referral": True})
 
 

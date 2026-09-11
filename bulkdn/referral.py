@@ -51,6 +51,14 @@ class AccessConfig:
     require_referral: bool = False
     codes: list[str] = field(default_factory=list)
     wallets: list[str] = field(default_factory=list)
+    # Accounts that may run regardless of who referred them.
+    #
+    # Without this the gate locks out its own author: the check asks "who
+    # referred you", and a referrer was not referred by themselves, so the
+    # owner's own wallets come back with a null referrer and are refused.
+    # Checked before the indexer is contacted, so the owner can also run while
+    # it is down.
+    owner_wallets: list[str] = field(default_factory=list)
     # The gate only ever blocks startup, so refusing on an indexer outage
     # cannot strand open positions -- which is why it defaults to closed.
     allow_on_error: bool = False
@@ -60,10 +68,11 @@ class AccessConfig:
         return self.require_referral
 
     def validate(self) -> None:
-        if self.require_referral and not (self.codes or self.wallets):
+        if self.require_referral and not (self.codes or self.wallets or self.owner_wallets):
             raise ValueError(
-                "access.require_referral is on but no codes or wallets are listed -- "
-                "that would refuse every account, including yours"
+                "access.require_referral is on but no codes, wallets, or "
+                "owner_wallets are listed -- that would refuse every account, "
+                "including yours"
             )
 
 
@@ -143,6 +152,11 @@ def check_access(
     """
     if not config.enabled:
         return AccessDecision(True, "referral gating is off")
+
+    # Before the network call: the owner should not be locked out by their own
+    # gate, nor by an indexer outage.
+    if wallet in set(config.owner_wallets):
+        return AccessDecision(True, "owner wallet")
 
     try:
         status = fetch_referral(wallet, base_url=base_url)
