@@ -42,7 +42,7 @@ legs:
 # ---------------------------------------------------------------------------
 #  HOW LONG TO HOLD
 # ---------------------------------------------------------------------------
-hold_minutes: 5.0           # time fully open before the exit phase starts
+hold_minutes: 0.5           # time fully open before the exit phase starts
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ hold_minutes: 5.0           # time fully open before the exit phase starts
 # ---------------------------------------------------------------------------
 execution_target:
   cycles: 0                 # number of open/hold/exit cycles; 0 = unlimited
-  burn_usd: 100             # stop once this much has gone to fees
+  burn_usd: 20  # stop once this much has gone to fees
   volume_usd: 0             # stop once this much qualifying volume is done
 
 
@@ -79,17 +79,6 @@ risk:
   ws_stale_timeout_s: 30.0      # no market data for this long => stop
   price_stale_timeout_s: 15.0   # refuse to re-price on a stale quote
 
-
-# ---------------------------------------------------------------------------
-#  NOTIFICATIONS (optional)
-#
-#  The bot runs unattended and can stop itself on a safety limit. Without
-#  this, that only appears in a console nobody is watching.
-#  Get a token from @BotFather; get your numeric id from @userinfobot.
-# ---------------------------------------------------------------------------
-telegram:
-  bot_token: ""             # e.g. "12345:AAE..."; empty disables notifications
-  user_ids: []              # e.g. [21957123]
 
 
 # ===========================================================================
