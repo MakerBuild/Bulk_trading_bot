@@ -127,17 +127,26 @@ def test_allow_on_error_cannot_turn_an_outage_into_a_pass(monkeypatch):
 def test_the_address_is_not_in_the_source():
     """A reader gets a digest, not the value to substitute."""
     import pathlib
+    import re
 
     source = pathlib.Path(referral.__file__).read_text(encoding="utf-8")
     for sealed_value in referral.SEALED_WALLETS:
-        assert len(sealed_value) == 64, "not a sha256 digest"
-    # The shipped constants are digests; no base58 address sits beside them.
-    assert "2xW5" not in source
+        assert re.fullmatch(r"[0-9a-f]{64}", sealed_value), "not a sha256 digest"
+
+    # And nothing address-shaped sits beside them. Written as a search rather
+    # than a comparison against the real address, so this test does not carry
+    # the value it exists to keep out of the file.
+    #
+    # The digests are removed first: hex is a subset of the base58 alphabet, so
+    # a digest matches the pattern for an address and would mask a real one.
+    block = source[source.index("SEALED_WALLETS"):source.index("def wallet_digest")]
+    block = re.sub(r"[0-9a-f]{64}", "", block)
+    assert not re.search(r"[1-9A-HJ-NP-Za-km-z]{32,44}", block)
 
 
 def test_digests_fold_case_for_codes_but_not_for_wallets():
     """base58 is case-sensitive: a near-match is a different key, not a typo."""
-    assert referral.code_digest(" maker ") == referral.code_digest("MAKER")
+    assert referral.code_digest(" example ") == referral.code_digest("EXAMPLE")
     assert referral.wallet_digest("ABC") != referral.wallet_digest("abc")
     assert referral.wallet_digest(" ABC ") == referral.wallet_digest("ABC")
 
