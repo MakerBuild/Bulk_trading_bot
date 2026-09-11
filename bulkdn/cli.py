@@ -56,7 +56,7 @@ class Runtime:
     def __init__(self, config: Config, dry_run: bool):
         self.config = config
         self.dry_run = dry_run
-        self.symbols = [config.btc.symbol, config.sol.symbol]
+        self.symbols = [config.master_account.symbol, config.sub_account.symbol]
 
         # Must be installed before any client is constructed: it repairs fill
         # parsing and TLS handling inside the SDK itself.
@@ -157,7 +157,7 @@ class Runtime:
         """
         wanted = {
             leg.symbol: leg.leverage
-            for leg in (self.config.btc, self.config.sol)
+            for leg in (self.config.master_account, self.config.sub_account)
             if leg.leverage is not None
         }
         if not wanted:

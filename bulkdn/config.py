@@ -138,8 +138,11 @@ class ExecutionTarget:
 
 @dataclass
 class Config:
-    btc: LegConfig
-    sol: LegConfig
+    # Named for the account that OPENS each leg, not for a coin: the symbols
+    # are configurable, so `btc`/`sol` would be a lie the moment someone
+    # trades something else.
+    master_account: LegConfig
+    sub_account: LegConfig
     hold_minutes: float = 5.0
     chase_interval_s: float = 1.0
     reconcile_interval_s: float = 5.0
@@ -191,7 +194,10 @@ class Config:
     @property
     def legs(self) -> dict[str, LegConfig]:
         """Legs keyed by symbol, which is how the rest of the bot looks them up."""
-        return {self.btc.symbol: self.btc, self.sol.symbol: self.sol}
+        return {
+            self.master_account.symbol: self.master_account,
+            self.sub_account.symbol: self.sub_account,
+        }
 
     def validate(self, require_credentials: bool = True, require_sub1: bool = True) -> None:
         """Validate the configuration.
@@ -209,9 +215,9 @@ class Config:
                 "`bulkdn encrypt-key`"
             )
         self.target.validate()
-        self.btc.validate("btc")
-        self.sol.validate("sol")
-        if self.btc.symbol == self.sol.symbol:
+        self.master_account.validate("master_account")
+        self.sub_account.validate("sub_account")
+        if self.master_account.symbol == self.sub_account.symbol:
             raise ConfigError("the two legs must use different symbols")
         if self.hold_minutes < 0:
             raise ConfigError("hold_minutes must be >= 0")
@@ -327,8 +333,20 @@ def load_config(
         raise ConfigError(f"config file not found: {path}") from exc
 
     legs = raw.get("legs")
-    if not isinstance(legs, dict) or "btc" not in legs or "sol" not in legs:
-        raise ConfigError("config must define legs.btc and legs.sol")
+    if not isinstance(legs, dict):
+        raise ConfigError("legs must be a mapping")
+    if "btc" in legs or "sol" in legs:
+        # Renamed rather than silently ignored: a config still using the old
+        # keys would otherwise start with default legs and trade the wrong
+        # sizes.
+        raise ConfigError(
+            "legs.btc and legs.sol were renamed to legs.master_account and "
+            "legs.sub_account -- they name the account that opens each leg, "
+            "not a coin. Rename the two keys; the fields inside are unchanged."
+        )
+    missing = [k for k in ("master_account", "sub_account") if k not in legs]
+    if missing:
+        raise ConfigError(f"config must define legs.{' and legs.'.join(missing)}")
 
     risk_raw = raw.get("risk") or {}
     if not isinstance(risk_raw, dict):
@@ -347,8 +365,8 @@ def load_config(
 
     config = Config(
         sub1_pubkey=raw.get("sub1_pubkey", ""),
-        btc=_leg_from_dict(legs["btc"], "btc"),
-        sol=_leg_from_dict(legs["sol"], "sol"),
+        master_account=_leg_from_dict(legs["master_account"], "master_account"),
+        sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
         hold_minutes=float(raw.get("hold_minutes", 5.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),
         reconcile_interval_s=float(raw.get("reconcile_interval_s", 5.0)),

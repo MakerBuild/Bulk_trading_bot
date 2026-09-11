@@ -70,8 +70,8 @@ class FakeFeed:
 def make_config():
     return Config(
         sub1_pubkey=SUB1,
-        btc=LegConfig(symbol=BTC, size=1.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=1.0),
-        sol=LegConfig(symbol=SOL, size=10.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=10.0),
+        master_account=LegConfig(symbol=BTC, size=1.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=1.0),
+        sub_account=LegConfig(symbol=SOL, size=10.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=10.0),
         hold_minutes=1.0,
         risk=RiskConfig(),
         private_key="x",

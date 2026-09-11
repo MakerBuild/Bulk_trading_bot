@@ -85,7 +85,7 @@ class Strategy:
             master.pubkey: master,
             sub1.pubkey: sub1,
         }
-        self.symbols = [config.btc.symbol, config.sol.symbol]
+        self.symbols = [config.master_account.symbol, config.sub_account.symbol]
         self._seen_trades = SeenTrades()
         self.guard = LiquidationGuard(
             specs=feed.specs,
@@ -108,21 +108,25 @@ class Strategy:
         buys to cover the shorts.
         """
         master, sub1 = self.master.pubkey, self.sub1.pubkey
-        btc, sol = self.config.btc.symbol, self.config.sol.symbol
+        # Each leg is named for the account that opens it, which is what the
+        # config keys mean. The master goes long `master_leg` and short
+        # `sub_leg`; the sub-account does the reverse.
+        master_leg = self.config.master_account.symbol
+        sub_leg = self.config.sub_account.symbol
 
         if phase == Phase.EXIT:
             return [
-                # Sub1 covers its BTC short; master sells to close its long.
-                LegRoles(btc, maker=sub1, taker=master, maker_is_buy=True, reduce_only=True),
-                # Master covers its SOL short; sub1 sells to close its long.
-                LegRoles(sol, maker=master, taker=sub1, maker_is_buy=True, reduce_only=True),
+                # Sub1 covers the short it took hedging the master's long.
+                LegRoles(master_leg, maker=sub1, taker=master, maker_is_buy=True, reduce_only=True),
+                # Master covers the short it took hedging sub1's long.
+                LegRoles(sub_leg, maker=master, taker=sub1, maker_is_buy=True, reduce_only=True),
             ]
 
         # OPEN, and HOLD reuses the same roles so any drift is corrected on the
         # same account that was hedging during entry.
         return [
-            LegRoles(btc, maker=master, taker=sub1, maker_is_buy=True, reduce_only=False),
-            LegRoles(sol, maker=sub1, taker=master, maker_is_buy=True, reduce_only=False),
+            LegRoles(master_leg, maker=master, taker=sub1, maker_is_buy=True, reduce_only=False),
+            LegRoles(sub_leg, maker=sub1, taker=master, maker_is_buy=True, reduce_only=False),
         ]
 
     def _roles_by_symbol(self, phase: Phase) -> dict[str, LegRoles]:
@@ -447,8 +451,8 @@ class Strategy:
         self.title.set_phase("OPEN")
         self.state.reset_legs(
             {
-                self.config.btc.symbol: self.config.btc.size,
-                self.config.sol.symbol: self.config.sol.size,
+                self.config.master_account.symbol: self.config.master_account.size,
+                self.config.sub_account.symbol: self.config.sub_account.size,
             }
         )
         self.store.save(self.state)
@@ -728,7 +732,7 @@ def build_chase_params(config: Config) -> dict[str, ChaseParams]:
             max_distance_bps=leg.max_distance_bps,
             max_order_size=leg.max_order_size,
         )
-        for leg in (config.btc, config.sol)
+        for leg in (config.master_account, config.sub_account)
     }
 
 
@@ -739,4 +743,4 @@ def build_hedge_ceilings(config: Config) -> dict[str, float]:
     diverged by more than the strategy can account for, and firing a very large
     market order on that basis would be worse than halting.
     """
-    return {leg.symbol: leg.size * 2.0 for leg in (config.btc, config.sol)}
+    return {leg.symbol: leg.size * 2.0 for leg in (config.master_account, config.sub_account)}

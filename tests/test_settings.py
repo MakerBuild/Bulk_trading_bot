@@ -111,3 +111,51 @@ def test_current_leverage_tolerates_absence_and_junk():
     assert current_leverage({}) == {}
     assert current_leverage({"leverageSettings": None}) == {}
     assert current_leverage({"leverageSettings": [{"symbol": "X"}, 5, []]}) == {}
+
+
+# -- leg key rename ---------------------------------------------------------
+
+
+def test_old_leg_keys_are_rejected_with_a_pointer(tmp_path):
+    """Silently ignoring them would start the bot with default sizes.
+
+    `legs.btc`/`legs.sol` named coins, but the symbols are configurable, so the
+    keys now name the account that opens each leg instead.
+    """
+    import yaml
+
+    from bulkdn.config import ConfigError, load_config
+
+    path = tmp_path / "settings.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "legs": {
+                    "btc": {"symbol": "BTC-USD", "size": 0.001, "max_order_size": 0.001},
+                    "sol": {"symbol": "SOL-USD", "size": 2.0, "max_order_size": 2.0},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="master_account"):
+        load_config(str(path), require_credentials=False)
+
+
+def test_a_missing_leg_is_named(tmp_path):
+    import yaml
+
+    from bulkdn.config import ConfigError, load_config
+
+    path = tmp_path / "settings.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"legs": {"master_account": {"symbol": "BTC-USD", "size": 0.001,
+                                         "max_order_size": 0.001}}}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="sub_account"):
+        load_config(str(path), require_credentials=False)

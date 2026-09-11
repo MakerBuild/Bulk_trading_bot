@@ -14,25 +14,30 @@
 # ---------------------------------------------------------------------------
 #  WHAT TO TRADE
 #
-#  Two legs, opposite directions, so the pair nets out to roughly zero:
-#    OPEN  master buys BTC   |  sub-account buys SOL
-#    EXIT  both are closed, each fill hedged on the other account
+#  Two legs, opposite directions, so the pair nets out to roughly zero.
+#  Each leg is named for the account that OPENS it:
 #
-#  `size` is the total you accumulate per cycle, in the base coin
-#  (0.001 BTC, 2 SOL). Both legs run at the same time.
+#    master_account   the master buys this, the sub-account shorts it
+#    sub_account      the sub-account buys this, the master shorts it
+#
+#  Both run at the same time, and each fill is hedged on the other account.
+#  `size` is the total you accumulate per cycle, in the base coin.
+#
+#  Any market the exchange lists works -- the names below are just which
+#  account trades what, not a coin the bot is tied to.
 # ---------------------------------------------------------------------------
 legs:
-  btc:
+  master_account:
     symbol: BTC-USD
-    size: 0.001             # total BTC per cycle
+    size: 0.001             # total per cycle, in BTC
     leverage: 10            # 1-50, capped by the market's own maximum
     offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
     max_distance_bps: 5.0   # re-price the order once it drifts this far
     max_order_size: 0.001   # cap on any single resting order
 
-  sol:
+  sub_account:
     symbol: SOL-USD
-    size: 2.0               # total SOL per cycle
+    size: 2.0               # total per cycle, in SOL
     leverage: 10
     offset_bps: 3.0
     max_distance_bps: 8.0
