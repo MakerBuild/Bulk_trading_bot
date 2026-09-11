@@ -25,7 +25,8 @@ from .config import Config
 from .feed import MarketFeed
 from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
-from .marketdata import round_notional
+from .liquidation import LiquidationGuard
+from .marketdata import round_notional, round_size
 from .notify import Notifier
 from .positions import PositionBook, SeenTrades
 from .reconcile import (
@@ -86,6 +87,13 @@ class Strategy:
         }
         self.symbols = [config.btc.symbol, config.sol.symbol]
         self._seen_trades = SeenTrades()
+        self.guard = LiquidationGuard(
+            specs=feed.specs,
+            names={master.pubkey: master.name, sub1.pubkey: sub1.name},
+        )
+        # Set the instant a position update shows an external reduction, so
+        # the response does not wait for the next reconcile tick.
+        self._liquidation_seen = asyncio.Event()
         self._hedge_queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
         self._halt_reason: str | None = None
@@ -175,12 +183,66 @@ class Strategy:
 
         return handler
 
+    async def _guard_liquidation(self, phase: Phase) -> bool:
+        """Close the surviving leg if the other one was closed externally.
+
+        Returns True when it acted, which means trading is over: a liquidation
+        says the account could not carry the position, so the response is to
+        get flat and stop, not to rebuild the pair.
+
+        Reduce-only throughout, so a stale reading can never turn a close into
+        a new position in the opposite direction.
+        """
+        events = self.guard.check(self.book, phase, [self.master.pubkey, self.sub1.pubkey])
+        if not events:
+            return False
+
+        for event in events:
+            log.critical("LIQUIDATION: %s", event.describe())
+
+        # Close everything still standing in the affected symbols, on both
+        # accounts. Which side was hit does not change the answer -- the pair
+        # is broken either way, and a lone leg is outright exposure.
+        affected = {event.symbol for event in events}
+        for symbol in affected:
+            for session in (self.master, self.sub1):
+                size = self.book.authoritative(session.pubkey, symbol)
+                rounded = round_size(abs(size), self.feed.specs[symbol])
+                if rounded < self.feed.specs[symbol].lot_size:
+                    continue
+                try:
+                    # size > 0 is long, so closing it is a sell.
+                    await session.market(symbol, size < 0, rounded, reduce_only=True)
+                    log.critical(
+                        "closed %s %.8f on %s after liquidation",
+                        symbol, rounded, session.name,
+                    )
+                except Exception as exc:
+                    log.critical(
+                        "COULD NOT CLOSE %s on %s after liquidation: %s -- "
+                        "close it by hand now",
+                        symbol, session.name, exc,
+                    )
+
+        reason = "; ".join(event.describe() for event in events)
+        self.notifier.send_soon(self.notifier.halted(f"liquidation -- {reason}"))
+        self._trigger_halt(f"liquidation -- {reason}")
+        return True
+
     def _make_position_handler(self, session: AccountSession):
         def handler(update) -> None:
             symbol = getattr(update, "symbol", None)
             if symbol not in self.symbols:
                 return
             self.book.set_authoritative(session.pubkey, symbol, float(update.size or 0.0))
+
+            # Cheap and synchronous -- no I/O, just arithmetic on the book.
+            # Closing the survivor happens in the worker; a handler that
+            # awaited an order would deadlock the socket it arrived on.
+            if self.guard.check(
+                self.book, self.state.phase, [self.master.pubkey, self.sub1.pubkey]
+            ):
+                self._liquidation_seen.set()
 
         return handler
 
@@ -199,6 +261,14 @@ class Strategy:
     async def _hedge_worker(self) -> None:
         """Drains fill signals and restores neutrality, one symbol at a time."""
         while not self._stop.is_set():
+            # Checked first and on every pass, including the idle one. A
+            # liquidation leaves the survivor outright directional, so it must
+            # not queue behind a hedge -- and it makes any pending hedge moot.
+            if self._liquidation_seen.is_set():
+                self._liquidation_seen.clear()
+                await self._guard_liquidation(self.state.phase)
+                continue
+
             try:
                 symbol = await asyncio.wait_for(self._hedge_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
@@ -262,6 +332,12 @@ class Strategy:
                     await sync_positions(self.sessions.values(), self.book)
                 except Exception as exc:
                     log.error("position sync failed: %s", exc)
+
+                # Before hedging, not after. If a position was liquidated, the
+                # hedge rule's answer is to open a fresh one on the account
+                # that just ran out of margin -- exactly the wrong move.
+                if await self._guard_liquidation(phase):
+                    break
 
                 try:
                     corrections = await reconcile_net(self.hedger, roles_list, self.feed)
@@ -474,6 +550,9 @@ class Strategy:
                 self.state.hold_until = 0.0
                 self.store.save(self.state)
                 log.info("=== cycle %d complete ===", self.state.cycle_index)
+                # EXIT legitimately took every position to zero, so the peaks
+                # from this cycle would read as an external close in the next.
+                self.guard.reset()
                 await self.notifier.cycle_complete(
                     cycle=self.state.cycle_index,
                     of=self.config.cycles or None,

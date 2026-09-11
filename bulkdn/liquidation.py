@@ -1,0 +1,140 @@
+"""Detecting a position closed by someone other than this bot.
+
+A liquidation breaks the strategy's central assumption. The pair is only
+market-neutral because two opposite positions exist; when the exchange force-
+closes one of them, the survivor becomes outright directional exposure of the
+full leg size, and it stays that way until something notices.
+
+**The normal hedge rule makes this worse, not better.** It computes
+`net = maker + taker` and corrects by trading on the *taker* account. If the
+taker was the one liquidated, the correction is to open a fresh position on an
+account that just ran out of margin: at best rejected, at worst re-entering the
+position that was liquidated moments ago. The right response to a liquidation
+is the opposite one -- close the survivor.
+
+**Detection.** The bot knows what it does. During OPEN and HOLD it only ever
+adds to a position; nothing in those phases reduces one. So a position that
+shrinks during them was reduced by someone else, and that is the signal. This
+catches liquidation, ADL and a manual close from the web UI identically, which
+is correct: all three mean the pair is broken and re-hedging is wrong.
+
+EXIT is excluded because reducing positions is exactly what it does.
+
+The `riskHistory` endpoint reports liquidations authoritatively, but only as
+polled history. It is useful for confirming afterwards what happened, and is
+far too slow to be the trigger.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+
+from .marketdata import MarketSpec
+from .positions import PositionBook
+from .state import Phase
+
+log = logging.getLogger(__name__)
+
+# Phases in which the bot never reduces a position, so any reduction is
+# external. EXIT is deliberately absent.
+_ACCUMULATING = (Phase.OPEN, Phase.HOLD)
+
+
+@dataclass(frozen=True)
+class Liquidation:
+    """A position that shrank without this bot closing it."""
+
+    account: str
+    account_name: str
+    symbol: str
+    previous: float
+    current: float
+
+    @property
+    def closed_size(self) -> float:
+        return abs(self.previous) - abs(self.current)
+
+    @property
+    def fully_closed(self) -> bool:
+        return abs(self.current) == 0.0
+
+    def describe(self) -> str:
+        what = "closed" if self.fully_closed else "reduced"
+        return (
+            f"{self.account_name} {self.symbol} position {what} externally: "
+            f"{self.previous:+.8f} -> {self.current:+.8f}"
+        )
+
+
+@dataclass
+class LiquidationGuard:
+    """Watches for positions reduced by anything other than this bot.
+
+    Tracks the largest absolute position seen for each account and symbol.
+    A drop below that peak, by more than one lot, during an accumulating phase
+    is the signal. One lot of slack keeps dust and rounding from tripping it.
+    """
+
+    specs: dict[str, MarketSpec]
+    names: dict[str, str] = field(default_factory=dict)
+    # Signed, so a wiped short is reported as the short it was. Storing only
+    # the magnitude means reading the direction off the current position, and
+    # a fully closed one is zero -- which renders every liquidated short as a
+    # long.
+    _peak: dict[tuple[str, str], float] = field(default_factory=dict)
+
+    def reset(self) -> None:
+        """Forget peaks. Called when a cycle ends, since EXIT legitimately
+        takes every position back to zero."""
+        self._peak.clear()
+
+    def observe(self, account: str, symbol: str, size: float) -> None:
+        """Record a position without judging it. Used during EXIT."""
+        key = (account, symbol)
+        if abs(size) >= abs(self._peak.get(key, 0.0)):
+            self._peak[key] = size
+
+    def check(
+        self, book: PositionBook, phase: Phase, accounts: list[str]
+    ) -> list[Liquidation]:
+        """Return any position that shrank externally since the last check.
+
+        Uses confirmed positions only. An optimistic overlay exists to make
+        hedging fast and can briefly show a fill the exchange has not applied;
+        deciding a liquidation happened on that basis would be a false alarm
+        with an expensive response.
+        """
+        if phase not in _ACCUMULATING:
+            # Still track peaks, so a later phase starts from the real high.
+            for account in accounts:
+                for symbol in self.specs:
+                    self.observe(account, symbol, book.authoritative(account, symbol))
+            return []
+
+        found: list[Liquidation] = []
+        for account in accounts:
+            for symbol, spec in self.specs.items():
+                current = book.authoritative(account, symbol)
+                key = (account, symbol)
+                peak = self._peak.get(key, 0.0)
+
+                if abs(current) > abs(peak):
+                    self._peak[key] = current
+                    continue
+
+                if abs(peak) - abs(current) > spec.lot_size:
+                    found.append(
+                        Liquidation(
+                            account=account,
+                            account_name=self.names.get(account, account[:8]),
+                            symbol=symbol,
+                            previous=peak,
+                            current=current,
+                        )
+                    )
+                    # Re-baseline, so one event is reported once rather than on
+                    # every tick until the phase ends.
+                    self._peak[key] = current
+
+        return found
