@@ -118,3 +118,21 @@ def test_a_halt_with_no_recorded_reason_still_reads_cleanly():
         v for v in monitor_for(session).check() if v.kind == "reject_streak"
     ).detail
     assert detail.endswith("consecutive rejected transactions")
+
+
+def test_the_halt_points_at_the_command_that_actually_clears_it():
+    """`flatten` resets the state itself, so telling anyone to delete a file
+    sends them to do by hand what the tool already does -- to a file the README
+    warns against deleting."""
+    import inspect
+
+    from bulkdn import cli, strategy
+
+    message = inspect.getsource(strategy.Strategy._recover)
+    assert "flatten --live" in message
+    assert "delete" not in message.lower()
+
+    # And the claim it makes is true: flatten clears the halt.
+    resets = inspect.getsource(cli.cmd_flatten)
+    assert "halted_reason = None" in resets
+    assert "Phase.IDLE" in resets

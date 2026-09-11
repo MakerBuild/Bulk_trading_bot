@@ -672,10 +672,16 @@ class Strategy:
         )
 
         if self.state.phase == Phase.HALTED:
+            # Deliberately not cleared automatically, even though `has_positions`
+            # above already knows both accounts are flat. A halt means something
+            # went wrong; restarting past it without the operator having read
+            # the reason is how the same fault repeats unseen.
             raise RuntimeError(
                 f"state file records a halt: {self.state.halted_reason}. "
-                "Investigate, run `bulkdn flatten` if positions remain, then delete "
-                "the state file to start again."
+                "Read that reason first. Then `run.bat flatten --live` to clear "
+                "it -- that cancels every order, closes both accounts "
+                "reduce-only (a no-op when they are already flat), and resets "
+                "the state to IDLE."
             )
 
         if not has_positions:
