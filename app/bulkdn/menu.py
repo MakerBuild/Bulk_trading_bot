@@ -322,7 +322,17 @@ def _shown(path: pathlib.Path) -> str:
 
 
 def _delete(path: pathlib.Path) -> str:
+    """Remove a path, except the key file, which is emptied in place.
+
+    Deleting that one would take away the place the next key is pasted,
+    and getting it back means re-running install.bat. What has to go is
+    the key inside it, not the file."""
+    from .config import PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE
+
     try:
+        if path.name == PRIVATE_KEY_FILE:
+            path.write_text(PRIVATE_KEY_TEMPLATE, encoding="utf-8")
+            return f"  emptied {_shown(path)} -- ready for a new key"
         if path.is_dir():
             shutil.rmtree(path)
         else:
@@ -360,7 +370,7 @@ def _erase_targets(config: Config) -> list[tuple[str, str, list[pathlib.Path], s
         ("1", "Trading state", [pathlib.Path(config.state_file)],
          "what the bot has open, and any recorded halt"),
         ("2", "Private key", [pathlib.Path(PRIVATE_KEY_FILE)],
-         "the key this bot signs with"),
+         "wipes the key; the file stays, ready for a new one"),
         ("3", "Build caches", _cache_dirs(pathlib.Path.cwd()),
          "bytecode and lint caches -- these hold your username"),
     ]
@@ -406,7 +416,7 @@ def _erase_data(config: Config) -> None:
         _pause()
         return
 
-    print("\n  About to delete:")
+    print("\n  About to erase:")
     for path in targets:
         print(f"    {_shown(path)}")
 
@@ -428,7 +438,7 @@ def _erase_data(config: Config) -> None:
             print("  aborted")
             _pause()
             return
-    elif not _confirm(f"Delete {len(targets)} item(s) from this computer."):
+    elif not _confirm(f"Erase {len(targets)} item(s) from this computer."):
         print("  aborted")
         _pause()
         return

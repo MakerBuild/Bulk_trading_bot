@@ -28,6 +28,22 @@ PRIVATE_KEY_ENV = "BULK_PRIVATE_KEY"
 # for a password when the file is encrypted.
 PRIVATE_KEY_FILE = "private_key.local"
 
+# What the file looks like with no key in it. Erasing the key rewrites the file
+# to this rather than deleting it: the operator still needs somewhere obvious to
+# paste the next one, and a missing file means re-running install.bat to get it
+# back. install.bat writes the same text on a first install -- test_erase checks
+# the two have not drifted.
+PRIVATE_KEY_TEMPLATE = """# Paste your BULK master account's base58 private key on the line
+# below -- one line, no quotes, nothing else.
+#
+# This file never leaves your machine. Once the key is in, encrypt it
+# from the menu: Accounts Management -> Encrypt Private Key.
+#
+# A sub-account has no key of its own -- it is created by, and signed
+# for by, the master -- so this one key is all the bot needs.
+
+"""
+
 # Mainnet endpoints, as published in the BULK OpenAPI spec (v3.0.10).
 #
 # This bot is mainnet-only. There is no network selector: the signature domain

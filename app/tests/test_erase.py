@@ -58,19 +58,20 @@ def test_a_refused_confirmation_deletes_nothing(workspace, monkeypatch):
     _root, state, key, _cache = workspace
     run(monkeypatch, state, ["1", "no", ""])
     assert state.exists() and key.exists()
+    assert "not a real key" in key.read_text(encoding="utf-8")
 
 
-def test_the_key_is_not_removed_by_the_ordinary_yes(workspace, monkeypatch):
+def test_the_key_is_not_wiped_by_the_ordinary_yes(workspace, monkeypatch):
     """`yes` clears every other confirmation in this menu. Not this one."""
     _root, state, key, _cache = workspace
     run(monkeypatch, state, ["2", "yes", ""])
-    assert key.exists()
+    assert "not a real key" in key.read_text(encoding="utf-8")
 
 
 def test_the_key_needs_its_own_words(workspace, monkeypatch):
     _root, state, key, _cache = workspace
     run(monkeypatch, state, ["2", "DELETE KEY", ""])
-    assert not key.exists()
+    assert "not a real key" not in key.read_text(encoding="utf-8")
     # And only the key.
     assert state.exists()
 
@@ -103,7 +104,9 @@ def test_all_of_the_above_still_needs_the_key_phrase(workspace, monkeypatch):
 def test_all_of_the_above_clears_everything_when_confirmed(workspace, monkeypatch):
     _root, state, key, cache = workspace
     run(monkeypatch, state, ["9", "DELETE KEY", ""])
-    assert not state.exists() and not key.exists() and not cache.exists()
+    assert not state.exists() and not cache.exists()
+    assert key.exists(), "the key file itself must survive"
+    assert "not a real key" not in key.read_text(encoding="utf-8")
 
 
 # -- the venv is not a cache ------------------------------------------------
@@ -161,3 +164,51 @@ def test_paths_are_shown_relative_to_the_project(workspace, monkeypatch, capsys)
     assert "app" in out
     assert str(root) not in out, "an absolute path leaked into the listing"
     assert menu._shown(cache).startswith("app")
+
+
+# -- the key file is emptied, never removed ---------------------------------
+#
+# It is where the next key gets pasted. Deleting it leaves no obvious place to
+# put one, and getting it back means re-running install.bat -- which is not
+# what "erase my data" should cost.
+
+
+def test_the_key_file_survives_with_its_instructions(workspace, monkeypatch):
+    from bulkdn.config import PRIVATE_KEY_TEMPLATE
+
+    _root, state, key, _cache = workspace
+    run(monkeypatch, state, ["2", "DELETE KEY", ""])
+
+    assert key.exists()
+    assert key.read_text(encoding="utf-8") == PRIVATE_KEY_TEMPLATE
+    assert "Paste your BULK master account" in key.read_text(encoding="utf-8")
+
+
+def test_the_emptied_file_is_not_read_as_a_key():
+    """The template is all comments, so nothing mistakes it for a key."""
+    from bulkdn.config import PRIVATE_KEY_TEMPLATE
+
+    lines = [
+        line for line in PRIVATE_KEY_TEMPLATE.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert lines == []
+
+
+def test_install_bat_writes_the_same_template():
+    """Two copies of this text exist -- batch cannot read a Python constant --
+    so they are checked against each other rather than trusted to stay equal."""
+    from bulkdn.config import PRIVATE_KEY_TEMPLATE
+
+    batch = pathlib.Path("install.bat").read_text(encoding="utf-8")
+    echoed = []
+    for line in batch.splitlines():
+        stripped = line.strip()
+        if "private_key.local echo" not in stripped:
+            continue
+        text = stripped.split("private_key.local echo", 1)[1]
+        # `echo.` is batch for a blank line, and `^>` escapes a redirect.
+        echoed.append("" if text.strip() == "." else text.strip().replace("^>", ">"))
+
+    expected = [line.strip() for line in PRIVATE_KEY_TEMPLATE.splitlines()]
+    assert echoed == expected, "install.bat and PRIVATE_KEY_TEMPLATE have drifted"
