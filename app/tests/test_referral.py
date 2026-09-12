@@ -23,6 +23,7 @@ def unsealed(monkeypatch):
     monkeypatch.setattr(referral, "SEALED_WALLETS", ())
     monkeypatch.setattr(referral, "SEALED_CODES", ())
     monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
+    monkeypatch.setattr(referral, "SEALED_REFERRAL_WALLETS", ())
     monkeypatch.setattr(referral, "SEALED_OWNER_WALLETS", ())
 
 WALLET = "EXAMPLE-REFERRED-WALLET"

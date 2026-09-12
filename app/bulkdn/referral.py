@@ -180,6 +180,73 @@ SEALED_OWNER_WALLETS: tuple[str, ...] = (
 )
 
 
+# The owner's own referral list, admitted explicitly.
+#
+# Why a list and not a check: BULK's public index does not carry the referral
+# of an account created on mainnet -- every attribution field comes back null
+# even for a wallet the exchange's own site shows as referred (see
+# docs/DESIGN.md). So the gate cannot ask "did this wallet come through me"
+# and get a truthful answer, and these are named instead.
+#
+# Digests, not addresses, for the same reason as the rest of this file: the
+# source ships, and a reader should not be handed the list. That hides it from
+# reading, not from a search -- the set of BULK accounts is enumerable, so
+# someone willing to hash all of them can match these. It is a list of who may
+# run a trading bot, not a secret.
+#
+# Replaced wholesale by the referral check once REFERRAL_API_KEY is set; until
+# then this is what admits them. To add one:
+#   python -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" <address>
+SEALED_REFERRAL_WALLETS: tuple[str, ...] = (
+    "bccf04aa515043b6a3e1034630d9a0a46ccb7c3dc02fef20b52ae41a184f8c9a",
+    "5467bf9c6c5308dabfd19878ccf346350c17f48560b604bd6fd5c22bfa0c3cb1",
+    "da91c6eb9d3a153bc859cc22ff0bc83dc44e32fa9363647b4f17fd97ca87ca9b",
+    "2b7fd137e9fc33c32e6d14d5537d665df8ad862705e15e8100d22b28dbc0df8d",
+    "0bdac4b3d7aec10a53660957141834076f528e9d1a40b8a933299981455b6b6c",
+    "9d3800163927b399fbb7b21ba9000f0d72e4aefae07d13de066000def25c038f",
+    "22c3ac7ce01512a229216b6cb01ae18645f1173232d320331b5c42d488acc368",
+    "f0bf4626285afa0681645efae55878a6edc3203c6695889a6f7c67c6c1243a27",
+    "bbb68df0b18a9ceecc35ee743013ae12738dea42e89b84f8fee7d5fb7cdfadcc",
+    "fedd548cbad6bedc956dc4e83752c240919ba7d62c00dc06f1e9eb18be5818c4",
+    "df5010ff922ea9dd3a56ef2523f81461b6ecff52d51292417a3c1f7699ebb6a3",
+    "1960947137c6a6f5713af5182cf4a0244a83348b8eb47c9345ab4d37fe4715b8",
+    "0cd228ab98c8d8b76459a53ddaab0dab182d669f65c3606528bceda7e4a3320d",
+    "7102e11a9d175df44db0226e1a4a6d88ab907a8dcccb44d195872b29c47728b0",
+    "98b4e5f2d6ba1a0cab3be03a11848719d88bd54863a2828f726f1d1ff5e84c92",
+    "71ca90f773cef279b7b2d12cffd414652726e3039db24da6fd7fe349dcd74752",
+    "7dddb1bb09ea0dfbb636d8b253c809092b49b5b05ed86824bd33e1996333156a",
+    "797aa5164d72aa17475c8d5f0795067fdd088314d4b66964b9b80943f3a2a5ff",
+    "4e1b063d130616418529944f3b625ffbebec4fb2d677fd3b0475f295cd5daa06",
+    "a9c52c4b5fd0c8ec435f6c2ffdb8302068be3ecffa2087fdf26e96b0db63946c",
+    "aa0b78ddc7a2289c1be5aaf001ebc8f77b652bfff3af40f312099cdc5e18cad9",
+    "e964d747da8c35c1e501fc4839da75a7fc2bcc0da1cf81eae5c9571b692ca1b0",
+    "0af31d1d7338d0eeb7b59bf97c7c049f4f4fb54af56ce49c020493f27b000464",
+    "acae1ce8b23f08b653f9b5a2aaef04437e63d07d543b98ba0715febd9d737b9d",
+    "3fd0f416f9ebfe2f03c0d8a0d1b77e96ae71b6fef87e330e3ac2372ef2d5074f",
+    "8f8387e0b02624200483985be847a1dcf86dceaba878446e680235da4bce7ef5",
+    "845cc326b3178068d1496125b3ac707236ae38d24e18aee98ed84e0af8506a1b",
+    "ad3bb6fd925e15772320aeae4e8337516389f32045ca116b9f4c595b96b09df8",
+    "ea050b2cfcc87c7883312a8dcf060afa0284b4c264db47a08beefc1cc4f4293b",
+    "4ffb81375344ad7304e9775b0a6a47485fc478fdab45e326642329bfc565671b",
+    "a4caf1718253c908713e9c79367c458c4064ecb5adf55a22e132feea620f2242",
+    "923048d05f1d4d33289d9d0437744d5bfd4df1d264f560dcf92ebdf31818fe47",
+    "523f45334bf043bda19efd7c17c23cac5aecbbb9b2a4a03f8939fb8a35f665ca",
+    "581e31267804b4fec253a6bbffd9cf844820ea3f5b9da537f63631cb7897b064",
+    "87e7f300501382ac231766ac1a23015898e75c2484e8cbd2e47d59e264942490",
+    "ac1eee7990aef4386e488ab9f296d6eb0d3d48f626bae1474a6e06bfa47eb66a",
+    "df32139e2b8adbddf25138456d4c810b07aefb881b6c95808f082c831df4cbac",
+    "a0305722b8cbe1bb9f5761f22337a23a3f3838492871920ceb5e7a566ef2d527",
+    "1e6727ec8e624c10fe5a1ee1281e0be8b1b3bf7b9b693bd14dd8895bba35d1ba",
+    "6cf5b0911dce96a06e540bab4bc6b97d1cd4162907427d7e13c86243ce027668",
+    "2268d6b7300a4fdf491d7b16b987450d335c895a7ab8802cab474e1191d1f86f",
+    "542757bf04ec78eb8409deb6aab0124b98074f9752c352dbec6dc4e137839dff",
+    "a1761624214ce4250106ac66fff9082713713090dfde7517e08453903a5b6781",
+    "0fd50d46581b9881de3cc5dc0c013277faa766aa6583e7466586d8459eea611d",
+    "1469c3bcafc05e9ab186713ce6e4baa42b4b23715c2760fdd074a579afb0093a",
+    "b26746fbd65ac5d689ee4628b9639c9d76367050d22e91dea4e8a88c071214b4",
+)
+
+
 def wallet_digest(value: str) -> str:
     """How a wallet is compared. Addresses are case-sensitive base58."""
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()
@@ -192,7 +259,12 @@ def code_digest(value: str) -> str:
 
 def is_sealed() -> bool:
     """Whether this build carries its own allow-list."""
-    return bool(SEALED_WALLETS or SEALED_CODES or SEALED_INVITE_CODES)
+    return bool(
+        SEALED_WALLETS
+        or SEALED_CODES
+        or SEALED_INVITE_CODES
+        or SEALED_REFERRAL_WALLETS
+    )
 
 
 @dataclass(frozen=True)
@@ -203,6 +275,9 @@ class _Allowed:
     codes: frozenset[str]
     invite_codes: frozenset[str]
     owner_wallets: frozenset[str]
+    # Named referrals. Admitted the same way as an owner wallet, kept apart so
+    # the log says which of the two let someone in.
+    referral_wallets: frozenset[str]
     allow_on_error: bool
     enabled: bool
 
@@ -220,6 +295,9 @@ def _allowed(config: AccessConfig) -> _Allowed:
             codes=frozenset(SEALED_CODES),
             invite_codes=frozenset(SEALED_INVITE_CODES),
             owner_wallets=frozenset(SEALED_OWNER_WALLETS),
+            # Admitted without asking the indexer, because for an account
+            # created on mainnet the indexer has no answer to give.
+            referral_wallets=frozenset(SEALED_REFERRAL_WALLETS),
             allow_on_error=False,
             enabled=True,
         )
@@ -228,6 +306,8 @@ def _allowed(config: AccessConfig) -> _Allowed:
         codes=frozenset(code_digest(c) for c in config.codes if c.strip()),
         invite_codes=frozenset(code_digest(c) for c in config.invite_codes if c.strip()),
         owner_wallets=frozenset(wallet_digest(w) for w in config.owner_wallets if w.strip()),
+        # No config equivalent: a named list only exists in a sealed build.
+        referral_wallets=frozenset(),
         allow_on_error=config.allow_on_error,
         enabled=config.require_referral,
     )
@@ -438,9 +518,13 @@ def check_access(
     if not allowed.enabled:
         return AccessDecision(True, "referral gating is off")
 
-    # Before the network call: the owner should not be locked out by their own
-    # gate, nor by an indexer outage.
-    if wallet_digest(wallet) in allowed.owner_wallets:
+    # Before the network call: neither the owner nor a named referral should be
+    # locked out by an indexer that has no record of them, or by an outage.
+    # Reported apart so a support question can be answered from the log.
+    digest = wallet_digest(wallet)
+    if digest in allowed.referral_wallets:
+        return AccessDecision(True, "on the build's referral list")
+    if digest in allowed.owner_wallets:
         return AccessDecision(True, "owner wallet")
 
     try:

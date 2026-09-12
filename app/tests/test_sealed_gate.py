@@ -30,6 +30,7 @@ def sealed(monkeypatch):
     monkeypatch.setattr(referral, "SEALED_CODES",
                         (referral.code_digest(OWNER_CODE),))
     monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
+    monkeypatch.setattr(referral, "SEALED_REFERRAL_WALLETS", ())
     monkeypatch.setattr(referral, "SEALED_OWNER_WALLETS", ())
 
 
@@ -156,6 +157,7 @@ def test_an_unsealed_build_still_reads_the_config(monkeypatch):
     monkeypatch.setattr(referral, "SEALED_WALLETS", ())
     monkeypatch.setattr(referral, "SEALED_CODES", ())
     monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
+    monkeypatch.setattr(referral, "SEALED_REFERRAL_WALLETS", ())
     assert not referral.is_sealed()
 
     serve(monkeypatch, referred_by(wallet=OUTSIDER))
