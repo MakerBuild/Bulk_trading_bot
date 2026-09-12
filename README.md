@@ -149,3 +149,5 @@ Everything else lives in `app/`, which you can ignore: the code, the test suite,
 the tool settings, the longer guides, the local Python environment, and
 `app/state/`, where the bot records what it has open — do not delete anything in
 `app/state/` while a cycle is running.
+
+<!-- новая версия -->
