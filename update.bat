@@ -32,8 +32,9 @@ if errorlevel 1 (
 
 if exist ".git" goto :pull
 
-echo %REPO% | find "CHANGE-ME" >nul
-if not errorlevel 1 (
+rem Pure batch, deliberately: `find` here would be whichever find is first on
+rem PATH, and on a machine with Git Bash installed that is the Unix one.
+if not "%REPO%"=="%REPO:CHANGE-ME=%" (
     echo.
     echo   This build has no repository set, so it cannot fetch updates.
     echo   Ask whoever sent it to you for a build that does.
@@ -60,7 +61,8 @@ echo   Installing it...
 rem /E copies everything; /XD .git leaves the clone's own history behind. No
 rem /PURGE, so anything here that is not in the repository simply stays.
 robocopy "%TMPDIR%" "." /E /XD ".git" /NFL /NDL /NJH /NJS /NP >nul
-if %ERRORLEVEL% GEQ 8 (
+rem robocopy returns 0-7 for success of various kinds; 8 and up is failure.
+if errorlevel 8 (
     echo   Copy failed.
     rd /s /q "%TMPDIR%"
     pause
