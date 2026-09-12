@@ -1,53 +1,98 @@
 @echo off
 rem Update to the latest version, keeping your settings and your key.
 rem
-rem Both are untracked, so `git pull` cannot touch them: settings.yaml is your
-rem copy of settings.default.yaml, and private_key.local was never in git.
+rem Works whether this folder was cloned or unzipped. A clone pulls; an
+rem unzipped copy fetches a fresh one into a temp folder and copies it over.
+rem
+rem Your files are never touched, and not because they are listed as exceptions
+rem -- none of them exists in the repository to copy over, so there is nothing
+rem to overwrite them with:
+rem     settings.yaml        yours, made from settings.default.yaml
+rem     private_key.local    yours, never in git
+rem     app\state            what the bot has open
+rem     app\.venv            the local Python environment
 
 setlocal
 cd /d "%~dp0"
 
+rem ---------------------------------------------------------------------------
+rem The repository this checks for updates. Public, so no login is needed.
+set "REPO=https://github.com/CHANGE-ME/CHANGE-ME.git"
+rem ---------------------------------------------------------------------------
+
 where git >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo   git is not installed, so this folder cannot update itself.
-    echo   Get it from https://git-scm.com/downloads and run this again.
+    echo   git is not installed. Get it from https://git-scm.com/downloads,
+    echo   keep every default, then run this again.
     echo.
     pause
     exit /b 1
 )
 
-if not exist ".git" (
+if exist ".git" goto :pull
+
+echo %REPO% | find "CHANGE-ME" >nul
+if not errorlevel 1 (
     echo.
-    echo   This copy was unzipped, not cloned, so there is nothing to update
-    echo   from. To switch: clone the repository fresh, then copy your
-    echo   settings.yaml and private_key.local across.
+    echo   This build has no repository set, so it cannot fetch updates.
+    echo   Ask whoever sent it to you for a build that does.
     echo.
     pause
     exit /b 1
 )
 
+rem -- unzipped copy: fetch a fresh one and copy it over ----------------------
+set "TMPDIR=%TEMP%\bulkdn-update-%RANDOM%"
+echo.
+echo   Downloading the latest version...
+git clone --depth 1 --quiet "%REPO%" "%TMPDIR%"
+if errorlevel 1 (
+    echo.
+    echo   Could not reach the repository. Check your internet connection.
+    echo.
+    if exist "%TMPDIR%" rd /s /q "%TMPDIR%"
+    pause
+    exit /b 1
+)
+
+echo   Installing it...
+rem /E copies everything; /XD .git leaves the clone's own history behind. No
+rem /PURGE, so anything here that is not in the repository simply stays.
+robocopy "%TMPDIR%" "." /E /XD ".git" /NFL /NDL /NJH /NJS /NP >nul
+if %ERRORLEVEL% GEQ 8 (
+    echo   Copy failed.
+    rd /s /q "%TMPDIR%"
+    pause
+    exit /b 1
+)
+rd /s /q "%TMPDIR%"
+goto :deps
+
+rem -- cloned copy: a pull is enough -----------------------------------------
+:pull
 echo.
 echo   Fetching...
 git pull --ff-only
 if errorlevel 1 (
     echo.
-    echo   Update failed. Usually this means a file here was edited by hand.
-    echo   `git status` says which; settings.yaml and private_key.local are
-    echo   never the cause -- neither is tracked.
+    echo   Update failed. Usually a tracked file was edited by hand; `git status`
+    echo   says which. Your settings and key are never the cause -- neither is
+    echo   tracked.
     echo.
     pause
     exit /b 1
 )
 
-rem Dependencies can move with a release, and re-running this is cheap when
-rem they have not. install.bat is safe to repeat by design.
+:deps
+rem Dependencies can move with a release, and re-running this is cheap when they
+rem have not. install.bat is safe to repeat by design.
 echo.
 echo   Updating dependencies...
 call "%~dp0install.bat"
 
 echo.
-echo   Up to date. If settings.default.yaml gained options you want, copy
-echo   them into your settings.yaml -- yours is never overwritten.
+echo   Up to date. Your settings and key were left alone.
+echo   If settings.default.yaml gained options you want, copy them across.
 echo.
 pause
