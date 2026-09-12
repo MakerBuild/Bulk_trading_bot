@@ -151,3 +151,4 @@ the tool settings, the longer guides, the local Python environment, and
 `app/state/` while a cycle is running.
 
 <!-- новая версия -->
+<!-- релиз 2 -->
