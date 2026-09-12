@@ -92,6 +92,14 @@ rem The bot is started as `python -m bulkdn` from this directory, so the
 rem package is already importable and needs no install of its own. Skipping it
 rem also keeps a bulkdn.egg-info folder out of the way.
 
+rem The operator's settings are a copy of the shipped defaults, not the shipped
+rem file itself. Keeping them apart is what lets an update be a `git pull`:
+rem a tracked settings.yaml would conflict for anyone who had changed a size.
+if not exist "settings.yaml" (
+    copy /y "settings.default.yaml" "settings.yaml" >nul
+    echo   Created settings.yaml from the defaults -- edit that one.
+)
+
 rem Create the key file on first run, so there is one obvious place to put the
 rem key rather than a template to notice and rename.
 if not exist "private_key.local" (
@@ -123,7 +131,7 @@ if errorlevel 1 (
 echo.
 echo   Done. Next:
 echo     1. Put your base58 private key on one line in private_key.local
-echo     2. Edit settings.yaml
+echo     2. Edit settings.yaml (your copy; settings.default.yaml is the shipped one)
 echo     3. Run run.bat
 echo.
 pause

@@ -22,7 +22,10 @@ app/state/*
 private_key.local
 .env
 
-# settings.yaml is tracked and holds safe defaults. Personal variants
-# (settings.mine.yaml, settings.prod.yaml) stay out of git.
+# The operator's own settings. `settings.default.yaml` is what ships; the
+# installer copies it to `settings.yaml` on first run, and that copy is theirs
+# to edit. Tracking it would mean a merge conflict on every update for anyone
+# who had changed a size.
+settings.yaml
 settings.*.yaml
-!settings.yaml
+!settings.default.yaml
