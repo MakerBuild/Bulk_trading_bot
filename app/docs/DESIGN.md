@@ -357,6 +357,7 @@ See `settings.yaml`. The parameters that shape execution:
 | `legs.*.max_order_notional_usd` | Cap on any single resting order, in dollars |
 | `legs.*.max_order_size` | The same cap, as a base quantity |
 | `hold_minutes` | Time fully open before exiting; a number or a `low-high` range drawn per cycle |
+| `max_phase_minutes` | Cap on OPEN or EXIT; hitting it halts, which cancels and flattens. HOLD is exempt |
 | `chase_interval_s` | How often resting orders are re-evaluated |
 | `hedge_tolerance_lots` | Net exposure tolerated before hedging (must be ≥ 1 lot) |
 | `overlay_ttl_ms` | How long an unconfirmed fill is trusted before falling back to exchange truth |

@@ -45,6 +45,25 @@ import contextlib
 log = logging.getLogger(__name__)
 
 
+# Reconnects tolerated within one cycle before a dropped socket is treated as
+# a fault rather than a blip. Chosen against observed behaviour: the live
+# drops came minutes apart, so several in one cycle means something is
+# wrong rather than unlucky.
+MAX_RECONNECTS_PER_CYCLE = 5
+
+
+def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
+    """How long a phase may run, in seconds. 0 means no limit.
+
+    HOLD is exempt: it ends on a deadline it set itself, so a cap could only
+    cut a legitimately long hold short. OPEN and EXIT wait on fills, which may
+    never arrive, and those are what this exists for.
+    """
+    if phase == Phase.HOLD or max_phase_minutes <= 0:
+        return 0.0
+    return max_phase_minutes * 60
+
+
 class Halted(Exception):
     """Raised when a risk limit trips. Always followed by cancel + flatten."""
 
@@ -97,6 +116,8 @@ class Strategy:
         self._hedge_queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
         self._halt_reason: str | None = None
+        # Reset each cycle: a drop an hour ago says nothing about this one.
+        self._reconnects = 0
 
     # -- leg roles ---------------------------------------------------------
 
@@ -317,10 +338,25 @@ class Strategy:
 
         Halting is still the outcome when the retry fails: an unattended bot
         that cannot see its fills must not keep resting orders on the book.
+
+        And it is the outcome for a socket that keeps flapping. Healing without
+        a limit would reconnect forever: no rejection is recorded, so the reject
+        streak never trips, and the cycle would never finish while the log
+        scrolled past unread. The pair stays hedged throughout -- the reconciler
+        works over HTTP -- so this is about not hiding a persistent fault, not
+        about exposure.
         """
         dropped = [v for v in violations if v.kind == "disconnected"]
         if not dropped or len(dropped) != len(violations):
             return False
+
+        if self._reconnects >= MAX_RECONNECTS_PER_CYCLE:
+            log.error(
+                "the socket has dropped %d times this cycle -- not reconnecting again",
+                self._reconnects,
+            )
+            return False
+        self._reconnects += 1
 
         restored = False
         for session in (self.master, self.sub1):
@@ -346,8 +382,22 @@ class Strategy:
         """Run the chase/reconcile/risk loop until `is_done()` or a halt."""
         last_reconcile = 0.0
         roles_list = self.roles_for(phase)
+        started = time.monotonic()
+        budget = phase_budget_s(phase, self.config.max_phase_minutes)
 
         while not self._stop.is_set():
+            # Before the risk checks: a phase that will not end is the thing
+            # being caught, and EXIT is where it matters. The sweep that closes
+            # whatever the exit legs left runs only after this loop returns, so
+            # a maker order that never fills leaves positions open indefinitely
+            # with the bot still looking busy. Halting flattens both accounts.
+            if budget and time.monotonic() - started > budget:
+                self._trigger_halt(
+                    f"{label} did not finish within "
+                    f"{self.config.max_phase_minutes:g} minutes"
+                )
+                break
+
             violations = self.risk.check()
             if violations and await self._healed(violations):
                 violations = self.risk.check()
@@ -576,6 +626,7 @@ class Strategy:
                     break
                 cycle += 1
                 self.state.cycle_index += 1
+                self._reconnects = 0
                 self.state.cycle_started_at = time.time()
                 self.title.set_cycle(self.state.cycle_index)
                 log.info(

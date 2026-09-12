@@ -120,6 +120,17 @@ risk:
   ws_stale_timeout_s: 30.0      # no market data for this long => stop
   price_stale_timeout_s: 15.0   # refuse to re-price on a stale quote
 
+# How long the open or exit phase may run before the cycle is called stuck.
+# HOLD is exempt -- it ends on its own clock.
+#
+# Not a speed setting: a normal phase takes under a minute, so this only fires
+# when a resting order is never going to fill. It matters most on the way out,
+# where the sweep that closes anything left over runs only once the phase ends
+# -- so without this, an exit that cannot fill leaves positions open with the
+# bot still looking busy. Hitting it cancels, closes both accounts and stops.
+# 0 disables it.
+max_phase_minutes: 30
+
 
 
 # ===========================================================================

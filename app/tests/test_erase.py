@@ -212,3 +212,55 @@ def test_install_bat_writes_the_same_template():
 
     expected = [line.strip() for line in PRIVATE_KEY_TEMPLATE.splitlines()]
     assert echoed == expected, "install.bat and PRIVATE_KEY_TEMPLATE have drifted"
+
+
+# -- what the menu says about the key ---------------------------------------
+#
+# An empty password encrypts under a constant published in keystore.py. The
+# menu used to call that "encrypted", which tells an operator they are
+# protected when anyone holding this repository can open the file.
+
+
+def _write(path, seed, password=None):
+    import json
+
+    from bulkdn import keystore
+
+    fast = keystore.KdfParams(ops=1, mem=8 * 1024 * 1024)
+    if password is None:
+        path.write_text(seed, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(keystore.encrypt(seed, password, fast)), encoding="utf-8")
+
+
+def test_a_bare_key_reads_as_plaintext(tmp_path):
+    from bulkdn import keystore, menu
+
+    f = tmp_path / "k.local"
+    _write(f, "EXAMPLE-SEED")
+    assert menu._key_state(str(f)) == "PLAINTEXT"
+    assert keystore.is_encrypted(str(f)) is False
+
+
+def test_the_default_password_is_called_out(tmp_path):
+    from bulkdn import keystore, menu
+
+    f = tmp_path / "k.local"
+    _write(f, "EXAMPLE-SEED", keystore.DEFAULT_PASSWORD)
+    # is_encrypted alone cannot tell these apart -- that was the bug.
+    assert keystore.is_encrypted(str(f)) is True
+    assert menu._key_state(str(f)) == "default password"
+
+
+def test_a_real_password_reads_as_encrypted(tmp_path):
+    from bulkdn import menu
+
+    f = tmp_path / "k.local"
+    _write(f, "EXAMPLE-SEED", "a real password")
+    assert menu._key_state(str(f)) == "encrypted"
+
+
+def test_a_missing_file_is_not_reported_as_protected(tmp_path):
+    from bulkdn import menu
+
+    assert menu._key_state(str(tmp_path / "absent.local")) == "PLAINTEXT"

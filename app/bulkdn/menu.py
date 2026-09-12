@@ -449,12 +449,34 @@ def _erase_data(config: Config) -> None:
     _pause()
 
 
-def _accounts_menu(config: Config) -> None:
+def _key_state(path: str) -> str:
+    """How well the key file is actually protected, not merely whether it is.
+
+    An empty password encrypts under a constant published in keystore.py, so
+    the file opens for anyone holding this repository. Reporting that as
+    "encrypted" tells an operator they are protected when they are not -- and
+    the warning they saw is months behind them. It is detected the only way
+    available: by opening the file with that constant.
+
+    Costs one Argon2 derivation, so it is read once per visit rather than on
+    every redraw of the menu.
+    """
     from . import keystore
+
+    if not keystore.is_encrypted(path):
+        return "PLAINTEXT"
+    try:
+        keystore.load(path, keystore.DEFAULT_PASSWORD)
+    except Exception:  # noqa: BLE001 - anything but success means a real password
+        return "encrypted"
+    return "default password"
+
+
+def _accounts_menu(config: Config) -> None:
     from .config import PRIVATE_KEY_FILE
 
+    state = _key_state(PRIVATE_KEY_FILE)
     while True:
-        state = "encrypted" if keystore.is_encrypted(PRIVATE_KEY_FILE) else "PLAINTEXT"
         print("\n" + _box("ACCOUNTS MANAGEMENT", [
             "1. Create New Subaccount",
             "2. Balance All Subaccounts",
@@ -469,8 +491,10 @@ def _accounts_menu(config: Config) -> None:
             _balance_subaccounts(config)
         elif choice == "3":
             _encrypt_key(config)
+            state = _key_state(PRIVATE_KEY_FILE)
         elif choice == "4":
             _erase_data(config)
+            state = _key_state(PRIVATE_KEY_FILE)
         elif choice in ("5", "0"):
             return
 

@@ -63,6 +63,7 @@ class FakeStrategy:
         self.sub1 = sub1
         self.book = object()
         self.resyncs = 0
+        self._reconnects = 0
 
     async def healed(self, violations):
         from bulkdn.strategy import Strategy
@@ -171,3 +172,31 @@ async def test_a_dry_run_session_is_never_reconnected():
     master.client.is_connected = False
     await strategy.healed(DROPPED)
     assert master.client.attempts == 0
+
+
+# -- a flapping socket is a fault, not a blip -------------------------------
+
+
+async def test_reconnects_are_capped_within_a_cycle():
+    """Otherwise the cycle never ends: no rejection is recorded, so the reject
+    streak never trips, and the log scrolls past unread."""
+    from bulkdn.strategy import MAX_RECONNECTS_PER_CYCLE
+
+    strategy, master, _sub1 = build()
+    for _ in range(MAX_RECONNECTS_PER_CYCLE):
+        master.client.is_connected = False
+        assert await strategy.healed(DROPPED) is True
+
+    master.client.is_connected = False
+    assert await strategy.healed(DROPPED) is False, "the cap did not hold"
+
+
+async def test_the_cap_counts_attempts_not_failures():
+    """A socket that reconnects every time is still flapping."""
+    from bulkdn.strategy import MAX_RECONNECTS_PER_CYCLE
+
+    strategy, master, _sub1 = build()
+    for _ in range(MAX_RECONNECTS_PER_CYCLE):
+        master.client.is_connected = False
+        await strategy.healed(DROPPED)
+    assert strategy._reconnects == MAX_RECONNECTS_PER_CYCLE

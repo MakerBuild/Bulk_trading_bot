@@ -298,6 +298,14 @@ class Config:
     master_account: LegConfig
     sub_account: LegConfig
     hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(5.0, 5.0))
+    # How long OPEN or EXIT may run before the cycle is called stuck.
+    # HOLD is exempt: it ends on a clock it sets itself.
+    #
+    # Not a performance knob -- a normal phase takes under a minute, so
+    # this only ever fires when a resting order is not going to fill. It
+    # matters most in EXIT, where the sweep that closes leftovers runs
+    # only after the phase ends. 0 disables it.
+    max_phase_minutes: float = 30.0
     chase_interval_s: float = 1.0
     reconcile_interval_s: float = 5.0
     cycles: int = 1
@@ -389,6 +397,8 @@ class Config:
                 "max_margin_fraction must be between 0 and 1 "
                 f"(0.25 = a quarter of available margin), got {self.max_margin_fraction}"
             )
+        if self.max_phase_minutes < 0:
+            raise ConfigError("max_phase_minutes must be >= 0 (0 disables it)")
         if self.chase_interval_s <= 0:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
@@ -549,6 +559,7 @@ def load_config(
         master_account=_leg_from_dict(legs["master_account"], "master_account"),
         sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
         hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
+        max_phase_minutes=float(raw.get("max_phase_minutes", 30.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),
         reconcile_interval_s=float(raw.get("reconcile_interval_s", 5.0)),
         cycles=target.cycles,
