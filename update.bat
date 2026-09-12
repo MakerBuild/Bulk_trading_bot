@@ -60,7 +60,19 @@ if errorlevel 1 (
 echo   Installing it...
 rem /E copies everything; /XD .git leaves the clone's own history behind. No
 rem /PURGE, so anything here that is not in the repository simply stays.
-robocopy "%TMPDIR%" "." /E /XD ".git" /NFL /NDL /NJH /NJS /NP >nul
+rem
+rem /XF update.bat matters: cmd reads a batch file from disk as it runs,
+rem keeping a byte offset into it. Replacing this file mid-run leaves cmd
+rem carrying on at that offset inside different bytes, executing whatever
+rem fragment of a line it lands in -- seen as "'EL' is not recognized" from
+rem a line that is a plain comment.
+rem
+rem The usual workaround is to re-run from a copy in TEMP. Do not: a batch
+rem file that copies itself to TEMP and then fetches from the network is
+rem what a self-replicating script looks like, and Windows Defender deleted
+rem this file on write, twice, while it did that. So this script never
+rem updates itself; if it ever must change, that needs a fresh zip.
+robocopy "%TMPDIR%" "." /E /XD ".git" /XF "update.bat" /NFL /NDL /NJH /NJS /NP >nul
 rem robocopy returns 0-7 for success of various kinds; 8 and up is failure.
 if errorlevel 8 (
     echo   Copy failed.
