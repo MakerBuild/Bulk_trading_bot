@@ -14,6 +14,12 @@ drift, so an order failing to fill is held exactly where it is failing. So a
 second trigger watches the clock -- after `chase_patience_s` unfilled, the order
 gives up its offset and moves onto the touch. It still never crosses, so the
 fill stays on the maker side; what is spent is queue position, not fees.
+
+From then on the leg is on a shorter leash. `max_distance_bps` is the tolerance
+for an order deliberately resting away from the market; once the order is meant
+to be ON it, that tolerance is far too loose -- at 8bps an ETH order sat $1.08
+below the best bid, ten levels deep, with the drift rule calling it fine. A
+tightened leg follows the touch within `tight_distance_bps` instead.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ class ChaseParams:
     max_distance_bps: float
     max_order_size: float
     chase_patience_s: float = 0.0
+    tight_distance_bps: float = 1.0
 
 
 def effective_offset_bps(
@@ -202,10 +209,21 @@ class Chaser:
                 ),
             )
 
-        if drift > params.max_distance_bps:
+        # A leg that has tightened is meant to be on the market, not near it,
+        # so it follows the touch on a much shorter leash. max_distance_bps is
+        # the tolerance for an order deliberately resting away from the price;
+        # applying it after tightening left an ETH order $1.08 below the best
+        # bid, ten levels deep, with the drift rule calling that acceptable.
+        allowed = (
+            params.tight_distance_bps if was_tightened else params.max_distance_bps
+        )
+        if drift > allowed:
             return await self._place(
                 session, roles, leg, target, desired, replace_oid=leg.oid,
-                reason=f"drift {drift:.1f}bps > {params.max_distance_bps:.1f}bps",
+                reason=(
+                    f"drift {drift:.1f}bps > {allowed:.1f}bps"
+                    + (" (following the touch)" if was_tightened else "")
+                ),
             )
         if undersized:
             # The cap or a target change left the book short of what the leg

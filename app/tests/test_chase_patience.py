@@ -80,3 +80,51 @@ def test_a_negative_patience_is_refused():
 def test_params_default_to_off():
     """A ChaseParams built without it behaves as the chaser always did."""
     assert ChaseParams(offset_bps=2.0, max_distance_bps=5.0, max_order_size=1.0).chase_patience_s == 0.0
+
+
+# -- following the touch once committed --------------------------------------
+#
+# From a live book: an ETH order resting at 2527.26 with the best bid at
+# 2528.34 -- $1.08 behind, ten levels deep. The leg had already tightened, so
+# it was meant to be on the market, but max_distance_bps (8) still governed the
+# replace and called 4.3bps of lag acceptable.
+
+
+def replace_threshold(params, tightened):
+    """The rule under test, as the chaser applies it."""
+    return params.tight_distance_bps if tightened else params.max_distance_bps
+
+
+def params(max_distance=8.0, tight=1.0):
+    return ChaseParams(
+        offset_bps=3.0, max_distance_bps=max_distance,
+        max_order_size=1.0, chase_patience_s=8.0, tight_distance_bps=tight,
+    )
+
+
+def test_a_waiting_order_keeps_the_loose_tolerance():
+    """It is resting away from the market on purpose; chasing every tick would
+    burn nonces and queue position for nothing."""
+    assert replace_threshold(params(), tightened=False) == 8.0
+
+
+def test_a_committed_order_follows_the_price():
+    assert replace_threshold(params(), tightened=True) == 1.0
+
+
+def test_the_live_lag_would_now_trigger_a_replace():
+    order, bid = 2527.26, 2528.34
+    lag_bps = (bid - order) / bid * 10_000
+
+    assert lag_bps > replace_threshold(params(), tightened=True), "still held"
+    assert lag_bps < replace_threshold(params(), tightened=False), (
+        "this is the case that used to be tolerated"
+    )
+
+
+def test_the_threshold_must_be_positive():
+    leg = LegConfig(
+        symbol="BTC-USD", size=1.0, max_order_size=1.0, tight_distance_bps=0.0
+    )
+    with pytest.raises(ConfigError, match="tight_distance_bps"):
+        leg.validate("master_account")

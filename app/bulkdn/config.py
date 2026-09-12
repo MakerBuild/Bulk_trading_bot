@@ -98,6 +98,14 @@ class LegConfig:
     # order never crosses, so the fill stays on the maker side. 0 keeps the
     # offset for as long as the order rests.
     chase_patience_s: float = 8.0
+    # The replace threshold once a leg has tightened onto the touch.
+    #
+    # `max_distance_bps` is the tolerance for an order deliberately resting
+    # away from the market, and it is far too loose for one that is meant to be
+    # ON the market: at 8bps an ETH order sat $1.08 below the best bid, ten
+    # levels deep, and the drift rule called that fine. Once we have decided we
+    # want the fill, the order follows the touch instead.
+    tight_distance_bps: float = 1.0
     # The per-order cap, in whichever unit suits; it defaults to the whole leg.
     max_order_size: float = 0.0
     max_order_notional_usd: float = 0.0
@@ -146,6 +154,8 @@ class LegConfig:
             raise ConfigError(f"legs.{name}.max_distance_bps must be > 0")
         if self.chase_patience_s < 0:
             raise ConfigError(f"legs.{name}.chase_patience_s must be >= 0 (0 disables it)")
+        if self.tight_distance_bps <= 0:
+            raise ConfigError(f"legs.{name}.tight_distance_bps must be > 0")
         if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
             raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
 
@@ -442,6 +452,7 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             offset_bps=float(raw.get("offset_bps", 0.0)),
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
             chase_patience_s=float(raw.get("chase_patience_s", 8.0)),
+            tight_distance_bps=float(raw.get("tight_distance_bps", 1.0)),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(

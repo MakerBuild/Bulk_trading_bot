@@ -56,6 +56,10 @@ legs:
     chase_patience_s: 8     # unfilled this long? give up the offset and sit
                             # on the best price. Still passive -- the order
                             # never crosses, so it stays a maker fill.
+    tight_distance_bps: 1.0 # once it has, follow the price this closely.
+                            # max_distance_bps is the tolerance for an order
+                            # deliberately waiting away from the market; this
+                            # is for one that is meant to be ON it.
     max_order_notional_usd: 100  # cap on any single resting order, in dollars
 
   sub_account:
@@ -65,6 +69,7 @@ legs:
     offset_bps: 3.0
     max_distance_bps: 8.0
     chase_patience_s: 8
+    tight_distance_bps: 1.0
     max_order_notional_usd: 100
 
 

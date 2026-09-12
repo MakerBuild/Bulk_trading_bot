@@ -960,6 +960,7 @@ def build_chase_params(config: Config) -> dict[str, ChaseParams]:
             max_distance_bps=leg.max_distance_bps,
             max_order_size=leg.max_order_size,
             chase_patience_s=leg.chase_patience_s,
+            tight_distance_bps=leg.tight_distance_bps,
         )
         for leg in (config.master_account, config.sub_account)
     }
