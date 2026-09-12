@@ -93,6 +93,11 @@ class LegConfig:
     notional_usd: float = 0.0
     offset_bps: float = 0.0
     max_distance_bps: float = 5.0
+    # How long a resting order may go unfilled before it stops sitting
+    # `offset_bps` inside the touch and moves onto it. Still passive -- the
+    # order never crosses, so the fill stays on the maker side. 0 keeps the
+    # offset for as long as the order rests.
+    chase_patience_s: float = 8.0
     # The per-order cap, in whichever unit suits; it defaults to the whole leg.
     max_order_size: float = 0.0
     max_order_notional_usd: float = 0.0
@@ -139,6 +144,8 @@ class LegConfig:
             raise ConfigError(f"legs.{name}.offset_bps must be >= 0")
         if self.max_distance_bps <= 0:
             raise ConfigError(f"legs.{name}.max_distance_bps must be > 0")
+        if self.chase_patience_s < 0:
+            raise ConfigError(f"legs.{name}.chase_patience_s must be >= 0 (0 disables it)")
         if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
             raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
 
@@ -434,6 +441,7 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             notional_usd=notional_usd,
             offset_bps=float(raw.get("offset_bps", 0.0)),
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
+            chase_patience_s=float(raw.get("chase_patience_s", 8.0)),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(

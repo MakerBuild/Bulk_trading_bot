@@ -354,6 +354,7 @@ See `settings.yaml`. The parameters that shape execution:
 | `legs.*.size` | The same, as a base quantity. One or the other per leg, never both |
 | `legs.*.offset_bps` | How far inside the touch the resting order sits |
 | `legs.*.max_distance_bps` | Drift that triggers a cancel+replace |
+| `legs.*.chase_patience_s` | Unfilled for this long: give up the offset and rest on the touch. Still passive |
 | `legs.*.max_order_notional_usd` | Cap on any single resting order, in dollars |
 | `legs.*.max_order_size` | The same cap, as a base quantity |
 | `hold_minutes` | Time fully open before exiting; a number or a `low-high` range drawn per cycle |

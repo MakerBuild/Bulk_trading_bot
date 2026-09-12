@@ -53,6 +53,9 @@ legs:
     leverage: 10            # 1-50, capped by the market's own maximum
     offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
     max_distance_bps: 5.0   # re-price the order once it drifts this far
+    chase_patience_s: 8     # unfilled this long? give up the offset and sit
+                            # on the best price. Still passive -- the order
+                            # never crosses, so it stays a maker fill.
     max_order_notional_usd: 100  # cap on any single resting order, in dollars
 
   sub_account:
@@ -61,6 +64,7 @@ legs:
     leverage: 10            # ETH-USD allows up to 25
     offset_bps: 3.0
     max_distance_bps: 8.0
+    chase_patience_s: 8
     max_order_notional_usd: 100
 
 

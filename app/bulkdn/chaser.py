@@ -8,6 +8,12 @@ the leg has no order working.
 An order is only replaced once it has drifted further than `max_distance_bps`
 from its target. Replacing on every tick would burn through nonces, invite rate
 limiting, and lose queue position for no benefit.
+
+That rule alone leaves one gap: if the market does not move, the order does not
+drift, so an order failing to fill is held exactly where it is failing. So a
+second trigger watches the clock -- after `chase_patience_s` unfilled, the order
+gives up its offset and moves onto the touch. It still never crosses, so the
+fill stays on the maker side; what is spent is queue position, not fees.
 """
 
 from __future__ import annotations
@@ -36,6 +42,32 @@ class ChaseParams:
     offset_bps: float
     max_distance_bps: float
     max_order_size: float
+    chase_patience_s: float = 0.0
+
+
+def effective_offset_bps(
+    base_bps: float, resting_for_s: float, patience_s: float, tightened: bool
+) -> float:
+    """How far inside the touch to rest, given how long we have been waiting.
+
+    Sitting `offset_bps` inside the touch is what makes the fill a maker fill,
+    but it also means waiting for the market to come to us -- observed taking
+    anywhere from 17 seconds to over two and a half minutes on a live cycle.
+    Once an order has rested longer than `patience_s`, it gives up the offset
+    and moves onto the touch: the best price that is still passive.
+
+    It never crosses. The order joins the bid rather than lifting the ask, so
+    the fill is still on the maker side and the rebate is unaffected.
+
+    Sticky once tightened, for the rest of the leg. Letting it spring back to
+    the full offset would walk the order away from the market again, and it
+    would only have to walk back after the next wait.
+    """
+    if tightened:
+        return 0.0
+    if patience_s <= 0 or resting_for_s < patience_s:
+        return base_bps
+    return 0.0
 
 
 @dataclass
@@ -65,6 +97,10 @@ class Chaser:
         self.params = params
         self.price_stale_timeout_s = price_stale_timeout_s
         self._placed_at: dict[str, float] = {}
+        # Legs that waited out their patience and now rest on the touch. By
+        # symbol, not by order id: the decision belongs to the leg, and a
+        # replacement should not start the wait over.
+        self._tightened: set[str] = set()
 
     # -- sizing ------------------------------------------------------------
 
@@ -104,6 +140,7 @@ class Chaser:
             if leg.oid:
                 await self._cancel(session, leg, symbol)
             leg.complete = True
+            self._tightened.discard(symbol)
             return ChaseOutcome(symbol, "complete", f"remaining={remaining:.8f}")
 
         if quote.age_s > self.price_stale_timeout_s:
@@ -111,12 +148,23 @@ class Chaser:
                 symbol, "skipped", f"stale price ({quote.age_s:.1f}s old)"
             )
 
+        resting_for = (
+            time.monotonic() - self._placed_at[leg.oid]
+            if leg.oid and leg.oid in self._placed_at
+            else 0.0
+        )
+        was_tightened = symbol in self._tightened
+        offset = effective_offset_bps(
+            params.offset_bps, resting_for, params.chase_patience_s, was_tightened
+        )
+        tightening_now = offset < params.offset_bps and not was_tightened
+
         target = chase_price(
             best_bid=quote.best_bid,
             best_ask=quote.best_ask,
             mark_price=quote.mark_price,
             is_buy=roles.maker_is_buy,
-            offset_bps=params.offset_bps,
+            offset_bps=offset,
             spec=spec,
         )
         if target is None:
@@ -140,6 +188,19 @@ class Chaser:
 
         drift = distance_bps(resting.price, target)
         undersized = resting.size < desired - spec.lot_size
+
+        if tightening_now:
+            # Below max_distance_bps, so the drift rule would have held this
+            # order where it was. That is the whole point: the market never
+            # came to it, so it goes to the market instead.
+            self._tightened.add(symbol)
+            return await self._place(
+                session, roles, leg, target, desired, replace_oid=leg.oid,
+                reason=(
+                    f"unfilled for {resting_for:.0f}s -- moving onto the touch "
+                    f"from {params.offset_bps:g}bps inside"
+                ),
+            )
 
         if drift > params.max_distance_bps:
             return await self._place(
@@ -273,3 +334,7 @@ class Chaser:
     async def cancel_leg(self, roles: LegRoles, leg: LegState) -> None:
         """Public cancel, used on phase transitions and shutdown."""
         await self._cancel(self.sessions[roles.maker], leg, roles.symbol)
+        # The next phase gets its own patience: entry and exit are different
+        # sides of the book and one having been slow says nothing about the
+        # other.
+        self._tightened.discard(roles.symbol)
