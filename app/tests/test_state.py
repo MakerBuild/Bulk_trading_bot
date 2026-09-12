@@ -19,16 +19,23 @@ def test_round_trip(tmp_path):
     path = tmp_path / "state.json"
     store = StateStore(str(path))
 
-    state = StrategyState(phase=Phase.HOLD, cycle_index=3, hold_until=123.0)
-    state.reset_legs({"BTC-USD": 0.01, "SOL-USD": 1.0})
+    state = StrategyState(cycle_index=3)
+    for symbol, size in (("BTC-USD", 0.01), ("SOL-USD", 1.0)):
+        leg = state.leg(symbol)
+        leg.target_size = size
+        leg.phase = Phase.HOLD
+        leg.hold_until = 123.0
     state.leg("BTC-USD").oid = "abc123"
     state.leg("BTC-USD").price = 100_000.0
     store.save(state)
 
     loaded = store.load()
+    # The persisted pair phase is written from the legs, so it cannot disagree
+    # with them the way it did when nothing kept the field in step.
     assert loaded.phase == Phase.HOLD
+    assert loaded.leg("BTC-USD").phase == Phase.HOLD
+    assert loaded.leg("BTC-USD").hold_until == 123.0
     assert loaded.cycle_index == 3
-    assert loaded.hold_until == 123.0
     assert loaded.leg("BTC-USD").oid == "abc123"
     assert loaded.leg("BTC-USD").target_size == 0.01
     assert loaded.leg("SOL-USD").target_size == 1.0

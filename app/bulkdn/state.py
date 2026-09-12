@@ -85,13 +85,6 @@ class StrategyState:
             self.legs[symbol] = LegState(symbol=symbol)
         return self.legs[symbol]
 
-    def reset_legs(self, targets: dict[str, float]) -> None:
-        """Start a fresh set of legs for a new phase."""
-        self.legs = {
-            symbol: LegState(symbol=symbol, target_size=size)
-            for symbol, size in targets.items()
-        }
-
     def hold_remaining_s(self) -> float:
         return max(0.0, self.hold_until - time.time())
 
@@ -113,7 +106,11 @@ class StrategyState:
 
     def to_dict(self) -> dict:
         data = asdict(self)
-        data["phase"] = self.phase.value
+        # Written from the legs, not from the field. Nothing updates the field
+        # while a cycle runs -- the legs carry the phase now -- so persisting it
+        # raw records whatever it happened to be at startup. A flatten read that
+        # as IDLE and skipped resetting a state whose legs were mid-cycle.
+        data["phase"] = self.summary_phase.value
         for leg in data["legs"].values():
             leg["phase"] = Phase(leg["phase"]).value
         return data

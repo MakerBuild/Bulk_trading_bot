@@ -333,13 +333,18 @@ async def cmd_flatten(config: Config, dry_run: bool) -> int:
         await flatten(runtime.sessions, runtime.book, runtime.feed, runtime.symbols)
 
         state = runtime.store.load()
-        if state.phase != Phase.IDLE:
+        # Legs, not the summary: a leg can hold an order id with the pair
+        # reading IDLE, and leaving that behind is what made a flatten look
+        # like it had done nothing.
+        if state.summary_phase != Phase.IDLE or state.legs:
             state.phase = Phase.IDLE
             state.halted_reason = None
             state.hold_until = 0.0
             state.legs = {}
             runtime.store.save(state)
             log.info("state reset to IDLE")
+        else:
+            log.info("state was already IDLE -- nothing to reset")
         return 0
     finally:
         await runtime.stop()

@@ -143,3 +143,48 @@ def test_resetting_one_leg_leaves_the_others_peak():
 
     found = guard.check(book_with(0.0, 0.0), phases, [ACCT])
     assert [f.symbol for f in found] == [ETH], "BTC was reset; ETH was not"
+
+
+# -- the persisted pair phase cannot drift from the legs ---------------------
+#
+# Nothing updates the pair's own phase field while a cycle runs -- the legs
+# carry it now. Persisting the field raw recorded whatever it happened to be at
+# startup, and a live `flatten` read that as IDLE, skipped resetting a state
+# whose legs still held an order id, and reported nothing wrong.
+
+
+def test_the_saved_phase_is_written_from_the_legs(tmp_path):
+    from bulkdn.state import StateStore
+
+    state = StrategyState(legs={
+        BTC: LegState(symbol=BTC, phase=Phase.OPEN, oid="still-resting"),
+        ETH: LegState(symbol=ETH, phase=Phase.HOLD),
+    })
+    # The stale field, exactly as a live run left it.
+    state.phase = Phase.IDLE
+
+    path = tmp_path / "state.json"
+    StateStore(str(path)).save(state)
+
+    assert StateStore(str(path)).load().phase == Phase.OPEN
+
+
+def test_a_halt_still_outranks_the_legs(tmp_path):
+    from bulkdn.state import StateStore
+
+    state = StrategyState(legs={BTC: LegState(symbol=BTC, phase=Phase.OPEN)})
+    state.phase = Phase.HALTED
+    state.halted_reason = "something went wrong"
+
+    path = tmp_path / "state.json"
+    StateStore(str(path)).save(state)
+    loaded = StateStore(str(path)).load()
+
+    assert loaded.phase == Phase.HALTED
+    assert loaded.halted_reason == "something went wrong"
+
+
+def test_a_leg_holding_an_order_is_not_idle():
+    """What flatten keys off. An order id with an IDLE pair is the bug."""
+    state = StrategyState(legs={BTC: LegState(symbol=BTC, oid="still-resting")})
+    assert state.legs, "flatten must see the leg even when the phase reads IDLE"
