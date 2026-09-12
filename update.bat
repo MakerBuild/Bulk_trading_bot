@@ -44,7 +44,7 @@ rem Dependencies can move with a release, and re-running this is cheap when
 rem they have not. install.bat is safe to repeat by design.
 echo.
 echo   Updating dependencies...
-call install.bat
+call "%~dp0install.bat"
 
 echo.
 echo   Up to date. If settings.default.yaml gained options you want, copy
