@@ -16,7 +16,7 @@ pair stays close to market-neutral while it trades.
    Tick **"Add python.exe to PATH"** in the installer — without it nothing else works.
 2. **Install git** from [git-scm.com](https://git-scm.com/downloads), keeping every
    default. The BULK library is fetched from GitHub.
-3. **Get the code.** `git clone <repository>` is the better route -- `update.bat`
+3. **Get the code.** `git clone https://github.com/MakerBuild/Bulk_trading_bot.git` is the better route -- `update.bat`
    then pulls new versions for you. A zip works too, and `update.bat` still
    fetches updates for it.
 4. **Double-click `install.bat`.** It builds a local environment, installs

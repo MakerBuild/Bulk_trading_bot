@@ -17,7 +17,7 @@ cd /d "%~dp0"
 
 rem ---------------------------------------------------------------------------
 rem The repository this checks for updates. Public, so no login is needed.
-set "REPO=https://github.com/CHANGE-ME/CHANGE-ME.git"
+set "REPO=https://github.com/MakerBuild/Bulk_trading_bot.git"
 rem ---------------------------------------------------------------------------
 
 where git >nul 2>&1
