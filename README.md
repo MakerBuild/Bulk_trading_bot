@@ -16,7 +16,10 @@ pair stays close to market-neutral while it trades.
    Tick **"Add python.exe to PATH"** in the installer — without it nothing else works.
 2. **Install git** from [git-scm.com](https://git-scm.com/downloads), keeping every
    default. The BULK library is fetched from GitHub.
-3. **Double-click `install.bat`.** It builds a local environment, installs
+3. **Get the code.** `git clone <repository>` is the better route -- `update.bat`
+   then pulls new versions for you. A zip works too, and `update.bat` still
+   fetches updates for it.
+4. **Double-click `install.bat`.** It builds a local environment, installs
    everything, and checks that transaction signing works. Safe to re-run.
 
 Never done this before? **[ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md](ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md)** walks through it
@@ -140,6 +143,8 @@ its owner's referral or invite.
 |---|---|
 | `ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md` | start here: every step, in Russian |
 | `install.bat` | one-time setup |
+| `update.bat` | fetch the latest version; leaves your settings and key alone |
+| `release.bat` | build a zip to hand out, from git rather than the folder |
 | `run.bat` | start the bot |
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your key |
