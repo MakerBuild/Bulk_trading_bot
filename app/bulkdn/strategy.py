@@ -62,6 +62,12 @@ log = logging.getLogger(__name__)
 # wrong rather than unlucky.
 MAX_RECONNECTS_PER_CYCLE = 5
 
+# How long a position read stays good enough to share. Three callers now want
+# one -- the supervisor and each leg confirming a phase -- and a live run showed
+# them fetching the same numbers three times within the same second. Short
+# enough that nobody acts on anything stale, long enough to collapse a burst.
+POSITION_FRESHNESS_S = 0.5
+
 
 def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
     """How long a phase may run, in seconds. 0 means no limit.
@@ -129,6 +135,8 @@ class Strategy:
         self._halt_reason: str | None = None
         # Reset each cycle: a drop an hour ago says nothing about this one.
         self._reconnects = 0
+        self._sync_lock = asyncio.Lock()
+        self._synced_at = 0.0
 
     # -- leg roles ---------------------------------------------------------
 
@@ -430,7 +438,7 @@ class Strategy:
                 # the book decays toward zero and would otherwise make the bot
                 # believe it is flat while real positions are still open.
                 try:
-                    await sync_positions(self.sessions.values(), self.book)
+                    await self._sync_positions()
                 except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("position sync failed: %s", exc)
 
@@ -456,6 +464,22 @@ class Strategy:
                 self._log_untradeable_residuals()
 
             await asyncio.sleep(self.config.chase_interval_s)
+
+    async def _sync_positions(self, max_age_s: float = POSITION_FRESHNESS_S) -> None:
+        """Read positions from the exchange, sharing one read between callers.
+
+        The legs and the supervisor all want the same numbers, and they ask on
+        their own schedules. The lock makes a burst of callers wait on the first
+        one's read rather than each issuing its own, which is what a live run
+        showed happening: the same pair of account fetches three times over.
+
+        Still the exchange's answer, not a guess -- only the request is shared.
+        """
+        async with self._sync_lock:
+            if time.monotonic() - self._synced_at < max_age_s:
+                return
+            await sync_positions(self.sessions.values(), self.book)
+            self._synced_at = time.monotonic()
 
     def _phases_by_symbol(self) -> dict[str, Phase]:
         return {symbol: self.state.leg(symbol).phase for symbol in self.symbols}
@@ -634,7 +658,7 @@ class Strategy:
         so it is confirmed against the exchange before being acted on.
         """
         try:
-            await sync_positions(self.sessions.values(), self.book)
+            await self._sync_positions()
         except Exception as exc:
             log.error("could not verify %s completion: %s", label, exc)
             return False
