@@ -1,4 +1,15 @@
-"""The delta-neutral cycle: OPEN -> HOLD -> EXIT -> COMPLETE.
+"""The delta-neutral cycle: OPEN -> HOLD -> EXIT -> COMPLETE, per leg.
+
+Each leg runs that cycle on its own clock, as its own task. They shared one
+phase once, and it cost real time: a leg filled on both accounts sat idle until
+the other filled before its hold could start, and a leg that had closed could
+not place its next entry until the other closed too.
+
+Nothing required the synchrony. The hedge is computed per symbol --
+`net = position[maker] + position[taker]` -- so the two legs never had anything
+to agree about. What is genuinely shared moves to `_supervise`: the risk limits,
+which are about the pair, and the position read, which is one pair of HTTP calls
+either way.
 
 Concurrency note, because it dictates the shape of this module: the SDK awaits
 event handlers inline inside its WebSocket receive loop, and order responses are
@@ -153,6 +164,18 @@ class Strategy:
     def _roles_by_symbol(self, phase: Phase) -> dict[str, LegRoles]:
         return {roles.symbol: roles for roles in self.roles_for(phase)}
 
+    def leg_roles(self, symbol: str) -> LegRoles:
+        """Roles for one symbol, at the phase that symbol is actually in.
+
+        Legs advance independently, so asking for "the" phase is meaningless
+        once one is exiting while the other is still opening.
+        """
+        return self._roles_by_symbol(self.state.leg(symbol).phase)[symbol]
+
+    def _live_roles(self) -> list[LegRoles]:
+        """Roles for every leg, each at its own phase."""
+        return [self.leg_roles(symbol) for symbol in self.symbols]
+
     # -- handlers (synchronous; see module docstring) ----------------------
 
     def install_handlers(self) -> None:
@@ -188,7 +211,7 @@ class Strategy:
 
             self.book.apply_fill(session.pubkey, symbol, is_buy, size)
 
-            roles = self._roles_by_symbol(self.state.phase).get(symbol)
+            roles = self._roles_by_symbol(self.state.leg(symbol).phase).get(symbol)
             if roles is not None and session.pubkey == roles.taker:
                 # This is one of our own hedge orders landing; retire its
                 # reservation so net exposure reads correctly.
@@ -265,7 +288,9 @@ class Strategy:
             # Closing the survivor happens in the worker; a handler that
             # awaited an order would deadlock the socket it arrived on.
             if self.guard.check(
-                self.book, self.state.phase, [self.master.pubkey, self.sub1.pubkey]
+                self.book,
+                self._phases_by_symbol(),
+                [self.master.pubkey, self.sub1.pubkey],
             ):
                 self._liquidation_seen.set()
 
@@ -291,7 +316,7 @@ class Strategy:
             # not queue behind a hedge -- and it makes any pending hedge moot.
             if self._liquidation_seen.is_set():
                 self._liquidation_seen.clear()
-                await self._guard_liquidation(self.state.phase)
+                await self._guard_liquidation(self._phases_by_symbol())
                 continue
 
             try:
@@ -299,9 +324,9 @@ class Strategy:
             except asyncio.TimeoutError:
                 continue
 
-            roles = self._roles_by_symbol(self.state.phase).get(symbol)
-            if roles is None:
+            if symbol not in self.symbols:
                 continue
+            roles = self.leg_roles(symbol)
             try:
                 await self.hedger.hedge(roles, mark_price=self.feed.reference_price(symbol))
             except HedgeLimitExceeded as exc:
@@ -378,43 +403,23 @@ class Strategy:
 
     # -- phase driver ------------------------------------------------------
 
-    async def _drive(self, phase: Phase, is_done, label: str) -> None:
-        """Run the chase/reconcile/risk loop until `is_done()` or a halt."""
+    # -- supervisor --------------------------------------------------------
+
+    async def _supervise(self) -> None:
+        """Safety and reconciliation for the pair, while the legs run themselves.
+
+        One loop, not one per leg: the risk limits are about the pair, the
+        position read is a single pair of HTTP calls, and running either twice
+        as often would buy nothing.
+        """
         last_reconcile = 0.0
-        roles_list = self.roles_for(phase)
-        started = time.monotonic()
-        budget = phase_budget_s(phase, self.config.max_phase_minutes)
-
         while not self._stop.is_set():
-            # Before the risk checks: a phase that will not end is the thing
-            # being caught, and EXIT is where it matters. The sweep that closes
-            # whatever the exit legs left runs only after this loop returns, so
-            # a maker order that never fills leaves positions open indefinitely
-            # with the bot still looking busy. Halting flattens both accounts.
-            if budget and time.monotonic() - started > budget:
-                self._trigger_halt(
-                    f"{label} did not finish within "
-                    f"{self.config.max_phase_minutes:g} minutes"
-                )
-                break
-
             violations = self.risk.check()
             if violations and await self._healed(violations):
                 violations = self.risk.check()
             if violations:
                 self._trigger_halt("; ".join(str(v) for v in violations))
-                break
-
-            for roles in roles_list:
-                leg = self.state.leg(roles.symbol)
-                if leg.complete and phase != Phase.HOLD:
-                    continue
-                if phase == Phase.HOLD:
-                    continue
-                try:
-                    await self.chaser.step(roles, leg)
-                except Exception as exc:
-                    log.error("chase step for %s failed: %s", roles.symbol, exc)
+                return
 
             now = time.monotonic()
             if now - last_reconcile >= self.config.reconcile_interval_s:
@@ -426,37 +431,199 @@ class Strategy:
                 # believe it is flat while real positions are still open.
                 try:
                     await sync_positions(self.sessions.values(), self.book)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("position sync failed: %s", exc)
 
                 # Before hedging, not after. If a position was liquidated, the
-                # hedge rule's answer is to open a fresh one on the account
-                # that just ran out of margin -- exactly the wrong move.
-                if await self._guard_liquidation(phase):
-                    break
+                # hedge rule's answer is to open a fresh one on the account that
+                # still holds something -- exactly the wrong response.
+                if await self._guard_liquidation(self._phases_by_symbol()):
+                    return
 
                 try:
-                    corrections = await reconcile_net(self.hedger, roles_list, self.feed)
+                    corrections = await reconcile_net(
+                        self.hedger, self._live_roles(), self.feed
+                    )
                     for correction in corrections:
                         log.info("reconciler corrected %s", correction)
                 except HedgeLimitExceeded as exc:
                     self._trigger_halt(f"hedge limit exceeded -- {exc}")
-                    break
-                except Exception as exc:
+                    return
+                except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("reconcile failed: %s", exc)
+
                 self.risk.log_exposure()
                 self._log_untradeable_residuals()
 
+            await asyncio.sleep(self.config.chase_interval_s)
+
+    def _phases_by_symbol(self) -> dict[str, Phase]:
+        return {symbol: self.state.leg(symbol).phase for symbol in self.symbols}
+
+    # -- one leg's chase loop ----------------------------------------------
+
+    async def _drive_leg(self, symbol: str, is_done, label: str) -> None:
+        """Keep one leg's order near the market until `is_done()`.
+
+        Only this leg. The other is a separate task at its own phase, which is
+        the whole point: a filled leg must not wait on an unfilled one.
+        """
+        leg = self.state.leg(symbol)
+        started = time.monotonic()
+        budget = phase_budget_s(leg.phase, self.config.max_phase_minutes)
+
+        while not self._stop.is_set():
+            if budget and time.monotonic() - started > budget:
+                self._trigger_halt(
+                    f"{symbol} {label} did not finish within "
+                    f"{self.config.max_phase_minutes:g} minutes"
+                )
+                return
+
+            if leg.phase != Phase.HOLD and not leg.complete:
+                try:
+                    await self.chaser.step(self.leg_roles(symbol), leg)
+                except Exception as exc:  # noqa: BLE001 - retried next tick
+                    log.error("chase step for %s failed: %s", symbol, exc)
+
             self.store.save(self.state)
 
-            if is_done() and await self._confirm_done(is_done, label):
-                log.info("%s complete", label)
+            if is_done() and await self._confirm_done(is_done, f"{symbol} {label}"):
+                log.info("%s %s complete", symbol, label)
                 return
 
             await asyncio.sleep(self.config.chase_interval_s)
 
-        if self._halt_reason:
-            raise Halted(self._halt_reason)
+    def _leg_is_neutral(self, symbol: str) -> bool:
+        """Whether this leg has no hedge left that could actually be placed."""
+        roles = self.leg_roles(symbol)
+        if abs(self.hedger.in_flight.total(symbol)) > 0:
+            return False
+        price = self.feed.reference_price(symbol)
+        return self.hedger.actionable_hedge(roles, price) <= 0
+
+    def _leg_is_flat(self, symbol: str) -> bool:
+        spec = self.feed.specs[symbol]
+        return all(
+            abs(self.book.authoritative(session.pubkey, symbol)) < spec.lot_size
+            for session in (self.master, self.sub1)
+        )
+
+    # -- one leg's phases --------------------------------------------------
+
+    async def _leg_open(self, symbol: str, target_size: float) -> None:
+        leg = self.state.leg(symbol)
+        leg.phase = Phase.OPEN
+        leg.complete = False
+        leg.oid = None
+        leg.target_size = target_size
+        leg.hold_until = 0.0
+        roles = self.leg_roles(symbol)
+        log.info(
+            "=== %s OPEN: maker=%s taker=%s target=%g ===",
+            symbol, self.sessions[roles.maker].name,
+            self.sessions[roles.taker].name, target_size,
+        )
+        self.store.save(self.state)
+
+        await self._drive_leg(
+            symbol,
+            lambda: leg.complete and self._leg_is_neutral(symbol),
+            "open",
+        )
+
+    async def _leg_hold(self, symbol: str) -> None:
+        leg = self.state.leg(symbol)
+        if not leg.hold_until:
+            # Drawn per leg and stored as a deadline, so a restart mid-hold
+            # resumes this hold rather than rolling a fresh one -- and so a leg
+            # that filled first starts counting first.
+            leg.hold_until = time.time() + self.config.hold_minutes.pick() * 60
+        leg.phase = Phase.HOLD
+        self.store.save(self.state)
+
+        log.info("=== %s HOLD: %.1f minutes ===", symbol, leg.hold_remaining_s() / 60)
+        await self._drive_leg(symbol, lambda: leg.hold_remaining_s() <= 0, "hold")
+
+    async def _leg_exit(self, symbol: str) -> None:
+        leg = self.state.leg(symbol)
+        # Pull the entry order before reversing roles: it would fight the close.
+        if leg.oid:
+            await self.chaser.cancel_leg(self.leg_roles(symbol), leg)
+
+        leg.phase = Phase.EXIT
+        leg.complete = False
+        leg.oid = None
+        # The exit target is whatever is actually held, not the configured size:
+        # the entry may have filled only partially.
+        roles = self.leg_roles(symbol)
+        leg.target_size = abs(self.book.effective(roles.maker, symbol))
+        log.info("=== %s EXIT: %g to close ===", symbol, leg.target_size)
+        self.store.save(self.state)
+
+        # The closing limit order only unwinds the maker side. The taker side is
+        # reduced by hedges, and hedges stop once the pair is neutral -- so if
+        # partial fills and lot rounding leave the two accounts differing by
+        # less than one lot while both are still non-zero, no hedge will ever
+        # fire and the taker's residual would sit there forever. Completion
+        # therefore waits on the maker leg, then sweeps the rest.
+        await self._drive_leg(symbol, lambda: leg.complete, "exit")
+
+        if not self._stop.is_set() and not self._leg_is_flat(symbol):
+            log.info("%s: closing residual left after the exit leg", symbol)
+            await flatten(self.sessions, self.book, self.feed, [symbol])
+
+    # -- one leg's cycle ---------------------------------------------------
+
+    async def _run_leg(self, symbol: str, configured_size: float) -> None:
+        """OPEN -> HOLD -> EXIT, repeatedly, for one leg on its own clock."""
+        leg = self.state.leg(symbol)
+
+        while not self._stop.is_set():
+            if self.config.cycles and leg.cycle_index >= self.config.cycles:
+                return
+            reached = self._target_reached()
+            if reached:
+                log.info("%s: execution target reached: %s", symbol, reached)
+                return
+
+            # A restart lands mid-cycle, so each phase is entered only if this
+            # leg has not already passed it.
+            if leg.phase in (Phase.IDLE, Phase.COMPLETE):
+                leg.cycle_index += 1
+                # Shown as one number, so it follows whichever leg is ahead.
+                self.state.cycle_index = max(
+                    self.state.cycle_index,
+                    *(self.state.leg(s).cycle_index for s in self.symbols),
+                )
+                self.title.set_cycle(self.state.cycle_index)
+                log.info("=== %s cycle %d ===", symbol, leg.cycle_index)
+                await self._leg_open(symbol, configured_size)
+
+            if self._stop.is_set():
+                return
+            if leg.phase == Phase.OPEN:
+                await self._leg_hold(symbol)
+
+            if self._stop.is_set():
+                return
+            if leg.phase == Phase.HOLD:
+                await self._leg_exit(symbol)
+
+            if self._stop.is_set():
+                return
+            leg.phase = Phase.COMPLETE
+            leg.hold_until = 0.0
+            self.store.save(self.state)
+            log.info("=== %s cycle %d complete ===", symbol, leg.cycle_index)
+            # This leg legitimately went to zero, so its peaks would read as an
+            # external close on the next entry.
+            self.guard.reset_symbol(symbol)
+            await self.notifier.cycle_complete(
+                cycle=leg.cycle_index,
+                of=self.config.cycles or None,
+                detail=f"{symbol}: {self._progress_detail()}",
+            )
 
     async def _confirm_done(self, is_done, label: str) -> bool:
         """Re-check a completion claim against freshly fetched positions.
@@ -491,7 +658,7 @@ class Strategy:
         submitted. Such residuals are real exposure and are reported by
         `_log_untradeable_residuals`; the USD risk limits still police them.
         """
-        for roles in self.roles_for(self.state.phase):
+        for roles in self._live_roles():
             if abs(self.hedger.in_flight.total(roles.symbol)) > 0:
                 return False
             price = self.feed.reference_price(roles.symbol)
@@ -500,7 +667,7 @@ class Strategy:
         return True
 
     def _log_untradeable_residuals(self) -> None:
-        for roles in self.roles_for(self.state.phase):
+        for roles in self._live_roles():
             price = self.feed.reference_price(roles.symbol)
             residual = self.hedger.untradeable_residual(roles, price)
             if residual:
@@ -532,77 +699,6 @@ class Strategy:
                     return False
         return True
 
-    # -- phases ------------------------------------------------------------
-
-    async def _phase_open(self) -> None:
-        log.info("=== OPEN: %s ===", " | ".join(
-            f"{r.symbol} maker={self.sessions[r.maker].name} taker={self.sessions[r.taker].name}"
-            for r in self.roles_for(Phase.OPEN)
-        ))
-        self.state.phase = Phase.OPEN
-        self.title.set_phase("OPEN")
-        self.state.reset_legs(
-            {
-                self.config.master_account.symbol: self.config.master_account.size,
-                self.config.sub_account.symbol: self.config.sub_account.size,
-            }
-        )
-        self.store.save(self.state)
-
-        await self._drive(
-            Phase.OPEN,
-            lambda: self._legs_complete() and self._is_neutral(),
-            "open",
-        )
-
-    async def _phase_hold(self) -> None:
-        if not self.state.hold_until:
-            # Drawn once and stored as a deadline, so a restart mid-hold
-            # resumes this hold rather than rolling a fresh one.
-            self.state.hold_until = time.time() + self.config.hold_minutes.pick() * 60
-        self.state.phase = Phase.HOLD
-        self.title.set_phase("HOLD")
-        self.store.save(self.state)
-
-        remaining = self.state.hold_remaining_s()
-        log.info("=== HOLD: %.1f minutes ===", remaining / 60)
-
-        await self._drive(
-            Phase.HOLD,
-            lambda: self.state.hold_remaining_s() <= 0,
-            "hold",
-        )
-
-    async def _phase_exit(self) -> None:
-        log.info("=== EXIT ===")
-        # Pull anything left from the entry phase before reversing roles: an
-        # entry order still resting would fight the closes.
-        await self._cancel_strategy_orders(Phase.OPEN)
-
-        self.state.phase = Phase.EXIT
-        self.title.set_phase("EXIT")
-        # Exit targets are whatever is actually held, not the configured size --
-        # the entry may have filled only partially.
-        self.state.reset_legs(
-            {
-                roles.symbol: abs(self.book.effective(roles.maker, roles.symbol))
-                for roles in self.roles_for(Phase.EXIT)
-            }
-        )
-        self.store.save(self.state)
-
-        # The closing limit orders only unwind the maker side of each pair. The
-        # taker side is reduced by hedges, and hedges stop once the pair is
-        # neutral -- so if partial fills and lot rounding leave the two accounts
-        # differing by less than one lot while both are still non-zero, no hedge
-        # will ever fire and the taker's residual would sit there forever.
-        # Completion therefore waits on the maker legs, then sweeps the rest.
-        await self._drive(Phase.EXIT, self._legs_complete, "exit")
-
-        if not self._all_flat():
-            log.info("closing residual positions left after the exit legs")
-            await flatten(self.sessions, self.book, self.feed, self.symbols)
-
     async def _cancel_strategy_orders(self, phase: Phase) -> None:
         for roles in self.roles_for(phase):
             leg = self.state.legs.get(roles.symbol)
@@ -612,51 +708,43 @@ class Strategy:
     # -- entry point -------------------------------------------------------
 
     async def run(self) -> None:
+        """Run both legs, each on its own clock, until they finish or a halt.
+
+        The legs were once driven in lockstep by a single loop, which made each
+        wait for the slowest: a filled leg could not start its hold until the
+        other filled, and a closed leg could not re-open until the other closed.
+        Nothing required that -- the hedge is computed per symbol -- so they now
+        run as separate tasks and the shared work moves to `_supervise`.
+        """
         self.install_handlers()
         worker = asyncio.create_task(self._hedge_worker())
+        supervisor = asyncio.create_task(self._supervise())
+        sizes = {
+            self.config.master_account.symbol: self.config.master_account.size,
+            self.config.sub_account.symbol: self.config.sub_account.size,
+        }
+        legs: list[asyncio.Task] = []
 
         try:
             await self._recover()
 
-            cycle = 0
-            while self.config.cycles == 0 or cycle < self.config.cycles:
-                reached = self._target_reached()
-                if reached:
-                    log.info("execution target reached: %s", reached)
-                    break
-                cycle += 1
-                self.state.cycle_index += 1
-                self._reconnects = 0
-                self.state.cycle_started_at = time.time()
-                self.title.set_cycle(self.state.cycle_index)
-                log.info(
-                    "=== cycle %d%s ===",
-                    self.state.cycle_index,
-                    f"/{self.config.cycles}" if self.config.cycles else "",
-                )
+            legs = [
+                asyncio.create_task(self._run_leg(symbol, sizes[symbol]))
+                for symbol in self.symbols
+            ]
+            # One leg raising must not leave the other trading on alone, so the
+            # first exception cancels the rest before it propagates.
+            done, pending = await asyncio.wait(
+                legs, return_when=asyncio.FIRST_EXCEPTION
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
+            await asyncio.gather(*pending, return_exceptions=True)
 
-                if self.state.phase in (Phase.IDLE, Phase.COMPLETE):
-                    self.state.hold_until = 0.0
-                    await self._phase_open()
-
-                if self.state.phase == Phase.OPEN:
-                    await self._phase_hold()
-
-                if self.state.phase == Phase.HOLD:
-                    await self._phase_exit()
-
-                self.state.phase = Phase.COMPLETE
-                self.state.hold_until = 0.0
-                self.store.save(self.state)
-                log.info("=== cycle %d complete ===", self.state.cycle_index)
-                # EXIT legitimately took every position to zero, so the peaks
-                # from this cycle would read as an external close in the next.
-                self.guard.reset()
-                await self.notifier.cycle_complete(
-                    cycle=self.state.cycle_index,
-                    of=self.config.cycles or None,
-                    detail=self._progress_detail(),
-                )
+            if self._halt_reason:
+                raise Halted(self._halt_reason)
 
         except Halted as exc:
             await self._emergency_stop(str(exc))
@@ -667,9 +755,12 @@ class Strategy:
             raise
         finally:
             self._stop.set()
-            worker.cancel()
+            for task in (*legs, supervisor, worker):
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await worker
+                await asyncio.gather(
+                    *(*legs, supervisor, worker), return_exceptions=True
+                )
 
     def _progress_detail(self) -> str:
         """Spend and volume so far, for a notification and the window title.
@@ -762,15 +853,9 @@ class Strategy:
         """
         sync_positions_http([self.master, self.sub1], self.book)
 
-        has_positions = any(
-            abs(self.book.authoritative(session.pubkey, symbol)) >= self.feed.specs[symbol].lot_size
-            for session in (self.master, self.sub1)
-            for symbol in self.symbols
-        )
-
         if self.state.phase == Phase.HALTED:
-            # Deliberately not cleared automatically, even though `has_positions`
-            # above already knows both accounts are flat. A halt means something
+            # Deliberately not cleared automatically, even though the per-leg
+            # pass below would find both accounts flat. A halt means something
             # went wrong; restarting past it without the operator having read
             # the reason is how the same fault repeats unseen.
             raise RuntimeError(
@@ -781,25 +866,39 @@ class Strategy:
                 "the state to IDLE."
             )
 
-        if not has_positions:
-            if self.state.phase not in (Phase.IDLE, Phase.COMPLETE):
-                log.warning(
-                    "state says %s but both accounts are flat -- starting clean",
-                    self.state.phase.value,
-                )
-            self.state.phase = Phase.IDLE
-            self.state.hold_until = 0.0
-        else:
-            log.warning(
-                "recovered open positions with state phase=%s", self.state.phase.value
+        # Decided per leg, because legs recover independently: one may have
+        # been mid-entry while the other was already unwinding.
+        for symbol in self.symbols:
+            leg = self.state.leg(symbol)
+            spec = self.feed.specs[symbol]
+            leg_has_positions = any(
+                abs(self.book.authoritative(session.pubkey, symbol)) >= spec.lot_size
+                for session in (self.master, self.sub1)
             )
-            if self.state.phase in (Phase.IDLE, Phase.COMPLETE):
+
+            if not leg_has_positions:
+                if leg.phase not in (Phase.IDLE, Phase.COMPLETE):
+                    log.warning(
+                        "%s: state says %s but both accounts are flat -- starting clean",
+                        symbol, leg.phase.value,
+                    )
+                leg.phase = Phase.IDLE
+                leg.hold_until = 0.0
+                continue
+
+            log.warning(
+                "%s: recovered open positions with phase=%s", symbol, leg.phase.value
+            )
+            if leg.phase in (Phase.IDLE, Phase.COMPLETE):
                 # Positions exist that this bot has no plan for. Unwinding is
                 # the only safe interpretation -- resuming an entry would add
                 # to a position of unknown provenance.
-                log.warning("positions exist with no recorded plan -- exiting them")
-                self.state.phase = Phase.HOLD
-                self.state.hold_until = 0.0
+                log.warning("%s: positions exist with no recorded plan -- exiting", symbol)
+                leg.phase = Phase.HOLD
+                leg.hold_until = 0.0
+
+        self.state.phase = self.state.summary_phase
+        self.state.hold_until = 0.0
 
         # Resting orders cannot be reliably matched to the recovered plan, and
         # an unrecognised order is an unhedged fill waiting to happen.
@@ -812,7 +911,7 @@ class Strategy:
 
         # Correct any exposure inherited from the previous process.
         corrections = await reconcile_net(
-            self.hedger, self.roles_for(self.state.phase), self.feed
+            self.hedger, self._live_roles(), self.feed
         )
         for correction in corrections:
             log.warning("recovery corrected %s", correction)

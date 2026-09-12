@@ -21,7 +21,7 @@ import pytest
 from bulkdn import strategy as strategy_module
 from bulkdn.config import ConfigError
 from bulkdn.state import Phase
-from bulkdn.strategy import Halted, Strategy, phase_budget_s
+from bulkdn.strategy import Strategy, phase_budget_s
 
 
 @pytest.fixture
@@ -38,44 +38,54 @@ def clock(monkeypatch):
     return clock
 
 
+SYMBOL = "BTC-USD"
+
+
 def build(max_phase_minutes, phase=Phase.EXIT):
+    from bulkdn.state import LegState, StrategyState
+
     s = Strategy.__new__(Strategy)
     s.config = type("C", (), {
         "max_phase_minutes": max_phase_minutes,
         "chase_interval_s": 0.01,
         "reconcile_interval_s": 999.0,
     })()
-    s.risk = type("R", (), {"check": lambda self: []})()
     s.store = type("St", (), {"save": lambda self, _s: None})()
     s._stop = asyncio.Event()
     s._halt_reason = None
-    s._reconnects = 0
     s.title = type("T", (), {"halted": lambda self, _r: None})()
     s.notifier = type("N", (), {
         "send_soon": lambda self, _c: None,
         "halted": lambda self, _r: None,
     })()
-    s.state = type("S", (), {"phase": phase})()
-    s.roles_for = lambda _p: []
+    s.state = StrategyState(legs={SYMBOL: LegState(symbol=SYMBOL, phase=phase)})
+    # The leg is marked done so the chase step is never reached: this is about
+    # the clock, not about placing orders.
+    s.state.leg(SYMBOL).complete = True
     return s
 
 
 async def drive(s, phase):
-    try:
-        await Strategy._drive(s, phase, lambda: False, "exit")
-    except Halted as exc:
-        return str(exc)
-    return None
+    """Returns the recorded halt reason, if the leg gave up.
+
+    `_drive_leg` records rather than raises: the other leg is a separate task
+    and has to unwind on its own before `run` turns the reason into a Halted.
+    """
+    await Strategy._drive_leg(s, SYMBOL, lambda: False, "exit")
+    return s._halt_reason
 
 
 async def test_a_phase_that_cannot_finish_is_halted(clock):
     """And a halt cancels and flattens, which is the point of raising."""
     clock.now = 40 * 60  # forty minutes in
-    reason = await drive(build(max_phase_minutes=30), Phase.EXIT)
+    s = build(max_phase_minutes=30)
+    reason = await drive(s, Phase.EXIT)
 
     assert reason is not None, "the loop ran on"
+    assert s._stop.is_set(), "the other leg was never told to stop"
     assert "did not finish within" in reason
     assert "30" in reason
+    assert SYMBOL in reason, "a halt should say which leg stalled"
 
 
 @pytest.mark.parametrize("phase", [Phase.OPEN, Phase.EXIT])

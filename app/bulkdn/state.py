@@ -48,10 +48,22 @@ class LegState:
     size: float | None = None
     target_size: float = 0.0
     complete: bool = False
+    # Each leg runs its own OPEN -> HOLD -> EXIT. They were lockstep once, and
+    # that made every leg wait for the slowest: a filled BTC leg sat idle until
+    # ETH filled before its hold could start, and a closed ETH leg could not
+    # re-open until BTC had closed too. The pair is hedged per symbol, so there
+    # was never anything to synchronise -- only an accident of one shared phase.
+    phase: Phase = Phase.IDLE
+    hold_until: float = 0.0
+    cycle_index: int = 0
     # Order IDs that were replaced but whose cancels were never confirmed.
     # Swept on the next chase pass so a failed cancel can't leave a duplicate
     # order resting alongside its replacement.
     stale_oids: list = field(default_factory=list)
+
+    def hold_remaining_s(self) -> float:
+        """Seconds left on this leg's hold. Its own clock, not the pair's."""
+        return max(0.0, self.hold_until - time.time())
 
     def remember_stale(self, oid: str | None) -> None:
         if oid and oid != self.oid and oid not in self.stale_oids:
@@ -83,17 +95,42 @@ class StrategyState:
     def hold_remaining_s(self) -> float:
         return max(0.0, self.hold_until - time.time())
 
+    @property
+    def summary_phase(self) -> Phase:
+        """One phase to show for a pair whose legs may be in different ones.
+
+        The least advanced wins, so a display never claims the cycle is further
+        along than its slowest leg. HALTED outranks everything: it is the one
+        that must not be hidden behind a leg that happens to be opening.
+        """
+        phases = [leg.phase for leg in self.legs.values()]
+        if not phases:
+            return self.phase
+        if Phase.HALTED in phases or self.phase == Phase.HALTED:
+            return Phase.HALTED
+        order = [Phase.IDLE, Phase.OPEN, Phase.HOLD, Phase.EXIT, Phase.COMPLETE]
+        return min(phases, key=lambda p: order.index(p) if p in order else 0)
+
     def to_dict(self) -> dict:
         data = asdict(self)
         data["phase"] = self.phase.value
+        for leg in data["legs"].values():
+            leg["phase"] = Phase(leg["phase"]).value
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> StrategyState:
-        legs = {
-            symbol: LegState(**leg_data)
-            for symbol, leg_data in (data.get("legs") or {}).items()
-        }
+        legs = {}
+        for symbol, stored in (data.get("legs") or {}).items():
+            fields = dict(stored)
+            # Written before legs had phases of their own. Inheriting the
+            # cycle's phase is what that file meant.
+            fields["phase"] = Phase(
+                fields.get("phase") or data.get("phase", Phase.IDLE.value)
+            )
+            fields.setdefault("hold_until", float(data.get("hold_until", 0.0)))
+            fields.setdefault("cycle_index", int(data.get("cycle_index", 0)))
+            legs[symbol] = LegState(**fields)
         return cls(
             phase=Phase(data.get("phase", Phase.IDLE.value)),
             cycle_index=int(data.get("cycle_index", 0)),

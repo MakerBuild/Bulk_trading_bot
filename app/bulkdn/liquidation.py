@@ -84,6 +84,16 @@ class LiquidationGuard:
     # long.
     _peak: dict[tuple[str, str], float] = field(default_factory=dict)
 
+    def reset_symbol(self, symbol: str) -> None:
+        """Forget one symbol's peaks, leaving the other leg's intact.
+
+        Legs finish their cycles independently, so clearing both would erase the
+        high-water mark of a leg that is still holding a position -- and its
+        next real shrink would then go unnoticed.
+        """
+        for key in [k for k in self._peak if k[1] == symbol]:
+            del self._peak[key]
+
     def reset(self) -> None:
         """Forget peaks. Called when a cycle ends, since EXIT legitimately
         takes every position back to zero."""
@@ -96,7 +106,10 @@ class LiquidationGuard:
             self._peak[key] = size
 
     def check(
-        self, book: PositionBook, phase: Phase, accounts: list[str]
+        self,
+        book: PositionBook,
+        phase: Phase | dict[str, Phase],
+        accounts: list[str],
     ) -> list[Liquidation]:
         """Return any position that shrank externally since the last check.
 
@@ -105,7 +118,13 @@ class LiquidationGuard:
         deciding a liquidation happened on that basis would be a false alarm
         with an expensive response.
         """
-        if phase not in _ACCUMULATING:
+        # Legs run their own phases, so `phase` may be a mapping of symbol to
+        # phase. One leg exiting must not stop the other being watched.
+        def accumulating(symbol: str) -> bool:
+            per_leg = phase[symbol] if isinstance(phase, dict) else phase
+            return per_leg in _ACCUMULATING
+
+        if not any(accumulating(symbol) for symbol in self.specs):
             # Still track peaks, so a later phase starts from the real high.
             for account in accounts:
                 for symbol in self.specs:
@@ -116,6 +135,12 @@ class LiquidationGuard:
         for account in accounts:
             for symbol, spec in self.specs.items():
                 current = book.authoritative(account, symbol)
+                if not accumulating(symbol):
+                    # This leg is unwinding, so shrinking is the plan. Keep the
+                    # peak current or its next entry would start from a high
+                    # that belongs to the position it just closed.
+                    self.observe(account, symbol, current)
+                    continue
                 key = (account, symbol)
                 peak = self._peak.get(key, 0.0)
 

@@ -356,10 +356,16 @@ async def cmd_status(config: Config) -> int:
     print(f"endpoint     : {config.http_url}")
     print(f"master       : {runtime.master.pubkey}")
     print(f"sub1         : {runtime.sub1.pubkey}")
-    print(f"phase        : {state.phase.value}")
-    print(f"cycle        : {state.cycle_index}")
-    if state.hold_until:
-        print(f"hold remaining: {state.hold_remaining_s() / 60:.1f} min")
+    # Per leg, because they no longer move together: one can be holding while
+    # the other is still filling, and a single phase would hide that.
+    print(f"phase        : {state.summary_phase.value}")
+    for symbol in runtime.symbols:
+        leg = state.leg(symbol)
+        held = (
+            f", {leg.hold_remaining_s() / 60:.1f} min of hold left"
+            if leg.hold_remaining_s() > 0 else ""
+        )
+        print(f"  {symbol:10} {leg.phase.value:9} cycle {leg.cycle_index}{held}")
     if state.halted_reason:
         print(f"halted       : {state.halted_reason}")
 

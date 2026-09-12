@@ -354,10 +354,10 @@ def _live_cycle_warning(state_file: pathlib.Path) -> str | None:
         state = StateStore(str(state_file)).load()
     except Exception:  # noqa: BLE001 - an unreadable file warns about nothing
         return None
-    if state.phase in (Phase.IDLE, Phase.COMPLETE):
+    if state.summary_phase in (Phase.IDLE, Phase.COMPLETE):
         return None
     return (
-        f"the state file records phase {state.phase.value}. If that is still "
+        f"the state file records phase {state.summary_phase.value}. If that is still "
         f"true on the exchange, deleting it leaves the bot unable to find those "
         f"positions on the next run. Close All Positions first."
     )

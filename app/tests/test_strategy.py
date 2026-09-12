@@ -145,17 +145,20 @@ def test_hold_reuses_the_open_roles(tmp_path):
     assert strategy.roles_for(Phase.HOLD) == strategy.roles_for(Phase.OPEN)
 
 
-# -- hold length -----------------------------------------------------------
+# -- hold length, per leg --------------------------------------------------
+#
+# Each leg holds on its own clock. They ran in lockstep once, which meant a leg
+# that filled first waited for the other before its hold could even start.
 
 
-async def _hold_without_waiting(strategy) -> None:
-    """Run _phase_hold for its bookkeeping, skipping the wait it then does."""
+async def _hold_without_waiting(strategy, symbol) -> None:
+    """Run the hold for its bookkeeping, skipping the wait it then does."""
 
     async def no_wait(*_args, **_kwargs):
         return None
 
-    strategy._drive = no_wait
-    await strategy._phase_hold()
+    strategy._drive_leg = no_wait
+    await strategy._leg_hold(symbol)
 
 
 async def test_the_hold_deadline_is_drawn_from_the_configured_range(tmp_path):
@@ -163,21 +166,36 @@ async def test_the_hold_deadline_is_drawn_from_the_configured_range(tmp_path):
     strategy.config.hold_minutes = HoldTime(0.5, 1.0)
 
     started = time.time()
-    await _hold_without_waiting(strategy)
+    await _hold_without_waiting(strategy, BTC)
 
     # A deadline, not a duration, so the wait survives a restart.
-    assert started + 30 <= strategy.state.hold_until <= started + 60 + 1
+    leg = strategy.state.leg(BTC)
+    assert started + 30 <= leg.hold_until <= started + 60 + 1
+
+
+async def test_each_leg_holds_on_its_own_clock(tmp_path):
+    """The point of the change: one leg's hold does not wait on the other."""
+    strategy, *_ = build(tmp_path, phase=Phase.HOLD)
+    strategy.config.hold_minutes = HoldTime(0.5, 1.0)
+
+    await _hold_without_waiting(strategy, BTC)
+    btc_deadline = strategy.state.leg(BTC).hold_until
+
+    assert btc_deadline > 0
+    assert strategy.state.leg(SOL).hold_until == 0.0, "the other leg was dragged in"
+    assert strategy.state.leg(BTC).phase == Phase.HOLD
+    assert strategy.state.leg(SOL).phase != Phase.HOLD
 
 
 async def test_a_restart_finishes_the_hold_it_was_serving(tmp_path):
     """Re-rolling on restart would let a crash loop extend the hold forever."""
     strategy, *_ = build(tmp_path, phase=Phase.HOLD)
     strategy.config.hold_minutes = HoldTime(0.5, 1.0)
-    strategy.state.hold_until = 1_700_000_000.0
+    strategy.state.leg(BTC).hold_until = 1_700_000_000.0
 
-    await _hold_without_waiting(strategy)
+    await _hold_without_waiting(strategy, BTC)
 
-    assert strategy.state.hold_until == 1_700_000_000.0
+    assert strategy.state.leg(BTC).hold_until == 1_700_000_000.0
 
 
 # -- fill handling ---------------------------------------------------------
