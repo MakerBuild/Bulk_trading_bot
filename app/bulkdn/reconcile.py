@@ -21,6 +21,7 @@ from .feed import MarketFeed
 from .hedger import Hedger, LegRoles
 from .marketdata import round_size
 from .positions import PositionBook
+from .retry import describe
 
 log = logging.getLogger(__name__)
 
@@ -84,7 +85,7 @@ async def cancel_all_orders(
             # Nothing to cancel is the common case and is not an error.
             log.debug("%s: cancel-all returned %s", session.name, exc)
         except Exception as exc:
-            log.warning("%s: cancel-all failed: %s", session.name, exc)
+            log.warning("%s: cancel-all failed: %s", session.name, describe(exc))
 
 
 async def reconcile_net(

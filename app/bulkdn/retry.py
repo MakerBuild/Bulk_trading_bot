@@ -56,6 +56,24 @@ class RetryExhausted(Exception):
         self.last = last
 
 
+def describe(exc: BaseException) -> str:
+    """An exception as something worth reading in a log file.
+
+    `str(exc)` alone is empty for several of the ones that matter most here --
+    `asyncio.TimeoutError` chief among them. A live run logged
+
+        ERROR bulkdn.strategy: hedge for BTC-USD failed:
+
+    and that blank was the whole report of a hedge that did not happen. Worse,
+    it hid the cause: the SDK had failed to parse an order status, so the
+    response never came back and the wait timed out. The class name alone would
+    have pointed straight at it.
+    """
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"{name}: {text}" if text else name
+
+
 def _backoff(delay: float, attempt: int) -> float:
     """Exponential, capped. Keeps a flapping endpoint from being hammered."""
     return min(delay * (2 ** (attempt - 1)), 30.0)

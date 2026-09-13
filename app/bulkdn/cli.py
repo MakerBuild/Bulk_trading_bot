@@ -32,6 +32,7 @@ from .impact import ImpactBook
 from .hedger import Hedger
 from .positions import PositionBook
 from .reconcile import cancel_all_orders, flatten, sync_positions_http
+from .retry import describe
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
 from .sizing import plan_sizes, resolve_notionals
@@ -393,7 +394,7 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
     except Halted as exc:
         # The halt itself was already reported from _trigger_halt, which fires
         # before the flatten so the alert does not wait on it.
-        log.critical("halted: %s", exc)
+        log.critical("halted: %s", describe(exc))
         return 2
     except KeyboardInterrupt:
         return 130

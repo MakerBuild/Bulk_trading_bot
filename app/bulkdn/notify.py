@@ -19,6 +19,7 @@ import logging
 from dataclasses import dataclass, field
 
 import aiohttp
+from .retry import describe
 
 log = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ class Notifier:
                     for user_id in self.config.user_ids:
                         await self._send_one(session, user_id, chunk)
         except Exception as exc:  # noqa: BLE001 - reporting must never break trading
-            log.warning("telegram notification failed: %s", exc)
+            log.warning("telegram notification failed: %s", describe(exc))
 
     async def _send_one(self, session: aiohttp.ClientSession, user_id: int, text: str) -> None:
         try:
@@ -83,7 +84,7 @@ class Notifier:
                 if not payload.get("ok"):
                     log.warning("telegram rejected message to %s: %s", user_id, payload)
         except Exception as exc:  # noqa: BLE001 - one bad recipient must not stop the rest
-            log.warning("telegram send to %s failed: %s", user_id, exc)
+            log.warning("telegram send to %s failed: %s", user_id, describe(exc))
 
     # -- event helpers -----------------------------------------------------
     #

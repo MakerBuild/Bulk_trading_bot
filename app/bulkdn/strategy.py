@@ -48,6 +48,7 @@ from .reconcile import (
     sync_positions,
     sync_positions_http,
 )
+from .retry import describe
 from .risk import RiskMonitor
 from .state import Phase, StateStore, StrategyState
 from .window import WindowTitle
@@ -164,7 +165,7 @@ class Strategy:
                 "could not write the state file (%s) -- continuing. A restart "
                 "may not know which phase this cycle was in; positions are read "
                 "back from the exchange either way.",
-                exc,
+                describe(exc),
             )
 
     @property
@@ -399,7 +400,7 @@ class Strategy:
             except Exception as exc:
                 # The reconciler re-derives from position, so a single failure
                 # is recoverable; a persistent one trips the reject streak.
-                log.error("hedge for %s failed: %s", symbol, exc)
+                log.error("hedge for %s failed: %s", symbol, describe(exc))
 
     def _trigger_halt(self, reason: str) -> None:
         if self._halt_reason is None:
@@ -497,7 +498,7 @@ class Strategy:
                 try:
                     await self._sync_positions()
                 except Exception as exc:  # noqa: BLE001 - retried next tick
-                    log.error("position sync failed: %s", exc)
+                    log.error("position sync failed: %s", describe(exc))
 
                 # Before hedging, not after. If a position was liquidated, the
                 # hedge rule's answer is to open a fresh one on the account that
@@ -515,7 +516,7 @@ class Strategy:
                     self._trigger_halt(f"hedge limit exceeded -- {exc}")
                     return
                 except Exception as exc:  # noqa: BLE001 - retried next tick
-                    log.error("reconcile failed: %s", exc)
+                    log.error("reconcile failed: %s", describe(exc))
 
                 self.risk.log_exposure()
                 self._log_untradeable_residuals()
@@ -565,7 +566,7 @@ class Strategy:
                 try:
                     await self.chaser.step(self.leg_roles(symbol), leg)
                 except Exception as exc:  # noqa: BLE001 - retried next tick
-                    log.error("chase step for %s failed: %s", symbol, exc)
+                    log.error("chase step for %s failed: %s", symbol, describe(exc))
 
             self._persist()
 
@@ -752,6 +753,33 @@ class Strategy:
                     spec.min_notional,
                 )
 
+    def _net_verdict(self, symbol: str, net: float) -> str:
+        """How to describe a leftover imbalance, in the same terms as the hedger.
+
+        Three outcomes, not two. A residual can be too small to trade -- under a
+        lot, or worth less than the market's minimum order -- and calling that
+        "NOT hedged" is alarming out of all proportion: a live stop reported
+        $0.23 of BTC dust that way, in the same breath as the next line calling
+        the very same amount unhedgeable. The operator reads a stop message as
+        "am I exposed", and the honest answer for dust is no, not really.
+
+        So the threshold is the one the hedger actually acts on, rather than a
+        lot size that happens to be nearby. Anything it could close and has not
+        is still reported loudly, because that one does need closing.
+        """
+        spec = self.feed.specs[symbol]
+        if abs(net) < spec.lot_size:
+            return ""
+
+        price = self.feed.reference_price(symbol) or 0.0
+        value = abs(net) * price
+        if price and value < spec.min_notional:
+            return (
+                f" -- ${round_notional(value)} of dust, below {symbol}'s "
+                f"${spec.min_notional} minimum order, so it cannot be closed"
+            )
+        return " -- NOT hedged"
+
     def _log_open_positions(self) -> None:
         """Say what is still open, in the log, at the moment the run ends.
 
@@ -775,8 +803,7 @@ class Strategy:
                     phase,
                     ", ".join(f"{name} {size:+.8f}" for name, size in held.items()),
                     net,
-                    "" if abs(net) < self.feed.specs[symbol].lot_size
-                    else " -- NOT hedged",
+                    self._net_verdict(symbol, net),
                 )
             else:
                 log.info("%s flat after cycle %d", symbol, cycle)
@@ -930,7 +957,7 @@ class Strategy:
         try:
             totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - never block trading on this
-            log.warning("could not read fill history to start the target: %s", exc)
+            log.warning("could not read fill history to start the target: %s", describe(exc))
             return
 
         self.state.baseline_fees_usd = totals.fees_usd
@@ -967,7 +994,7 @@ class Strategy:
         try:
             totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - never block trading on this
-            log.warning("could not read fill history for the execution target: %s", exc)
+            log.warning("could not read fill history for the execution target: %s", describe(exc))
             return None
 
         burned = _burned(totals.fees_usd - self.state.baseline_fees_usd)

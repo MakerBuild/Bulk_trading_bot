@@ -105,6 +105,73 @@ async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
         return await _original_ws_connect(url, **kwargs)
 
 
+# Every spelling `OrderStatus.from_string` accepts, in its own capitalisation.
+# Kept here because the SDK expresses them as a `match` statement, which cannot
+# be read back at runtime.
+_KNOWN_STATUSES = (
+    "resting", "placed", "working", "filled", "partiallyFilled",
+    "cancelled", "cancelledRiskLimit", "cancelAllRejected", "cancelOneRejected",
+    "cancelledSelfCrossing", "cancelledReduceOnly", "cancelledIOC",
+    "rejectedCrossing", "rejectedDuplicate", "rejectedRiskLimit",
+    "rejectedInvalid",
+)
+_STATUS_BY_LOWER = {name.lower(): name for name in _KNOWN_STATUSES}
+
+
+def _tolerant_status_from_string(original):
+    """Accept a status the SDK spells differently, and never drop a response.
+
+    Live, the exchange sends `cancelledIoc` where the SDK matches
+    `cancelledIOC`. A pure capitalisation difference, and the enum member it
+    needs already exists -- but `from_string` raises on it, and it is called
+    from `_handle_post_response`, which is how an order submission's reply gets
+    back to the caller. So the reply was dropped, the awaiting `wait_for` ran to
+    its timeout, and a hedge failed. Seen four times in one session, once
+    directly before `hedge for BTC-USD failed`.
+
+    Matching case-insensitively against the SDK's own list of spellings is
+    exact: it never invents a status, it only forgives capitalisation.
+
+    A status on neither list is different. Raising drops the response and costs
+    a hedge; guessing could be worse -- reading a new NON-terminal status as
+    cancelled would tell the chaser its order had died and it would place a
+    second one. So the guess is confined to the two prefixes that are terminal
+    by construction, and anything else still raises.
+    """
+
+    def parse(cls, s: str):
+        try:
+            return original(s)
+        except ValueError:
+            pass
+
+        spelled = _STATUS_BY_LOWER.get(str(s).lower())
+        if spelled is not None:
+            log.debug("order status %r accepted as %r", s, spelled)
+            return original(spelled)
+
+        text = str(s).lower()
+        for prefix, fallback in (("cancel", "cancelled"), ("reject", "rejectedInvalid")):
+            if text.startswith(prefix):
+                log.warning(
+                    "unknown order status %r -- treating it as %r so the order "
+                    "response is still delivered. Both are terminal, so nothing "
+                    "downstream acts on the difference.",
+                    s, fallback,
+                )
+                return original(fallback)
+
+        log.error(
+            "unknown order status %r, and it is neither a cancel nor a reject. "
+            "Refusing to guess: reading a non-terminal status as terminal would "
+            "have the chaser replace an order that is still live.",
+            s,
+        )
+        raise ValueError(f"Unknown order status {s}")
+
+    return classmethod(parse)
+
+
 def _first(data: dict, *names: str, default: Any = None) -> Any:
     for name in names:
         if name in data and data[name] is not None:
@@ -138,6 +205,12 @@ def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = True) -> 
         return
 
     Fill.from_api = _robust_fill_from_api  # type: ignore[method-assign]
+
+    from bulk_api.common.enums import OrderStatus
+
+    OrderStatus.from_string = _tolerant_status_from_string(  # type: ignore[method-assign]
+        OrderStatus.from_string
+    )
 
     import bulk_api.api.bulk_ws as bulk_ws_module
     import websockets.asyncio.client as websockets_client

@@ -45,6 +45,7 @@ from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
 from .hedger import LegRoles
 from .marketdata import chase_price, distance_bps, round_size
+from .retry import describe
 from .positions import PositionBook
 from .state import LegState
 
@@ -340,7 +341,7 @@ class Chaser:
             # Usually means it already filled or was already cancelled.
             log.debug("%s: cancel of %s not accepted: %s", symbol, oid[:8], exc)
         except Exception as exc:
-            log.warning("%s: cancel of %s failed: %s", symbol, oid[:8], exc)
+            log.warning("%s: cancel of %s failed: %s", symbol, oid[:8], describe(exc))
             leg.remember_stale(oid)
         leg.oid = None
         leg.price = None
@@ -368,7 +369,7 @@ class Chaser:
             try:
                 await session.cancel(leg.symbol, oid)
             except Exception as exc:
-                log.warning("%s: sweep cancel of %s failed: %s", leg.symbol, oid[:8], exc)
+                log.warning("%s: sweep cancel of %s failed: %s", leg.symbol, oid[:8], describe(exc))
 
         # Anything no longer on the book needs no further attention.
         leg.stale_oids = [oid for oid in leg.stale_oids if oid in order_map]
