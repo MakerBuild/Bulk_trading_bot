@@ -23,7 +23,6 @@ from .accounts import build_sessions, discover_sub_account, verify_sub_account
 from .chaser import Chaser
 from .console import watch_for_stop
 from .config import Config, ConfigError, load_config
-from .menu import run_menu
 from .feed import MarketFeed
 from .notify import Notifier
 from .referral import AccessDenied
@@ -381,14 +380,14 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
     stopper = asyncio.create_task(watch_for_stop(strategy.request_stop))
     try:
         await strategy.run()
-        if strategy._stop_requested:
+        if strategy.stop_reason:
             log.info("stopped on request -- see above for what is still open")
             runtime.title.set_phase("stopped")
             return 0
         log.info("all cycles complete")
         runtime.title.set_phase("done")
         await runtime.notifier.run_finished(
-            cycles=strategy.state.cycle_index, detail=strategy._progress_detail()
+            cycles=strategy.state.cycle_index, detail=await strategy.progress_detail()
         )
         return 0
     except Halted as exc:
@@ -730,6 +729,14 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command in (None, "menu"):
+            # Imported here, not at the top. `menu` is a front end over these
+            # commands and calls back into them, so importing it at module
+            # scope made the two mutually dependent -- and paid for with eight
+            # `from .cli import ...` lines hidden inside menu's functions. One
+            # deferred import in the one place that needs it costs less and
+            # says which direction the dependency actually runs.
+            from .menu import run_menu
+
             return run_menu(config, args.config)
         if args.command == "run":
             return asyncio.run(cmd_run(config, dry_run))

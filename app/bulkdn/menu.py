@@ -20,6 +20,14 @@ from collections.abc import Callable
 import requests
 
 from .accounts import short_pubkey, unwrap_full_account
+from .cli import (
+    LOG_FILE,
+    cmd_create_subaccount,
+    cmd_encrypt_key,
+    cmd_flatten,
+    cmd_run,
+    cmd_status,
+)
 from .config import Config, ConfigError
 
 BOX_WIDTH = 46
@@ -124,8 +132,6 @@ def _http(config: Config):
 
 
 def _start(config: Config) -> None:
-    from .cli import cmd_run
-
     print("\n  1. dry run  -- connects and logs, submits nothing")
     print("  2. live     -- REAL FUNDS")
     print("  0. back")
@@ -144,8 +150,6 @@ def _start(config: Config) -> None:
 
 
 def _active_strategy(config: Config) -> None:
-    from .cli import cmd_status
-
     asyncio.run(cmd_status(config))
     _pause()
 
@@ -156,8 +160,6 @@ def _logs() -> None:
     Here so that "send me your logs" needs no explanation of where they are:
     the path is printed even when the file does not exist yet.
     """
-    from .cli import LOG_FILE
-
     path = pathlib.Path(LOG_FILE).resolve()
     print(f"\n  {path}")
 
@@ -200,7 +202,7 @@ def _history(config: Config) -> None:
     Volume and fees are summed from the fills themselves rather than tracked
     separately, so the numbers cannot drift from what the exchange recorded.
     """
-    from .fees import Realised, _fills_page, burned_usd
+    from .fees import Realised, burned_usd, fills_page
 
     http = _http(config)
     accounts = _accounts(config)
@@ -210,8 +212,8 @@ def _history(config: Config) -> None:
     for label, pubkey in accounts:
         print(f"\n  {label} {short_pubkey(pubkey)}")
         try:
-            # Raw dicts, not the SDK's parsed model -- see fees._fills_page.
-            rows, _ = _fills_page(http, pubkey, limit=20, cursor=None)
+            # Raw dicts, not the SDK's parsed model -- see fees.fills_page.
+            rows, _ = fills_page(http, pubkey, limit=20, cursor=None)
         except Exception as exc:
             print(f"    query failed: {exc}")
             continue
@@ -245,8 +247,6 @@ def _history(config: Config) -> None:
 
 
 def _create_subaccount(config: Config) -> None:
-    from .cli import cmd_create_subaccount
-
     name = _ask("\n  name (1-32 chars, A-Z a-z 0-9 - _): ")
     if not name:
         print("  aborted")
@@ -323,8 +323,6 @@ def _balance_subaccounts(config: Config) -> None:
 
 
 def _encrypt_key(config: Config) -> None:
-    from .cli import cmd_encrypt_key
-
     cmd_encrypt_key(config)
     _pause()
 
@@ -385,7 +383,20 @@ def _close_log_handlers() -> None:
         handler.close()
 
 
-def _delete(path: pathlib.Path) -> str:
+def _same_file(a: pathlib.Path, b: pathlib.Path) -> bool:
+    """Whether two paths name the same file, however each was spelled.
+
+    `settings.yaml`, `.\\settings.yaml` and an absolute path are all the same
+    file and all reachable here, since one side comes from --config and the
+    other from a listing.
+    """
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return False
+
+
+def _delete(path: pathlib.Path, settings: pathlib.Path | None = None) -> str:
     """Remove a path -- except the two that have to keep existing.
 
     The key file is emptied in place: deleting it would take away the place the
@@ -395,15 +406,18 @@ def _delete(path: pathlib.Path) -> str:
     reason and one more -- "erase my data" should leave a copy that still runs,
     and a bot with no settings file does not start at all. What has to go is
     the sizes and the leverage, not the file.
+
+    `settings` is passed in rather than inferred. This once matched any `.yaml`
+    path, which meant any future yaml added to the erase list would have been
+    silently overwritten with the settings template instead of deleted.
     """
-    from .cli import LOG_FILE
     from .config import PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE, SETTINGS_TEMPLATE
 
     try:
         if path.name == PRIVATE_KEY_FILE:
             path.write_text(PRIVATE_KEY_TEMPLATE, encoding="utf-8")
             return f"  emptied {_shown(path)} -- ready for a new key"
-        if path.suffix in (".yaml", ".yml"):
+        if settings is not None and _same_file(path, settings):
             template = pathlib.Path(SETTINGS_TEMPLATE)
             if not template.exists():
                 return (
@@ -446,8 +460,6 @@ def _live_cycle_warning(state_file: pathlib.Path) -> str | None:
 
 def _log_files() -> list[pathlib.Path]:
     """The log and its rollovers, newest first."""
-    from .cli import LOG_FILE
-
     return sorted(pathlib.Path.cwd().glob(f"{LOG_FILE}*"))
 
 
@@ -563,7 +575,7 @@ def _erase_data(config: Config, config_path: str) -> None:
 
     print()
     for path in targets:
-        print(_delete(path))
+        print(_delete(path, settings=pathlib.Path(config_path)))
     for line in _venv_note():
         print(line)
     _pause()
@@ -792,8 +804,6 @@ def _configuration(config: Config, config_path: str) -> None:
 
 
 def _close_all(config: Config) -> None:
-    from .cli import cmd_flatten
-
     print("\n  Cancels every order and closes all strategy positions at market.")
     print("  Reduce-only throughout, so it can never open a position.")
     print("\n  1. dry run -- show what would be sent")

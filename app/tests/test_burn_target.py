@@ -33,6 +33,10 @@ class FakeTotals:
 class FakeStrategy:
     """Only what _target_reached touches."""
 
+    # The real one, so the test drives the actual code path: the history read
+    # is handed to a worker thread rather than run on the event loop.
+    _read_totals = Strategy._read_totals
+
     def __init__(self, target, state=None):
         class Config:
             pass
@@ -51,8 +55,8 @@ class FakeStrategy:
         self.master = Session()
         self.sub1 = Session()
 
-    def reached(self):
-        return Strategy._target_reached(self)
+    async def reached(self):
+        return await Strategy._target_reached(self)
 
 
 def _started_at(fees, volume=0.0):
@@ -74,9 +78,9 @@ def totals(monkeypatch):
     return fake
 
 
-def reached(target_usd, fees_usd, totals, *, baseline=0.0):
+async def reached(target_usd, fees_usd, totals, *, baseline=0.0):
     totals.value = FakeTotals(fees_usd)
-    return FakeStrategy(
+    return await FakeStrategy(
         ExecutionTarget(cycles=0, burn_usd=target_usd), _started_at(baseline)
     ).reached()
 
@@ -84,19 +88,19 @@ def reached(target_usd, fees_usd, totals, *, baseline=0.0):
 # -- a charge is negative, and burning it is positive -------------------------
 
 
-def test_a_negative_total_is_money_spent():
+async def test_a_negative_total_is_money_spent():
     assert burned_usd(-3.0795) == pytest.approx(3.0795)
 
 
-def test_a_positive_total_is_not_spending():
+async def test_a_positive_total_is_not_spending():
     """Nothing on BULK produces one today -- maker fills are 0.0, not rebated --
     so it is floored rather than counted as negative spend."""
     assert burned_usd(1.5) == 0.0
 
 
-def test_the_reason_string_carries_no_minus_sign(totals):
+async def test_the_reason_string_carries_no_minus_sign(totals):
     """What the operator reads at the end of a run."""
-    reason = reached(3.0, -3.5, totals)
+    reason = await reached(3.0, -3.5, totals)
     assert reason is not None
     assert "-" not in reason
     assert "$3.5000" in reason
@@ -105,56 +109,56 @@ def test_the_reason_string_carries_no_minus_sign(totals):
 # -- the target is reached by spending ---------------------------------------
 
 
-def test_spending_past_the_target_finishes(totals):
-    assert reached(3.0, -3.5, totals)
+async def test_spending_past_the_target_finishes(totals):
+    assert await reached(3.0, -3.5, totals)
 
 
-def test_exactly_on_the_target_counts(totals):
-    assert reached(3.0, -3.0, totals)
+async def test_exactly_on_the_target_counts(totals):
+    assert await reached(3.0, -3.0, totals)
 
 
-def test_short_of_the_target_keeps_going(totals):
-    assert reached(3.0, -2.99, totals) is None
+async def test_short_of_the_target_keeps_going(totals):
+    assert await reached(3.0, -2.99, totals) is None
 
 
-def test_a_positive_total_never_reaches_the_target(totals):
+async def test_a_positive_total_never_reaches_the_target(totals):
     """Not spending is not progress toward a spend target."""
-    assert reached(3.0, 100.0, totals) is None
+    assert await reached(3.0, 100.0, totals) is None
 
 
 # -- and it counts from the start of the run ----------------------------------
 
 
-def test_the_account_history_before_the_run_does_not_count(totals):
+async def test_the_account_history_before_the_run_does_not_count(totals):
     """The reported bug: $3.08 burned last week ended the next run instantly."""
-    assert reached(3.0, -3.0795, totals, baseline=-3.0795) is None
+    assert await reached(3.0, -3.0795, totals, baseline=-3.0795) is None
 
 
-def test_only_what_this_run_burned_counts(totals):
+async def test_only_what_this_run_burned_counts(totals):
     """Started at -3.08, now at -5.08: this run has burned $2, not $5.08."""
-    assert reached(3.0, -5.0795, totals, baseline=-3.0795) is None
-    assert reached(2.0, -5.0795, totals, baseline=-3.0795)
+    assert await reached(3.0, -5.0795, totals, baseline=-3.0795) is None
+    assert await reached(2.0, -5.0795, totals, baseline=-3.0795)
 
 
-def test_without_a_baseline_nothing_is_judged(totals):
+async def test_without_a_baseline_nothing_is_judged(totals):
     """A run that could not read its starting point must not compare against
     the lifetime figure -- that is exactly the bug."""
     totals.value = FakeTotals(-100.0)
     strategy = FakeStrategy(ExecutionTarget(burn_usd=3.0), StrategyState())
     assert strategy.state.has_baseline is False
-    assert strategy.reached() is None
+    assert await strategy.reached() is None
 
 
-def test_a_volume_target_also_counts_from_the_start(totals):
+async def test_a_volume_target_also_counts_from_the_start(totals):
     totals.value = FakeTotals(0.0, volume=1500.0)
     strategy = FakeStrategy(
         ExecutionTarget(volume_usd=1000.0), _started_at(0.0, volume=1000.0)
     )
     # 1500 - 1000 = 500 done of 1000.
-    assert strategy.reached() is None
+    assert await strategy.reached() is None
 
     totals.value = FakeTotals(0.0, volume=2000.0)
-    assert strategy.reached()
+    assert await strategy.reached()
 
 
 # -- clearing it --------------------------------------------------------------
@@ -169,7 +173,7 @@ def test_clearing_the_baseline_makes_the_next_run_measure_fresh():
     assert state.baseline_volume_usd == 0.0
 
 
-def test_a_baseline_survives_a_save_and_load(tmp_path):
+async def test_a_baseline_survives_a_save_and_load(tmp_path):
     """An interrupted run resumes its own count rather than starting over."""
     from bulkdn.state import StateStore
 
@@ -181,7 +185,7 @@ def test_a_baseline_survives_a_save_and_load(tmp_path):
     assert loaded.baseline_volume_usd == pytest.approx(500.0)
 
 
-def test_a_state_file_written_before_baselines_reads_as_unstarted():
+async def test_a_state_file_written_before_baselines_reads_as_unstarted():
     state = StrategyState.from_dict({"phase": "IDLE", "cycle_index": 2})
     assert state.has_baseline is False
 
@@ -189,8 +193,8 @@ def test_a_state_file_written_before_baselines_reads_as_unstarted():
 # -- zero is off -------------------------------------------------------------
 
 
-def test_zero_disables_the_target(totals):
-    assert reached(0.0, -100.0, totals) is None
+async def test_zero_disables_the_target(totals):
+    assert await reached(0.0, -100.0, totals) is None
 
 
 def test_zero_needs_no_fill_history():

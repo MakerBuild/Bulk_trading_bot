@@ -164,7 +164,7 @@ class Realised:
         inside it is real spend that earns no tier credit, which is why the two
         are counted separately rather than netted.
 
-        Rows are plain dicts straight from the API. See `_fills_page` for why
+        Rows are plain dicts straight from the API. See `fills_page` for why
         they are not the SDK's parsed model.
         """
         total = cls()
@@ -186,7 +186,7 @@ class Realised:
         )
 
 
-def _fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[dict], str | None]:
+def fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[dict], str | None]:
     """Fetch one page of fills as raw dicts.
 
     Deliberately not `http.get_fills_page`. The SDK parses every row into
@@ -234,7 +234,7 @@ def realised_for_account(
     total = Realised()
     cursor = None
     for _ in range(max_pages):
-        rows, cursor = _fills_page(http, user, limit, cursor)
+        rows, cursor = fills_page(http, user, limit, cursor)
         total = total + Realised.from_fills(rows, tree)
         if not cursor or not rows:
             break

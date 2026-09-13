@@ -46,7 +46,7 @@ class FakeHttp:
     """Serves one page per account, then stops.
 
     Answers the raw `/account` POST rather than the SDK's `get_fills_page`,
-    because that is what `_fills_page` calls.
+    because that is what `fills_page` calls.
     """
 
     base_url = "https://example.test/api/v1"
@@ -56,7 +56,7 @@ class FakeHttp:
         self.calls = []
 
     def install(self, monkeypatch):
-        """Answer `_fills_page`'s POST from `self.pages`."""
+        """Answer `fills_page`'s POST from `self.pages`."""
 
         class Response:
             def __init__(self, rows):
@@ -197,7 +197,7 @@ def test_fills_without_a_trade_id_are_counted(monkeypatch):
 def test_a_page_returned_as_a_bare_list_is_accepted(monkeypatch):
     """History queries answer {data, page}; a shape change should degrade to
     no rows rather than an exception."""
-    from bulkdn.fees import _fills_page
+    from bulkdn.fees import fills_page
 
     class Response:
         def raise_for_status(self):
@@ -207,7 +207,7 @@ def test_a_page_returned_as_a_bare_list_is_accepted(monkeypatch):
             return [fill(MASTER, OUTSIDER)]
 
     monkeypatch.setattr("bulkdn.fees.requests.post", lambda url, json, timeout: Response())
-    rows, cursor = _fills_page(FakeHttp({}), MASTER, limit=20, cursor=None)
+    rows, cursor = fills_page(FakeHttp({}), MASTER, limit=20, cursor=None)
     assert len(rows) == 1
     assert cursor is None
 

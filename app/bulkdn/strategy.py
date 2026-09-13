@@ -143,6 +143,16 @@ class Strategy:
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
 
+    @property
+    def stop_reason(self) -> str | None:
+        """Why this run ended early, or None if it ended on its own terms.
+
+        The public half of `request_stop`. `cmd_run` needs to tell "the operator
+        pressed stop" from "the cycles ran out" to choose an ending, and it was
+        reading the underscored attribute across a module boundary to do it.
+        """
+        return self._stop_requested
+
     def request_stop(self, reason: str = "operator") -> None:
         """Ask both legs to stop, from outside the run loop.
 
@@ -636,7 +646,7 @@ class Strategy:
         while not self._stop.is_set():
             if self.config.cycles and leg.cycle_index >= self.config.cycles:
                 return
-            reached = self._target_reached()
+            reached = await self._target_reached()
             if reached:
                 log.info("%s: execution target reached: %s", symbol, reached)
                 return
@@ -676,7 +686,7 @@ class Strategy:
             await self.notifier.cycle_complete(
                 cycle=leg.cycle_index,
                 of=self.config.cycles or None,
-                detail=f"{symbol}: {self._progress_detail()}",
+                detail=f"{symbol}: {await self.progress_detail()}",
             )
 
     async def _confirm_done(self, is_done, label: str) -> bool:
@@ -771,7 +781,7 @@ class Strategy:
             await self._recover()
             # After recovery, so an interrupted run is recognised as one and
             # keeps the count it already had.
-            self.capture_target_baseline()
+            await self.capture_target_baseline()
 
             legs = [
                 asyncio.create_task(self._run_leg(symbol, sizes[symbol]))
@@ -825,8 +835,12 @@ class Strategy:
                     *(*legs, supervisor, worker), return_exceptions=True
                 )
 
-    def _progress_detail(self) -> str:
+    async def progress_detail(self) -> str:
         """Spend and volume so far, for a notification and the window title.
+
+        Public because `cmd_run` reports it when a run finishes, and reaching
+        across a module boundary for an underscored name is how a private
+        method becomes an interface nobody agreed to.
 
         Reads the same fill history the execution target uses. A failure is not
         worth surfacing -- this is a progress line, not a control input -- so it
@@ -836,9 +850,7 @@ class Strategy:
         if not target.measures_fills:
             return ""
         try:
-            totals = realised_for_tree(
-                self.master.http, [self.master.pubkey, self.sub1.pubkey]
-            )
+            totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - cosmetic
             log.debug("could not read totals for the progress line: %s", exc)
             return ""
@@ -858,7 +870,25 @@ class Strategy:
             self.title.set_note(detail)
         return detail
 
-    def capture_target_baseline(self) -> None:
+    async def _read_totals(self):
+        """The fill history, read without stopping everything else.
+
+        `realised_for_tree` is synchronous `requests`, and this is called from
+        inside the event loop -- between cycles, and once at the start of a run.
+        Called directly it froze the loop for the length of the walk: measured
+        at 2.9-3.8s against a 575-fill account, during which the chaser placed
+        nothing, the hedge worker ran not at all, and fills arriving on the
+        socket sat unprocessed. It gets worse as the history grows; the walk is
+        paginated a thousand fills at a time.
+
+        A thread keeps the loop turning. The same pattern `reconcile` already
+        uses for its HTTP position read.
+        """
+        return await asyncio.to_thread(
+            realised_for_tree, self.master.http, [self.master.pubkey, self.sub1.pubkey]
+        )
+
+    async def capture_target_baseline(self) -> None:
         """Record where the fill history stood, so the target counts from now.
 
         Taken once per run. If the state file already carries one, this run is
@@ -874,9 +904,7 @@ class Strategy:
         if not target.measures_fills or self.state.has_baseline:
             return
         try:
-            totals = realised_for_tree(
-                self.master.http, [self.master.pubkey, self.sub1.pubkey]
-            )
+            totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - never block trading on this
             log.warning("could not read fill history to start the target: %s", exc)
             return
@@ -892,7 +920,7 @@ class Strategy:
             totals.qualifying_volume_usd,
         )
 
-    def _target_reached(self) -> str | None:
+    async def _target_reached(self) -> str | None:
         """Whether a spend or volume target has been met, as a reason string.
 
         Checked between cycles only. A target reached halfway through an open
@@ -913,9 +941,7 @@ class Strategy:
             return None
 
         try:
-            totals = realised_for_tree(
-                self.master.http, [self.master.pubkey, self.sub1.pubkey]
-            )
+            totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - never block trading on this
             log.warning("could not read fill history for the execution target: %s", exc)
             return None
