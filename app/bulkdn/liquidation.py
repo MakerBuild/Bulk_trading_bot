@@ -52,10 +52,6 @@ class Liquidation:
     current: float
 
     @property
-    def closed_size(self) -> float:
-        return abs(self.previous) - abs(self.current)
-
-    @property
     def fully_closed(self) -> bool:
         return abs(self.current) == 0.0
 

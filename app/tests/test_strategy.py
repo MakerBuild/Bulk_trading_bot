@@ -299,16 +299,21 @@ def test_fills_without_a_trade_id_are_all_applied(tmp_path):
 # -- completion predicates -------------------------------------------------
 
 
-def test_neutral_only_when_both_symbols_are_flat_net(tmp_path):
+def test_a_leg_is_neutral_only_when_its_own_net_is_flat(tmp_path):
+    """Each leg is judged alone. One symbol going off-hedge must not be able to
+    hold the other's phase open -- that lockstep is what the per-leg rewrite
+    removed."""
     strategy, book, *_ = build(tmp_path)
     book.set_authoritative(MASTER, BTC, 1.0)
     book.set_authoritative(SUB1, BTC, -1.0)
     book.set_authoritative(SUB1, SOL, 10.0)
     book.set_authoritative(MASTER, SOL, -10.0)
-    assert strategy._is_neutral() is True
+    assert strategy._leg_is_neutral(BTC) is True
+    assert strategy._leg_is_neutral(SOL) is True
 
     book.set_authoritative(SUB1, BTC, -0.5)
-    assert strategy._is_neutral() is False
+    assert strategy._leg_is_neutral(BTC) is False
+    assert strategy._leg_is_neutral(SOL) is True
 
 
 def test_not_neutral_while_a_hedge_is_in_flight(tmp_path):
@@ -316,20 +321,22 @@ def test_not_neutral_while_a_hedge_is_in_flight(tmp_path):
     book.set_authoritative(MASTER, BTC, 0.0)
     book.set_authoritative(SUB1, BTC, 0.0)
     strategy.hedger.in_flight.add(BTC, -0.1)
-    assert strategy._is_neutral() is False
+    assert strategy._leg_is_neutral(BTC) is False
 
 
-def test_all_flat_requires_every_account_and_symbol_at_zero(tmp_path):
+def test_a_leg_is_flat_only_when_both_accounts_hold_nothing(tmp_path):
     strategy, book, *_ = build(tmp_path)
     book.set_authoritative(MASTER, BTC, 0.0)
     book.set_authoritative(SUB1, BTC, 0.0)
-    assert strategy._all_flat() is True
+    assert strategy._leg_is_flat(BTC) is True
 
-    # A hedged pair is neutral but decidedly not flat.
+    # A hedged leg is neutral but decidedly not flat. Keeping the two apart is
+    # what stops EXIT declaring itself done on a leg that nets to zero while
+    # both sides are still open.
     book.set_authoritative(MASTER, BTC, 1.0)
     book.set_authoritative(SUB1, BTC, -1.0)
-    assert strategy._is_neutral() is True
-    assert strategy._all_flat() is False
+    assert strategy._leg_is_neutral(BTC) is True
+    assert strategy._leg_is_flat(BTC) is False
 
 
 # -- end-to-end hedge sequence --------------------------------------------

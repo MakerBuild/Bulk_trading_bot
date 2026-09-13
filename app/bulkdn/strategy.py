@@ -519,7 +519,14 @@ class Strategy:
             await asyncio.sleep(self.config.chase_interval_s)
 
     def _leg_is_neutral(self, symbol: str) -> bool:
-        """Whether this leg has no hedge left that could actually be placed."""
+        """Whether this leg has no hedge left that could actually be placed.
+
+        A residual smaller than one lot or below the market's minimum notional
+        cannot be traded away, so it does not count as outstanding work -- if it
+        did, the phase would wait forever on a hedge that can never be
+        submitted. Such residuals are real exposure and are reported by
+        `_log_untradeable_residuals`; the USD risk limits still police them.
+        """
         roles = self.leg_roles(symbol)
         if abs(self.hedger.in_flight.total(symbol)) > 0:
             return False
@@ -671,25 +678,6 @@ class Strategy:
         )
         return False
 
-    # -- completion predicates --------------------------------------------
-
-    def _is_neutral(self) -> bool:
-        """Whether no hedge remains that could actually be placed.
-
-        A residual smaller than one lot or below the market's minimum notional
-        cannot be traded away, so it does not count as outstanding work -- if it
-        did, the phase would wait forever on a hedge that can never be
-        submitted. Such residuals are real exposure and are reported by
-        `_log_untradeable_residuals`; the USD risk limits still police them.
-        """
-        for roles in self._live_roles():
-            if abs(self.hedger.in_flight.total(roles.symbol)) > 0:
-                return False
-            price = self.feed.reference_price(roles.symbol)
-            if self.hedger.actionable_hedge(roles, price) > 0:
-                return False
-        return True
-
     def _log_untradeable_residuals(self) -> None:
         for roles in self._live_roles():
             price = self.feed.reference_price(roles.symbol)
@@ -706,28 +694,6 @@ class Strategy:
                     roles.symbol,
                     spec.min_notional,
                 )
-
-    def _legs_complete(self) -> bool:
-        return all(self.state.leg(symbol).complete for symbol in self.symbols)
-
-    def _all_flat(self) -> bool:
-        """Whether both accounts hold nothing in either strategy symbol.
-
-        Uses confirmed positions only. This gates the end of the cycle, and an
-        unconfirmed guess is not good enough to declare positions closed.
-        """
-        for symbol in self.symbols:
-            spec = self.feed.specs[symbol]
-            for session in (self.master, self.sub1):
-                if abs(self.book.authoritative(session.pubkey, symbol)) >= spec.lot_size:
-                    return False
-        return True
-
-    async def _cancel_strategy_orders(self, phase: Phase) -> None:
-        for roles in self.roles_for(phase):
-            leg = self.state.legs.get(roles.symbol)
-            if leg and leg.oid:
-                await self.chaser.cancel_leg(roles, leg)
 
     # -- entry point -------------------------------------------------------
 

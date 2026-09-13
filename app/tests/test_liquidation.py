@@ -64,7 +64,7 @@ def test_partial_reduction_is_reported():
 
     assert len(events) == 1
     assert not events[0].fully_closed
-    assert events[0].closed_size == 0.6
+    assert (events[0].previous, events[0].current) == (-1.0, -0.4)
 
 
 def test_reduction_during_open_is_reported():

@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 import requests
 
@@ -55,19 +55,6 @@ from .retry import TRANSIENT_EXCEPTIONS, retry
 log = logging.getLogger(__name__)
 
 INDEXER_URL = "https://indexer.bulk.trade/v1/aura/wallet"
-
-# Where a MAINNET account's referral actually lives. The public wallet record
-# above carries it only for pre-deposit accounts; for one created on mainnet
-# every attribution field comes back null, even while app.bulk.trade shows
-# "You were referred by <code>" for the same wallet. This endpoint answers 401
-# without a key, so it is consulted only when one is configured.
-MAINNET_REFERRAL_URL = "https://indexer.bulk.trade/v1/aura/mainnet/referrals"
-REFERRAL_API_KEY_HEADER = "x-aura-referral-api-key"
-
-# Read-only key for the endpoint above, when the build has one. Empty means the
-# gate sees only what the public record carries -- which is nothing, for a
-# mainnet account.
-REFERRAL_API_KEY = ""
 
 
 @dataclass
@@ -194,8 +181,12 @@ SEALED_OWNER_WALLETS: tuple[str, ...] = (
 # someone willing to hash all of them can match these. It is a list of who may
 # run a trading bot, not a secret.
 #
-# Replaced wholesale by the referral check once REFERRAL_API_KEY is set; until
-# then this is what admits them. To add one:
+# The live check now admits exactly these same people -- the indexer reports
+# `referred_by_wallet` for mainnet accounts, which it did not when this list was
+# written. So the list has become the floor under that check rather than a
+# substitute for it: it is consulted before the network call, and a sealed build
+# refuses on an indexer outage, so without it an outage locks everyone out.
+# To add one:
 #   python -c "import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())" <address>
 SEALED_REFERRAL_WALLETS: tuple[str, ...] = (
     "bccf04aa515043b6a3e1034630d9a0a46ccb7c3dc02fef20b52ae41a184f8c9a",
@@ -295,8 +286,8 @@ def _allowed(config: AccessConfig) -> _Allowed:
             codes=frozenset(SEALED_CODES),
             invite_codes=frozenset(SEALED_INVITE_CODES),
             owner_wallets=frozenset(SEALED_OWNER_WALLETS),
-            # Admitted without asking the indexer, because for an account
-            # created on mainnet the indexer has no answer to give.
+            # Admitted without asking the indexer, so an outage cannot lock out
+            # the people this build was made for.
             referral_wallets=frozenset(SEALED_REFERRAL_WALLETS),
             allow_on_error=False,
             enabled=True,
@@ -424,82 +415,7 @@ def fetch_referral(wallet: str, *, timeout: int = 20, base_url: str = INDEXER_UR
     if not isinstance(data, dict):
         raise IndexerUnavailable("indexer returned an unexpected payload shape")
 
-    status = ReferralStatus.from_api(wallet, data)
-    if status.has_origin or not REFERRAL_API_KEY:
-        return status
-
-    # The public record says nothing about where this wallet came from, which
-    # for a mainnet account means "not recorded here" rather than "arrived on
-    # its own". Ask the endpoint that does hold it before concluding anything.
-    return _with_mainnet_referral(wallet, status, timeout=timeout)
-
-
-def _with_mainnet_referral(
-    wallet: str, status: ReferralStatus, *, timeout: int = 20
-) -> ReferralStatus:
-    """Fill in a referrer from the key-gated mainnet table, if it has one.
-
-    Never raises: a failure here leaves the public answer standing, so a key
-    that has expired or an endpoint that has moved degrades to the behaviour of
-    a build with no key rather than refusing everybody.
-
-    The field names are read tolerantly. The response shape is not published,
-    and the app bundle reads `referrer_wallet` and `referral_code` where the
-    public record calls them `referred_by_wallet` and `referred_by_code`.
-    """
-    try:
-        response = requests.get(
-            f"{MAINNET_REFERRAL_URL}/{wallet}",
-            headers={REFERRAL_API_KEY_HEADER: REFERRAL_API_KEY},
-            timeout=timeout,
-        )
-        if response.status_code != 200:
-            log.warning(
-                "mainnet referral lookup for %s returned HTTP %s",
-                wallet, response.status_code,
-            )
-            return status
-        data = response.json()
-    except Exception as exc:  # noqa: BLE001 - the public answer still stands
-        log.warning("mainnet referral lookup for %s failed: %s", wallet, exc)
-        return status
-
-    if not isinstance(data, dict):
-        return status
-    # Some shapes nest the record; look one level down before giving up.
-    for key in ("referral", "data", "result"):
-        inner = data.get(key)
-        if isinstance(inner, dict) and _first(inner, *_REFERRER_WALLET_KEYS):
-            data = inner
-            break
-
-    referrer = _as_str(_first(data, *_REFERRER_WALLET_KEYS))
-    code = _as_str(_first(data, *_REFERRER_CODE_KEYS))
-    if not (referrer or code):
-        return status
-
-    log.info("mainnet referral for %s: wallet=%s code=%s", wallet, referrer, code)
-    return replace(
-        status,
-        referred_by_wallet=status.referred_by_wallet or referrer,
-        referred_by_code=status.referred_by_code or code,
-    )
-
-
-_REFERRER_WALLET_KEYS = (
-    "referrer_wallet", "referred_by_wallet", "referrerWallet", "referrer",
-)
-_REFERRER_CODE_KEYS = (
-    "referral_code", "referred_by_code", "referralCode", "code",
-)
-
-
-def _first(data: dict, *names: str):
-    for name in names:
-        value = data.get(name)
-        if value is not None:
-            return value
-    return None
+    return ReferralStatus.from_api(wallet, data)
 
 
 def check_access(

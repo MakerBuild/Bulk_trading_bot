@@ -330,3 +330,26 @@ def test_enabled_with_no_allowlist_is_an_error():
 def test_non_mapping_is_an_error():
     with pytest.raises(ConfigError, match="must be a mapping"):
         _access_from_dict(["nope"])
+
+
+# -- how an account is judged to have arrived ------------------------------
+#
+# `has_origin` is the one gate that runs before any allow-list is consulted:
+# a wallet with neither route is refused outright. Either route alone counts,
+# because accounts arrive by both and refusing one would refuse most people.
+
+
+@pytest.mark.parametrize(
+    "payload, expected",
+    [
+        ({"referred_by_code": "EXAMPLE"}, True),
+        ({"referred_by_wallet": "EXAMPLE-REFERRER-WALLET"}, True),
+        ({"access": {"invited_by_code_id": "abc"}}, True),
+        ({"access": {"invited_by_wallet": "EXAMPLE-INVITER-WALLET"}}, True),
+        ({"referred_by_code": None, "referred_by_wallet": None}, False),
+        ({}, False),
+    ],
+)
+def test_either_route_counts_as_an_origin(payload, expected):
+    status = referral.ReferralStatus.from_api("EXAMPLE-WALLET", payload)
+    assert status.has_origin is expected

@@ -530,29 +530,29 @@ because on the wallet this was built for roughly two thirds arrived by invite.
 
 ### What the public index actually carries
 
-Measured against live records, not assumed. This is the limit the gate runs
-into, and it is worth stating before the mechanism:
+Measured against live records, not assumed:
 
 | account | `referred_by_wallet` | `access.invited_by_wallet` | gate |
 |---|---|---|---|
 | pre-deposit era | set | — | passes |
 | invited by a wallet | — | set, `inviter_kind: user` | passes |
-| created on mainnet | **null** | **null**, `inviter_kind: admin` | **refused** |
+| created on mainnet | set | — | passes |
 
-A mainnet account comes back from `/v1/aura/wallet/<pubkey>` with every
-attribution field null, while app.bulk.trade shows "You were referred by
-&lt;code&gt;" for that same wallet. The site reads a different table:
+The last row used to read **null / null / refused**, and it is why the sealed
+allow-list below exists. A mainnet account came back from
+`/v1/aura/wallet/<pubkey>` with every attribution field null while
+app.bulk.trade showed "You were referred by &lt;code&gt;" for that same wallet,
+because the site read a key-gated table the public endpoint did not join
+against. The bot carried a `REFERRAL_API_KEY` branch to query that table.
 
-```
-GET /v1/aura/mainnet/referrals/<pubkey>  -> 401 missing x-aura-referral-api-key
-GET /v1/aura/referrals/traders/<pubkey>  -> 401
-GET /v1/aura/access/codes/<pubkey>       -> 401
-```
+BULK has since populated the public record. Re-measured against every wallet on
+the sealed list: **46 of 46** now return both `referred_by_wallet` and
+`referred_by_code`, all naming the same owner, with no disagreement against the
+list. Emptying the list in a live process and letting only the indexer answer
+admitted the same 46 and still refused a wallet that had signed up elsewhere.
 
-So without a key the gate cannot see a mainnet referral at all, and refuses
-accounts that did sign up through the owner. `REFERRAL_API_KEY` in
-`referral.py` closes this: when set, a wallet whose public record says nothing
-is looked up there before being refused.
+So the key-gated branch is gone — it was unreachable anyway, as no key was ever
+issued. The gate reads the public record and nothing else.
 
 One further trap: `access.invited_by_code_id` is an internal id
 (`INV-3-031806`), not the `BULK-XXX-XXX` code an owner can see and share, so
@@ -576,6 +576,16 @@ Every field that block used to have was a way around the check:
 
 A gate its own config file can open is not a gate, so a sealed build reads none
 of them. A fork that empties `SEALED_WALLETS` gets the configurable gate back.
+
+Two lists, doing different jobs. `SEALED_WALLETS` and `SEALED_CODES` hold the
+owner's referrer identity, and are what the live indexer answer is matched
+against. `SEALED_REFERRAL_WALLETS` names the individual accounts, and is checked
+*before* the network call. Now that the indexer answers for mainnet accounts the
+second list admits nobody the first would not, and it is kept for one reason: a
+sealed build has `allow_on_error=False`, so an indexer outage refuses every
+wallet it has to ask about. The named list is the floor under that — those
+accounts keep running through an outage. New referrals are admitted by the live
+check without being added to it.
 
 ### What it does not do
 

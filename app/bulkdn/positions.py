@@ -141,10 +141,6 @@ class PositionBook:
         overlays = self._prune(key)
         return base + sum(entry.delta for entry in overlays)
 
-    def pending_delta(self, account: str, symbol: str) -> float:
-        """Sum of unconfirmed deltas, for logging and diagnostics."""
-        return sum(entry.delta for entry in self._prune((account, symbol)))
-
     def net(self, account_a: str, account_b: str, symbol: str) -> float:
         """Combined signed exposure across both accounts. Zero means neutral."""
         return self.effective(account_a, symbol) + self.effective(account_b, symbol)

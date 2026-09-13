@@ -31,10 +31,10 @@ def test_authoritative_update_supersedes_the_overlay():
     assert book.effective(MASTER, BTC) == 0.1
 
     # Once the exchange confirms, the guess is discarded rather than added on
-    # top -- keeping both is how a position gets double-counted.
+    # top -- keeping both is how a position gets double-counted. An overlay left
+    # in place would read 0.2 here, so this value is the whole assertion.
     book.set_authoritative(MASTER, BTC, 0.1)
     assert book.effective(MASTER, BTC) == 0.1
-    assert book.pending_delta(MASTER, BTC) == 0.0
 
 
 def test_overlay_expires_so_a_lost_fill_cannot_drift_forever():
