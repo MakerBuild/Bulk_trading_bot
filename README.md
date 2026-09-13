@@ -147,7 +147,7 @@ its owner's referral or invite.
 | `run.bat` | start the bot |
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your key |
-| `ЛОГИ.txt` | everything the bot has done; appears on the first run |
+| `logs.txt` | everything the bot has done; appears on the first run |
 | `app/dev/release.bat` | build a zip to hand out, from git rather than the folder |
 | `app/docs/DESIGN.md` | how it works internally |
 

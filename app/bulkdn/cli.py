@@ -47,7 +47,7 @@ log = logging.getLogger("bulkdn")
 # operator already has open. A console window scrolls, and is gone when it is
 # closed -- so "it stopped overnight and I don't know why" had no answer. This
 # file is that answer, and it is the first thing to ask anyone for.
-LOG_FILE = "ЛОГИ.txt"
+LOG_FILE = "logs.txt"
 # Rolls at 5MB and keeps two older files. A long live run writes a few MB a day,
 # so this is roughly a week of history and cannot fill a disk.
 LOG_MAX_BYTES = 5 * 1024 * 1024

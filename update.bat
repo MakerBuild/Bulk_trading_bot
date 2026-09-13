@@ -11,7 +11,7 @@ rem     settings.yaml        yours, made from settings.default.yaml
 rem     private_key.local    yours, never in git
 rem     app\state            what the bot has open
 rem     app\.venv            the local Python environment
-rem     ЛОГИ.txt             what the bot has done
+rem     logs.txt             what the bot has done
 
 setlocal
 cd /d "%~dp0"

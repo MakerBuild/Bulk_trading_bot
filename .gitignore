@@ -33,5 +33,11 @@ settings.*.yaml
 # The log file, and the two rollovers the handler keeps. Written into the
 # folder the operator has open so it is easy to find and easy to send; never
 # committed, because it is a record of one machine's runs.
+logs.txt
+logs.txt.*
+
+# The name this file had before. Someone who ran an older build still has one
+# sitting in their folder, and it must not be committed just because it was
+# renamed.
 ЛОГИ.txt
 ЛОГИ.txt.*
