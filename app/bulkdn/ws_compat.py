@@ -15,9 +15,24 @@ hedge. Both spellings are accepted here.
 replayed fills. `Fill` has no such field upstream, so it is attached
 dynamically; the dataclass has no `__slots__`, so this is safe.
 
-**3. TLS verification fails against the live endpoints.** Observed on
-`mainnet-ws1.bulk.trade`, whose certificate is expired. Without a fallback the socket never
-connects and the bot runs blind on HTTP polling alone.
+**3. TLS verification fails against the live endpoints -- on Windows.** This was
+read the wrong way round for a while, and the wrong reading is worth recording
+because the fix that followed from it was to turn verification off.
+
+The certificates are fine. Measured against all three hosts:
+
+    mainnet-ws1.bulk.trade    system store   REJECTED  certificate has expired
+    mainnet-ws1.bulk.trade    certifi        OK        valid to 22 Nov 2026
+
+What has expired is a root in the Windows certificate store, not anything BULK
+serves. `requests` never noticed because it ships `certifi` and uses it; the
+SDK's WebSocket goes through `ssl.create_default_context()`, which on Windows
+means the system store, so it failed where every HTTP call succeeded.
+
+So the socket is opened against certifi's bundle -- the same trust anchors the
+HTTP half of this bot has been using all along -- and verification stays on.
+The bypass below survives only as a last resort for an operator who cannot
+connect at all, and it is no longer reached in normal use.
 """
 
 from __future__ import annotations
@@ -69,11 +84,39 @@ def _insecure_context() -> ssl.SSLContext:
     return ctx
 
 
-async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
-    """Open a socket, falling back to unverified TLS if the cert is rejected.
+def verified_context() -> ssl.SSLContext:
+    """A verifying context that trusts what `requests` trusts.
 
-    Once a bypass has been needed it stays latched for the process, so
-    reconnects don't pay the failed handshake every time.
+    `ssl.create_default_context()` with no arguments reads the operating
+    system's trust store, and on Windows that store has an expired root which
+    rejects BULK's perfectly valid certificates. certifi ships its own bundle
+    and is already installed -- it is how every HTTP call in this bot verifies
+    today -- so pointing the socket at the same bundle makes the two halves
+    agree instead of one of them giving up.
+
+    Falls back to the system store if certifi is somehow absent, which is no
+    worse than the position before this existed.
+    """
+    try:
+        import certifi
+    except ImportError:
+        log.warning(
+            "certifi is not installed -- falling back to the system certificate "
+            "store, which on Windows may reject a valid certificate. "
+            "`pip install certifi` fixes it."
+        )
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
+    """Open a socket, verifying against certifi's bundle.
+
+    Only if that is rejected too does the bypass come into play, and then it
+    stays latched for the process so reconnects don't pay a failed handshake
+    every time. Before certifi was used here the bypass fired on every run on
+    Windows, which meant the account stream -- fills and positions, the input
+    to every hedge -- came from an endpoint nothing had authenticated.
     """
     global _bypass_latched
     kwargs.setdefault("open_timeout", _OPEN_TIMEOUT)
@@ -90,16 +133,23 @@ async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
         kwargs["ssl"] = _insecure_context()
         return await _original_ws_connect(url, **kwargs)
 
+    # Verified against certifi rather than the system store -- see
+    # verified_context. Only set when the caller has not chosen for itself.
+    kwargs.setdefault("ssl", verified_context())
+
     try:
         return await _original_ws_connect(url, **kwargs)
-    except ssl.SSLCertVerificationError:
+    except ssl.SSLCertVerificationError as exc:
         if not _auto_bypass:
             raise
         _bypass_latched = True
         log.warning(
-            "TLS verification failed for %s -- retrying without certificate "
-            "checks. Traffic is still encrypted but the endpoint is unauthenticated.",
-            url,
+            "TLS verification failed for %s even against certifi's certificate "
+            "bundle (%s). Retrying WITHOUT certificate checks: traffic stays "
+            "encrypted, but nothing proves the endpoint is BULK, and fills and "
+            "positions read from it are what every hedge is based on. If this "
+            "persists, check the URL and the system clock before trusting it.",
+            url, exc.verify_message or exc,
         )
         kwargs["ssl"] = _insecure_context()
         return await _original_ws_connect(url, **kwargs)

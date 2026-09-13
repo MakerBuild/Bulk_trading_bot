@@ -189,9 +189,30 @@ Every `run --live` trades real money, and `--live` is the only interlock.
 **There is no rehearsal environment.** Dry-run (`run` without `--live`) is the only way to
 exercise the bot without spending, and it cannot advance past OPEN because nothing fills.
 
-**The mainnet WebSocket serves an expired certificate.** Verification fails; the HTTP host is
-clean. `ws_ssl_auto_bypass` (on by default) retries without verification, which is what keeps the
-account stream connectable.
+**The WebSocket verifies against certifi, not the system trust store.** This was diagnosed
+backwards at first, and the wrong diagnosis is worth keeping because of what followed from it: the
+note here used to read "the mainnet WebSocket serves an expired certificate", and the response was
+to turn verification off by default.
+
+The certificates are valid. Measured against all three hosts:
+
+| host | system store | certifi |
+|---|---|---|
+| `mainnet-ws1.bulk.trade` | rejected — certificate has expired | OK, valid to 22 Nov 2026 |
+| `mainnet-api1.bulk.trade` | rejected — certificate has expired | OK |
+| `indexer.bulk.trade` | rejected — certificate has expired | OK |
+
+What expired is a root in the Windows store. `requests` never noticed because it ships certifi and
+uses it — which is why every HTTP call worked while the socket, going through
+`ssl.create_default_context()`, failed on the same machine in the same second.
+
+`ws_compat.verified_context()` points the socket at certifi's bundle, so both halves of the bot
+trust the same anchors and verification stays on. Confirmed against the live endpoint: the handshake
+succeeds and the bypass does not latch.
+
+`ws_ssl_auto_bypass` survives for an operator who cannot connect at all. It is no longer reached in
+normal use, and when it does fire it says plainly that fills and positions — the input to every
+hedge — are then coming from an endpoint nothing has authenticated.
 
 Test in this order:
 

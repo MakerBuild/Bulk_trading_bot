@@ -153,3 +153,78 @@ def test_the_threshold_is_the_market_minimum_not_the_lot():
     just_over = (spec.min_notional * 1.1) / 76_700.0
     assert "dust" in verdict(just_under)
     assert verdict(just_over) == " -- NOT hedged"
+
+
+# -- 4. TLS is verified, not bypassed -----------------------------------------
+#
+# The bypass fired on every run on Windows, and the reason recorded in the code
+# was that BULK's certificate had expired. It had not. Measured against all
+# three hosts: the system store rejects them, certifi accepts them, valid to
+# 22 Nov 2026. What expired is a root in the Windows store. `requests` never
+# noticed because it ships certifi; the socket used the system store and gave
+# up on verification instead.
+
+
+def test_the_verified_context_actually_verifies():
+    import ssl as ssl_module
+
+    from bulkdn.ws_compat import verified_context
+
+    ctx = verified_context()
+    assert ctx.verify_mode is ssl_module.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_it_trusts_what_requests_trusts():
+    """The whole point: the two halves of the bot agree on a trust store."""
+    import certifi
+
+    from bulkdn.ws_compat import verified_context
+
+    ctx = verified_context()
+    loaded = {c["subject"] for c in ctx.get_ca_certs()}
+    assert loaded, "no certificate authorities were loaded"
+    bundle = ssl_bundle_count(certifi.where())
+    assert len(loaded) > bundle * 0.5, "certifi's bundle does not look loaded"
+
+
+def ssl_bundle_count(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read().count("BEGIN CERTIFICATE")
+
+
+def test_a_missing_certifi_degrades_rather_than_crashing(monkeypatch):
+    """No worse than the position before this existed."""
+    import builtins
+    import ssl as ssl_module
+
+    from bulkdn import ws_compat
+
+    real_import = builtins.__import__
+
+    def no_certifi(name, *args, **kwargs):
+        if name == "certifi":
+            raise ImportError("no certifi")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_certifi)
+    ctx = ws_compat.verified_context()
+    assert ctx.verify_mode is ssl_module.CERT_REQUIRED
+
+
+def test_the_bypass_is_still_reachable_but_no_longer_the_default():
+    """Kept for an operator who genuinely cannot connect -- and only then."""
+    import ssl as ssl_module
+
+    from bulkdn.ws_compat import _insecure_context, verified_context
+
+    assert _insecure_context().verify_mode is ssl_module.CERT_NONE
+    assert verified_context().verify_mode is ssl_module.CERT_REQUIRED
+
+
+def test_install_bat_names_certifi():
+    """It arrives with requests today, which is not a promise."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    assert "certifi" in (root / "install.bat").read_text(encoding="utf-8")

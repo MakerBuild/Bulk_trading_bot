@@ -81,7 +81,11 @@ echo   Installing dependencies...
 echo   ^(pip will report bulk-keychain and solders as missing. That is expected:
 echo    the SDK declares them and never imports them. The signing check at the
 echo    end is what tells you the install works.^)
-"%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML
+rem certifi is named even though requests would pull it in anyway: the bot now
+rem uses it directly, to verify the WebSocket against the same trust anchors as
+rem its HTTP calls. A dependency that is only there by accident is one a future
+rem version of requests can drop.
+"%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi
 if errorlevel 1 (
     echo   Dependency install failed -- see the error above.
     pause
