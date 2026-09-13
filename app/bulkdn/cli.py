@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import logging.handlers
 import sys
 
 from bulk_api.common import SignatureDomain
 
 from .accounts import build_sessions, discover_sub_account, verify_sub_account
 from .chaser import Chaser
+from .console import watch_for_stop
 from .config import Config, ConfigError, load_config
 from .menu import run_menu
 from .feed import MarketFeed
@@ -40,12 +43,51 @@ from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
 log = logging.getLogger("bulkdn")
 
 
-def configure_logging(level: str) -> None:
+# Everything printed to the console is also appended here, in the folder the
+# operator already has open. A console window scrolls, and is gone when it is
+# closed -- so "it stopped overnight and I don't know why" had no answer. This
+# file is that answer, and it is the first thing to ask anyone for.
+LOG_FILE = "ЛОГИ.txt"
+# Rolls at 5MB and keeps two older files. A long live run writes a few MB a day,
+# so this is roughly a week of history and cannot fill a disk.
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUPS = 2
+
+
+def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
+    """Log to the console, and to `log_file` alongside it.
+
+    The file gets full timestamps where the console gets clock time only: on
+    screen the date is obvious, in a file read days later it is the point.
+    """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    if log_file:
+        try:
+            handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUPS,
+                encoding="utf-8",
+            )
+            handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+            logging.getLogger().addHandler(handler)
+        except OSError as exc:
+            # A read-only folder or a file held open by an editor. Losing the
+            # file is not a reason to refuse to trade, so this is a warning and
+            # the console log carries on alone.
+            logging.getLogger("bulkdn").warning(
+                "could not open %s for logging (%s) -- console only", log_file, exc
+            )
+
     # The SDK logs every frame at DEBUG, which drowns out the strategy.
     logging.getLogger("bulk_api").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -295,6 +337,31 @@ class Runtime:
 # -- commands --------------------------------------------------------------
 
 
+STOP_BANNER = [
+    "S  --  stop and cancel",
+    "",
+    "Stops both legs at the next tick and pulls every resting",
+    "order, then returns to the menu. Open positions are left",
+    "as they are -- close them with `6. Close All Positions`.",
+]
+
+
+def _print_stop_banner() -> None:
+    """The one control available while the run has the terminal.
+
+    Measured rather than typed: hand-aligned box borders drift the moment a
+    line is edited, and a crooked box is the first thing read as "unfinished".
+    """
+    width = max(len(line) for line in STOP_BANNER) + 4
+    rule = "  +" + "-" * width + "+"
+    print()
+    print(rule)
+    for line in STOP_BANNER:
+        print("  |  " + line.ljust(width - 2) + "|")
+    print(rule)
+    print()
+
+
 async def cmd_run(config: Config, dry_run: bool) -> int:
     runtime = Runtime(config, dry_run)
     await runtime.start()
@@ -305,8 +372,19 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
         sub1=runtime.sub1.pubkey,
         dry_run=dry_run,
     )
+    _print_stop_banner()
+    # The banner scrolls away within a minute, so the reminder lives in the
+    # title bar, which does not.
+    runtime.title.set_hint("S = stop")
+    # Started before the legs and cancelled after them, so the key works for the
+    # whole run including the recovery pass at the start.
+    stopper = asyncio.create_task(watch_for_stop(strategy.request_stop))
     try:
         await strategy.run()
+        if strategy._stop_requested:
+            log.info("stopped on request -- see above for what is still open")
+            runtime.title.set_phase("stopped")
+            return 0
         log.info("all cycles complete")
         runtime.title.set_phase("done")
         await runtime.notifier.run_finished(
@@ -320,7 +398,15 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception:
+        # Logged rather than only raised, so the traceback reaches the log file
+        # and not just the console window that is about to close.
+        log.exception("run failed")
+        raise
     finally:
+        stopper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stopper
         await runtime.stop()
 
 

@@ -132,11 +132,33 @@ class Strategy:
         self._liquidation_seen = asyncio.Event()
         self._hedge_queue: asyncio.Queue = asyncio.Queue()
         self._stop = asyncio.Event()
+        # Why the stop happened, when it was asked for from outside rather than
+        # reached by finishing. Distinguishes "the operator pressed stop" from
+        # "the cycles ran out", which want different endings.
+        self._stop_requested: str | None = None
         self._halt_reason: str | None = None
         # Reset each cycle: a drop an hour ago says nothing about this one.
         self._reconnects = 0
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
+
+    def request_stop(self, reason: str = "operator") -> None:
+        """Ask both legs to stop, from outside the run loop.
+
+        Safe to call at any moment and from any task. It sets a flag rather
+        than cancelling anything: a leg checks it once per chase tick, so an
+        order already being submitted completes and is accounted for, and the
+        stop lands a second later with the book in a state the run can describe.
+        Cancelling mid-flight is what leaves an order on the exchange that the
+        state file does not know about.
+
+        Idempotent -- pressing the key twice is not a harder stop.
+        """
+        if self._stop.is_set():
+            return
+        self._stop_requested = reason
+        log.warning("stop requested (%s) -- finishing the current step", reason)
+        self._stop.set()
 
     # -- leg roles ---------------------------------------------------------
 
@@ -695,6 +717,35 @@ class Strategy:
                     spec.min_notional,
                 )
 
+    def _log_open_positions(self) -> None:
+        """Say what is still open, in the log, at the moment the run ends.
+
+        The first question after a stop is "what am I holding now". Answering it
+        here means the log file alone answers it, without reconnecting to ask.
+        """
+        for symbol in self.symbols:
+            leg = self.state.legs.get(symbol)
+            phase = leg.phase.name if leg else "IDLE"
+            cycle = leg.cycle_index if leg else 0
+            held = {
+                session.name: self.book.authoritative(session.pubkey, symbol)
+                for session in (self.master, self.sub1)
+            }
+            net = sum(held.values())
+            if any(abs(v) > 0 for v in held.values()):
+                log.warning(
+                    "%s left open after cycle %d in %s: %s, net %+.8f%s",
+                    symbol,
+                    cycle,
+                    phase,
+                    ", ".join(f"{name} {size:+.8f}" for name, size in held.items()),
+                    net,
+                    "" if abs(net) < self.feed.specs[symbol].lot_size
+                    else " -- NOT hedged",
+                )
+            else:
+                log.info("%s flat after cycle %d", symbol, cycle)
+
     # -- entry point -------------------------------------------------------
 
     async def run(self) -> None:
@@ -732,6 +783,17 @@ class Strategy:
             for task in done:
                 task.result()
             await asyncio.gather(*pending, return_exceptions=True)
+
+            if self._stop_requested:
+                # The legs left their loops without reaching the end of a phase,
+                # so whatever was resting is still resting. Pull it: an order
+                # left working after the bot exits fills with nothing watching,
+                # and the hedge that would answer it is no longer running.
+                log.warning(
+                    "stopped on %s -- cancelling resting orders", self._stop_requested
+                )
+                await cancel_all_orders([self.master, self.sub1], self.symbols)
+                self._log_open_positions()
 
             if self._halt_reason:
                 raise Halted(self._halt_reason)

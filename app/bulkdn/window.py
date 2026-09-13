@@ -27,6 +27,10 @@ class WindowTitle:
         self.cycle = 0
         self.phase = "starting"
         self.note = ""
+        # A control the operator can use right now, kept at the end of the
+        # title. The banner that announces it scrolls away; this does not, so
+        # someone returning to a window hours later can still see how to stop.
+        self.hint = ""
         self.update()
 
     def set_cycle(self, cycle: int, cycles: int | None = None) -> None:
@@ -44,6 +48,10 @@ class WindowTitle:
         self.note = note
         self.update()
 
+    def set_hint(self, hint: str) -> None:
+        self.hint = hint
+        self.update()
+
     def halted(self, reason: str) -> None:
         self.phase = "HALTED"
         # The title is a few dozen characters; a long reason would push the
@@ -58,6 +66,8 @@ class WindowTitle:
         title = f"{self.name} [{progress}] {self.phase}"
         if self.note:
             title += f" | {self.note}"
+        if self.hint:
+            title += f"  --  {self.hint}"
         try:
             ctypes.windll.kernel32.SetConsoleTitleW(title)
         except Exception as exc:  # noqa: BLE001 - cosmetic only

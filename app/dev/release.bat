@@ -5,9 +5,13 @@ rem Built from git, not from the folder, so nothing local can leak into it: not
 rem app\.venv (which carries your Windows username in pyvenv.cfg), not
 rem private_key.local, not app\state, not the build caches. There is nothing to
 rem remember to delete, because none of it is ever reachable.
+rem
+rem Lives in app\dev because the operator never runs it -- it is for whoever
+rem hands the bot out. Two levels up is the project root, which is where git
+rem and the archive have to be run from.
 
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0..\.."
 
 where git >nul 2>&1
 if errorlevel 1 (

@@ -12,6 +12,7 @@ a menu entry that silently does nothing is worse than one that admits it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import pathlib
 import shutil
 from collections.abc import Callable
@@ -128,6 +129,8 @@ def _start(config: Config) -> None:
     print("\n  1. dry run  -- connects and logs, submits nothing")
     print("  2. live     -- REAL FUNDS")
     print("  0. back")
+    print("\n  Once it is running, press S to stop and cancel -- you do not")
+    print("  need a second window, and you do not need to close this one.")
     choice = _ask("\n  > ")
     if choice == "1":
         asyncio.run(cmd_run(config, dry_run=True))
@@ -144,6 +147,50 @@ def _active_strategy(config: Config) -> None:
     from .cli import cmd_status
 
     asyncio.run(cmd_status(config))
+    _pause()
+
+
+def _logs() -> None:
+    """The tail of the log file, and where to find the whole thing.
+
+    Here so that "send me your logs" needs no explanation of where they are:
+    the path is printed even when the file does not exist yet.
+    """
+    from .cli import LOG_FILE
+
+    path = pathlib.Path(LOG_FILE).resolve()
+    print(f"\n  {path}")
+
+    if not path.exists():
+        print("\n  No log file yet -- it is written the first time the bot runs.")
+        _pause()
+        return
+
+    if path.stat().st_size == 0:
+        print("\n  Empty so far. It fills up as the bot runs.")
+        _pause()
+        return
+
+    print(f"  {_human_size(path.stat().st_size)}\n")
+    try:
+        # Read as bytes from the end: a long run's log is megabytes, and there
+        # is no reason to pull all of it into memory to show the last screen.
+        with open(path, "rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - 16_000))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        print(f"  could not read it: {exc}")
+        _pause()
+        return
+
+    lines = tail.splitlines()
+    if size > 16_000 and lines:
+        lines = lines[1:]  # the first line is probably cut in half
+    for line in lines[-40:]:
+        print(f"  {line}")
+    print("\n  Open the file itself for everything above this.")
     _pause()
 
 
@@ -321,18 +368,38 @@ def _shown(path: pathlib.Path) -> str:
         return str(path)
 
 
+def _close_log_handlers() -> None:
+    """Detach the file handlers so the log file can be removed on Windows.
+
+    Windows will not unlink a file another handle has open, and this process is
+    holding one.
+
+    Not reattached afterwards, deliberately. Someone who just erased their logs
+    would not expect the file to reappear a moment later because the menu kept
+    writing to it. The console still shows everything, and the next run starts
+    a fresh file.
+    """
+    root = logging.getLogger()
+    for handler in [h for h in root.handlers if isinstance(h, logging.FileHandler)]:
+        root.removeHandler(handler)
+        handler.close()
+
+
 def _delete(path: pathlib.Path) -> str:
     """Remove a path, except the key file, which is emptied in place.
 
     Deleting that one would take away the place the next key is pasted,
     and getting it back means re-running install.bat. What has to go is
     the key inside it, not the file."""
+    from .cli import LOG_FILE
     from .config import PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE
 
     try:
         if path.name == PRIVATE_KEY_FILE:
             path.write_text(PRIVATE_KEY_TEMPLATE, encoding="utf-8")
             return f"  emptied {_shown(path)} -- ready for a new key"
+        if path.name.startswith(LOG_FILE):
+            _close_log_handlers()
         if path.is_dir():
             shutil.rmtree(path)
         else:
@@ -363,6 +430,13 @@ def _live_cycle_warning(state_file: pathlib.Path) -> str | None:
     )
 
 
+def _log_files() -> list[pathlib.Path]:
+    """The log and its rollovers, newest first."""
+    from .cli import LOG_FILE
+
+    return sorted(pathlib.Path.cwd().glob(f"{LOG_FILE}*"))
+
+
 def _erase_targets(config: Config) -> list[tuple[str, str, list[pathlib.Path], str]]:
     from .config import PRIVATE_KEY_FILE
 
@@ -373,6 +447,8 @@ def _erase_targets(config: Config) -> list[tuple[str, str, list[pathlib.Path], s
          "wipes the key; the file stays, ready for a new one"),
         ("3", "Build caches", _cache_dirs(pathlib.Path.cwd()),
          "bytecode and lint caches -- these hold your username"),
+        ("4", "Logs", _log_files(),
+         "every run this machine has made, and your addresses"),
     ]
 
 
@@ -406,7 +482,7 @@ def _erase_data(config: Config) -> None:
     print("  0. back")
 
     choice = _ask("\n  > ")
-    if choice not in ("1", "2", "3", "9"):
+    if choice not in ("1", "2", "3", "4", "9"):
         return
 
     wanted = entries if choice == "9" else [e for e in entries if e[0] == choice]
@@ -684,6 +760,7 @@ def run_menu(config: Config, config_path: str) -> int:
         "4. Accounts Management",
         "5. Configuration",
         "6. Close All Positions",
+        "7. Logs",
         "0. Exit",
     ]
     actions: dict[str, Callable[[], None]] = {
@@ -693,6 +770,7 @@ def run_menu(config: Config, config_path: str) -> int:
         "4": lambda: _accounts_menu(config),
         "5": lambda: _configuration(config, config_path),
         "6": lambda: _close_all(config),
+        "7": _logs,
     }
 
     while True:

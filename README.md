@@ -144,10 +144,11 @@ its owner's referral or invite.
 | `ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md` | start here: every step, in Russian |
 | `install.bat` | one-time setup |
 | `update.bat` | fetch the latest version; leaves your settings and key alone |
-| `release.bat` | build a zip to hand out, from git rather than the folder |
 | `run.bat` | start the bot |
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your key |
+| `ЛОГИ.txt` | everything the bot has done; appears on the first run |
+| `app/dev/release.bat` | build a zip to hand out, from git rather than the folder |
 | `app/docs/DESIGN.md` | how it works internally |
 
 Everything else lives in `app/`, which you can ignore: the code, the test suite,

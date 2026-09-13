@@ -11,6 +11,7 @@ rem     settings.yaml        yours, made from settings.default.yaml
 rem     private_key.local    yours, never in git
 rem     app\state            what the bot has open
 rem     app\.venv            the local Python environment
+rem     ЛОГИ.txt             what the bot has done
 
 setlocal
 cd /d "%~dp0"
@@ -99,6 +100,12 @@ if errorlevel 1 (
 )
 
 :deps
+rem Files that moved in a later version. Neither a pull nor a robocopy deletes
+rem anything, so without this the old copy sits in the root looking current.
+rem Only ever list files that shipped with the bot -- never anything of the
+rem operator's.
+if exist "release.bat" if exist "app\dev\release.bat" del "release.bat"
+
 rem Dependencies can move with a release, and re-running this is cheap when they
 rem have not. install.bat is safe to repeat by design.
 echo.

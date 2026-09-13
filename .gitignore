@@ -29,3 +29,9 @@ private_key.local
 settings.yaml
 settings.*.yaml
 !settings.default.yaml
+
+# The log file, and the two rollovers the handler keeps. Written into the
+# folder the operator has open so it is easy to find and easy to send; never
+# committed, because it is a record of one machine's runs.
+ЛОГИ.txt
+ЛОГИ.txt.*
