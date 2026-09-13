@@ -85,3 +85,113 @@ def test_remember_stale_ignores_the_current_order():
 def test_hold_remaining_never_negative():
     state = StrategyState(hold_until=0.0)
     assert state.hold_remaining_s() == 0.0
+
+
+# -- a locked destination must not kill a live run ---------------------------
+#
+# From a live cycle: the folder was inside OneDrive, which had the state file
+# open to upload it, and os.replace raised
+#
+#     PermissionError: [WinError 5] -> app/state/strategy_state.json
+#
+# mid-HOLD. The run died with hedged positions open on both accounts and
+# nothing left running to close them. The file is a hint about phase; the
+# exchange is the ledger. Losing the hint must never cost the positions.
+
+
+def test_a_transient_lock_is_retried(tmp_path, monkeypatch):
+    import os as os_module
+
+    from bulkdn import state as state_module
+
+    store = StateStore(str(tmp_path / "state.json"))
+    store.save(StrategyState(phase=Phase.OPEN))
+
+    calls = {"n": 0}
+    real_replace = os_module.replace
+
+    def flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(5, "Access is denied")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(state_module.os, "replace", flaky)
+    monkeypatch.setattr(state_module, "REPLACE_RETRY_DELAY_S", 0.001)
+
+    store.save(StrategyState(phase=Phase.HOLD, cycle_index=4))
+
+    assert calls["n"] == 3, "it should have retried past the lock"
+    assert StateStore(str(tmp_path / "state.json")).load().phase == Phase.HOLD
+
+
+def test_a_permanent_lock_still_raises(tmp_path, monkeypatch):
+    """Retrying forever would hide a real problem, like a full disk."""
+    from bulkdn import state as state_module
+
+    store = StateStore(str(tmp_path / "state.json"))
+
+    def always_locked(src, dst):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(state_module.os, "replace", always_locked)
+    monkeypatch.setattr(state_module, "REPLACE_RETRY_DELAY_S", 0.001)
+
+    with pytest.raises(PermissionError):
+        store.save(StrategyState(phase=Phase.OPEN))
+
+
+def test_no_temp_files_are_left_behind(tmp_path, monkeypatch):
+    from bulkdn import state as state_module
+
+    store = StateStore(str(tmp_path / "state.json"))
+    monkeypatch.setattr(
+        state_module.os, "replace",
+        lambda src, dst: (_ for _ in ()).throw(PermissionError(5, "denied")),
+    )
+    monkeypatch.setattr(state_module, "REPLACE_RETRY_DELAY_S", 0.001)
+
+    with pytest.raises(PermissionError):
+        store.save(StrategyState(phase=Phase.OPEN))
+
+    assert not list(tmp_path.glob(".state-*.tmp")), "a temp file survived the failure"
+
+
+def test_an_unchanged_save_writes_nothing(tmp_path, monkeypatch):
+    """`_drive_leg` saves twice a second while the contents change only on a
+    phase transition. Rewriting the file that often is what put it under a sync
+    client's nose in the first place."""
+    from bulkdn import state as state_module
+
+    store = StateStore(str(tmp_path / "state.json"))
+    state = StrategyState(phase=Phase.HOLD)
+    store.save(state)
+
+    writes = {"n": 0}
+    real_replace = state_module.os.replace
+
+    def counted(src, dst):
+        writes["n"] += 1
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(state_module.os, "replace", counted)
+
+    for _ in range(20):
+        store.save(state)
+    assert writes["n"] == 0, "an unchanged state was written to disk"
+
+    state.phase = Phase.EXIT
+    store.save(state)
+    assert writes["n"] == 1, "a changed state must still be written"
+
+
+def test_a_deleted_file_is_rewritten_even_if_unchanged(tmp_path):
+    """The skip must not leave the bot with no state file at all."""
+    path = tmp_path / "state.json"
+    store = StateStore(str(path))
+    state = StrategyState(phase=Phase.HOLD)
+    store.save(state)
+    path.unlink()
+
+    store.save(state)
+    assert path.exists()

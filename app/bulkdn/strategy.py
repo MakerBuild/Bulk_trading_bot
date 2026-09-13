@@ -143,6 +143,30 @@ class Strategy:
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
 
+    def _persist(self) -> None:
+        """Save the state file, and survive not being able to.
+
+        A write can fail for reasons that have nothing to do with trading --
+        the folder is in OneDrive, an antivirus has the file open, the disk is
+        full. That used to propagate: a live run died mid-HOLD on a
+        `PermissionError` from `os.replace` with hedged positions open on both
+        accounts and nothing left running to close them.
+
+        Abandoning open positions is a far worse outcome than a stale file, so
+        this reports and carries on. The state is still correct in memory, the
+        next tick tries again, and recovery reads positions back from the
+        exchange anyway -- the file is a hint about phase, not the ledger.
+        """
+        try:
+            self.store.save(self.state)
+        except OSError as exc:
+            log.error(
+                "could not write the state file (%s) -- continuing. A restart "
+                "may not know which phase this cycle was in; positions are read "
+                "back from the exchange either way.",
+                exc,
+            )
+
     @property
     def stop_reason(self) -> str | None:
         """Why this run ended early, or None if it ended on its own terms.
@@ -543,7 +567,7 @@ class Strategy:
                 except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("chase step for %s failed: %s", symbol, exc)
 
-            self.store.save(self.state)
+            self._persist()
 
             if is_done() and await self._confirm_done(is_done, f"{symbol} {label}"):
                 log.info("%s %s complete", symbol, label)
@@ -588,7 +612,7 @@ class Strategy:
             symbol, self.sessions[roles.maker].name,
             self.sessions[roles.taker].name, target_size,
         )
-        self.store.save(self.state)
+        self._persist()
 
         await self._drive_leg(
             symbol,
@@ -604,7 +628,7 @@ class Strategy:
             # that filled first starts counting first.
             leg.hold_until = time.time() + self.config.hold_minutes.pick() * 60
         leg.phase = Phase.HOLD
-        self.store.save(self.state)
+        self._persist()
 
         log.info("=== %s HOLD: %.1f minutes ===", symbol, leg.hold_remaining_s() / 60)
         await self._drive_leg(symbol, lambda: leg.hold_remaining_s() <= 0, "hold")
@@ -623,7 +647,7 @@ class Strategy:
         roles = self.leg_roles(symbol)
         leg.target_size = abs(self.book.effective(roles.maker, symbol))
         log.info("=== %s EXIT: %g to close ===", symbol, leg.target_size)
-        self.store.save(self.state)
+        self._persist()
 
         # The closing limit order only unwinds the maker side. The taker side is
         # reduced by hedges, and hedges stop once the pair is neutral -- so if
@@ -678,7 +702,7 @@ class Strategy:
                 return
             leg.phase = Phase.COMPLETE
             leg.hold_until = 0.0
-            self.store.save(self.state)
+            self._persist()
             log.info("=== %s cycle %d complete ===", symbol, leg.cycle_index)
             # This leg legitimately went to zero, so its peaks would read as an
             # external close on the next entry.
@@ -817,7 +841,7 @@ class Strategy:
             # instead: those are interruptions, and resuming should not hand
             # back progress that was already paid for.
             self.state.clear_baseline()
-            self.store.save(self.state)
+            self._persist()
 
         except Halted as exc:
             await self._emergency_stop(str(exc))
@@ -912,7 +936,7 @@ class Strategy:
         self.state.baseline_fees_usd = totals.fees_usd
         self.state.baseline_volume_usd = totals.qualifying_volume_usd
         self.state.baseline_at = time.time()
-        self.store.save(self.state)
+        self._persist()
         log.info(
             "execution target counts from now: $%.2f burned / $%.2f volume "
             "already on the account do not count toward it",
@@ -1039,17 +1063,17 @@ class Strategy:
         for correction in corrections:
             log.warning("recovery corrected %s", correction)
 
-        self.store.save(self.state)
+        self._persist()
 
     async def _emergency_stop(self, reason: str) -> None:
         log.critical("emergency stop: %s", reason)
         self.state.phase = Phase.HALTED
         self.state.halted_reason = reason
-        self.store.save(self.state)
+        self._persist()
 
         await cancel_all_orders([self.master, self.sub1], self.symbols)
         await flatten(self.sessions, self.book, self.feed, self.symbols)
-        self.store.save(self.state)
+        self._persist()
 
 
 def build_chase_params(config: Config) -> dict[str, ChaseParams]:

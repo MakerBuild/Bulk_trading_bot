@@ -223,3 +223,52 @@ def test_both_modules_import_in_either_order():
             sys.modules.pop(mod, None)
         importlib.import_module(first)
         importlib.import_module(second)
+
+
+# -- 5. a failed state write must not abandon open positions -----------------
+
+
+def test_the_strategy_never_saves_state_unguarded():
+    """Every save in strategy.py goes through _persist, which logs and carries
+    on. A run that dies on a file-permission error leaves hedged positions open
+    with nothing running to close them -- which is what happened live."""
+    tree = ast.parse(SOURCES["strategy"])
+    unguarded = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            if (
+                isinstance(f, ast.Attribute)
+                and f.attr == "save"
+                and isinstance(f.value, ast.Attribute)
+                and f.value.attr == "store"
+            ):
+                unguarded.append(node.lineno)
+    inside_persist = [
+        n.lineno
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef) and fn.name == "_persist"
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call)
+    ]
+    stray = [line for line in unguarded if line not in inside_persist]
+    assert not stray, (
+        f"strategy.py:{stray} calls store.save directly -- use _persist, so a "
+        "locked file cannot kill a run with positions open"
+    )
+
+
+async def test_a_locked_state_file_does_not_stop_a_leg(tmp_path):
+    """The behaviour, not just the shape."""
+    from bulkdn.state import StateStore, StrategyState
+
+    class Boom(StateStore):
+        def save(self, state):
+            raise PermissionError(5, "Access is denied")
+
+    class Fake:
+        _persist = strategy.Strategy._persist
+        store = Boom(str(tmp_path / "state.json"))
+        state = StrategyState()
+
+    Fake()._persist()  # must not raise

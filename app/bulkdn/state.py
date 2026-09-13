@@ -18,10 +18,17 @@ import os
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
+
 from enum import Enum
 import contextlib
 
 log = logging.getLogger(__name__)
+
+# How hard to try when the destination is locked by another process. Five
+# attempts starting at 50ms and doubling covers roughly 1.5s in total, which is
+# far longer than a sync client or a virus scanner holds a small file.
+REPLACE_ATTEMPTS = 5
+REPLACE_RETRY_DELAY_S = 0.05
 
 
 class Phase(str, Enum):
@@ -169,6 +176,9 @@ class StateStore:
 
     def __init__(self, path: str):
         self.path = path
+        # What was last written, so an unchanged save is a no-op. None means
+        # "nothing written yet this process", which forces the first save.
+        self._last_signature: str | None = None
 
     def load(self) -> StrategyState:
         """Read persisted state, or return a fresh IDLE state if none exists.
@@ -189,7 +199,24 @@ class StateStore:
             ) from exc
 
     def save(self, state: StrategyState) -> None:
+        """Write the state file atomically, and only when it has changed.
+
+        Skipping an unchanged write is not an optimisation. `_drive_leg` saves
+        once per chase tick per leg -- twice a second -- while the contents
+        change only on a phase transition. Any process that watches the folder
+        therefore had a file rewritten under it twice a second, all cycle.
+        """
         state.updated_at = time.time()
+        payload = json.dumps(state.to_dict(), indent=2)
+        # `updated_at` alone is not a change worth a write; it is a timestamp of
+        # the write itself, so comparing without it is what makes this work.
+        signature = json.dumps(
+            {k: v for k, v in state.to_dict().items() if k != "updated_at"},
+            sort_keys=True,
+        )
+        if signature == self._last_signature and os.path.exists(self.path):
+            return
+
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
 
@@ -198,11 +225,43 @@ class StateStore:
         )
         try:
             with handle:
-                json.dump(state.to_dict(), handle, indent=2)
+                handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(handle.name, self.path)
+            self._replace_with_retry(handle.name)
         except Exception:
             with contextlib.suppress(OSError):
                 os.unlink(handle.name)
             raise
+        self._last_signature = signature
+
+    def _replace_with_retry(self, temp_name: str) -> None:
+        """`os.replace`, which on Windows is not reliably atomic in practice.
+
+        The rename fails with a sharing violation whenever another process has
+        the destination open -- OneDrive uploading it, an antivirus reading it,
+        the search indexer. Seen live as
+
+            PermissionError: [WinError 5] -> app/state/strategy_state.json
+
+        which killed a run mid-HOLD with positions open on both accounts. The
+        lock is held for milliseconds, so a few retries clear it; the file is
+        fully written and fsynced before the first attempt, so a retry risks
+        nothing.
+        """
+        delay = REPLACE_RETRY_DELAY_S
+        for attempt in range(1, REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(temp_name, self.path)
+                if attempt > 1:
+                    log.info("state file written on attempt %d", attempt)
+                return
+            except PermissionError as exc:
+                if attempt == REPLACE_ATTEMPTS:
+                    raise
+                log.debug(
+                    "state file is locked by another process (%s) -- retry %d in %.2fs",
+                    exc, attempt, delay,
+                )
+                time.sleep(delay)
+                delay *= 2
