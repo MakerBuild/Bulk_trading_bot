@@ -386,18 +386,32 @@ def _close_log_handlers() -> None:
 
 
 def _delete(path: pathlib.Path) -> str:
-    """Remove a path, except the key file, which is emptied in place.
+    """Remove a path -- except the two that have to keep existing.
 
-    Deleting that one would take away the place the next key is pasted,
-    and getting it back means re-running install.bat. What has to go is
-    the key inside it, not the file."""
+    The key file is emptied in place: deleting it would take away the place the
+    next key is pasted, and getting it back means re-running install.bat.
+
+    The settings file is rewritten from the shipped template, for the same
+    reason and one more -- "erase my data" should leave a copy that still runs,
+    and a bot with no settings file does not start at all. What has to go is
+    the sizes and the leverage, not the file.
+    """
     from .cli import LOG_FILE
-    from .config import PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE
+    from .config import PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE, SETTINGS_TEMPLATE
 
     try:
         if path.name == PRIVATE_KEY_FILE:
             path.write_text(PRIVATE_KEY_TEMPLATE, encoding="utf-8")
             return f"  emptied {_shown(path)} -- ready for a new key"
+        if path.suffix in (".yaml", ".yml"):
+            template = pathlib.Path(SETTINGS_TEMPLATE)
+            if not template.exists():
+                return (
+                    f"  FAILED  {_shown(path)}  ({_shown(template)} is missing, "
+                    "so there is nothing to reset to -- run update.bat)"
+                )
+            shutil.copyfile(template, path)
+            return f"  reset {_shown(path)} to the shipped defaults"
         if path.name.startswith(LOG_FILE):
             _close_log_handlers()
         if path.is_dir():
@@ -437,7 +451,9 @@ def _log_files() -> list[pathlib.Path]:
     return sorted(pathlib.Path.cwd().glob(f"{LOG_FILE}*"))
 
 
-def _erase_targets(config: Config) -> list[tuple[str, str, list[pathlib.Path], str]]:
+def _erase_targets(
+    config: Config, config_path: str
+) -> list[tuple[str, str, list[pathlib.Path], str]]:
     from .config import PRIVATE_KEY_FILE
 
     return [
@@ -449,10 +465,34 @@ def _erase_targets(config: Config) -> list[tuple[str, str, list[pathlib.Path], s
          "bytecode and lint caches -- these hold your username"),
         ("4", "Logs", _log_files(),
          "every run this machine has made, and your addresses"),
+        ("5", "Settings", [pathlib.Path(config_path)],
+         "resets sizes, leverage and targets to the shipped defaults"),
     ]
 
 
-def _erase_data(config: Config) -> None:
+def _venv_note() -> list[str]:
+    """What an erase cannot reach, and what to do about it.
+
+    The bot runs from inside `app\\.venv`, and Windows will not let a running
+    program delete its own executable -- a rmtree from in here fails with
+    WinError 5 partway through and leaves a broken environment, which is worse
+    than leaving it alone. So it is reported rather than attempted.
+    """
+    venv = pathlib.Path("app/.venv")
+    if not venv.exists():
+        return []
+    return [
+        "",
+        f"  Not removable from here: {_shown(venv)}  ({_human_size(_size_of(venv))})",
+        "    No settings live in it -- but your Windows username does, in",
+        "    pyvenv.cfg, the activate scripts and the pip shims. The bot is",
+        "    running from inside it, so it cannot delete itself.",
+        "    To finish: close this window, delete the app\\.venv folder,",
+        "    then run install.bat to build a fresh one.",
+    ]
+
+
+def _erase_data(config: Config, config_path: str) -> None:
     """Delete what this machine has stored. Nothing here reaches the exchange."""
     from .config import PRIVATE_KEY_FILE
 
@@ -467,7 +507,7 @@ def _erase_data(config: Config) -> None:
         "untouched. Nothing reaches the exchange.",
     ]))
 
-    entries = _erase_targets(config)
+    entries = _erase_targets(config, config_path)
     print()
     for key, label, paths, note in entries:
         present = [p for p in paths if p.exists()]
@@ -478,11 +518,13 @@ def _erase_data(config: Config) -> None:
         where = _shown(present[0]) if len(present) == 1 else f"{len(present)} folders"
         print(f"  {key}. {label:14}  {where:34} {size:>10}")
         print(f"      {note}")
-    print("  9. All of the above")
+    print("  9. All of the above  -- back to a freshly installed copy")
     print("  0. back")
+    for line in _venv_note():
+        print(line)
 
     choice = _ask("\n  > ")
-    if choice not in ("1", "2", "3", "4", "9"):
+    if choice not in tuple(entry[0] for entry in entries) + ("9",):
         return
 
     wanted = entries if choice == "9" else [e for e in entries if e[0] == choice]
@@ -522,6 +564,8 @@ def _erase_data(config: Config) -> None:
     print()
     for path in targets:
         print(_delete(path))
+    for line in _venv_note():
+        print(line)
     _pause()
 
 
@@ -548,7 +592,7 @@ def _key_state(path: str) -> str:
     return "default password"
 
 
-def _accounts_menu(config: Config) -> None:
+def _accounts_menu(config: Config, config_path: str) -> None:
     from .config import PRIVATE_KEY_FILE
 
     state = _key_state(PRIVATE_KEY_FILE)
@@ -569,7 +613,7 @@ def _accounts_menu(config: Config) -> None:
             _encrypt_key(config)
             state = _key_state(PRIVATE_KEY_FILE)
         elif choice == "4":
-            _erase_data(config)
+            _erase_data(config, config_path)
             state = _key_state(PRIVATE_KEY_FILE)
         elif choice in ("5", "0"):
             return
@@ -784,7 +828,7 @@ def run_menu(config: Config, config_path: str) -> int:
         "1": lambda: _start(config),
         "2": lambda: _active_strategy(config),
         "3": lambda: _history(config),
-        "4": lambda: _accounts_menu(config),
+        "4": lambda: _accounts_menu(config, config_path),
         "5": lambda: _configuration(config, config_path),
         "6": lambda: _close_all(config),
         "7": _logs,

@@ -23,6 +23,11 @@ from .referral import AccessConfig
 log = logging.getLogger(__name__)
 
 PRIVATE_KEY_ENV = "BULK_PRIVATE_KEY"
+# The shipped settings, which install.bat copies to settings.yaml on a first
+# run. Under app/ because the operator never edits this one -- an update
+# overwrites it, and the bot never reads it. Erasing local data resets their
+# copy from here, so "clean" means the same file a fresh install produces.
+SETTINGS_TEMPLATE = "app/settings.default.yaml"
 
 # Fallback for when exporting an environment variable is inconvenient. Read
 # relative to the current working directory, same as `settings.yaml` itself.

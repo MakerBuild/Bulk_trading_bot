@@ -20,9 +20,14 @@ class StubConfig:
         self.state_file = str(state_file)
 
 
+SHIPPED_SETTINGS = "hold_minutes: 0.5-1.5\n"
+EDITED_SETTINGS = "hold_minutes: 9-9   # mine\nnotional_usd: 5000\n"
+
+
 @pytest.fixture
 def workspace(tmp_path, monkeypatch):
-    """A project folder with a key, a state file and a bytecode cache."""
+    """A project folder as an operator's really looks: key, state, cache,
+    settings they have edited, and the template those were made from."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "app" / "state").mkdir(parents=True)
     state = tmp_path / "app" / "state" / "strategy_state.json"
@@ -32,7 +37,15 @@ def workspace(tmp_path, monkeypatch):
     cache = tmp_path / "app" / "bulkdn" / "__pycache__"
     cache.mkdir(parents=True)
     (cache / "menu.cpython-314.pyc").write_bytes(b"\x00" * 64)
-    return tmp_path, state, key, cache
+
+    from bulkdn.config import SETTINGS_TEMPLATE
+
+    template = tmp_path / SETTINGS_TEMPLATE
+    template.parent.mkdir(parents=True, exist_ok=True)
+    template.write_text(SHIPPED_SETTINGS, encoding="utf-8")
+    settings = tmp_path / "settings.yaml"
+    settings.write_text(EDITED_SETTINGS, encoding="utf-8")
+    return tmp_path, state, key, cache, settings
 
 
 def feed(monkeypatch, answers):
@@ -40,22 +53,22 @@ def feed(monkeypatch, answers):
     monkeypatch.setattr(builtins, "input", lambda *_: next(it))
 
 
-def run(monkeypatch, state, answers):
+def run(monkeypatch, state, answers, config_path="settings.yaml"):
     feed(monkeypatch, answers)
-    menu._erase_data(StubConfig(state))
+    menu._erase_data(StubConfig(state), config_path)
 
 
 # -- nothing happens by accident -------------------------------------------
 
 
 def test_backing_out_deletes_nothing(workspace, monkeypatch):
-    _root, state, key, cache = workspace
+    _root, state, key, cache, _settings = workspace
     run(monkeypatch, state, ["0"])
     assert state.exists() and key.exists() and cache.exists()
 
 
 def test_a_refused_confirmation_deletes_nothing(workspace, monkeypatch):
-    _root, state, key, _cache = workspace
+    _root, state, key, _cache, _settings = workspace
     run(monkeypatch, state, ["1", "no", ""])
     assert state.exists() and key.exists()
     assert "not a real key" in key.read_text(encoding="utf-8")
@@ -63,13 +76,13 @@ def test_a_refused_confirmation_deletes_nothing(workspace, monkeypatch):
 
 def test_the_key_is_not_wiped_by_the_ordinary_yes(workspace, monkeypatch):
     """`yes` clears every other confirmation in this menu. Not this one."""
-    _root, state, key, _cache = workspace
+    _root, state, key, _cache, _settings = workspace
     run(monkeypatch, state, ["2", "yes", ""])
     assert "not a real key" in key.read_text(encoding="utf-8")
 
 
 def test_the_key_needs_its_own_words(workspace, monkeypatch):
-    _root, state, key, _cache = workspace
+    _root, state, key, _cache, _settings = workspace
     run(monkeypatch, state, ["2", "DELETE KEY", ""])
     assert "not a real key" not in key.read_text(encoding="utf-8")
     # And only the key.
@@ -80,21 +93,21 @@ def test_the_key_needs_its_own_words(workspace, monkeypatch):
 
 
 def test_state_only_leaves_the_key_alone(workspace, monkeypatch):
-    _root, state, key, cache = workspace
+    _root, state, key, cache, _settings = workspace
     run(monkeypatch, state, ["1", "yes", ""])
     assert not state.exists()
     assert key.exists() and cache.exists()
 
 
 def test_caches_only_leave_the_data_alone(workspace, monkeypatch):
-    _root, state, key, cache = workspace
+    _root, state, key, cache, _settings = workspace
     run(monkeypatch, state, ["3", "yes", ""])
     assert not cache.exists()
     assert state.exists() and key.exists()
 
 
 def test_all_of_the_above_still_needs_the_key_phrase(workspace, monkeypatch):
-    _root, state, key, cache = workspace
+    _root, state, key, cache, _settings = workspace
     run(monkeypatch, state, ["9", "yes", ""])
     # 'yes' is not the key phrase, so the whole batch aborts rather than
     # deleting the harmless parts and stopping at the key.
@@ -102,7 +115,7 @@ def test_all_of_the_above_still_needs_the_key_phrase(workspace, monkeypatch):
 
 
 def test_all_of_the_above_clears_everything_when_confirmed(workspace, monkeypatch):
-    _root, state, key, cache = workspace
+    _root, state, key, cache, _settings = workspace
     run(monkeypatch, state, ["9", "DELETE KEY", ""])
     assert not state.exists() and not cache.exists()
     assert key.exists(), "the key file itself must survive"
@@ -114,7 +127,7 @@ def test_all_of_the_above_clears_everything_when_confirmed(workspace, monkeypatc
 
 def test_the_virtualenv_is_never_offered(workspace, monkeypatch):
     """Deleting it would break the install; it is not the operator's data."""
-    root, _state, _key, _cache = workspace
+    root, _state, _key, _cache, _settings = workspace
     venv_cache = root / "app" / ".venv" / "Lib" / "site-packages" / "__pycache__"
     venv_cache.mkdir(parents=True)
     (venv_cache / "x.pyc").write_bytes(b"\x00")
@@ -128,7 +141,7 @@ def test_the_virtualenv_is_never_offered(workspace, monkeypatch):
 
 
 def test_an_open_cycle_is_called_out(workspace):
-    _root, state, _key, _cache = workspace
+    _root, state, _key, _cache, _settings = workspace
     state.write_text('{"phase": "OPEN"}', encoding="utf-8")
     warning = menu._live_cycle_warning(state)
     assert warning and "OPEN" in warning
@@ -136,7 +149,7 @@ def test_an_open_cycle_is_called_out(workspace):
 
 
 def test_an_idle_state_warns_about_nothing(workspace):
-    _root, state, _key, _cache = workspace
+    _root, state, _key, _cache, _settings = workspace
     assert menu._live_cycle_warning(state) is None
 
 
@@ -146,7 +159,7 @@ def test_a_missing_state_file_warns_about_nothing(tmp_path):
 
 def test_the_screen_fits_inside_the_frame(workspace, monkeypatch, capsys):
     """_box does not wrap, so a line that outgrows it splits the border."""
-    _root, state, _key, _cache = workspace
+    _root, state, _key, _cache, _settings = workspace
     run(monkeypatch, state, ["0"])
 
     lines = capsys.readouterr().out.splitlines()
@@ -157,7 +170,7 @@ def test_the_screen_fits_inside_the_frame(workspace, monkeypatch, capsys):
 
 
 def test_paths_are_shown_relative_to_the_project(workspace, monkeypatch, capsys):
-    root, state, _key, cache = workspace
+    root, state, _key, cache, _settings = workspace
     run(monkeypatch, state, ["0"])
 
     out = capsys.readouterr().out
@@ -176,7 +189,7 @@ def test_paths_are_shown_relative_to_the_project(workspace, monkeypatch, capsys)
 def test_the_key_file_survives_with_its_instructions(workspace, monkeypatch):
     from bulkdn.config import PRIVATE_KEY_TEMPLATE
 
-    _root, state, key, _cache = workspace
+    _root, state, key, _cache, _settings = workspace
     run(monkeypatch, state, ["2", "DELETE KEY", ""])
 
     assert key.exists()
@@ -264,3 +277,75 @@ def test_a_missing_file_is_not_reported_as_protected(tmp_path):
     from bulkdn import menu
 
     assert menu._key_state(str(tmp_path / "absent.local")) == "PLAINTEXT"
+
+
+# -- settings go back to the shipped ones, not away -------------------------
+#
+# "Erase my data" has to leave a copy that still runs. A bot with no settings
+# file does not start at all, so the sizes and the leverage are what go -- by
+# rewriting the file from the template install.bat used, which is exactly the
+# file a fresh install produces.
+
+
+def test_settings_are_reset_to_the_template(workspace, monkeypatch):
+    _root, state, _key, _cache, settings = workspace
+    run(monkeypatch, state, ["5", "yes", ""])
+
+    assert settings.exists(), "the bot cannot start without it"
+    assert settings.read_text(encoding="utf-8") == SHIPPED_SETTINGS
+    assert "5000" not in settings.read_text(encoding="utf-8")
+
+
+def test_resetting_settings_leaves_everything_else(workspace, monkeypatch):
+    _root, state, key, cache, _settings = workspace
+    run(monkeypatch, state, ["5", "yes", ""])
+    assert state.exists() and cache.exists()
+    assert "not a real key" in key.read_text(encoding="utf-8")
+
+
+def test_all_of_the_above_resets_the_settings_too(workspace, monkeypatch):
+    """The whole point of the button: a freshly installed copy."""
+    _root, state, key, cache, settings = workspace
+    run(monkeypatch, state, ["9", "DELETE KEY", ""])
+
+    assert not state.exists() and not cache.exists()
+    assert settings.read_text(encoding="utf-8") == SHIPPED_SETTINGS
+    assert key.exists() and "not a real key" not in key.read_text(encoding="utf-8")
+
+
+def test_a_missing_template_is_reported_not_guessed(workspace, monkeypatch, capsys):
+    """Better to say so than to delete the settings and leave nothing to run."""
+    from bulkdn.config import SETTINGS_TEMPLATE
+
+    root, state, _key, _cache, settings = workspace
+    (root / SETTINGS_TEMPLATE).unlink()
+
+    run(monkeypatch, state, ["5", "yes", ""])
+    out = capsys.readouterr().out
+    assert "FAILED" in out and "update.bat" in out
+    assert settings.read_text(encoding="utf-8") == EDITED_SETTINGS
+
+
+# -- what it cannot reach, it says so about ---------------------------------
+
+
+def test_the_virtualenv_is_reported_as_a_manual_step(workspace, monkeypatch, capsys):
+    """It holds the Windows username, and a running program cannot delete its
+    own executable -- a rmtree from in here fails partway and leaves a broken
+    environment. So it is named, with what to do, rather than attempted."""
+    root, state, _key, _cache, _settings = workspace
+    (root / "app" / ".venv" / "Scripts").mkdir(parents=True)
+    (root / "app" / ".venv" / "pyvenv.cfg").write_text(
+        "home = C:/Users/example", encoding="utf-8"
+    )
+
+    run(monkeypatch, state, ["0"])
+    out = capsys.readouterr().out
+    assert ".venv" in out
+    assert "install.bat" in out
+
+
+def test_no_venv_no_note(workspace, monkeypatch, capsys):
+    _root, state, _key, _cache, _settings = workspace
+    run(monkeypatch, state, ["0"])
+    assert "Not removable from here" not in capsys.readouterr().out
