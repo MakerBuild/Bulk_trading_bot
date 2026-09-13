@@ -65,9 +65,18 @@ rem it did that.
         git pull --ff-only
         if errorlevel 1 (
             echo.
-            echo   Update failed. Usually a tracked file was edited by hand;
-            echo   `git status` says which. Your settings and key are never the
-            echo   cause -- neither is tracked.
+            echo   Update failed. Almost always this means a file that ships
+            echo   with the bot was edited by hand, and git will not overwrite
+            echo   your edit without being told to. The line above names it.
+            echo.
+            echo   Your own files are never the cause: settings.yaml, your key,
+            echo   app\state and logs.txt are not tracked, so an update has
+            echo   nothing to overwrite them with.
+            echo.
+            echo   To throw away edits to the shipped files and update anyway:
+            echo.
+            echo       git checkout -- .
+            echo       update.bat
             echo.
             pause
             exit /b 1
