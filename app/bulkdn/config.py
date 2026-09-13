@@ -211,7 +211,7 @@ class ExecutionTarget:
         if self.burn_usd < 0:
             raise ConfigError(
                 "execution_target.burn_usd must be >= 0 -- it is an amount of "
-                "fees, counted whichever way they went"
+                "fees to spend, written as a plain positive amount"
             )
         if self.volume_usd < 0:
             raise ConfigError("execution_target.volume_usd must be >= 0")

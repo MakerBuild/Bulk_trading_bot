@@ -422,11 +422,16 @@ async def cmd_flatten(config: Config, dry_run: bool) -> int:
         # Legs, not the summary: a leg can hold an order id with the pair
         # reading IDLE, and leaving that behind is what made a flatten look
         # like it had done nothing.
-        if state.summary_phase != Phase.IDLE or state.legs:
+        if state.summary_phase != Phase.IDLE or state.legs or state.has_baseline:
             state.phase = Phase.IDLE
             state.halted_reason = None
             state.hold_until = 0.0
             state.legs = {}
+            # This is the "start over" command, so the execution target starts
+            # over with it. Without this, resuming after a flatten would carry
+            # the interrupted run's spend into what the operator reads as a
+            # fresh one.
+            state.clear_baseline()
             runtime.store.save(state)
             log.info("state reset to IDLE")
         else:

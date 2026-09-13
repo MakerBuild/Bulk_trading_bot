@@ -125,6 +125,23 @@ def account_fee_tier(
     )
 
 
+def burned_usd(fees_usd: float) -> float:
+    """A signed fee total, as the positive amount it cost.
+
+    BULK reports a charge as a NEGATIVE number on the fill -- a taker fill comes
+    back as `"takerFee": -0.035017` -- so a total of -3.0795 means $3.0795 was
+    paid. Printing the raw figure put a minus in front of every spend line and
+    read as though the account had earned it.
+
+    Maker fills come back as `"makerFee": 0.0`: passive execution is free here,
+    not rebated. So a total can reach zero but has no way to go above it, and a
+    positive figure would be a shape change rather than a windfall. It is
+    floored at zero anyway, because "burned -$0.40" is not something an operator
+    can act on.
+    """
+    return max(0.0, -fees_usd)
+
+
 @dataclass
 class Realised:
     """Totals summed from the exchange's own fill records."""

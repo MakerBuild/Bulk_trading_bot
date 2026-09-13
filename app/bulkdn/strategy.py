@@ -34,6 +34,7 @@ from .accounts import AccountSession
 from .chaser import ChaseParams, Chaser
 from .config import Config
 from .feed import MarketFeed
+from .fees import burned_usd as _burned
 from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
 from .liquidation import LiquidationGuard
@@ -768,6 +769,9 @@ class Strategy:
 
         try:
             await self._recover()
+            # After recovery, so an interrupted run is recognised as one and
+            # keeps the count it already had.
+            self.capture_target_baseline()
 
             legs = [
                 asyncio.create_task(self._run_leg(symbol, sizes[symbol]))
@@ -797,6 +801,13 @@ class Strategy:
 
             if self._halt_reason:
                 raise Halted(self._halt_reason)
+
+            # Reached the end on its own terms, so the goal is spent and the
+            # next start measures a new one. Kept after a stop or a halt
+            # instead: those are interruptions, and resuming should not hand
+            # back progress that was already paid for.
+            self.state.clear_baseline()
+            self.store.save(self.state)
 
         except Halted as exc:
             await self._emergency_stop(str(exc))
@@ -832,17 +843,54 @@ class Strategy:
             log.debug("could not read totals for the progress line: %s", exc)
             return ""
 
+        # Against the same baseline the target uses, or the notification would
+        # report one number while the stop rule acted on another.
+        burned = _burned(totals.fees_usd - self.state.baseline_fees_usd)
+        volume = totals.qualifying_volume_usd - self.state.baseline_volume_usd
+
         parts = []
         if target.burn_usd > 0:
-            parts.append(f"burn ${totals.fees_usd:,.4f} / ${target.burn_usd:,.2f}")
+            parts.append(f"burn ${burned:,.4f} / ${target.burn_usd:,.2f}")
         if target.volume_usd > 0:
-            parts.append(
-                f"volume ${totals.qualifying_volume_usd:,.2f} / ${target.volume_usd:,.2f}"
-            )
+            parts.append(f"volume ${volume:,.2f} / ${target.volume_usd:,.2f}")
         detail = "  ".join(parts)
         if detail:
             self.title.set_note(detail)
         return detail
+
+    def capture_target_baseline(self) -> None:
+        """Record where the fill history stood, so the target counts from now.
+
+        Taken once per run. If the state file already carries one, this run is
+        the continuation of an interrupted one and keeps its count -- restarting
+        after a crash should not hand back the progress already paid for.
+
+        A read that fails leaves no baseline, and `_target_reached` treats a
+        missing baseline as "cannot judge yet" rather than as zero. Treating it
+        as zero would compare this run against the account's whole lifetime and
+        stop immediately, which is the bug this replaces.
+        """
+        target = self.config.target
+        if not target.measures_fills or self.state.has_baseline:
+            return
+        try:
+            totals = realised_for_tree(
+                self.master.http, [self.master.pubkey, self.sub1.pubkey]
+            )
+        except Exception as exc:  # noqa: BLE001 - never block trading on this
+            log.warning("could not read fill history to start the target: %s", exc)
+            return
+
+        self.state.baseline_fees_usd = totals.fees_usd
+        self.state.baseline_volume_usd = totals.qualifying_volume_usd
+        self.state.baseline_at = time.time()
+        self.store.save(self.state)
+        log.info(
+            "execution target counts from now: $%.2f burned / $%.2f volume "
+            "already on the account do not count toward it",
+            _burned(totals.fees_usd),
+            totals.qualifying_volume_usd,
+        )
 
     def _target_reached(self) -> str | None:
         """Whether a spend or volume target has been met, as a reason string.
@@ -851,14 +899,17 @@ class Strategy:
         position is not a reason to abandon it -- the exit has to run, or the
         pair is left directional.
 
-        Totals come from the exchange's fill history rather than a local
-        counter, so a restart resumes against the real figure. A failure to
-        read it is logged and treated as "not reached": refusing to trade
-        because a read-only endpoint is down would be worse than overshooting
-        a soft goal by one cycle.
+        Measured as the distance travelled since `capture_target_baseline`, not
+        as the account's lifetime total. Totals still come from the exchange's
+        fill history rather than a local counter, so the figure survives a
+        restart and matches what was actually charged.
+
+        A failure to read it is logged and treated as "not reached": refusing to
+        trade because a read-only endpoint is down would be worse than
+        overshooting a soft goal by one cycle.
         """
         target = self.config.target
-        if not target.measures_fills:
+        if not target.measures_fills or not self.state.has_baseline:
             return None
 
         try:
@@ -869,28 +920,22 @@ class Strategy:
             log.warning("could not read fill history for the execution target: %s", exc)
             return None
 
-        # Distance from zero, not the signed figure. A maker-heavy pair earns
-        # more than it pays and runs a negative total, and a target that only
-        # counted upwards could never be reached by one -- observed live at
-        # -$1.44 against a target of $3, moving further away every cycle.
-        if target.burn_usd > 0 and abs(totals.fees_usd) >= target.burn_usd:
+        burned = _burned(totals.fees_usd - self.state.baseline_fees_usd)
+        volume = totals.qualifying_volume_usd - self.state.baseline_volume_usd
+
+        if target.burn_usd > 0 and burned >= target.burn_usd:
+            return f"burned ${burned:,.4f} of ${target.burn_usd:,.2f}"
+        if target.volume_usd > 0 and volume >= target.volume_usd:
             return (
-                f"burned ${totals.fees_usd:,.4f} of ${target.burn_usd:,.2f}"
-            )
-        if target.volume_usd > 0 and totals.qualifying_volume_usd >= target.volume_usd:
-            return (
-                f"qualifying volume ${totals.qualifying_volume_usd:,.2f} "
-                f"of ${target.volume_usd:,.2f}"
+                f"qualifying volume ${volume:,.2f} of ${target.volume_usd:,.2f}"
             )
 
         if target.burn_usd > 0:
-            log.info(
-                "burn progress: $%.4f / $%.2f", totals.fees_usd, target.burn_usd
-            )
+            log.info("burn progress: $%.4f / $%.2f", burned, target.burn_usd)
         if target.volume_usd > 0:
             log.info(
                 "volume progress: $%.2f / $%.2f qualifying (self-trades $%.2f excluded)",
-                totals.qualifying_volume_usd,
+                volume,
                 target.volume_usd,
                 totals.self_trade_volume_usd,
             )

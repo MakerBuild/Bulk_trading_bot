@@ -200,7 +200,7 @@ def _history(config: Config) -> None:
     Volume and fees are summed from the fills themselves rather than tracked
     separately, so the numbers cannot drift from what the exchange recorded.
     """
-    from .fees import Realised, _fills_page
+    from .fees import Realised, _fills_page, burned_usd
 
     http = _http(config)
     accounts = _accounts(config)
@@ -233,13 +233,13 @@ def _history(config: Config) -> None:
         grand = grand + totals
         print(
             f"    -- {totals.fills} fills, volume ${totals.volume_usd:,.2f}, "
-            f"fees ${totals.fees_usd:,.4f}"
+            f"burned ${burned_usd(totals.fees_usd):,.4f}"
         )
 
     print(f"\n  volume      ${grand.volume_usd:,.2f}")
     print(f"  self-trades ${grand.self_trade_volume_usd:,.2f}  (earn no tier credit)")
     print(f"  qualifying  ${grand.qualifying_volume_usd:,.2f}")
-    print(f"  fees        ${grand.fees_usd:,.4f}")
+    print(f"  burned      ${burned_usd(grand.fees_usd):,.4f}")
     print("\n  (last 20 fills per account -- Configuration -> Progress walks it all)")
     _pause()
 
@@ -666,26 +666,43 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
 
 
 def _target_progress(config: Config) -> None:
-    """Realised spend and volume against the configured targets."""
-    from .fees import account_fee_tier, fee_state, realised_for_tree
+    """Realised spend and volume, for this run and for the account's lifetime.
+
+    Both, because they answer different questions and showing only the lifetime
+    figure is what made a finished target look permanent.
+    """
+    from .fees import account_fee_tier, burned_usd, fee_state, realised_for_tree
+    from .state import StateStore
 
     accounts = [pk for _, pk in _accounts(config)]
     http = _http(config)
     totals = realised_for_tree(http, accounts)
+    state = StateStore(config.state_file).load()
 
     print(f"\n  fills {totals.fills}")
-    print(f"  fees            ${totals.fees_usd:,.4f}", end="")
-    if config.target.burn_usd > 0:
-        print(f"  of ${config.target.burn_usd:,.2f}")
+    print("\n  ALL TIME")
+    print(f"    burned        ${burned_usd(totals.fees_usd):,.4f}")
+    print(f"    volume        ${totals.volume_usd:,.2f}")
+    print(f"    self-trades   ${totals.self_trade_volume_usd:,.2f}  (earn no tier credit)")
+    print(f"    qualifying    ${totals.qualifying_volume_usd:,.2f}")
+
+    print("\n  THIS RUN", end="")
+    if not state.has_baseline:
+        print("\n    not started -- the target is measured from the next start")
     else:
-        print("  (no burn target)")
-    print(f"  volume          ${totals.volume_usd:,.2f}")
-    print(f"  self-trades     ${totals.self_trade_volume_usd:,.2f}  (earn no tier credit)")
-    print(f"  qualifying      ${totals.qualifying_volume_usd:,.2f}", end="")
-    if config.target.volume_usd > 0:
-        print(f"  of ${config.target.volume_usd:,.2f}")
-    else:
-        print("  (no volume target)")
+        burned = burned_usd(totals.fees_usd - state.baseline_fees_usd)
+        volume = totals.qualifying_volume_usd - state.baseline_volume_usd
+        print()
+        print(f"    burned        ${burned:,.4f}", end="")
+        if config.target.burn_usd > 0:
+            print(f"  of ${config.target.burn_usd:,.2f}")
+        else:
+            print("  (no burn target)")
+        print(f"    qualifying    ${volume:,.2f}", end="")
+        if config.target.volume_usd > 0:
+            print(f"  of ${config.target.volume_usd:,.2f}")
+        else:
+            print("  (no volume target)")
 
     quote = account_fee_tier(config.http_url, accounts[0])
     if quote:

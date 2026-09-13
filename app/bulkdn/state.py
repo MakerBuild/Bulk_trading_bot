@@ -79,6 +79,25 @@ class StrategyState:
     legs: dict[str, LegState] = field(default_factory=dict)
     halted_reason: str | None = None
     updated_at: float = 0.0
+    # Fill-history totals as they stood when this run began. The execution
+    # target is measured as the distance from here, so `burn_usd: 3` means "$3
+    # this run" and not "$3 since the account was opened" -- which, once passed,
+    # ended every later run before it placed an order.
+    #
+    # Persisted so a crash mid-run resumes the same count rather than starting
+    # the goal over; cleared when a run ends, so the next start measures fresh.
+    baseline_fees_usd: float = 0.0
+    baseline_volume_usd: float = 0.0
+    baseline_at: float = 0.0
+
+    @property
+    def has_baseline(self) -> bool:
+        return self.baseline_at > 0.0
+
+    def clear_baseline(self) -> None:
+        self.baseline_fees_usd = 0.0
+        self.baseline_volume_usd = 0.0
+        self.baseline_at = 0.0
 
     def leg(self, symbol: str) -> LegState:
         if symbol not in self.legs:
@@ -136,6 +155,12 @@ class StrategyState:
             legs=legs,
             halted_reason=data.get("halted_reason"),
             updated_at=float(data.get("updated_at", 0.0)),
+            # Absent in files written before the target had a baseline. Zero
+            # reads as "not captured", so the next run takes one -- which is
+            # the right answer for a file that predates the idea.
+            baseline_fees_usd=float(data.get("baseline_fees_usd", 0.0)),
+            baseline_volume_usd=float(data.get("baseline_volume_usd", 0.0)),
+            baseline_at=float(data.get("baseline_at", 0.0)),
         )
 
 

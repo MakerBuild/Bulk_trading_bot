@@ -459,10 +459,29 @@ position is not a reason to abandon it, or the pair is left directional.
 
 `burn_usd` and `volume_usd` are measured by walking the account tree's fill
 history (`POST /account {"type": "fills"}`) and summing what the exchange
-recorded, so they survive a restart and cannot drift from what was actually
-charged. If that read fails the run continues -- refusing to trade because a
-read-only endpoint is down would be worse than overshooting a soft goal by one
-cycle.
+recorded, so they cannot drift from what was actually charged. If that read
+fails the run continues -- refusing to trade because a read-only endpoint is
+down would be worse than overshooting a soft goal by one cycle.
+
+**Both are measured from the start of the run, not from the life of the
+account.** `run` records the totals as they stand into `baseline_fees_usd` /
+`baseline_volume_usd` in the state file and compares the distance travelled
+since. Without that, the lifetime figure passing `burn_usd` once ended every
+later run before it placed an order -- observed live as a session that finished
+in a second with `execution target reached: burned $-3.0795 of $3.00`, and
+unfixable except by editing the number upward after every run.
+
+The baseline is persisted rather than held in memory so that an interrupted run
+resumes its own count: a crash should not hand back progress already paid for.
+It is cleared when a run ends on its own terms, and by `flatten`, which is the
+deliberate way to start a goal over.
+
+**A fee is reported as a negative number.** A taker fill comes back as
+`"takerFee": -0.035017`, and a maker fill as `"makerFee": 0.0` -- passive
+execution here is free, not rebated. So the summed total runs negative, and
+`fees.burned_usd` flips it for anything an operator reads. Printing the raw
+figure put a minus in front of every spend line and read as though the account
+had earned the money it had spent.
 
 **`volume_usd` counts qualifying volume only.** The fee documentation states
 that "Self-trades between accounts under the same main account do not create

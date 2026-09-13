@@ -95,16 +95,20 @@ hold_minutes: 0.5-1.5
 #
 #  Whichever limit is hit first ends the run. 0 disables that limit.
 #  Spend and volume are read from the exchange's own fill records, so they
-#  survive a restart and match what you were actually charged.
+#  match what you were actually charged rather than a local guess.
 #
-#  burn_usd counts fees whichever way they went. The resting side of each leg
-#  earns a maker rebate and the hedge pays a taker fee, so the running total
-#  can be either sign -- `burn progress: $-1.44` means $1.44 earned, and counts
-#  toward a target of 3 exactly as $1.44 paid would. Write a plain amount.
+#  MEASURED FROM THE START OF EACH RUN, not from the life of the account. So
+#  `burn_usd: 3` means "$3 this run": finish one, press Start again, and the
+#  count begins at zero. What you burned last week does not end today's run
+#  before it places an order.
+#
+#  An interrupted run keeps its count when you restart it -- progress you have
+#  already paid for is not handed back. `flatten` clears it, which is the way
+#  to start the goal over deliberately.
 # ---------------------------------------------------------------------------
 execution_target:
   cycles: 0                 # number of open/hold/exit cycles; 0 = unlimited
-  burn_usd: 3               # stop once $3 of fees has accrued, either way
+  burn_usd: 3               # stop once $3 of fees has been spent this run
   volume_usd: 0             # stop once this much qualifying volume is done
 
 
