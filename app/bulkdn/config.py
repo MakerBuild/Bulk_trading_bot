@@ -8,6 +8,7 @@ signing authority.
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ import yaml
 from . import keystore
 from .notify import TelegramConfig
 from .referral import AccessConfig
+
+log = logging.getLogger(__name__)
 
 PRIVATE_KEY_ENV = "BULK_PRIVATE_KEY"
 
@@ -97,15 +100,16 @@ class LegConfig:
     # `offset_bps` inside the touch and moves onto it. Still passive -- the
     # order never crosses, so the fill stays on the maker side. 0 keeps the
     # offset for as long as the order rests.
-    chase_patience_s: float = 8.0
-    # The replace threshold once a leg has tightened onto the touch.
+    chase_patience_s: float = 3.0
+    # How many ticks PAST the touch to post, once the offset has been given up.
     #
-    # `max_distance_bps` is the tolerance for an order deliberately resting
-    # away from the market, and it is far too loose for one that is meant to be
-    # ON the market: at 8bps an ETH order sat $1.08 below the best bid, ten
-    # levels deep, and the drift rule called that fine. Once we have decided we
-    # want the fill, the order follows the touch instead.
-    tight_distance_bps: float = 1.0
+    # 1 makes the order the best bid or the best ask outright, which fills ahead
+    # of everyone queued at the old touch; 0 joins that queue and waits behind
+    # all of it. Still passive either way -- the order is posted inside the
+    # spread, never across it -- so this buys priority with a tick of price
+    # rather than with a taker fee. Clamped to stay one tick short of the other
+    # side, so a one-tick spread leaves the order on the touch.
+    improve_ticks: int = 1
     # The per-order cap, in whichever unit suits; it defaults to the whole leg.
     max_order_size: float = 0.0
     max_order_notional_usd: float = 0.0
@@ -154,8 +158,11 @@ class LegConfig:
             raise ConfigError(f"legs.{name}.max_distance_bps must be > 0")
         if self.chase_patience_s < 0:
             raise ConfigError(f"legs.{name}.chase_patience_s must be >= 0 (0 disables it)")
-        if self.tight_distance_bps <= 0:
-            raise ConfigError(f"legs.{name}.tight_distance_bps must be > 0")
+        if self.improve_ticks < 0:
+            raise ConfigError(
+                f"legs.{name}.improve_ticks must be >= 0 (0 joins the touch "
+                "instead of beating it)"
+            )
         if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
             raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
 
@@ -444,6 +451,17 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if cap_size <= 0 and cap_usd <= 0:
         cap_size, cap_usd = size, notional_usd
 
+    # Retired settings. Unknown keys are otherwise ignored in silence, which
+    # would let someone tune a number that stopped being read and conclude the
+    # bot ignores its own config.
+    if "tight_distance_bps" in raw:
+        log.warning(
+            "legs.%s.tight_distance_bps is no longer used and can be deleted. "
+            "A tightened order now follows the touch tick by tick, which is "
+            "what that setting was trying to approximate in the wrong unit.",
+            name,
+        )
+
     try:
         return LegConfig(
             symbol=raw["symbol"],
@@ -451,8 +469,8 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             notional_usd=notional_usd,
             offset_bps=float(raw.get("offset_bps", 0.0)),
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
-            chase_patience_s=float(raw.get("chase_patience_s", 8.0)),
-            tight_distance_bps=float(raw.get("tight_distance_bps", 1.0)),
+            chase_patience_s=float(raw.get("chase_patience_s", 3.0)),
+            improve_ticks=int(raw.get("improve_ticks", 1)),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(

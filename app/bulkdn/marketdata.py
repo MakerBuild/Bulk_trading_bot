@@ -101,6 +101,7 @@ def chase_price(
     is_buy: bool,
     offset_bps: float,
     spec: MarketSpec,
+    improve_ticks: int = 0,
 ) -> float | None:
     """Target price for a resting order, `offset_bps` inside the touch.
 
@@ -108,6 +109,14 @@ def chase_price(
     stays passive and earns the maker side. Falls back to the mark price when
     the book is unavailable (e.g. right after a reconnect). Returns None when
     there is no usable reference price at all.
+
+    `improve_ticks` steps that many ticks PAST the touch, into the spread, once
+    the offset has been given up. Joining the touch shares a price with everyone
+    already queued there and fills last among them; one tick better is alone at
+    the front of the book and fills first. It is still passive -- the order is
+    posted inside the spread, not across it -- so the fill stays on the maker
+    side. It is ignored while an offset is in force, because stepping forward
+    from a price deliberately set back from the market is contradictory.
     """
     reference = best_bid if is_buy else best_ask
     if reference is None or reference <= 0:
@@ -119,7 +128,41 @@ def chase_price(
     adjustment = dec_ref * Decimal(str(offset_bps)) / BPS
     target = dec_ref - adjustment if is_buy else dec_ref + adjustment
     price = round_price(float(target), spec, is_buy)
+
+    if improve_ticks > 0 and offset_bps <= 0:
+        price = _improved(price, best_bid, best_ask, is_buy, improve_ticks, spec)
+
     return price if price > 0 else None
+
+
+def _improved(
+    price: float,
+    best_bid: float | None,
+    best_ask: float | None,
+    is_buy: bool,
+    ticks: int,
+    spec: MarketSpec,
+) -> float:
+    """Step `ticks` into the spread without ever reaching the other side.
+
+    Needs both sides of the book: without an ask there is no way to know how
+    much room there is, and guessing is how a "passive" order crosses. A spread
+    of one tick has no room at all, and the price is left on the touch.
+    """
+    if spec.tick_size <= 0 or not best_bid or not best_ask or best_ask <= best_bid:
+        return price
+
+    tick = Decimal(str(spec.tick_size))
+    step = tick * ticks
+    if is_buy:
+        # One tick short of the ask is the best a buy can do and stay passive.
+        ceiling = Decimal(str(best_ask)) - tick
+        improved = min(Decimal(str(price)) + step, ceiling)
+        return float(max(improved, Decimal(str(price))))
+
+    floor_price = Decimal(str(best_bid)) + tick
+    improved = max(Decimal(str(price)) - step, floor_price)
+    return float(min(improved, Decimal(str(price))))
 
 
 def distance_bps(price_a: float, price_b: float) -> float:

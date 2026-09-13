@@ -53,13 +53,15 @@ legs:
     leverage: 10            # 1-50, capped by the market's own maximum
     offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
     max_distance_bps: 5.0   # re-price the order once it drifts this far
-    chase_patience_s: 8     # unfilled this long? give up the offset and sit
-                            # on the best price. Still passive -- the order
-                            # never crosses, so it stays a maker fill.
-    tight_distance_bps: 1.0 # once it has, follow the price this closely.
-                            # max_distance_bps is the tolerance for an order
-                            # deliberately waiting away from the market; this
-                            # is for one that is meant to be ON it.
+    chase_patience_s: 3     # unfilled this long? stop waiting and go get it.
+                            # Lower = fills sooner, and gives up the 2bps edge
+                            # sooner. 0 keeps waiting forever.
+    improve_ticks: 1        # then post ONE TICK better than the best price,
+                            # which makes this order the best bid or ask and
+                            # fills it ahead of everyone queued at the old one.
+                            # Still passive: inside the spread, never across
+                            # it, so it is a maker fill and pays no taker fee.
+                            # 0 = join the queue instead and wait behind it.
     max_order_notional_usd: 100  # cap on any single resting order, in dollars
 
   sub_account:
@@ -68,8 +70,8 @@ legs:
     leverage: 10            # ETH-USD allows up to 25
     offset_bps: 3.0
     max_distance_bps: 8.0
-    chase_patience_s: 8
-    tight_distance_bps: 1.0
+    chase_patience_s: 3
+    improve_ticks: 1
     max_order_notional_usd: 100
 
 

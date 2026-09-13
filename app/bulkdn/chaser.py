@@ -15,11 +15,24 @@ second trigger watches the clock -- after `chase_patience_s` unfilled, the order
 gives up its offset and moves onto the touch. It still never crosses, so the
 fill stays on the maker side; what is spent is queue position, not fees.
 
-From then on the leg is on a shorter leash. `max_distance_bps` is the tolerance
-for an order deliberately resting away from the market; once the order is meant
-to be ON it, that tolerance is far too loose -- at 8bps an ETH order sat $1.08
-below the best bid, ten levels deep, with the drift rule calling it fine. A
-tightened leg follows the touch within `tight_distance_bps` instead.
+From then on the leg is in a different mode, and a much more aggressive one.
+
+  * It does not join the touch, it beats it. `improve_ticks` posts the order
+    one tick INTO the spread, which makes it the best bid or the best ask
+    outright. Joining the touch means queueing behind everyone already at that
+    price and filling after all of them; one tick better is alone at the front
+    and fills first. Still passive -- inside the spread, never across it -- so
+    this buys priority with a tick of price, not with a taker fee.
+
+  * It follows tick by tick, not within a tolerance. Any price other than the
+    computed target means the touch has moved, so the order is replaced. A bps
+    tolerance was the wrong unit for "am I still at the front": at 8bps an ETH
+    order sat $1.08 below the best bid, ten levels deep, with the drift rule
+    calling that fine.
+
+This costs a transaction whenever the book moves, which is the trade being
+made. It is bounded by `chase_interval_s`, and when the touch has not moved the
+target rounds to the same tick and nothing is sent.
 """
 
 from __future__ import annotations
@@ -49,7 +62,7 @@ class ChaseParams:
     max_distance_bps: float
     max_order_size: float
     chase_patience_s: float = 0.0
-    tight_distance_bps: float = 1.0
+    improve_ticks: int = 1
 
 
 def effective_offset_bps(
@@ -173,6 +186,7 @@ class Chaser:
             is_buy=roles.maker_is_buy,
             offset_bps=offset,
             spec=spec,
+            improve_ticks=params.improve_ticks,
         )
         if target is None:
             return ChaseOutcome(symbol, "skipped", "no reference price")
@@ -209,21 +223,31 @@ class Chaser:
                 ),
             )
 
-        # A leg that has tightened is meant to be on the market, not near it,
-        # so it follows the touch on a much shorter leash. max_distance_bps is
-        # the tolerance for an order deliberately resting away from the price;
-        # applying it after tightening left an ETH order $1.08 below the best
-        # bid, ten levels deep, with the drift rule calling that acceptable.
-        allowed = (
-            params.tight_distance_bps if was_tightened else params.max_distance_bps
-        )
-        if drift > allowed:
+        # A tightened leg is meant to be AT the front of the book, so the test
+        # is not a tolerance but an identity: any price other than the target
+        # means the touch moved and this order is no longer where it was put.
+        # No threshold is right here -- bps is the wrong unit for "am I still
+        # the best bid". At $100k a 1bps tolerance is twenty ticks, which is
+        # twenty price levels of other people's orders ahead of this one, and
+        # that is what a live ETH leg sat behind for two and a half minutes.
+        #
+        # Self-limiting rather than a replace storm: when the touch has not
+        # moved the target rounds to the same tick and nothing is sent, so a
+        # transaction costs only when the book actually changed.
+        if was_tightened:
+            if resting.price != target:
+                return await self._place(
+                    session, roles, leg, target, desired, replace_oid=leg.oid,
+                    reason=f"following the touch {resting.price:g} -> {target:g}",
+                )
+        elif drift > params.max_distance_bps:
+            # Still resting deliberately away from the market, where a bps
+            # tolerance is the right unit: re-pricing on every tick would burn
+            # nonces to keep a distance that was chosen loosely in the first
+            # place.
             return await self._place(
                 session, roles, leg, target, desired, replace_oid=leg.oid,
-                reason=(
-                    f"drift {drift:.1f}bps > {allowed:.1f}bps"
-                    + (" (following the touch)" if was_tightened else "")
-                ),
+                reason=f"drift {drift:.1f}bps > {params.max_distance_bps:.1f}bps",
             )
         if undersized:
             # The cap or a target change left the book short of what the leg

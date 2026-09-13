@@ -6,15 +6,18 @@ seconds to over two and a half minutes, and the drift rule does not help: if
 the market has not moved, the order has not drifted, so it is held exactly
 where it is failing to fill.
 
-After `chase_patience_s` the order gives up the offset and moves onto the
-touch. It never crosses, so the fill is still a maker fill and the rebate is
-untouched -- this buys speed with queue position, not with fees.
+After `chase_patience_s` the order gives up the offset and goes to the market:
+it posts `improve_ticks` INTO the spread, which makes it the best bid or ask
+outright rather than joining the queue at the old one, and from then on it
+follows the touch tick by tick. It never crosses, so the fill is still a maker
+fill -- this buys speed with a tick of price, not with a taker fee.
 """
 
 import pytest
 
 from bulkdn.chaser import ChaseParams, effective_offset_bps
 from bulkdn.config import ConfigError, LegConfig
+from bulkdn.marketdata import MarketSpec, chase_price
 
 BASE = 2.0
 PATIENCE = 8.0
@@ -88,43 +91,119 @@ def test_params_default_to_off():
 # 2528.34 -- $1.08 behind, ten levels deep. The leg had already tightened, so
 # it was meant to be on the market, but max_distance_bps (8) still governed the
 # replace and called 4.3bps of lag acceptable.
+#
+# A bps tolerance was the wrong instrument entirely. A tightened order is meant
+# to be AT the front of the book, and "at the front" is a tick-level fact: a
+# 1bps tolerance on a $100k instrument with a $0.50 tick is twenty price levels
+# of other people's orders. So there is no threshold now -- any price other
+# than the computed target is a replace.
 
 
-def replace_threshold(params, tightened):
-    """The rule under test, as the chaser applies it."""
-    return params.tight_distance_bps if tightened else params.max_distance_bps
-
-
-def params(max_distance=8.0, tight=1.0):
+def params(max_distance=8.0, improve=1):
     return ChaseParams(
         offset_bps=3.0, max_distance_bps=max_distance,
-        max_order_size=1.0, chase_patience_s=8.0, tight_distance_bps=tight,
+        max_order_size=1.0, chase_patience_s=3.0, improve_ticks=improve,
     )
+
+
+def would_replace(resting_price, target, tightened, params):
+    """The rule under test, as the chaser applies it."""
+    if tightened:
+        return resting_price != target
+    lag = abs(resting_price - target) / abs(target) * 10_000
+    return lag > params.max_distance_bps
 
 
 def test_a_waiting_order_keeps_the_loose_tolerance():
     """It is resting away from the market on purpose; chasing every tick would
     burn nonces and queue position for nothing."""
-    assert replace_threshold(params(), tightened=False) == 8.0
+    assert not would_replace(2527.26, 2528.34, tightened=False, params=params())
 
 
-def test_a_committed_order_follows_the_price():
-    assert replace_threshold(params(), tightened=True) == 1.0
+def test_a_committed_order_follows_every_tick():
+    """The live case, which used to be held."""
+    assert would_replace(2527.26, 2528.34, tightened=True, params=params())
 
 
-def test_the_live_lag_would_now_trigger_a_replace():
-    order, bid = 2527.26, 2528.34
-    lag_bps = (bid - order) / bid * 10_000
-
-    assert lag_bps > replace_threshold(params(), tightened=True), "still held"
-    assert lag_bps < replace_threshold(params(), tightened=False), (
-        "this is the case that used to be tolerated"
-    )
+def test_an_unmoved_touch_sends_nothing():
+    """What stops this being a replace storm: same touch, same target, no tx."""
+    assert not would_replace(2528.34, 2528.34, tightened=True, params=params())
 
 
-def test_the_threshold_must_be_positive():
+def test_improve_ticks_must_not_be_negative():
     leg = LegConfig(
-        symbol="BTC-USD", size=1.0, max_order_size=1.0, tight_distance_bps=0.0
+        symbol="BTC-USD", size=1.0, max_order_size=1.0, improve_ticks=-1
     )
-    with pytest.raises(ConfigError, match="tight_distance_bps"):
+    with pytest.raises(ConfigError, match="improve_ticks"):
         leg.validate("master_account")
+
+
+def test_joining_the_touch_is_still_available():
+    """0 is the old behaviour, for anyone who would rather keep the spread."""
+    leg = LegConfig(symbol="BTC-USD", size=1.0, max_order_size=1.0, improve_ticks=0)
+    leg.validate("master_account")
+    assert leg.improve_ticks == 0
+
+
+# -- one tick better than the touch, and never one tick too far ---------------
+#
+# The aggression that does not cost a taker fee: being the best bid rather than
+# joining it. The whole risk is overshooting into the other side, so most of
+# these are about the clamp.
+
+BTC = MarketSpec("BTC-USD", tick_size=0.5, lot_size=0.001, min_notional=1.0)
+
+
+def price(bid, ask, is_buy, improve=1, offset=0.0, spec=BTC):
+    return chase_price(
+        best_bid=bid, best_ask=ask, mark_price=None,
+        is_buy=is_buy, offset_bps=offset, spec=spec, improve_ticks=improve,
+    )
+
+
+def test_a_buy_posts_one_tick_above_the_best_bid():
+    assert price(100_000.0, 100_010.0, is_buy=True) == 100_000.5
+
+
+def test_a_sell_posts_one_tick_below_the_best_ask():
+    assert price(100_000.0, 100_010.0, is_buy=False) == 100_009.5
+
+
+def test_it_never_reaches_the_other_side():
+    """A one-tick spread has no room: the order stays on the touch."""
+    assert price(100_000.0, 100_000.5, is_buy=True) == 100_000.0
+    assert price(100_000.0, 100_000.5, is_buy=False) == 100_000.5
+
+
+def test_a_wide_step_is_clamped_short_of_the_other_side():
+    """improve_ticks larger than the spread must not walk through it."""
+    assert price(100_000.0, 100_002.0, is_buy=True, improve=99) == 100_001.5
+    assert price(100_000.0, 100_002.0, is_buy=False, improve=99) == 100_000.5
+
+
+def test_the_improved_price_is_always_strictly_inside():
+    """The property that makes this a maker order rather than a taker one."""
+    for spread_ticks in range(1, 12):
+        bid = 100_000.0
+        ask = bid + spread_ticks * BTC.tick_size
+        for improve in (1, 2, 5, 50):
+            buy = price(bid, ask, is_buy=True, improve=improve)
+            sell = price(bid, ask, is_buy=False, improve=improve)
+            assert bid <= buy < ask, (spread_ticks, improve, buy)
+            assert bid < sell <= ask, (spread_ticks, improve, sell)
+
+
+def test_zero_ticks_joins_the_touch():
+    assert price(100_000.0, 100_010.0, is_buy=True, improve=0) == 100_000.0
+
+
+def test_an_offset_order_is_not_improved():
+    """While still waiting at a deliberate distance, stepping forward from it
+    would contradict the offset that was just applied."""
+    assert price(100_000.0, 100_010.0, is_buy=True, improve=1, offset=2.0) < 100_000.0
+
+
+def test_a_missing_book_side_is_not_guessed():
+    """Without an ask there is no way to know the room, and guessing is how a
+    'passive' order crosses. Falls back to the touch."""
+    assert price(100_000.0, None, is_buy=True) == 100_000.0
