@@ -1,1 +1,11 @@
+# Batch files must reach Windows with CRLF endings. cmd.exe tolerates LF in
+# most places but not all -- a label read without its carriage return can be
+# missed, and `goto` then falls off the end of the file.
 *.bat text eol=crlf
+
+# Left out of `git archive`, which is how releases are built. Both of these are
+# git's own plumbing: they mean nothing in an unpacked copy, and on a machine
+# where they are not marked hidden they are just two files an operator has to
+# wonder about. The repository still has them; only the zip does not.
+.gitattributes export-ignore
+.gitignore export-ignore
