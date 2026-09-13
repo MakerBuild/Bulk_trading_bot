@@ -96,7 +96,7 @@ rem The operator's settings are a copy of the shipped defaults, not the shipped
 rem file itself. Keeping them apart is what lets an update be a `git pull`:
 rem a tracked settings.yaml would conflict for anyone who had changed a size.
 if not exist "settings.yaml" (
-    copy /y "settings.default.yaml" "settings.yaml" >nul
+    copy /y "app\settings.default.yaml" "settings.yaml" >nul
     echo   Created settings.yaml from the defaults -- edit that one.
 )
 
@@ -131,7 +131,7 @@ if errorlevel 1 (
 echo.
 echo   Done. Next:
 echo     1. Put your base58 private key on one line in private_key.local
-echo     2. Edit settings.yaml (your copy; settings.default.yaml is the shipped one)
+echo     2. Edit settings.yaml -- the only settings file you touch
 echo     3. Run run.bat
 echo.
 pause

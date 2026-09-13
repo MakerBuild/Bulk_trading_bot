@@ -22,13 +22,13 @@ app/state/*
 private_key.local
 .env
 
-# The operator's own settings. `settings.default.yaml` is what ships; the
-# installer copies it to `settings.yaml` on first run, and that copy is theirs
-# to edit. Tracking it would mean a merge conflict on every update for anyone
-# who had changed a size.
+# The operator's own settings. `app/settings.default.yaml` is what ships; the
+# installer copies it to `settings.yaml` in the root on first run, and that copy
+# is theirs to edit. Tracking it would mean a merge conflict on every update for
+# anyone who had changed a size.
 settings.yaml
 settings.*.yaml
-!settings.default.yaml
+!app/settings.default.yaml
 
 # The log file, and the two rollovers the handler keeps. Written into the
 # folder the operator has open so it is easy to find and easy to send; never
