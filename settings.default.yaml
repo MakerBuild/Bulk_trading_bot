@@ -150,14 +150,23 @@ max_phase_minutes: 30
 # ---------------------------------------------------------------------------
 #  Access control
 #
-#  This build runs only for accounts that signed up through its owner. The
-#  allow-list is not here: it is compiled into the bot, as digests rather than
-#  addresses, so this file cannot widen it, narrow it, or switch it off.
+#  This build runs only for accounts that signed up through its owner. There is
+#  no list of admitted wallets anywhere -- not here and not in the source. At
+#  startup the bot asks BULK's public index who referred the account it is
+#  about to trade from, and runs only if the answer is the owner.
 #
-#  That is deliberate. Every field this block used to have was a way around
-#  the check -- adding a wallet, replacing one, granting an unconditional pass,
-#  turning the requirement off, or allowing everything when the referral index
-#  is unreachable. A gate its own config file can open is not a gate.
+#  So nothing has to be released when someone new signs up: sign up through the
+#  owner's link and it works on the next start. And an account that did not is
+#  refused no matter what this file says.
+#
+#  That the list is gone is deliberate. Every field this block used to have was
+#  a way around the check -- adding a wallet, replacing one, granting an
+#  unconditional pass, turning the requirement off, or allowing everything when
+#  the index is unreachable. A gate its own config file can open is not a gate.
+#
+#  One consequence worth knowing: while the index is unreachable, nothing runs.
+#  The check is at startup only, so it can never interrupt a cycle already
+#  under way or leave a position open.
 #
 #  Nothing to configure here. If you forked this for your own use, empty
 #  SEALED_WALLETS in app/bulkdn/referral.py and this block works again:
@@ -165,7 +174,6 @@ max_phase_minutes: 30
 #    access:
 #      require_referral: true
 #      wallets: ["<your referrer wallet>"]
-#      owner_wallets: ["<the account you run from>"]
 # ---------------------------------------------------------------------------
 
 

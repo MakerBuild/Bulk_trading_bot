@@ -22,9 +22,6 @@ def unsealed(monkeypatch):
     """
     monkeypatch.setattr(referral, "SEALED_WALLETS", ())
     monkeypatch.setattr(referral, "SEALED_CODES", ())
-    monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
-    monkeypatch.setattr(referral, "SEALED_REFERRAL_WALLETS", ())
-    monkeypatch.setattr(referral, "SEALED_OWNER_WALLETS", ())
 
 WALLET = "EXAMPLE-REFERRED-WALLET"
 REFERRER = "EXAMPLE-REFERRER-WALLET"
@@ -164,7 +161,7 @@ def test_denies_a_different_code(monkeypatch):
         WALLET, AccessConfig(require_referral=True, codes=["SOMETHINGELSE"])
     )
     assert not decision.allowed
-    assert "not on the allowed list" in decision.reason
+    assert "not the owner of this build" in decision.reason
 
 
 def test_denies_a_wallet_with_no_referrer(monkeypatch):
@@ -204,30 +201,24 @@ def test_invited_wallet_is_denied_for_a_different_inviter(monkeypatch):
     assert "invite code INV-3-031806" in decision.reason
 
 
-def test_an_explicit_invite_code_is_accepted(monkeypatch):
-    """Matched against `invited_by_code_id`, which is an INTERNAL id.
-
-    Not the BULK-XXX-XXX code the inviter holds -- so this route only works for
-    someone who can read the ids out of the API, which the owner cannot. The
-    wallet route above is the usable one.
-    """
+def test_an_invite_is_matched_on_the_inviter_not_the_code(monkeypatch):
+    """`invited_by_code_id` is an INTERNAL id (`INV-4-004748`), not the
+    BULK-XXX-XXX code an inviter holds and could list. So there is no code route
+    for invites at all -- the inviter's wallet is what the gate matches, and it
+    stays correct as codes are consumed and reissued."""
     _serve(monkeypatch, FakeResponse(200, INVITED))
-    decision = check_access(
-        WALLET,
-        AccessConfig(require_referral=True, invite_codes=["inv-3-031806"]),
-    )
-    assert decision.allowed
-    assert "invited by code" in decision.reason
 
-
-def test_the_shareable_code_does_not_match_the_internal_id(monkeypatch):
-    """The trap this documents: listing the codes you actually have matches nothing."""
-    _serve(monkeypatch, FakeResponse(200, INVITED))
-    decision = check_access(
-        WALLET,
-        AccessConfig(require_referral=True, invite_codes=["BULK-EDA-QQF"]),
+    by_wallet = check_access(
+        WALLET, AccessConfig(require_referral=True, wallets=[REFERRER])
     )
-    assert not decision.allowed
+    assert by_wallet.allowed
+    assert "invited by wallet" in by_wallet.reason
+
+    # Neither spelling of the code opens it.
+    for code in ("inv-3-031806", "BULK-EDA-QQF"):
+        assert not check_access(
+            WALLET, AccessConfig(require_referral=True, codes=[code])
+        ).allowed
 
 
 def test_missing_access_block_is_not_an_error(monkeypatch):
@@ -247,37 +238,38 @@ def test_neither_route_is_denied_with_a_clear_reason(monkeypatch):
     assert "referral or invite" in decision.reason
 
 
-def test_owner_wallet_runs_without_a_referral(monkeypatch):
-    """The gate must not lock out its own author.
+def test_a_referrer_wallet_is_refused_like_any_other(monkeypatch):
+    """Nobody referred the referrer, so the referrer does not pass.
 
-    A referrer was not referred by themselves, so the owner's wallet has a null
-    referrer and every code check fails for it.
+    There used to be an `owner_wallets` list that waved such an account through
+    without asking. It is gone on purpose: every wallet is judged on what the
+    indexer says about it, and a wallet the indexer has no referrer for is not
+    admitted, whoever it belongs to. The owner's *trading* accounts are
+    unaffected -- those did sign up through the referral link.
     """
     _serve(monkeypatch, FakeResponse(200, NO_REFERRER))
     decision = check_access(
         WALLET,
-        AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"], owner_wallets=[WALLET]),
+        AccessConfig(require_referral=True, codes=["EXAMPLE-REFERRER-CODE"]),
     )
-    assert decision.allowed
-    assert decision.reason == "owner wallet"
+    assert not decision.allowed
+    assert "did not sign up under a referral" in decision.reason
 
 
-def test_owner_wallet_skips_the_indexer_entirely(monkeypatch):
-    """So the owner can still run while the indexer is down."""
-    def boom(url, timeout):
-        raise AssertionError("the indexer must not be contacted for an owner wallet")
+def test_every_wallet_reaches_the_indexer(monkeypatch):
+    """No wallet is admitted or refused before the question is asked."""
+    asked = []
 
-    monkeypatch.setattr(requests, "get", boom)
+    def spy(url, timeout):
+        asked.append(url)
+        return FakeResponse(200, REFERRED)
+
+    monkeypatch.setattr(requests, "get", spy)
     decision = check_access(
-        WALLET, AccessConfig(require_referral=True, owner_wallets=[WALLET])
+        WALLET, AccessConfig(require_referral=True, wallets=[REFERRER])
     )
     assert decision.allowed
-
-
-def test_owner_list_alone_satisfies_validation():
-    """An owner-only build is a legitimate configuration, not an empty allowlist."""
-    cfg = _access_from_dict({"require_referral": True, "owner_wallet": WALLET})
-    assert cfg.owner_wallets == [WALLET]
+    assert len(asked) == 1 and WALLET in asked[0]
 
 
 def test_indexer_outage_denies_by_default(monkeypatch):
@@ -323,7 +315,7 @@ def test_config_accepts_a_single_unwrapped_code():
 
 def test_enabled_with_no_allowlist_is_an_error():
     """Would refuse every account, including the owner's."""
-    with pytest.raises(ConfigError, match="no codes, wallets, invite_codes"):
+    with pytest.raises(ConfigError, match="no codes or wallets"):
         _access_from_dict({"require_referral": True})
 
 

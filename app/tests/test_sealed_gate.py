@@ -1,10 +1,9 @@
-"""The gate when the build carries its own allow-list.
+"""The gate when the build carries its own owner identity.
 
-Reading the allow-list out of settings.yaml makes every field of it a bypass:
-`wallets` and `codes` add allowed referrers, `owner_wallets` is an
-unconditional pass, `require_referral: false` switches the gate off, and
-`allow_on_error: true` turns a pulled network cable into a pass. So a sealed
-build ignores that block entirely, and each of those is a test here.
+Reading that out of settings.yaml makes every field of it a bypass: `wallets`
+and `codes` add allowed referrers, `require_referral: false` switches the gate
+off, and `allow_on_error: true` turns a pulled network cable into a pass. So a
+sealed build ignores that block entirely, and each of those is a test here.
 
 This is a speed bump, not enforcement -- the source ships and the check is one
 edit away from gone. What these tests pin is that the edit has to be to the
@@ -29,9 +28,6 @@ def sealed(monkeypatch):
                         (referral.wallet_digest(OWNER),))
     monkeypatch.setattr(referral, "SEALED_CODES",
                         (referral.code_digest(OWNER_CODE),))
-    monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
-    monkeypatch.setattr(referral, "SEALED_REFERRAL_WALLETS", ())
-    monkeypatch.setattr(referral, "SEALED_OWNER_WALLETS", ())
 
 
 def serve(monkeypatch, payload):
@@ -89,13 +85,6 @@ def test_adding_a_code_to_the_config_admits_nobody(monkeypatch):
     serve(monkeypatch, referred_by(code="SOMEONE-ELSES-CODE"))
     widened = AccessConfig(require_referral=True, codes=["SOMEONE-ELSES-CODE"])
     assert not check_access(CALLER, widened).allowed
-
-
-def test_an_owner_wallet_in_the_config_is_not_an_unconditional_pass(monkeypatch):
-    """`owner_wallets` skips the indexer entirely, so it is the softest bypass."""
-    serve(monkeypatch, referred_by(wallet=OUTSIDER))
-    forged = AccessConfig(require_referral=True, owner_wallets=[CALLER])
-    assert not check_access(CALLER, forged).allowed
 
 
 # -- the config cannot switch the gate off ----------------------------------
@@ -156,8 +145,6 @@ def test_an_unsealed_build_still_reads_the_config(monkeypatch):
     """Someone forking this for their own use is not locked out of configuring it."""
     monkeypatch.setattr(referral, "SEALED_WALLETS", ())
     monkeypatch.setattr(referral, "SEALED_CODES", ())
-    monkeypatch.setattr(referral, "SEALED_INVITE_CODES", ())
-    monkeypatch.setattr(referral, "SEALED_REFERRAL_WALLETS", ())
     assert not referral.is_sealed()
 
     serve(monkeypatch, referred_by(wallet=OUTSIDER))
