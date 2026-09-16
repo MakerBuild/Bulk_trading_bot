@@ -85,7 +85,11 @@ rem certifi is named even though requests would pull it in anyway: the bot now
 rem uses it directly, to verify the WebSocket against the same trust anchors as
 rem its HTTP calls. A dependency that is only there by accident is one a future
 rem version of requests can drop.
-"%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi
+rem python-socks and PySocks are what let a SOCKS proxy work -- the first for the
+rem account stream, the second for HTTP. Neither library says anything useful at
+rem the point of failure without them, so they are installed for everyone rather
+rem than left for whoever turns out to need a proxy.
+"%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi python-socks PySocks
 if errorlevel 1 (
     echo   Dependency install failed -- see the error above.
     pause
@@ -117,6 +121,29 @@ if not exist "private_key.local" (
     >> private_key.local echo # for by, the master -- so this one key is all the bot needs.
     >> private_key.local echo.
     echo   Created private_key.local for your key.
+)
+
+rem Optional, and left empty on purpose: most operators never touch it. It
+rem exists so that someone in a country where BULK is blocked has one obvious
+rem place to put a proxy, rather than a config setting to discover.
+rem Kept in step with proxy.PROXY_TEMPLATE, which test_proxy checks.
+if not exist "proxy.local" (
+    > proxy.local echo # Optional. Leave this file as it is unless BULK is blocked where you are.
+    >> proxy.local echo #
+    >> proxy.local echo # Put ONE proxy address on the line below -- no quotes, nothing else. Examples:
+    >> proxy.local echo #
+    >> proxy.local echo #     http://user:password@proxy.example.com:8080
+    >> proxy.local echo #     socks5h://user:password@proxy.example.com:1080
+    >> proxy.local echo #     socks5h://proxy.example.com:1080
+    >> proxy.local echo #
+    >> proxy.local echo # socks5h is the one to ask your provider for: the "h" means the proxy resolves
+    >> proxy.local echo # the hostname, so the lookup does not happen on your machine -- which is what
+    >> proxy.local echo # fails first where DNS is what does the blocking.
+    >> proxy.local echo #
+    >> proxy.local echo # Everything the bot does goes through it: orders, positions, prices and the
+    >> proxy.local echo # account stream. This file never leaves your machine, but it usually holds a
+    >> proxy.local echo # password, so treat it like the key file.
+    echo   Created proxy.local ^(only needed if BULK is blocked where you are^).
 )
 
 rem Hide the repo's own bookkeeping, so the folder shows only the four files

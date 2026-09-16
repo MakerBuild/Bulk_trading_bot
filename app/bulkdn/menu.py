@@ -29,6 +29,7 @@ from .cli import (
     cmd_status,
 )
 from .config import Config, ConfigError
+from . import proxy
 
 BOX_WIDTH = 46
 
@@ -417,6 +418,12 @@ def _delete(path: pathlib.Path, settings: pathlib.Path | None = None) -> str:
         if path.name == PRIVATE_KEY_FILE:
             path.write_text(PRIVATE_KEY_TEMPLATE, encoding="utf-8")
             return f"  emptied {_shown(path)} -- ready for a new key"
+        if path.name == proxy.PROXY_FILE:
+            # Emptied rather than removed, for the same reason as the key file:
+            # it is where the next one gets pasted, and the instructions inside
+            # are most of what the file is.
+            path.write_text(proxy.PROXY_TEMPLATE, encoding="utf-8")
+            return f"  emptied {_shown(path)} -- ready for a new proxy"
         if settings is not None and _same_file(path, settings):
             template = pathlib.Path(SETTINGS_TEMPLATE)
             if not template.exists():
@@ -479,6 +486,8 @@ def _erase_targets(
          "every run this machine has made, and your addresses"),
         ("5", "Settings", [pathlib.Path(config_path)],
          "resets sizes, leverage and targets to the shipped defaults"),
+        ("6", "Proxy", [pathlib.Path(proxy.PROXY_FILE)],
+         "wipes the proxy address; it usually carries a password"),
     ]
 
 

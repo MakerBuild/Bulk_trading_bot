@@ -31,6 +31,7 @@ from .window import WindowTitle
 from .impact import ImpactBook
 from .hedger import Hedger
 from .positions import PositionBook
+from . import proxy
 from .reconcile import cancel_all_orders, flatten, sync_positions_http
 from .retry import describe
 from .risk import RiskMonitor
@@ -721,6 +722,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     configure_logging(args.log_level or config.log_level)
+
+    # Before anything opens a socket, and after logging so the choice is on the
+    # record. A bad proxy line stops the bot here rather than being ignored:
+    # connecting directly from a country that blocks BULK looks exactly like the
+    # exchange being down, and that is a long way to chase the wrong problem.
+    try:
+        proxy.configure()
+    except proxy.ProxyError as exc:
+        print(f"proxy error: {exc}", file=sys.stderr)
+        return 1
 
     dry_run = not getattr(args, "live", False)
     if not dry_run:
