@@ -182,3 +182,141 @@ async def flatten(
             max_passes,
             ", ".join(leftovers),
         )
+
+
+async def flatten_limit(
+    sessions: dict[str, AccountSession],
+    book: PositionBook,
+    feed: MarketFeed,
+    symbols: Sequence[str],
+    *,
+    improve_ticks: int = 1,
+    timeout_s: float = 300.0,
+    interval_s: float = 1.0,
+) -> bool:
+    """Close every strategy position with resting limit orders. True if flat.
+
+    The patient half of `flatten`. A market close pays the spread and the taker
+    fee on every unit; a limit close pays neither, at the cost of waiting and of
+    possibly not finishing at all. Which of those an operator wants is not
+    something this can decide, so both are offered and this one reports honestly
+    when it runs out of time.
+
+    The order is posted at the front of the book -- `improve_ticks` inside the
+    touch -- and re-priced whenever the touch moves, which is the same rule the
+    chaser uses once it has committed to filling. It never crosses, so the fill
+    stays on the maker side.
+
+    Reduce-only throughout, like `flatten`: a stale position reading can then
+    never flip an account into a new position facing the other way.
+
+    Positions are re-read from HTTP each pass rather than trusted from the local
+    book, and the read is offloaded to a thread -- this loops for minutes with a
+    live WebSocket behind it, and blocking the loop would stop the very book
+    updates the re-pricing depends on.
+    """
+    from .marketdata import chase_price
+
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    resting: dict[tuple[str, str], str] = {}
+
+    async def pull_all() -> None:
+        for (pubkey, symbol), oid in list(resting.items()):
+            session = sessions.get(pubkey)
+            if session is None:
+                continue
+            try:
+                await session.cancel(symbol, oid)
+            except Exception as exc:  # noqa: BLE001 - usually already filled
+                log.debug("limit close: cancel of %s failed: %s", oid[:8], describe(exc))
+        resting.clear()
+
+    try:
+        while True:
+            await sync_positions(list(sessions.values()), book)
+
+            outstanding = []
+            for session in sessions.values():
+                for symbol in symbols:
+                    spec = feed.specs.get(symbol)
+                    if spec is None:
+                        continue
+                    size = book.authoritative(session.pubkey, symbol)
+                    rounded = round_size(abs(size), spec)
+                    if rounded >= spec.lot_size:
+                        outstanding.append((session, symbol, size, rounded, spec))
+
+            if not outstanding:
+                log.info("limit close: all strategy positions are closed")
+                return True
+
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+
+            for session, symbol, size, rounded, spec in outstanding:
+                # A long is closed by selling, a short by buying.
+                is_buy = size < 0
+                quote = feed.quote(symbol)
+                target = chase_price(
+                    best_bid=quote.best_bid,
+                    best_ask=quote.best_ask,
+                    mark_price=quote.mark_price,
+                    is_buy=is_buy,
+                    offset_bps=0.0,
+                    spec=spec,
+                    improve_ticks=improve_ticks,
+                )
+                if target is None:
+                    log.warning("limit close: no price for %s yet", symbol)
+                    continue
+
+                key = (session.pubkey, symbol)
+                current = resting.get(key)
+                if current is not None:
+                    order = session.client.get_order_map().get(current)
+                    if order is not None and order.price == target and order.size >= rounded:
+                        continue
+
+                try:
+                    oid, _ = await session.place_limit(
+                        symbol=symbol,
+                        is_buy=is_buy,
+                        price=target,
+                        size=rounded,
+                        reduce_only=True,
+                        cancel_oid=current,
+                    )
+                except Exception as exc:  # noqa: BLE001 - retried on the next pass
+                    log.warning(
+                        "limit close: could not place %s on %s: %s",
+                        symbol, session.name, describe(exc),
+                    )
+                    continue
+
+                resting[key] = oid
+                log.info(
+                    "limit close: %s %s %.8f @ %.8f on %s",
+                    "BUY" if is_buy else "SELL", symbol, rounded, target, session.name,
+                )
+
+            await asyncio.sleep(interval_s)
+    finally:
+        # Reached on every exit, including Ctrl+C. An interrupted limit close
+        # that left its orders resting would be the worst of both worlds:
+        # reduce-only orders on the book, with nothing left watching to re-price
+        # them or hedge what they fill. The menu promises Ctrl+C pulls them;
+        # this is what makes that true.
+        await pull_all()
+
+    leftovers = [
+        f"{session.name} {symbol}={book.authoritative(session.pubkey, symbol):+.8f}"
+        for session in sessions.values()
+        for symbol in symbols
+        if abs(book.authoritative(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
+    ]
+    log.warning(
+        "limit close: gave up after %.0f minutes with %s still open. Orders are "
+        "cancelled; close at market if you need it done now.",
+        timeout_s / 60, ", ".join(leftovers) or "nothing",
+    )
+    return False

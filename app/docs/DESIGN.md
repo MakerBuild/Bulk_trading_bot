@@ -315,11 +315,21 @@ bulkdn encrypt-key  # encrypt the key file, or change its password
 bulkdn status     # positions, open orders, persisted phase
 bulkdn check      # validate config and account wiring
 bulkdn transfer --to <pubkey> --amount <n>   # fund a sub-account from the master
-bulkdn flatten --live   # cancel everything and close all strategy positions
+bulkdn flatten --live   # cancel everything and close all strategy positions at market
+bulkdn flatten --live --limit   # the same, but with resting orders (no taker fee)
+bulkdn flatten --live --limit --limit-timeout 600   # ...and wait longer than the 5min default
 ```
 
 `flatten` is the manual panic button. It is reduce-only throughout, so it can never open a
 new position in the opposite direction.
+
+`--limit` is the patient variant. It rests one tick inside the touch, re-prices as the touch
+moves, and never crosses, so every fill is on the maker side -- no spread paid, no taker fee.
+The trade is certainty: it fills only when someone trades with it. On timeout it cancels its
+orders, logs what is still open, and exits non-zero, because "I could not finish" and "you are
+flat" must not look the same to whatever called it. An interrupt cancels the orders too --
+leaving reduce-only orders resting with nothing watching them is the one outcome worse than
+either close.
 
 ---
 

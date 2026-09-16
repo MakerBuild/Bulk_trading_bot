@@ -32,7 +32,12 @@ from .impact import ImpactBook
 from .hedger import Hedger
 from .positions import PositionBook
 from . import proxy
-from .reconcile import cancel_all_orders, flatten, sync_positions_http
+from .reconcile import (
+    cancel_all_orders,
+    flatten,
+    flatten_limit,
+    sync_positions_http,
+)
 from .retry import describe
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
@@ -411,13 +416,39 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
         await runtime.stop()
 
 
-async def cmd_flatten(config: Config, dry_run: bool) -> int:
-    """Cancel everything and market-close both accounts, reduce-only."""
+async def cmd_flatten(
+    config: Config, dry_run: bool, *, limit: bool = False, timeout_s: float = 300.0
+) -> int:
+    """Cancel everything and close both accounts, reduce-only.
+
+    `limit` posts resting orders at the front of the book instead of taking the
+    spread. It is the cheaper close and the slower one, and it can run out of
+    time -- in which case the state is still reset and the positions are still
+    reported, so the operator can follow up at market.
+
+    Returns 1 when a limit close ran out of time with positions still open.
+    "I could not finish" and "you are flat" must not share an exit code: this
+    command is the panic button, and something scripted on top of it would
+    otherwise read a timeout as success and stop watching.
+    """
     runtime = Runtime(config, dry_run)
     await runtime.start(verify=False)
+    closed = True
     try:
         await cancel_all_orders([runtime.master, runtime.sub1], runtime.symbols)
-        await flatten(runtime.sessions, runtime.book, runtime.feed, runtime.symbols)
+        if limit:
+            closed = await flatten_limit(
+                runtime.sessions,
+                runtime.book,
+                runtime.feed,
+                runtime.symbols,
+                improve_ticks=config.master_account.improve_ticks,
+                timeout_s=timeout_s,
+            )
+        else:
+            await flatten(
+                runtime.sessions, runtime.book, runtime.feed, runtime.symbols
+            )
 
         state = runtime.store.load()
         # Legs, not the summary: a leg can hold an order id with the pair
@@ -437,6 +468,13 @@ async def cmd_flatten(config: Config, dry_run: bool) -> int:
             log.info("state reset to IDLE")
         else:
             log.info("state was already IDLE -- nothing to reset")
+
+        if not closed:
+            print("")
+            print("  Limit close ran out of time -- positions are STILL OPEN.")
+            print("  The orders have been cancelled. Run it again, or close")
+            print("  at market if you need to be flat now.")
+            return 1
         return 0
     finally:
         await runtime.stop()
@@ -681,6 +719,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     flat = sub.add_parser("flatten", help="cancel all orders and close all strategy positions")
     flat.add_argument("--live", action="store_true", help="actually submit the closing orders")
+    flat.add_argument(
+        "--limit",
+        action="store_true",
+        help="close with resting limit orders instead of at market: no spread "
+             "and no taker fee, but it takes time and may not finish",
+    )
+    flat.add_argument(
+        "--limit-timeout",
+        type=float,
+        default=300.0,
+        metavar="SECONDS",
+        help="how long --limit waits before giving up (default: 300)",
+    )
 
     xfer = sub.add_parser("transfer", help="move margin between master and sub-account")
     xfer.add_argument("--to", dest="to_pubkey", required=True, help="destination pubkey")
@@ -753,7 +804,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "run":
             return asyncio.run(cmd_run(config, dry_run))
         if args.command == "flatten":
-            return asyncio.run(cmd_flatten(config, dry_run))
+            return asyncio.run(
+                cmd_flatten(
+                    config,
+                    dry_run,
+                    limit=args.limit,
+                    timeout_s=args.limit_timeout,
+                )
+            )
         if args.command == "status":
             return asyncio.run(cmd_status(config))
         if args.command == "check":

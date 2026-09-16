@@ -812,18 +812,49 @@ def _configuration(config: Config, config_path: str) -> None:
             return
 
 
+LIMIT_CLOSE_TIMEOUT_S = 300.0
+
+
 def _close_all(config: Config) -> None:
-    print("\n  Cancels every order and closes all strategy positions at market.")
+    """Close everything, at market or with resting limit orders.
+
+    Both are reduce-only, so neither can open a position. The difference is what
+    they cost and what they promise:
+
+      market  pays the spread and a taker fee on every unit, and is done in
+              seconds. Use it when being flat matters more than the price.
+      limit   rests at the front of the book and pays neither, but it waits on
+              someone else to trade with it, and can run out of time.
+    """
+    print("\n  Cancels every order and closes all strategy positions.")
     print("  Reduce-only throughout, so it can never open a position.")
-    print("\n  1. dry run -- show what would be sent")
-    print("  2. live    -- REAL FUNDS")
+    print("\n  1. dry run       -- show what would be sent, submit nothing")
+    print("  2. market close  -- REAL FUNDS, immediate, pays the spread")
+    print("  3. limit close   -- REAL FUNDS, rests at the best price, no taker")
+    print(f"                      fee. Gives up after "
+          f"{LIMIT_CLOSE_TIMEOUT_S / 60:g} minutes if it cannot fill.")
     print("  0. back")
+
     choice = _ask("\n  > ")
     if choice == "1":
         asyncio.run(cmd_flatten(config, dry_run=True))
     elif choice == "2":
         if _confirm("Close all positions at market."):
             asyncio.run(cmd_flatten(config, dry_run=False))
+        else:
+            print("  aborted")
+    elif choice == "3":
+        if _confirm(
+            f"Close all positions with resting limit orders, giving up after "
+            f"{LIMIT_CLOSE_TIMEOUT_S / 60:g} minutes."
+        ):
+            print("\n  Resting at the front of the book. This waits on the market,")
+            print("  so it can take a while -- Ctrl+C cancels the orders and stops.")
+            asyncio.run(
+                cmd_flatten(
+                    config, dry_run=False, limit=True, timeout_s=LIMIT_CLOSE_TIMEOUT_S
+                )
+            )
         else:
             print("  aborted")
     _pause()
