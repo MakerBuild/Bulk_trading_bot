@@ -20,6 +20,11 @@ app/state/*
 # The private key. Read from BULK_PRIVATE_KEY, or from this file as a
 # fallback. Never commit it.
 private_key.local
+
+# The proxy address, for operators where BULK is blocked. Belongs here for the
+# same reason as the key: install.bat creates it, and the line an operator puts
+# in it usually carries a password.
+proxy.local
 .env
 
 # The operator's own settings. `app/settings.default.yaml` is what ships; the
