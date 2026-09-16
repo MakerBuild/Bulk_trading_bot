@@ -43,6 +43,10 @@ class FakeSession:
         self.client = FakeClient(succeed_on)
         self.dry_run = dry_run
         self.reconnects = 0
+        # How long this socket has been silent. A live socket reports a small
+        # number; a half-open one reports a growing one while still claiming to
+        # be connected, which is the case `_healed` has to recognise.
+        self.last_message_age_s = 0.0
 
     @property
     def is_connected(self):
@@ -55,6 +59,13 @@ class FakeSession:
         return await AccountSession.reconnect(self, attempts=attempts, delay=delay)
 
 
+class FakeRisk:
+    """Only the threshold `_healed` reads."""
+
+    class config:
+        ws_stale_timeout_s = 30.0
+
+
 class FakeStrategy:
     """Only the parts of Strategy that _healed touches."""
 
@@ -63,7 +74,8 @@ class FakeStrategy:
         self.sub1 = sub1
         self.book = object()
         self.resyncs = 0
-        self._reconnects = 0
+        self._reconnect_times = []
+        self.risk = FakeRisk()
 
     async def healed(self, violations):
         from bulkdn.strategy import Strategy
@@ -177,13 +189,13 @@ async def test_a_dry_run_session_is_never_reconnected():
 # -- a flapping socket is a fault, not a blip -------------------------------
 
 
-async def test_reconnects_are_capped_within_a_cycle():
+async def test_reconnects_are_capped_within_the_window():
     """Otherwise the cycle never ends: no rejection is recorded, so the reject
     streak never trips, and the log scrolls past unread."""
-    from bulkdn.strategy import MAX_RECONNECTS_PER_CYCLE
+    from bulkdn.strategy import MAX_RECONNECTS
 
     strategy, master, _sub1 = build()
-    for _ in range(MAX_RECONNECTS_PER_CYCLE):
+    for _ in range(MAX_RECONNECTS):
         master.client.is_connected = False
         assert await strategy.healed(DROPPED) is True
 
@@ -193,10 +205,132 @@ async def test_reconnects_are_capped_within_a_cycle():
 
 async def test_the_cap_counts_attempts_not_failures():
     """A socket that reconnects every time is still flapping."""
-    from bulkdn.strategy import MAX_RECONNECTS_PER_CYCLE
+    from bulkdn.strategy import MAX_RECONNECTS
 
     strategy, master, _sub1 = build()
-    for _ in range(MAX_RECONNECTS_PER_CYCLE):
+    for _ in range(MAX_RECONNECTS):
         master.client.is_connected = False
         await strategy.healed(DROPPED)
-    assert strategy._reconnects == MAX_RECONNECTS_PER_CYCLE
+    assert len(strategy._reconnect_times) == MAX_RECONNECTS
+
+
+# -- the budget forgives drops that are far apart ----------------------------
+#
+# The cap was written as "per cycle" and the reset was never implemented, so
+# five was the allowance for the entire run. An unlimited run therefore halted
+# on its sixth dropped socket however many hours apart they fell -- reported as
+# the bot dying overnight with the WebSocket "falling off".
+
+
+async def test_old_drops_fall_out_of_the_window(monkeypatch):
+    """A socket that blips once an hour is not a flapping socket."""
+    from bulkdn import strategy as strategy_module
+    from bulkdn.strategy import MAX_RECONNECTS, RECONNECT_WINDOW_S
+
+    strategy, master, _sub1 = build()
+    clock = [0.0]
+    monkeypatch.setattr(strategy_module.time, "monotonic", lambda: clock[0])
+
+    # Spend the whole budget, an hour apart each time.
+    for _ in range(MAX_RECONNECTS * 3):
+        clock[0] += RECONNECT_WINDOW_S * 6
+        master.client.is_connected = False
+        assert await strategy.healed(DROPPED) is True, "an isolated drop was refused"
+
+    assert len(strategy._reconnect_times) == 1, "the window did not clear"
+
+
+async def test_drops_inside_the_window_still_trip_it(monkeypatch):
+    """And a socket that blips five times in ten minutes is."""
+    from bulkdn import strategy as strategy_module
+    from bulkdn.strategy import MAX_RECONNECTS, RECONNECT_WINDOW_S
+
+    strategy, master, _sub1 = build()
+    clock = [0.0]
+    monkeypatch.setattr(strategy_module.time, "monotonic", lambda: clock[0])
+
+    for _ in range(MAX_RECONNECTS):
+        clock[0] += RECONNECT_WINDOW_S / (MAX_RECONNECTS + 2)
+        master.client.is_connected = False
+        assert await strategy.healed(DROPPED) is True
+
+    clock[0] += 1.0
+    master.client.is_connected = False
+    assert await strategy.healed(DROPPED) is False, "the cap did not hold"
+
+
+async def test_the_window_reopens_once_the_burst_ages_out(monkeypatch):
+    """A halt is for a fault happening now, not for one that has passed."""
+    from bulkdn import strategy as strategy_module
+    from bulkdn.strategy import MAX_RECONNECTS, RECONNECT_WINDOW_S
+
+    strategy, master, _sub1 = build()
+    clock = [0.0]
+    monkeypatch.setattr(strategy_module.time, "monotonic", lambda: clock[0])
+
+    for _ in range(MAX_RECONNECTS):
+        master.client.is_connected = False
+        await strategy.healed(DROPPED)
+    master.client.is_connected = False
+    assert await strategy.healed(DROPPED) is False
+
+    clock[0] += RECONNECT_WINDOW_S + 1
+    master.client.is_connected = False
+    assert await strategy.healed(DROPPED) is True, "still refusing after the burst aged out"
+
+
+# -- a socket that went quiet without closing --------------------------------
+#
+# The reported symptom: "the websocket falls off". A peer that vanishes without
+# a close frame leaves the client still reporting connected, so silence is the
+# only evidence. The watchdog fires at ws_stale_timeout_s (30s) while the
+# library's own keepalive needs ping_interval + ping_timeout (80s) to notice --
+# so the stale check always won the race, and it halted instead of reconnecting.
+
+STALE = [Violation("stale_stream", "master has received nothing for 31s")]
+
+
+async def test_a_silent_socket_is_reconnected_not_halted():
+    strategy, master, _sub1 = build()
+    master.client.is_connected = True          # still claims to be up
+    master.last_message_age_s = 31.0           # and has said nothing for 31s
+
+    assert await strategy.healed(STALE) is True, "a stale socket must be retried"
+    assert master.reconnects == 1
+
+
+async def test_a_talking_socket_is_left_alone():
+    """Only the silent one is touched, even when the pair is checked together."""
+    strategy, master, sub1 = build()
+    for session in (master, sub1):
+        session.client.is_connected = True
+    master.last_message_age_s = 31.0
+    sub1.last_message_age_s = 1.0
+
+    await strategy.healed(STALE)
+    assert master.reconnects == 1
+    assert sub1.reconnects == 0
+
+
+async def test_staleness_mixed_with_a_real_fault_still_halts():
+    """Exposure over the cap is not something a reconnect fixes."""
+    strategy, master, _sub1 = build()
+    master.client.is_connected = True
+    master.last_message_age_s = 31.0
+
+    mixed = STALE + [Violation("exposure", "net exposure $900 over $500")]
+    assert await strategy.healed(mixed) is False
+
+
+async def test_the_stale_threshold_comes_from_the_risk_config():
+    """Not a second copy of the number that can drift from the first."""
+    strategy, master, _sub1 = build()
+    master.client.is_connected = True
+    master.last_message_age_s = 20.0
+
+    strategy.risk.config.ws_stale_timeout_s = 60.0
+    assert await strategy.healed(STALE) is False, "20s is not stale at a 60s threshold"
+
+    strategy.risk.config.ws_stale_timeout_s = 10.0
+    assert await strategy.healed(STALE) is True, "20s is stale at a 10s threshold"
+    strategy.risk.config.ws_stale_timeout_s = 30.0

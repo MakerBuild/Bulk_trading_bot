@@ -58,11 +58,17 @@ import contextlib
 log = logging.getLogger(__name__)
 
 
-# Reconnects tolerated within one cycle before a dropped socket is treated as
-# a fault rather than a blip. Chosen against observed behaviour: the live
-# drops came minutes apart, so several in one cycle means something is
-# wrong rather than unlucky.
-MAX_RECONNECTS_PER_CYCLE = 5
+# Reconnects tolerated before a dropped socket is treated as a persistent fault
+# rather than a blip -- five of them inside ten minutes.
+#
+# Counted over a moving window, not per cycle. It was written as a per-cycle
+# budget and the reset was never implemented, so in practice it was five for the
+# entire run: an unlimited run halted on its sixth drop no matter how many hours
+# apart they fell. A window also survives the legs running independently, where
+# "this cycle" is two different things at once and neither is the right moment
+# to forgive a fault.
+MAX_RECONNECTS = 5
+RECONNECT_WINDOW_S = 600.0
 
 # How long a position read stays good enough to share. Three callers now want
 # one -- the supervisor and each leg confirming a phase -- and a live run showed
@@ -139,8 +145,9 @@ class Strategy:
         # "the cycles ran out", which want different endings.
         self._stop_requested: str | None = None
         self._halt_reason: str | None = None
-        # Reset each cycle: a drop an hour ago says nothing about this one.
-        self._reconnects = 0
+        # When each recent reconnect happened. Older entries fall out of the
+        # window on their own, so a drop an hour ago says nothing about this one.
+        self._reconnect_times: list[float] = []
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
 
@@ -422,10 +429,18 @@ class Strategy:
         mid-cycle, having done nothing wrong. It is a transient condition and
         deserves a retry before the kill switch.
 
-        Only `disconnected` is retried. Every other violation -- exposure over
-        the cap, a position too large, a streak of rejections -- says the
-        strategy itself is misbehaving, and reconnecting would not address any
-        of them.
+        `disconnected` and `stale_stream` are both retried; every other
+        violation -- exposure over the cap, a position too large, a streak of
+        rejections -- says the strategy itself is misbehaving, and reconnecting
+        would not address any of them.
+
+        `stale_stream` used to halt outright, and that was the more damaging of
+        the two. A socket whose peer vanished without a close frame still reads
+        as connected, so the silence is all there is to go on -- and the
+        watchdog fires at `ws_stale_timeout_s` (30s by default) while the
+        library's own keepalive needs `ping_interval + ping_timeout` (80s) to
+        notice. The stale check therefore always won, and a condition a
+        reconnect fixes in two seconds was killing runs instead.
 
         Halting is still the outcome when the retry fails: an unattended bot
         that cannot see its fills must not keep resting orders on the book.
@@ -436,24 +451,48 @@ class Strategy:
         scrolled past unread. The pair stays hedged throughout -- the reconciler
         works over HTTP -- so this is about not hiding a persistent fault, not
         about exposure.
+
+        "Keeps flapping" is measured over `RECONNECT_WINDOW_S`, so a socket that
+        blips once an hour is forgiven each time and one that blips five times in
+        ten minutes is not.
         """
-        dropped = [v for v in violations if v.kind == "disconnected"]
+        RECOVERABLE = ("disconnected", "stale_stream")
+        dropped = [v for v in violations if v.kind in RECOVERABLE]
         if not dropped or len(dropped) != len(violations):
             return False
 
-        if self._reconnects >= MAX_RECONNECTS_PER_CYCLE:
+        now = time.monotonic()
+        self._reconnect_times = [
+            t for t in self._reconnect_times if now - t < RECONNECT_WINDOW_S
+        ]
+        if len(self._reconnect_times) >= MAX_RECONNECTS:
             log.error(
-                "the socket has dropped %d times this cycle -- not reconnecting again",
-                self._reconnects,
+                "the socket has dropped %d times in the last %g minutes -- "
+                "not reconnecting again",
+                len(self._reconnect_times),
+                RECONNECT_WINDOW_S / 60,
             )
             return False
-        self._reconnects += 1
+        self._reconnect_times.append(now)
 
         restored = False
+        stale_after = self.risk.config.ws_stale_timeout_s
         for session in (self.master, self.sub1):
-            if session.dry_run or session.is_connected:
+            if session.dry_run:
                 continue
-            log.warning("%s: WebSocket dropped -- trying to reconnect", session.name)
+            # `is_connected` alone is not enough: a half-open socket reports
+            # connected and delivers nothing, which is the case this exists for.
+            silent_for = session.last_message_age_s
+            if session.is_connected and silent_for <= stale_after:
+                continue
+            if session.is_connected:
+                log.warning(
+                    "%s: WebSocket has delivered nothing for %.0fs but still "
+                    "reads as connected -- reconnecting",
+                    session.name, silent_for,
+                )
+            else:
+                log.warning("%s: WebSocket dropped -- trying to reconnect", session.name)
             if await session.reconnect():
                 restored = True
             else:
