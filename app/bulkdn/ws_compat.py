@@ -119,15 +119,26 @@ async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
     to every hedge -- came from an endpoint nothing had authenticated.
     """
     global _bypass_latched
-    kwargs.setdefault("open_timeout", _OPEN_TIMEOUT)
+    kwargs["open_timeout"] = kwargs.get("open_timeout") or _OPEN_TIMEOUT
 
-    # The library defaults to dropping a socket when a pong is more than 20s
-    # late, and BULK's account stream is late that often -- observed killing a
-    # live cycle twice with "keepalive ping timeout; no close frame received".
-    # A longer timeout still notices a genuinely dead peer, and the risk layer
-    # watches for a silent-but-open socket separately via ws_stale_timeout_s.
-    kwargs.setdefault("ping_interval", _PING_INTERVAL)
-    kwargs.setdefault("ping_timeout", _PING_TIMEOUT)
+    # ASSIGNED, NOT setdefault -- and that is the whole point of these two lines.
+    #
+    # The SDK passes `ping_timeout=10` explicitly in its own `connect()`, so
+    # `setdefault` was a no-op and every socket this bot has ever opened ran on
+    # a ten-second pong deadline, not the sixty this file claimed. Any pong from
+    # BULK later than ten seconds killed the connection -- which is exactly the
+    # "keepalive ping timeout; no close frame received" the comment here already
+    # recorded having seen end live cycles. The fix was written and never
+    # applied.
+    #
+    # Overriding a caller's explicit argument is normally wrong. It is the
+    # entire job of this module: the SDK's choices are what is being corrected,
+    # and it is the only caller. A longer deadline still notices a genuinely
+    # dead peer -- the risk layer watches for a silent-but-open socket
+    # separately via ws_stale_timeout_s, and that path now reconnects rather
+    # than halting.
+    kwargs["ping_interval"] = _PING_INTERVAL
+    kwargs["ping_timeout"] = _PING_TIMEOUT
 
     if _insecure_ssl or _bypass_latched:
         kwargs["ssl"] = _insecure_context()

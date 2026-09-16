@@ -334,3 +334,76 @@ async def test_the_stale_threshold_comes_from_the_risk_config():
     strategy.risk.config.ws_stale_timeout_s = 10.0
     assert await strategy.healed(STALE) is True, "20s is stale at a 10s threshold"
     strategy.risk.config.ws_stale_timeout_s = 30.0
+
+
+# -- the keepalive settings have to survive the SDK's own arguments ----------
+#
+# ws_compat set them with `setdefault`, and the SDK passes ping_timeout=10
+# explicitly in its connect(). So the override never applied: every socket the
+# bot opened ran on a ten-second pong deadline while the code said sixty, and a
+# pong later than that killed the connection. Reported as the WebSocket
+# "falling off"; the comment in ws_compat had already recorded the symptom.
+
+
+async def _captured_kwargs(monkeypatch, **caller_kwargs):
+    from bulkdn import ws_compat
+
+    seen = {}
+
+    async def fake_connect(url, **kwargs):
+        seen.update(kwargs)
+
+        class Socket:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return Socket()
+
+    monkeypatch.setattr(ws_compat, "_original_ws_connect", fake_connect)
+    await ws_compat._connect_with_ssl_fallback("wss://example.invalid", **caller_kwargs)
+    return seen
+
+
+async def test_the_sdk_cannot_shorten_the_pong_deadline(monkeypatch):
+    """These are the arguments bulk_ws.connect really passes."""
+    from bulkdn.ws_compat import _PING_INTERVAL, _PING_TIMEOUT
+
+    seen = await _captured_kwargs(
+        monkeypatch, ping_interval=20, ping_timeout=10, close_timeout=10
+    )
+    assert seen["ping_timeout"] == _PING_TIMEOUT, "the SDK's 10s deadline won again"
+    assert seen["ping_interval"] == _PING_INTERVAL
+
+
+async def test_the_settings_apply_when_nobody_asks(monkeypatch):
+    from bulkdn.ws_compat import _OPEN_TIMEOUT, _PING_TIMEOUT
+
+    seen = await _captured_kwargs(monkeypatch)
+    assert seen["ping_timeout"] == _PING_TIMEOUT
+    assert seen["open_timeout"] == _OPEN_TIMEOUT
+
+
+async def test_unrelated_arguments_are_passed_through(monkeypatch):
+    """Only the keepalive is this module's business."""
+    seen = await _captured_kwargs(
+        monkeypatch, close_timeout=7, max_size=1234, compression=None
+    )
+    assert seen["close_timeout"] == 7
+    assert seen["max_size"] == 1234
+    assert seen["compression"] is None
+
+
+async def test_the_deadline_outlasts_the_stale_watchdog():
+    """Otherwise the two race, and the one that cannot reconnect wins.
+
+    The stale watchdog fires first on purpose: it reconnects, where a keepalive
+    timeout drops the socket and leaves the bot to notice.
+    """
+    from bulkdn.config import RiskConfig
+    from bulkdn.ws_compat import _PING_INTERVAL, _PING_TIMEOUT
+
+    detect_s = _PING_INTERVAL + _PING_TIMEOUT
+    assert RiskConfig().ws_stale_timeout_s < detect_s
