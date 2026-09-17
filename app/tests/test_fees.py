@@ -8,6 +8,8 @@ that never happened.
 
 from types import SimpleNamespace
 
+import pytest
+
 from bulkdn.fees import (
     FeeSchedule,
     Realised,
@@ -138,6 +140,86 @@ def test_account_fee_tier_returns_none_on_404(monkeypatch):
         lambda *a, **k: SimpleNamespace(status_code=404),
     )
     assert account_fee_tier("http://x", MASTER) is None
+
+
+# The shape captured from mainnet-api1; the volume figures are made up, the
+# field names and nesting are not -- those are the part that was wrong. The parser was
+# written against a guessed shape -- a flat object -- and the real one wraps the
+# quote in `feeTier` inside a list. Every field missed, every `or 0.0` supplied
+# a zero, and the menu reported "taker 0.0 bps" against a real 3.5.
+LIVE_FEE_TIER = [
+    {
+        "feeTier": {
+            "scopeInstrument": None,
+            "rollingVolume": 12500.0,
+            "tierIndex": 0,
+            "tierThreshold": 0.0,
+            "makerBps": 0.0,
+            "takerBps": 3.5,
+            "windowDays": 14,
+            "assessmentEpochDay": 20712,
+            "assessmentCutoff": 1789516800000000000,
+            "assessedAccountVolume": 12500.0,
+            "makerNumerator": 0.0,
+            "marketDenominator": 0.0,
+            "makerSharePpm": 0,
+            "makerShareRebateBps": 0.0,
+            "effectiveMakerBps": 0.0,
+        }
+    }
+]
+
+
+def _quote(monkeypatch, body):
+    monkeypatch.setattr(
+        "bulkdn.fees.requests.post",
+        lambda *a, **k: SimpleNamespace(
+            status_code=200, json=lambda: body, raise_for_status=lambda: None
+        ),
+    )
+    return account_fee_tier("http://x", MASTER)
+
+
+def test_the_real_payload_shape_is_read(monkeypatch):
+    quote = _quote(monkeypatch, LIVE_FEE_TIER)
+    assert quote is not None
+    assert quote.taker_bps == 3.5
+    assert quote.maker_bps == 0.0
+    assert quote.window_days == 14
+    assert quote.rolling_volume == pytest.approx(12500.0)
+    assert quote.tier_index == 0
+
+
+def test_a_null_scope_reads_as_global(monkeypatch):
+    """That is what the account-wide schedule looks like on the wire."""
+    assert _quote(monkeypatch, LIVE_FEE_TIER).scope_instrument == "global"
+
+
+def test_an_unwrapped_payload_still_works(monkeypatch):
+    """In case the envelope goes away again; the fields are what matter."""
+    flat = dict(LIVE_FEE_TIER[0]["feeTier"])
+    assert _quote(monkeypatch, flat).taker_bps == 3.5
+
+
+def test_a_payload_with_no_rates_is_no_quote_rather_than_free(monkeypatch):
+    """A zero fee and an unreadable response must not look the same. One of
+    them tells someone sizing a burn target that trading costs nothing."""
+    assert _quote(monkeypatch, [{"feeTier": {"rollingVolume": 1.0}}]) is None
+    assert _quote(monkeypatch, [{"somethingElse": {"takerBps": 3.5}}]) is None
+
+
+def test_a_genuine_zero_is_still_reported(monkeypatch):
+    """A real tier can reach zero; only a missing one is refused."""
+    body = [{"feeTier": {"makerBps": 0.0, "takerBps": 0.0, "windowDays": 14}}]
+    quote = _quote(monkeypatch, body)
+    assert quote is not None and quote.taker_bps == 0.0 and quote.window_days == 14
+
+
+def test_the_window_is_never_invented(monkeypatch):
+    """`windowDays: 0` was the visible symptom -- no exchange runs a zero-day
+    fee window, so it could only have come from a field that was not found."""
+    quote = _quote(monkeypatch, LIVE_FEE_TIER)
+    assert quote.window_days > 0
 
 
 # -- realised ---------------------------------------------------------------

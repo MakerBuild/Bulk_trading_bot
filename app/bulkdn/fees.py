@@ -114,8 +114,21 @@ def account_fee_tier(
         data = data[0] if data else {}
     if not isinstance(data, dict) or not data:
         return None
+    # The quote arrives wrapped: `[{"feeTier": {...}}]`. Reading the outer
+    # object found none of the fields and every `or 0.0` filled in a zero, so
+    # the menu printed "taker 0.0 bps" over a real 3.5 -- a fee schedule that
+    # does not exist, stated as fact.
+    data = data.get("feeTier") if isinstance(data.get("feeTier"), dict) else data
+
+    # No rate in the payload means no quote, not a free account. A zero here is
+    # the difference between "trading costs nothing" and "we could not tell",
+    # and only one of those is safe to show someone sizing a burn target.
+    if "takerBps" not in data and "makerBps" not in data:
+        return None
+
     return AccountFeeTier(
-        scope_instrument=data.get("scopeInstrument", "global"),
+        # Null is what the global scope looks like on the wire.
+        scope_instrument=data.get("scopeInstrument") or "global",
         rolling_volume=float(data.get("rollingVolume") or 0.0),
         tier_index=int(data.get("tierIndex") or 0),
         tier_threshold=float(data.get("tierThreshold") or 0.0),
