@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .retry import TRANSIENT_EXCEPTIONS, retry
+from .retry import TRANSIENT_EXCEPTIONS, describe, retry
 
 log = logging.getLogger(__name__)
 
@@ -325,7 +325,7 @@ def check_access(
             log.warning(
                 "could not verify referral for %s (%s) -- allowing, because "
                 "access.allow_on_error is set",
-                wallet, exc,
+                wallet, describe(exc),
             )
             return AccessDecision(True, f"indexer unavailable, allowed by config: {exc}")
         return AccessDecision(False, f"could not verify referral: {exc}")

@@ -16,6 +16,7 @@ from collections.abc import Sequence
 
 from .accounts import AccountSession
 from .marketdata import MarketSpec
+from .retry import describe
 
 log = logging.getLogger(__name__)
 
@@ -97,14 +98,14 @@ class MarketFeed:
                     "could not subscribe to %s book snapshot (%s); "
                     "chasing will fall back to mark price",
                     symbol,
-                    exc,
+                    describe(exc),
                 )
                 continue
             try:
                 await self.session.client.subscribe_orderbook_delta(symbol)
             except Exception as exc:
                 # The snapshot alone still yields a usable, if staler, book.
-                log.warning("could not subscribe to %s book deltas: %s", symbol, exc)
+                log.warning("could not subscribe to %s book deltas: %s", symbol, describe(exc))
 
     def quote(self, symbol: str) -> Quote:
         client = self.session.client
@@ -149,6 +150,6 @@ class MarketFeed:
             body.raise_for_status()
             data = body.json()
         except Exception as exc:
-            log.warning("could not read a price for %s over HTTP: %s", symbol, exc)
+            log.warning("could not read a price for %s over HTTP: %s", symbol, describe(exc))
             return 0.0
         return float(data.get("markPrice") or data.get("lastPrice") or 0.0)

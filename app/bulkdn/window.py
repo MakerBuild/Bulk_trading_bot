@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+from .retry import describe
 
 log = logging.getLogger(__name__)
 
@@ -71,4 +72,4 @@ class WindowTitle:
         try:
             ctypes.windll.kernel32.SetConsoleTitleW(title)
         except Exception as exc:  # noqa: BLE001 - cosmetic only
-            log.debug("could not set console title: %s", exc)
+            log.debug("could not set console title: %s", describe(exc))

@@ -37,7 +37,7 @@ from .feed import MarketFeed
 from .fees import burned_usd as _burned
 from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
-from .liquidation import LiquidationGuard
+from .liquidation import LiquidationGuard, recent_liquidations
 from .marketdata import round_notional, round_size
 from .notify import Notifier
 from .positions import PositionBook, SeenTrades
@@ -67,6 +67,11 @@ log = logging.getLogger(__name__)
 # apart they fell. A window also survives the legs running independently, where
 # "this cycle" is two different things at once and neither is the right moment
 # to forgive a fault.
+# How long after an unanswered submission a change in that symbol might
+# still be our own, and how many times we may say so before giving up.
+DOUBT_WINDOW_S = 120.0
+MAX_DOUBT_DEFERRALS = 3
+
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
 
@@ -145,6 +150,10 @@ class Strategy:
         # "the cycles ran out", which want different endings.
         self._stop_requested: str | None = None
         self._halt_reason: str | None = None
+        # How many times each symbol's external-change signal has been put
+        # down to this bot's own unanswered orders. Bounded, so a fault that
+        # keeps looking like our own doing cannot be deferred forever.
+        self._doubt_deferrals: dict[str, int] = {}
         # When each recent reconnect happened. Older entries fall out of the
         # window on their own, so a drop an hour ago says nothing about this one.
         self._reconnect_times: list[float] = []
@@ -313,13 +322,31 @@ class Strategy:
 
         Reduce-only throughout, so a stale reading can never turn a close into
         a new position in the opposite direction.
+
+        The local signal is a trigger, not a diagnosis. It fires on any change
+        the bot cannot account for, and a submission that never came back may
+        still have executed -- which looks identical. A live run ended that
+        way: three hedges landed unacknowledged during an exchange outage, the
+        position flipped, and the exchange had no record of any liquidation.
+
+        So a symbol we have an unanswered order in gets one more chance, and
+        only on a condition that matters: that a fresh position read actually
+        succeeds. Deferring on the strength of a guess during an outage would
+        be trading blind, which is the thing this exists to prevent. When the
+        read works, the guess is replaced by the exchange's own answer and the
+        ordinary hedge rule can correct from there.
         """
         events = self.guard.check(self.book, phase, [self.master.pubkey, self.sub1.pubkey])
         if not events:
             return False
 
+        if await self._deferred_to_our_own_orders(events):
+            return False
+
+        confirmed = await self._liquidation_confirmed()
+        label = "liquidation" if confirmed else "position closed externally"
         for event in events:
-            log.critical("LIQUIDATION: %s", event.describe())
+            log.critical("%s: %s", label.upper(), event.describe())
 
         # Close everything still standing in the affected symbols, on both
         # accounts. Which side was hit does not change the answer -- the pair
@@ -335,19 +362,64 @@ class Strategy:
                     # size > 0 is long, so closing it is a sell.
                     await session.market(symbol, size < 0, rounded, reduce_only=True)
                     log.critical(
-                        "closed %s %.8f on %s after liquidation",
-                        symbol, rounded, session.name,
+                        "closed %s %.8f on %s after %s",
+                        symbol, rounded, session.name, label,
                     )
                 except Exception as exc:
                     log.critical(
-                        "COULD NOT CLOSE %s on %s after liquidation: %s -- "
+                        "COULD NOT CLOSE %s on %s after %s: %s -- "
                         "close it by hand now",
-                        symbol, session.name, exc,
+                        symbol, session.name, label, describe(exc),
                     )
 
-        reason = "; ".join(event.describe() for event in events)
-        self.notifier.send_soon(self.notifier.halted(f"liquidation -- {reason}"))
-        self._trigger_halt(f"liquidation -- {reason}")
+        reason = f"{label} -- " + "; ".join(event.describe() for event in events)
+        self.notifier.send_soon(self.notifier.halted(reason))
+        self._trigger_halt(reason)
+        return True
+
+    async def _deferred_to_our_own_orders(self, events) -> bool:
+        """True when every event is explained by an order of ours in the dark.
+
+        Only ever true once the exchange has answered with fresh positions. If
+        that read fails the caller carries on to the halt, because at that
+        point nothing is known -- not what happened, and not what is open.
+        """
+        in_doubt: set[str] = set()
+        for session in (self.master, self.sub1):
+            in_doubt |= session.symbols_in_doubt(DOUBT_WINDOW_S)
+
+        explainable = [
+            event for event in events
+            if event.symbol in in_doubt
+            and self._doubt_deferrals.get(event.symbol, 0) < MAX_DOUBT_DEFERRALS
+        ]
+        if not explainable or len(explainable) != len(events):
+            return False
+
+        try:
+            # Force a read rather than accept a cached one: replacing the guess
+            # is the entire justification for not halting here.
+            await self._sync_positions(max_age_s=0.0)
+        except Exception as exc:  # noqa: BLE001 - then we know nothing at all
+            log.critical(
+                "could not re-read positions to tell whether %s was our own "
+                "doing (%s) -- treating it as external",
+                ", ".join(sorted({e.symbol for e in events})), describe(exc),
+            )
+            return False
+
+        for event in explainable:
+            seen = self._doubt_deferrals.get(event.symbol, 0) + 1
+            self._doubt_deferrals[event.symbol] = seen
+            log.warning(
+                "%s -- but an order of ours in %s went unanswered, and a fresh "
+                "read of both accounts has now replaced the guess. Carrying on "
+                "rather than calling it a liquidation (%d/%d).",
+                event.describe(), event.symbol, seen, MAX_DOUBT_DEFERRALS,
+            )
+            self.guard.reset_symbol(event.symbol)
+            for session in (self.master, self.sub1):
+                session.settled(event.symbol)
         return True
 
     def _make_position_handler(self, session: AccountSession):
@@ -418,6 +490,42 @@ class Strategy:
             # to flatten, and must not wait on Telegram to do it.
             self.notifier.send_soon(self.notifier.halted(reason))
             self._stop.set()
+
+    async def _liquidation_confirmed(self) -> bool:
+        """Did the exchange actually liquidate something? True if it cannot say.
+
+        Fails safe on purpose. This is asked in the middle of whatever went
+        wrong, which is when the query is least likely to answer, and "I could
+        not ask" must land on the same side as "yes": closing a healthy pair
+        costs a spread, while trading on into a real liquidation does not have
+        a bounded cost.
+        """
+        for session in (self.master, self.sub1):
+            try:
+                events = await asyncio.to_thread(
+                    recent_liquidations, self.config.http_url, session.pubkey
+                )
+            except Exception as exc:  # noqa: BLE001 - unreachable means unknown
+                log.warning(
+                    "could not confirm with the exchange whether %s was "
+                    "liquidated (%s) -- treating it as one",
+                    session.name, describe(exc),
+                )
+                return True
+            if events:
+                for event in events:
+                    log.critical(
+                        "exchange confirms %s on %s: %s",
+                        event.get("eventType", "risk event"), session.name,
+                        event.get("reason", ""),
+                    )
+                return True
+        log.warning(
+            "the exchange reports no liquidation on either account, so this "
+            "was something else closing the position -- a manual close, or an "
+            "order of ours we never saw the answer to"
+        )
+        return False
 
     # -- connection recovery -----------------------------------------------
 

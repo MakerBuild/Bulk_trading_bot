@@ -20,15 +20,27 @@ is correct: all three mean the pair is broken and re-hedging is wrong.
 
 EXIT is excluded because reducing positions is exactly what it does.
 
-The `riskHistory` endpoint reports liquidations authoritatively, but only as
-polled history. It is useful for confirming afterwards what happened, and is
-far too slow to be the trigger.
+**Confirmation.** The local signal is a good trigger and a poor diagnosis. It
+fires on anything the bot cannot account for, and during an exchange outage
+that includes the bot's own orders: a hedge whose response timed out still
+executed, and the position it moved looks exactly like one someone else closed.
+A live run ended that way -- three duplicate hedges landed unacknowledged, the
+position flipped, and the bot reported a liquidation the exchange had no record
+of.
+
+So the trigger stays local and immediate, and `recent_liquidations` is asked
+afterwards what really happened. It is far too slow to detect with, but it is
+authoritative about what it reports, and the difference decides whether the run
+is over or merely out of sync.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
+
+import requests
 
 from .marketdata import MarketSpec
 from .positions import PositionBook
@@ -159,3 +171,37 @@ class LiquidationGuard:
                     self._peak[key] = current
 
         return found
+
+
+def recent_liquidations(
+    http_url: str,
+    user: str,
+    *,
+    within_s: float = 300.0,
+    timeout: int = 10,
+) -> list[dict]:
+    """Liquidations and ADLs the exchange recorded for `user`, recently.
+
+    Raises on any failure rather than returning an empty list. "Nothing was
+    liquidated" and "I could not ask" must not look the same to the caller:
+    one of them means the run can continue, and guessing it during an outage --
+    which is exactly when this is asked -- would be guessing in the unsafe
+    direction.
+    """
+    response = requests.post(
+        f"{http_url}/account",
+        json={"type": "riskEvents", "user": user},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    body = response.json()
+    events = body.get("data") if isinstance(body, dict) else body
+    if not isinstance(events, list):
+        raise ValueError(f"riskEvents returned {type(body).__name__}, not a list")
+
+    cutoff_ns = (time.time() - within_s) * 1e9
+    return [
+        event
+        for event in events
+        if isinstance(event, dict) and float(event.get("timestamp") or 0) >= cutoff_ns
+    ]

@@ -23,13 +23,14 @@ import contextlib
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from collections.abc import Callable, Sequence
 
 import requests
 from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
+from .retry import describe
 from bulk_api.common import (
     OrderStatus,
     Side,
@@ -205,6 +206,26 @@ class AccountSession:
     # streak alone says a kill switch fired; this says why, which is the part
     # anyone reading the halt an hour later actually needs.
     last_reject: str = ""
+    # Symbols whose most recent submission never came back with an answer,
+    # and when that happened. A request that times out may still have executed
+    # -- that is what a timeout means here -- so until a fresh position read
+    # says otherwise, any change in these symbols might be our own doing.
+    # Without this the liquidation guard reads our own unacknowledged fill as
+    # someone else closing the position, which is the opposite conclusion.
+    unconfirmed: dict[str, float] = field(default_factory=dict)
+
+    def symbols_in_doubt(self, within_s: float) -> set[str]:
+        """Symbols with a submission whose outcome is still unknown."""
+        now = time.monotonic()
+        return {
+            symbol
+            for symbol, at in self.unconfirmed.items()
+            if now - at <= within_s
+        }
+
+    def settled(self, symbol: str) -> None:
+        """A fresh authoritative read covers whatever was in doubt here."""
+        self.unconfirmed.pop(symbol, None)
 
     async def connect(self) -> None:
         if not await self.client.connect():
@@ -234,7 +255,7 @@ class AccountSession:
             except Exception as exc:  # noqa: BLE001 - every failure is the same here
                 log.warning(
                     "%s: reconnect attempt %d/%d failed: %s",
-                    self.name, attempt, attempts, exc,
+                    self.name, attempt, attempts, describe(exc),
                 )
             if attempt < attempts:
                 await asyncio.sleep(delay)
@@ -244,7 +265,7 @@ class AccountSession:
         try:
             await self.client.disconnect()
         except Exception as exc:  # pragma: no cover - shutdown best effort
-            log.warning("%s: error during disconnect: %s", self.name, exc)
+            log.warning("%s: error during disconnect: %s", self.name, describe(exc))
 
     @property
     def is_connected(self) -> bool:
@@ -275,7 +296,24 @@ class AccountSession:
         onto the target price between reading it and the order landing. Counting
         it would let an active market trip the kill switch.
         """
-        responses = await self.client.submit(actions, **kwargs)
+        try:
+            responses = await self.client.submit(actions, **kwargs)
+        except Exception:
+            # No answer came back. The actions may have executed anyway, so
+            # every symbol they touched is now in doubt until a position read
+            # settles it. A rejection is not in doubt -- that IS an answer.
+            at = time.monotonic()
+            for action in actions:
+                symbol = getattr(action, "symbol", None)
+                if symbol:
+                    self.unconfirmed[symbol] = at
+            raise
+
+        for action in actions:
+            symbol = getattr(action, "symbol", None)
+            if symbol:
+                self.unconfirmed.pop(symbol, None)
+
         rejected = [r for r in responses if r.is_error()]
         if rejected:
             faults = [r for r in rejected if r.status != OrderStatus.REJECTED_CROSSING]
