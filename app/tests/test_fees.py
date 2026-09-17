@@ -6,6 +6,7 @@ no tier credit. A volume target that counted them would stop early on progress
 that never happened.
 """
 
+import itertools
 from types import SimpleNamespace
 
 import pytest
@@ -24,13 +25,22 @@ SUB = "EXAMPLE-SUBACCOUNT-PUBKEY"
 OUTSIDER = "EXAMPLE-UNRELATED-PUBKEY"
 
 
-def fill(maker, taker, amount=1.0, price=100.0, fee=0.05):
+_next_trade = itertools.count(1)
+
+
+def fill(maker, taker, amount=1.0, price=100.0, fee=0.05, trade=None):
     """One row in the shape the API actually returns.
 
     A plain dict, and with no `tradeId`: mainnet sends `slot` and `sequence`
     separately, which is what made the SDK's strict history parser reject the
-    whole page. Nothing here reads either field.
+    whole page.
+
+    Those two fields identify the TRADE, so every row gets its own by default.
+    Pass the same `trade` to two rows to build the two sides of one trade --
+    which is what a fill between two accounts of the tree looks like when both
+    their histories are read.
     """
+    seq = trade if trade is not None else next(_next_trade)
     return {
         "maker": maker,
         "taker": taker,
@@ -40,7 +50,7 @@ def fill(maker, taker, amount=1.0, price=100.0, fee=0.05):
         "symbol": "SOL-USD",
         "isBuy": True,
         "slot": 112226064,
-        "sequence": 14,
+        "sequence": seq,
     }
 
 
@@ -225,17 +235,36 @@ def test_the_window_is_never_invented(monkeypatch):
 # -- realised ---------------------------------------------------------------
 
 
-def test_self_trades_are_excluded_from_qualifying_volume(monkeypatch):
-    """Both sides inside the tree: real spend, no tier credit."""
-    http = FakeHttp({MASTER: [fill(MASTER, SUB)], SUB: [fill(MASTER, SUB)]}).install(monkeypatch)
+def test_a_trade_between_our_own_accounts_counts_once(monkeypatch):
+    """It appears in both their histories. Summing the two views inflated the
+    total by its whole notional -- the goal then read 5.7% short of the
+    exchange's own figure on a live account."""
+    both = [fill(MASTER, SUB, trade=7)]
+    http = FakeHttp({MASTER: both, SUB: list(both)}).install(monkeypatch)
     totals = realised_for_tree(http, [MASTER, SUB])
 
-    assert totals.fills == 2
-    assert totals.volume_usd == 200.0
-    assert totals.self_trade_volume_usd == 200.0
-    assert totals.qualifying_volume_usd == 0.0
-    # Fees are still charged on a self-trade.
+    assert totals.fills == 2, "both rows were read"
+    assert totals.volume_usd == 100.0, "the trade was counted twice"
+    assert totals.self_trade_volume_usd == 100.0
+    assert totals.qualifying_volume_usd == 100.0, "it counts, like any other trade"
+    # Both sides were charged, and both are ours to pay.
     assert totals.fees_usd == 0.1
+
+
+def test_the_fee_of_a_deduplicated_side_is_still_paid(monkeypatch):
+    """Volume is the thing counted twice. Money is not."""
+    both = [fill(MASTER, SUB, trade=9, fee=0.05)]
+    http = FakeHttp({MASTER: both, SUB: list(both)}).install(monkeypatch)
+    assert realised_for_tree(http, [MASTER, SUB]).fees_usd == 0.1
+
+
+def test_two_separate_trades_are_both_counted(monkeypatch):
+    """The fix must not collapse genuinely different trades."""
+    http = FakeHttp({
+        MASTER: [fill(MASTER, SUB), fill(MASTER, SUB)],
+        SUB: [],
+    }).install(monkeypatch)
+    assert realised_for_tree(http, [MASTER, SUB]).volume_usd == 200.0
 
 
 def test_external_counterparty_counts_toward_qualifying_volume(monkeypatch):
@@ -255,7 +284,7 @@ def test_a_mixed_history_splits_correctly(monkeypatch):
 
     assert totals.volume_usd == 300.0
     assert totals.self_trade_volume_usd == 100.0
-    assert totals.qualifying_volume_usd == 200.0
+    assert totals.qualifying_volume_usd == 300.0
 
 
 def test_fills_without_a_trade_id_are_counted(monkeypatch):
@@ -299,7 +328,7 @@ def test_totals_add():
     b = Realised(fills=2, fees_usd=2.0, volume_usd=20.0, self_trade_volume_usd=1.0)
     total = a + b
     assert (total.fills, total.fees_usd, total.volume_usd) == (3, 3.0, 30.0)
-    assert total.qualifying_volume_usd == 25.0
+    assert total.qualifying_volume_usd == 30.0
 
 
 def test_every_account_in_the_tree_is_walked(monkeypatch):
@@ -318,7 +347,7 @@ def test_from_fills_is_what_both_screens_use():
     assert totals.fills == 2
     assert totals.volume_usd == 300.0
     assert totals.self_trade_volume_usd == 100.0
-    assert totals.qualifying_volume_usd == 200.0
+    assert totals.qualifying_volume_usd == 300.0
     assert totals.fees_usd == 0.1
 
 
@@ -327,3 +356,25 @@ def test_from_fills_on_an_empty_page_is_zero():
 
     empty = Realised.from_fills([], {MASTER})
     assert (empty.fills, empty.volume_usd, empty.fees_usd) == (0, 0.0, 0.0)
+
+
+def test_both_volume_definitions_are_reported():
+    """The referral window counts a trade between our own accounts; the fee
+    documentation says it creates no qualifying volume. Both cannot be checked
+    yet, so the bot reports each rather than picking one silently."""
+    from bulkdn.fees import Realised
+
+    rows = [fill(MASTER, SUB, trade=1), fill(OUTSIDER, MASTER, amount=2.0, trade=2)]
+    totals = Realised.from_fills(rows, {MASTER, SUB}, set())
+
+    assert totals.volume_usd == 300.0
+    assert totals.self_trade_volume_usd == 100.0
+    assert totals.qualifying_volume_usd == 300.0, "the referral figure counts it"
+    assert totals.tier_volume_usd == 200.0, "the documented tier rule does not"
+
+
+def test_the_two_differ_only_by_the_self_traded_amount():
+    from bulkdn.fees import Realised
+
+    t = Realised(volume_usd=958_778.70, self_trade_volume_usd=55_120.10)
+    assert t.qualifying_volume_usd - t.tier_volume_usd == pytest.approx(55_120.10)

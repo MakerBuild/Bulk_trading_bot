@@ -166,16 +166,54 @@ class Realised:
 
     @property
     def qualifying_volume_usd(self) -> float:
-        """Volume that counts toward the fee tier."""
+        """Every trade, counted once. What the referral window shows.
+
+        Verified: this returned $958,778.70 against $958.8K on the referral
+        screen for a live account, matching to the rounding.
+
+        It used to subtract `self_trade_volume_usd` as well, and that was wrong
+        for this figure by exactly the self-trade total. Two separate errors
+        were tangled together and only one of them was real arithmetic:
+
+        * A trade between two accounts of the same tree appears in BOTH their
+          histories. Summing the two views counted it twice. That is a plain
+          bug against any definition, and it is fixed in `from_fills`.
+        * Subtracting it on top, so it scored zero. Whether that is right
+          depends on which volume is being measured -- see `tier_volume_usd`.
+        """
+        return self.volume_usd
+
+    @property
+    def tier_volume_usd(self) -> float:
+        """The same, minus trades between our own accounts.
+
+        The fee documentation says "Self-trades between accounts under the same
+        main account do not create qualifying volume", so this is the figure
+        the FEE TIER should be read against.
+
+        It is kept separate rather than reconciled because the two cannot both
+        be checked yet: the referral window plainly counts such a trade, and
+        the tier's own `rollingVolume` reads 0 until the exchange reassesses.
+        Reporting one number for both would be picking a winner without
+        evidence, and an operator sizing a goal deserves to see which is which.
+        """
         return self.volume_usd - self.self_trade_volume_usd
 
     @classmethod
-    def from_fills(cls, rows, tree: set[str]) -> Realised:
-        """Total one page of fills, splitting out self-trades.
+    def from_fills(cls, rows, tree: set[str], seen: set | None = None) -> Realised:
+        """Total one page of fills.
 
-        `tree` is every pubkey under the same master. A fill with both sides
-        inside it is real spend that earns no tier credit, which is why the two
-        are counted separately rather than netted.
+        `seen` carries trade ids across the whole walk so each trade is counted
+        once. A trade between two accounts of the same tree appears in BOTH
+        their histories, and summing the two views inflated the total by its
+        notional -- 365 of 1465 trades in a live run, 5.7% of the figure the
+        goal was measured against.
+
+        Fees are taken from every row regardless, because both sides of such a
+        trade are charged and both are ours to pay.
+
+        `tree` is every pubkey under the same master, which is what makes a
+        fill identifiable as being between two of them.
 
         Rows are plain dicts straight from the API. See `fills_page` for why
         they are not the SDK's parsed model.
@@ -185,6 +223,15 @@ class Realised:
             notional = float(fill.get("amount") or 0.0) * float(fill.get("price") or 0.0)
             total.fills += 1
             total.fees_usd += float(fill.get("fee") or 0.0)
+
+            # `slot` and `sequence` identify the trade itself. Verified unique
+            # across a live history: 1830 rows, 1465 ids, no collisions.
+            trade = (fill.get("slot"), fill.get("sequence"))
+            if seen is not None:
+                if trade in seen:
+                    continue
+                seen.add(trade)
+
             total.volume_usd += notional
             if fill.get("maker") in tree and fill.get("taker") in tree:
                 total.self_trade_volume_usd += notional
@@ -234,7 +281,8 @@ def fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[di
 
 
 def realised_for_account(
-    http, user: str, tree: set[str], limit: int = 1000, max_pages: int = 20
+    http, user: str, tree: set[str], limit: int = 1000, max_pages: int = 20,
+    seen: set | None = None,
 ) -> Realised:
     """Walk an account's fill history and total spend and volume.
 
@@ -248,7 +296,7 @@ def realised_for_account(
     cursor = None
     for _ in range(max_pages):
         rows, cursor = fills_page(http, user, limit, cursor)
-        total = total + Realised.from_fills(rows, tree)
+        total = total + Realised.from_fills(rows, tree, seen)
         if not cursor or not rows:
             break
     return total
@@ -257,11 +305,14 @@ def realised_for_account(
 def realised_for_tree(http, accounts: list[str], **kwargs) -> Realised:
     """Totals across every account in one master tree.
 
-    Each account is walked separately because a fill that crossed between two
-    of them appears once in each view, and both views are real spend.
+    Each account is walked separately, and one `seen` set spans the walk: a
+    trade between two of them appears in both views, and counting it twice is
+    what made the goal read 5.7% short of the exchange's own figure. Its fees
+    still come from both views, because both sides were charged.
     """
     tree = set(accounts)
+    seen: set = set()
     total = Realised()
     for user in accounts:
-        total = total + realised_for_account(http, user, tree, **kwargs)
+        total = total + realised_for_account(http, user, tree, seen=seen, **kwargs)
     return total

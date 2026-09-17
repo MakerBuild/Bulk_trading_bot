@@ -514,13 +514,27 @@ execution here is free, not rebated. So the summed total runs negative, and
 figure put a minus in front of every spend line and read as though the account
 had earned the money it had spent.
 
-**`volume_usd` counts qualifying volume only.** The fee documentation states
-that "Self-trades between accounts under the same main account do not create
-qualifying volume", and this strategy hedges between a master and its own
-sub-account, so some fills do cross between them. Those are real spend but earn
-no tier credit; a fill whose maker and taker are both inside the tree is
-counted toward `burn_usd` and excluded from `volume_usd`. Menu item 5 →
-Progress shows the split.
+**`volume_usd` counts each trade once, and two figures are reported.** This
+strategy hedges between a master and its own sub-account, so some trades cross
+between them, and those appear in BOTH accounts' fill histories. Summing the
+two views counted such a trade twice -- a plain bug, fixed by deduplicating on
+`(slot, sequence)`, which identifies the trade itself.
+
+What to do with it beyond that is not settled, so both answers are shown:
+
+* `qualifying_volume_usd` counts it, like any other trade. On a live account
+  this gave $958,778.70 against $958.8K on the referral screen, matching to the
+  rounding, so this is the figure the referral programme uses.
+* `tier_volume_usd` subtracts it, because the fee documentation states that
+  "Self-trades between accounts under the same main account do not create
+  qualifying volume".
+
+The two differ by 5.7% on that account. They are not reconciled because they
+cannot both be checked yet: the referral window plainly counts such a trade,
+while the tier's own `rollingVolume` reads 0 until the exchange reassesses.
+`execution_target.volume_usd` is measured against the referral figure, which is
+the one an operator can see and compare. Menu item 5 → Progress shows all of
+it, including the self-traded amount on its own line.
 
 ## Leverage
 

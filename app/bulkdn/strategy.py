@@ -1172,7 +1172,8 @@ class Strategy:
             log.info("burn progress: $%.4f / $%.2f", burned, target.burn_usd)
         if target.volume_usd > 0:
             log.info(
-                "volume progress: $%.2f / $%.2f qualifying (self-trades $%.2f excluded)",
+                "volume progress: $%.2f / $%.2f qualifying "
+                "(of which $%.2f traded between your own accounts)",
                 volume,
                 target.volume_usd,
                 totals.self_trade_volume_usd,

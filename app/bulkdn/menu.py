@@ -240,8 +240,9 @@ def _history(config: Config) -> None:
         )
 
     print(f"\n  volume      ${grand.volume_usd:,.2f}")
-    print(f"  self-trades ${grand.self_trade_volume_usd:,.2f}  (earn no tier credit)")
-    print(f"  qualifying  ${grand.qualifying_volume_usd:,.2f}")
+    print(f"  self-trades ${grand.self_trade_volume_usd:,.2f}  (between your own accounts)")
+    print(f"  qualifying  ${grand.qualifying_volume_usd:,.2f}  (referral window)")
+    print(f"  fee tier    ${grand.tier_volume_usd:,.2f}  (docs say self-trades do not count)")
     print(f"  burned      ${burned_usd(grand.fees_usd):,.4f}")
     print("\n  (last 20 fills per account -- Configuration -> Progress walks it all)")
     _pause()
@@ -748,8 +749,9 @@ def _target_progress(config: Config) -> None:
     print("\n  ALL TIME")
     print(f"    burned        ${burned_usd(totals.fees_usd):,.4f}")
     print(f"    volume        ${totals.volume_usd:,.2f}")
-    print(f"    self-trades   ${totals.self_trade_volume_usd:,.2f}  (earn no tier credit)")
-    print(f"    qualifying    ${totals.qualifying_volume_usd:,.2f}")
+    print(f"    self-trades   ${totals.self_trade_volume_usd:,.2f}  (between your own accounts)")
+    print(f"    qualifying    ${totals.qualifying_volume_usd:,.2f}  (referral window)")
+    print(f"    fee tier      ${totals.tier_volume_usd:,.2f}  (docs say self-trades do not count)")
 
     print("\n  THIS RUN", end="")
     if not state.has_baseline:
