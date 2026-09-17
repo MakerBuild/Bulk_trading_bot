@@ -138,6 +138,32 @@ SEALED_CODES: tuple[str, ...] = (
     "8682907b1f0aef20dbac2739e6a985d3152241b15268965d72cda4554864dacb",
 )
 
+# Wallets the owner admits by name, alongside the referral question rather than
+# through it. For the account that signed up under someone else's link, or the
+# owner's own wallet, which nobody referred and which the rule above therefore
+# refuses.
+#
+# The alternative was adding that account's referrer to SEALED_WALLETS, and
+# that list is of REFERRERS: adding one admits everyone they have referred and
+# everyone they refer later, none of whom the owner ever sees. This list is of
+# operators, and admits exactly who is on it.
+#
+# It lives here and not in settings.yaml for the reason the block above gives:
+# the config ships with the archive and is the operator's to edit, so a name
+# they can add to is not a gate. Adding one costs a release, which is the
+# point -- it is the same bar as changing who the owner is.
+#
+# Checked before the indexer, so a listed wallet runs while the indexer is
+# down. That is deliberate and is the one privilege being on this list carries:
+# the owner has already answered, in the build, the question the indexer would
+# be asked.
+SEALED_OPERATORS: tuple[str, ...] = (
+    # Added 2026-09-17: signed up under another referrer, admitted by name.
+    # The address is not written here, only its digest -- for the reason the
+    # block above gives, and because a test enforces it.
+    "9803cdf7e77c45ac14b26c5c97b5d4f209b48b4e98ca79b9912cbb0c6c8076db",
+)
+
 
 def wallet_digest(value: str) -> str:
     """How a wallet is compared. Addresses are case-sensitive base58."""
@@ -151,7 +177,7 @@ def code_digest(value: str) -> str:
 
 def is_sealed() -> bool:
     """Whether this build carries its own owner identity."""
-    return bool(SEALED_WALLETS or SEALED_CODES)
+    return bool(SEALED_WALLETS or SEALED_CODES or SEALED_OPERATORS)
 
 
 @dataclass(frozen=True)
@@ -160,6 +186,8 @@ class _Allowed:
 
     wallets: frozenset[str]
     codes: frozenset[str]
+    # Admitted by name rather than by who referred them.
+    operators: frozenset[str]
     allow_on_error: bool
     enabled: bool
 
@@ -175,12 +203,17 @@ def _allowed(config: AccessConfig) -> _Allowed:
         return _Allowed(
             wallets=frozenset(SEALED_WALLETS),
             codes=frozenset(SEALED_CODES),
+            operators=frozenset(SEALED_OPERATORS),
             allow_on_error=False,
             enabled=True,
         )
+    # `operators` is not read from the config in either branch. Every other
+    # field here has a config source because an unsealed build is configured
+    # entirely; this one would be a line anybody could add to admit themselves.
     return _Allowed(
         wallets=frozenset(wallet_digest(w) for w in config.wallets if w.strip()),
         codes=frozenset(code_digest(c) for c in config.codes if c.strip()),
+        operators=frozenset(SEALED_OPERATORS),
         allow_on_error=config.allow_on_error,
         enabled=config.require_referral,
     )
@@ -316,7 +349,14 @@ def check_access(
     if not allowed.enabled:
         return AccessDecision(True, "referral gating is off")
 
-    # No wallet is admitted before this point. Every account, the owner's
+    # Named in the build by the owner. The only route that does not ask the
+    # indexer, because the answer it would give has already been overruled on
+    # purpose -- these are the accounts admitted despite what it says.
+    if wallet_digest(wallet) in allowed.operators:
+        log.info("%s is named directly in this build's operator list", wallet)
+        return AccessDecision(True, f"{wallet} is admitted by this build directly")
+
+    # No other wallet is admitted before this point. Every account, the owner's
     # included, is judged on what the indexer says about it right now.
     try:
         status = fetch_referral(wallet, base_url=base_url)
