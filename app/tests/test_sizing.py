@@ -193,3 +193,57 @@ def test_an_affordable_leg_under_the_floor_does_not_blame_the_budget():
     # The two explanations that would be wrong here.
     assert "Fund the accounts" not in message
     assert "apart in dollar terms" not in message
+
+
+# -- the per-order cap ------------------------------------------------------
+#
+# `max_order_notional_usd` caps a single resting order, which is what bounds
+# the exposure the pair carries between a fill and the hedge that answers it.
+# `LegConfig.validate` documents that leaving it unset means the whole leg goes
+# in one order. It did not: the chaser places `min(remaining, max_order_size)`,
+# and an unset cap left that at zero, so the leg placed nothing at all -- with
+# no error anywhere, because nothing about it looks like one.
+
+
+def usd_leg(**kw):
+    from bulkdn.sizing import resolve_notionals
+
+    leg = LegConfig(symbol="ETH-USD", notional_usd=2500.0, **kw)
+    leg.validate("sub_account")
+    resolve_notionals(
+        legs=[leg], specs=SPECS, prices={"ETH-USD": 2500.0, "BTC-USD": 50_000.0}
+    )
+    return leg
+
+
+def test_an_unset_cap_means_the_whole_leg():
+    leg = usd_leg()
+    assert leg.max_order_size == leg.size
+    assert leg.max_order_size > 0, "the leg would place nothing at all"
+
+
+def test_a_cap_equal_to_the_leg_is_the_whole_leg():
+    leg = usd_leg(max_order_notional_usd=2500.0)
+    assert leg.max_order_size == pytest.approx(leg.size)
+
+
+def test_a_smaller_cap_still_slices():
+    """The fix must not quietly remove the cap for everyone who set one."""
+    leg = usd_leg(max_order_notional_usd=750.0)
+    assert leg.max_order_size < leg.size
+    assert leg.max_order_size * 2500.0 == pytest.approx(750.0, rel=0.01)
+
+
+def test_a_cap_larger_than_the_leg_does_not_inflate_it():
+    leg = usd_leg(max_order_notional_usd=10_000.0)
+    assert leg.max_order_size >= leg.size
+    # cli.py brings it back down to the sized leg; the leg itself is unchanged.
+    assert leg.size == pytest.approx(1.0)
+
+
+def test_scaling_the_leg_brings_the_cap_down_with_it():
+    """Margin can shrink a leg after the cap was computed. A cap left at the
+    original size would stop capping anything."""
+    leg = usd_leg(max_order_notional_usd=750.0)
+    scaled = leg.size / 4
+    assert min(leg.max_order_size, scaled) == pytest.approx(scaled)

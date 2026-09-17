@@ -184,6 +184,17 @@ def resolve_notionals(
                 round_size(leg.max_order_notional_usd / price, spec), spec.lot_size
             )
 
+    # Outside the loop above, because a leg written in the base coin skips it
+    # entirely and still needs a cap.
+    for leg in legs:
+        if leg.max_order_size <= 0:
+            # No cap configured means the whole leg goes in one order, which is
+            # what `config.LegConfig.validate` documents. It was not what
+            # happened: the chaser takes `min(remaining, max_order_size)`, so a
+            # zero cap sized every order at zero and the leg never placed
+            # anything -- silently, because nothing about it is an error.
+            leg.max_order_size = leg.size
+
 
 def plan_sizes(
     *,
