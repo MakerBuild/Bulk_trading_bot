@@ -67,10 +67,15 @@ log = logging.getLogger(__name__)
 # apart they fell. A window also survives the legs running independently, where
 # "this cycle" is two different things at once and neither is the right moment
 # to forgive a fault.
-# How long after an unanswered submission a change in that symbol might
-# still be our own, and how many times we may say so before giving up.
+# How long after an unanswered submission a change in that symbol might still
+# be our own.
 DOUBT_WINDOW_S = 120.0
+# And how often we may say so before treating the symbol as faulty. Counted
+# over a window rather than for the life of the process: the bound is meant to
+# catch a fault that keeps recurring, and a run lasting hours will collect
+# unrelated single incidents that each deserved the benefit of the doubt.
 MAX_DOUBT_DEFERRALS = 3
+DEFERRAL_WINDOW_S = 900.0
 
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
@@ -150,10 +155,11 @@ class Strategy:
         # "the cycles ran out", which want different endings.
         self._stop_requested: str | None = None
         self._halt_reason: str | None = None
-        # How many times each symbol's external-change signal has been put
-        # down to this bot's own unanswered orders. Bounded, so a fault that
-        # keeps looking like our own doing cannot be deferred forever.
-        self._doubt_deferrals: dict[str, int] = {}
+        # When each symbol's external-change signal was last put down to this
+        # bot's own unanswered orders. Bounded over a window, so a fault that
+        # keeps looking like our own doing cannot be deferred forever, while
+        # incidents hours apart do not add up to one.
+        self._doubt_deferrals: dict[str, list[float]] = {}
         # When each recent reconnect happened. Older entries fall out of the
         # window on their own, so a drop an hour ago says nothing about this one.
         self._reconnect_times: list[float] = []
@@ -388,10 +394,16 @@ class Strategy:
         for session in (self.master, self.sub1):
             in_doubt |= session.symbols_in_doubt(DOUBT_WINDOW_S)
 
+        now = time.monotonic()
+        for symbol, seen in self._doubt_deferrals.items():
+            self._doubt_deferrals[symbol] = [
+                at for at in seen if now - at < DEFERRAL_WINDOW_S
+            ]
+
         explainable = [
             event for event in events
             if event.symbol in in_doubt
-            and self._doubt_deferrals.get(event.symbol, 0) < MAX_DOUBT_DEFERRALS
+            and len(self._doubt_deferrals.get(event.symbol, ())) < MAX_DOUBT_DEFERRALS
         ]
         if not explainable or len(explainable) != len(events):
             return False
@@ -409,13 +421,15 @@ class Strategy:
             return False
 
         for event in explainable:
-            seen = self._doubt_deferrals.get(event.symbol, 0) + 1
-            self._doubt_deferrals[event.symbol] = seen
+            self._doubt_deferrals.setdefault(event.symbol, []).append(now)
             log.warning(
                 "%s -- but an order of ours in %s went unanswered, and a fresh "
                 "read of both accounts has now replaced the guess. Carrying on "
-                "rather than calling it a liquidation (%d/%d).",
-                event.describe(), event.symbol, seen, MAX_DOUBT_DEFERRALS,
+                "rather than calling it a liquidation (%d/%d in the last "
+                "%.0f minutes).",
+                event.describe(), event.symbol,
+                len(self._doubt_deferrals[event.symbol]), MAX_DOUBT_DEFERRALS,
+                DEFERRAL_WINDOW_S / 60,
             )
             self.guard.reset_symbol(event.symbol)
             for session in (self.master, self.sub1):

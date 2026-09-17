@@ -62,7 +62,18 @@ legs:
                             # Still passive: inside the spread, never across
                             # it, so it is a maker fill and pays no taker fee.
                             # 0 = join the queue instead and wait behind it.
-    max_order_notional_usd: 100  # cap on any single resting order, in dollars
+    max_order_notional_usd: 100  # cap on any single resting order, in dollars.
+                            # 0 = no cap, the whole leg in one order.
+                            #
+                            # THIS NUMBER AND risk.max_net_exposure_usd ARE A
+                            # PAIR. A resting order that fills all at once
+                            # leaves the pair one-sided by that much until the
+                            # hedge lands a moment later, so the exposure limit
+                            # has to sit ABOVE this, with room to spare. Raise
+                            # one without the other and the first clean fill
+                            # trips the kill switch: every order cancelled,
+                            # both accounts closed at market, bot stopped.
+                            # Twice this value is a sane floor.
 
   sub_account:
     symbol: ETH-USD
@@ -72,7 +83,7 @@ legs:
     max_distance_bps: 8.0
     chase_patience_s: 3
     improve_ticks: 1
-    max_order_notional_usd: 100
+    max_order_notional_usd: 100  # see the note on the leg above
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +137,11 @@ execution_target:
 #  can remove. Keep max_net_exposure_usd comfortably above the larger floor.
 # ---------------------------------------------------------------------------
 risk:
-  max_net_exposure_usd: 500.0   # one-sided exposure the pair may carry
+  max_net_exposure_usd: 500.0   # one-sided exposure the pair may carry.
+                                # Must stay above legs.*.max_order_notional_usd
+                                # -- see the note there. 500 against the 100
+                                # above leaves 5x, which is why the shipped
+                                # pair is safe; change either and redo the sum.
   max_position_usd: 5000.0      # per account, per symbol
   max_reject_streak: 5          # consecutive rejected orders before stopping
   max_hedge_impact_bps: 0       # refuse a hedge whose slippage exceeds this;

@@ -360,3 +360,33 @@ def test_a_failed_close_reports_the_reason(monkeypatch, caplog):
     hand = [r.getMessage() for r in caplog.records if "close it by hand" in r.getMessage()]
     assert hand, "the operator was never told"
     assert "TimeoutError" in hand[0], f"no reason given: {hand[0]!r}"
+
+
+def test_incidents_hours_apart_do_not_add_up(monkeypatch):
+    """The bound is for a fault that keeps recurring. Counted for the life of
+    the process instead, a run lasting hours collects unrelated single
+    incidents -- each one correctly excused, each followed by a clean re-read
+    and hours of healthy trading -- and the fourth ends the run."""
+    from bulkdn.strategy import DEFERRAL_WINDOW_S
+
+    bot = bot_with([liquidation_event()], in_doubt=True)
+    for _ in range(MAX_DOUBT_DEFERRALS):
+        bot.master.unconfirmed[ETH] = time.monotonic()
+        assert run_guard(monkeypatch, bot) is False
+
+    # Same again, a window later.
+    aged = time.monotonic() - DEFERRAL_WINDOW_S - 1
+    bot._doubt_deferrals[ETH] = [aged] * MAX_DOUBT_DEFERRALS
+    bot.master.unconfirmed[ETH] = time.monotonic()
+    assert run_guard(monkeypatch, bot) is False, "old incidents still counted"
+
+
+def test_the_bound_still_holds_inside_the_window(monkeypatch):
+    """Ageing them out must not remove the bound for a fault firing steadily."""
+    bot = bot_with([liquidation_event()], in_doubt=True)
+    for _ in range(MAX_DOUBT_DEFERRALS):
+        bot.master.unconfirmed[ETH] = time.monotonic()
+        assert run_guard(monkeypatch, bot) is False
+
+    bot.master.unconfirmed[ETH] = time.monotonic()
+    assert run_guard(monkeypatch, bot) is True, "it deferred past the bound"
