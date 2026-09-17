@@ -94,6 +94,16 @@ class RoutedWsClient(BulkWebSocketClient):
             self.signer = self._hidden_signer
             self._hidden_signer = None
 
+        if connected:
+            # A socket that has just come up has been silent for zero seconds.
+            # The stale watchdog measures silence from this field, and leaving
+            # it at the DEAD socket's last message makes a successful reconnect
+            # still read as the failure it just fixed. That ended a three-hour
+            # run one second after "WebSocket reconnected on attempt 1": the
+            # heal worked, the re-check saw 31s of silence belonging to a socket
+            # that no longer existed, and the kill switch fired anyway.
+            self.last_message_at = time.monotonic()
+
         if connected and not had_subscriptions and self.account_pubkey:
             await self.subscribe_account(self.account_pubkey)
         return connected

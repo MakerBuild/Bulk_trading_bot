@@ -13,6 +13,7 @@ is retried, and that a retry never swallows a violation that reconnecting
 cannot fix.
 """
 
+import asyncio
 import pytest
 
 from bulkdn.risk import Violation
@@ -407,3 +408,68 @@ async def test_the_deadline_outlasts_the_stale_watchdog():
 
     detect_s = _PING_INTERVAL + _PING_TIMEOUT
     assert RiskConfig().ws_stale_timeout_s < detect_s
+
+
+# -- the silence clock belongs to the live socket ---------------------------
+#
+# A three-hour run ended at 02:29:54 on 2026-09-18 with
+#   02:29:52  sub1: WebSocket dropped -- trying to reconnect
+#   02:29:53  sub1: WebSocket reconnected on attempt 1
+#   02:29:54  HALT: stale_stream: sub1 has received nothing for 31s
+# The heal worked. The re-check that follows it measured silence from the dead
+# socket's last message, so the repair still looked like the fault.
+
+
+def routed_client(silent_for=0.0):
+    """A RoutedWsClient with its fields set directly.
+
+    Built without __init__ because that reaches for a signer and a URL, and
+    connect() only touches the handful of attributes set here.
+    """
+    import time
+
+    from bulkdn.accounts import RoutedWsClient
+
+    client = RoutedWsClient.__new__(RoutedWsClient)
+    client.last_message_at = time.monotonic() - silent_for
+    client.subscriptions = []
+    client.account_pubkey = None
+    client.signer = None
+    client._hidden_signer = None
+    return client
+
+
+def test_a_reconnected_socket_is_not_still_stale(monkeypatch):
+    """The field the watchdog reads has to belong to the socket that is live
+    now, or a successful reconnect halts on the silence it just repaired."""
+    import time
+
+    from bulk_api import BulkWebSocketClient
+
+    client = routed_client(silent_for=31.0)
+
+    async def up(self):
+        return True
+
+    monkeypatch.setattr(BulkWebSocketClient, "connect", up, raising=False)
+    assert asyncio.run(client.connect()) is True
+
+    silent = time.monotonic() - client.last_message_at
+    assert silent < 1.0, f"still reads as silent for {silent:.0f}s"
+
+
+def test_a_failed_connect_leaves_the_clock_alone(monkeypatch):
+    """Otherwise a socket that never came back would look freshly alive, and
+    the watchdog meant to catch it would never fire."""
+    from bulk_api import BulkWebSocketClient
+
+    client = routed_client(silent_for=31.0)
+    stale = client.last_message_at
+
+    async def down(self):
+        return False
+
+    monkeypatch.setattr(BulkWebSocketClient, "connect", down, raising=False)
+    assert asyncio.run(client.connect()) is False
+
+    assert client.last_message_at == stale, "a failed connect reset the clock"
