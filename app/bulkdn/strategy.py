@@ -541,6 +541,47 @@ class Strategy:
         )
         return False
 
+    async def _clear_orphans(self, symbol: str) -> None:
+        """Cancel anything resting in `symbol` after a submission with no answer.
+
+        A placement that times out may still have been accepted. The chaser
+        never learns the order id -- the exception is raised before it is
+        returned -- so on the next tick it places another, and the one before
+        it stays on the book. Each timeout therefore adds a live order.
+
+        A run ended that way: three chase steps timed out over thirty seconds,
+        all three orders were resting, all three filled, and the leg opened at
+        three times its size with nothing hedging it:
+
+            HALT: hedge limit exceeded -- BTC-USD: required hedge 0.09597600
+            exceeds ceiling 0.06398400 (maker=0.09597600, taker=0.00000000)
+
+        Cancel-all is the right tool and is already used for this reason on
+        startup and on halt: an order this bot cannot account for is an
+        unhedged fill waiting to happen. The chaser re-places on the next tick,
+        losing only queue position -- which is worth less than the risk of a
+        leg opening at a multiple of its size.
+        """
+        session = self.sessions[self.leg_roles(symbol).maker]
+        if symbol not in session.symbols_in_doubt(DOUBT_WINDOW_S):
+            # The submission was answered -- a rejection is an answer -- so
+            # nothing of ours can be resting unaccounted for.
+            return
+        try:
+            await session.cancel_all([symbol])
+            log.warning(
+                "%s: an order in %s went unanswered, so anything resting there "
+                "has been cancelled rather than left to fill unhedged",
+                session.name, symbol,
+            )
+            session.settled(symbol)
+        except Exception as exc:  # noqa: BLE001 - the next tick tries again
+            log.error(
+                "%s: could not clear a possibly-resting %s order (%s) -- the "
+                "leg may open larger than its size",
+                session.name, symbol, describe(exc),
+            )
+
     # -- connection recovery -----------------------------------------------
 
     async def _healed(self, violations) -> bool:
@@ -749,6 +790,7 @@ class Strategy:
                     await self.chaser.step(self.leg_roles(symbol), leg)
                 except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("chase step for %s failed: %s", symbol, describe(exc))
+                    await self._clear_orphans(symbol)
 
             self._persist()
 
