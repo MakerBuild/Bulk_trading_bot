@@ -92,6 +92,7 @@ async def reconcile_net(
     hedger: Hedger,
     roles: Sequence[LegRoles],
     feed: MarketFeed,
+    avoid_prices: dict[str, float | None] | None = None,
 ) -> list[str]:
     """Re-run the hedge rule for each leg, correcting any drift.
 
@@ -101,7 +102,11 @@ async def reconcile_net(
     """
     corrections: list[str] = []
     for leg in roles:
-        result = await hedger.hedge(leg, mark_price=feed.reference_price(leg.symbol))
+        result = await hedger.hedge(
+            leg,
+            mark_price=feed.reference_price(leg.symbol),
+            avoid_price=(avoid_prices or {}).get(leg.symbol),
+        )
         if result.acted:
             corrections.append(
                 f"{leg.symbol} {'BUY' if result.is_buy else 'SELL'} {result.hedged_size:.8f} "

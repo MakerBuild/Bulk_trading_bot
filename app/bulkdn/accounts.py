@@ -384,6 +384,46 @@ class AccountSession:
         # known once seqno/nonce/pubkey have been stamped on by submit().
         return order.order_id(), responses
 
+    async def aggressive_limit(
+        self,
+        symbol: str,
+        is_buy: bool,
+        price: float,
+        size: float,
+        reduce_only: bool = False,
+    ) -> list[OrderResponse]:
+        """Take liquidity, but only down to `price`. IOC: no remainder rests.
+
+        A market order sweeps as deep as it needs to, which is how a hedge ends
+        up matching this bot's own resting order on the other account. BULK's
+        self-trade prevention does not cover that: it is per account, and the
+        documentation is explicit that "orders from different sub-accounts under
+        the same main account can trade against each other".
+
+        Bounding the price is the only way to make that impossible rather than
+        merely unlikely -- no offset is deep enough, because how far a hedge
+        sweeps depends on the book at that instant, and it was measured reaching
+        $28.74 past the touch on BTC.
+
+        Whatever the bound leaves unfilled does not rest: IOC, because a hedge
+        that quietly became a maker order would leave the pair unhedged while
+        looking done. The remainder is picked up by the next trigger or by the
+        reconciler, from the position -- which is where the hedge size comes
+        from in the first place.
+        """
+        return await self.submit(
+            [
+                LimitOrder(
+                    symbol=symbol,
+                    side=Side.BUY if is_buy else Side.SELL,
+                    price=price,
+                    size=size,
+                    reduce_only=reduce_only,
+                    time_in_force=TimeInForce.IOC,
+                )
+            ]
+        )
+
     async def market(
         self,
         symbol: str,
