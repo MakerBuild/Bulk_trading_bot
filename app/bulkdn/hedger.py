@@ -181,22 +181,6 @@ class Hedger:
             self._locks[symbol] = asyncio.Lock()
         return self._locks[symbol]
 
-    @staticmethod
-    def _bounded_price(avoid_price: float | None, is_buy: bool, spec) -> float | None:
-        """A limit that stops one tick short of our own resting order.
-
-        None when there is nothing to avoid, so the caller sends a plain market
-        order. A buy has to stay BELOW a sell of ours and a sell has to stay
-        ABOVE a buy of ours -- one tick is the smallest gap the book has, and
-        anything wider gives up liquidity for no extra safety.
-
-        Also None when the bound lands at or below zero, which no order can use.
-        """
-        if avoid_price is None or avoid_price <= 0 or spec.tick_size <= 0:
-            return None
-        bound = avoid_price - spec.tick_size if is_buy else avoid_price + spec.tick_size
-        return bound if bound > 0 else None
-
     def tolerance(self, symbol: str) -> float:
         return self.specs[symbol].lot_size * self.tolerance_lots
 
@@ -247,27 +231,10 @@ class Hedger:
             return 0.0
         return net
 
-    async def hedge(
-        self,
-        roles: LegRoles,
-        mark_price: float | None = None,
-        avoid_price: float | None = None,
-    ) -> HedgeResult:
+    async def hedge(self, roles: LegRoles, mark_price: float | None = None) -> HedgeResult:
         """Bring `roles.symbol` back to neutral, if it has drifted.
 
         Safe to call redundantly -- it is a no-op when already neutral.
-
-        `avoid_price` is where this bot's own order rests on the other account.
-        Given one, the hedge is sent as a price-bounded IOC that stops a tick
-        short of it instead of a market order that would sweep through it. That
-        makes a trade between the two accounts impossible rather than unlikely;
-        BULK's own self-trade prevention does not help, because it is per
-        account and the two are different accounts.
-
-        The cost is that the hedge can come back short, or empty when there is
-        no external liquidity between the touch and that price. The pair is then
-        still exposed, which is real and is why `max_net_exposure_usd` exists;
-        the next trigger or the reconciler finishes the job from the position.
         """
         symbol = roles.symbol
         spec = self.specs[symbol]
@@ -327,34 +294,13 @@ class Hedger:
                 " (reduce-only)" if roles.reduce_only else "",
             )
 
-            bound = self._bounded_price(avoid_price, is_buy, spec)
-            if avoid_price is not None and bound is None:
-                # A bound was asked for and could not be computed -- a price at
-                # or below one tick, which no order can carry. Falling back to a
-                # market order here would be the one thing this is meant to
-                # prevent, so the hedge is held instead: the exposure stays real
-                # and visible to the risk limit, and the next trigger retries.
-                log.warning(
-                    "%s: hedge held -- cannot bound it away from our own order "
-                    "at %.8f, leaving %+.8f exposed",
-                    symbol, avoid_price, net,
-                )
-                return HedgeResult(symbol, net, 0.0, is_buy, "unboundable")
-
             signed = size if is_buy else -size
             # Reserve before sending. The fill for this order may arrive before
-            # the send returns, and the reservation has to already be there for
-            # the fill handler to retire it.
+            # `market()` returns, and the reservation has to already be there
+            # for the fill handler to retire it.
             self.in_flight.add(symbol, signed)
             try:
-                if bound is not None:
-                    await session.aggressive_limit(
-                        symbol, is_buy, bound, size, reduce_only=roles.reduce_only
-                    )
-                else:
-                    await session.market(
-                        symbol, is_buy, size, reduce_only=roles.reduce_only
-                    )
+                await session.market(symbol, is_buy, size, reduce_only=roles.reduce_only)
             except Exception:
                 # The order never made it, so the exposure is still real.
                 # Releasing the reservation lets the next trigger retry.

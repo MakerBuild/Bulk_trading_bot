@@ -487,11 +487,7 @@ class Strategy:
                 continue
             roles = self.leg_roles(symbol)
             try:
-                await self.hedger.hedge(
-                    roles,
-                    mark_price=self.feed.reference_price(symbol),
-                    avoid_price=self._resting_price(symbol),
-                )
+                await self.hedger.hedge(roles, mark_price=self.feed.reference_price(symbol))
             except HedgeLimitExceeded as exc:
                 self._trigger_halt(f"hedge limit exceeded -- {exc}")
             except Exception as exc:
@@ -544,17 +540,6 @@ class Strategy:
             "order of ours we never saw the answer to"
         )
         return False
-
-    def _resting_price(self, symbol: str) -> float | None:
-        """Where this bot's own order sits, for the hedge to steer around.
-
-        Gated on `oid` rather than on `price` alone: the two are set together
-        when an order is placed, but a few paths clear the id without clearing
-        the price, and a stale price would hold hedges away from an order that
-        is no longer on the book.
-        """
-        leg = self.state.leg(symbol)
-        return leg.price if leg.oid else None
 
     async def _clear_orphans(self, symbol: str) -> None:
         """Cancel anything resting in `symbol` after a submission with no answer.
@@ -746,15 +731,7 @@ class Strategy:
 
                 try:
                     corrections = await reconcile_net(
-                        self.hedger,
-                        self._live_roles(),
-                        self.feed,
-                        # The reconciler fires on a timer rather than off a
-                        # fill, so it is just as able to sweep into our own
-                        # resting order as the fill-driven hedge is.
-                        avoid_prices={
-                            s: self._resting_price(s) for s in self.symbols
-                        },
+                        self.hedger, self._live_roles(), self.feed
                     )
                     for correction in corrections:
                         log.info("reconciler corrected %s", correction)
