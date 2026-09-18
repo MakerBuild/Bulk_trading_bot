@@ -598,6 +598,7 @@ class Strategy:
         self._reconnect_times.append(now)
 
         restored = False
+        failed = []
         stale_after = self.risk.config.ws_stale_timeout_s
         for session in (self.master, self.sub1):
             if session.dry_run:
@@ -618,7 +619,27 @@ class Strategy:
             if await session.reconnect():
                 restored = True
             else:
+                failed.append(session)
                 log.error("%s: could not reconnect", session.name)
+
+        # The sessions are tried one after another, so an outage that ends
+        # midway leaves the earlier one having spent its attempts against a
+        # network that was still down. One socket coming back is proof the
+        # network did, so anything that failed before that gets another go --
+        # free, because the budget is charged per heal, not per attempt.
+        #
+        # This is what a DNS outage did: the master used its three attempts
+        # between 15:09:30 and 15:09:35 and lost all of them, sub1 succeeded at
+        # 15:09:42, and the halt fired a second later on a master that nobody
+        # had tried again.
+        if restored and failed:
+            for session in failed:
+                log.warning(
+                    "%s: another socket is back, so the network is -- retrying",
+                    session.name,
+                )
+                if await session.reconnect():
+                    restored = True
 
         if restored:
             # The socket missed whatever happened while it was down, so the

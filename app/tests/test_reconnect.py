@@ -473,3 +473,47 @@ def test_a_failed_connect_leaves_the_clock_alone(monkeypatch):
     assert asyncio.run(client.connect()) is False
 
     assert client.last_message_at == stale, "a failed connect reset the clock"
+
+
+# -- an outage that ends midway through the heal -----------------------------
+#
+# The sessions are tried one after another, so a network that comes back in the
+# middle leaves the earlier one having spent its attempts against a dead one.
+# A DNS outage on 2026-09-18 did exactly that:
+#
+#   15:09:30-35  master: three attempts, "getaddrinfo failed", gave up
+#   15:09:42     sub1:   reconnected on attempt 3 -- the network was back
+#   15:09:43     HALT: disconnected: master WebSocket is not connected
+#
+# The run ended on a socket nobody had tried again.
+
+
+async def test_a_session_that_failed_before_the_network_returned_is_retried():
+    """sub1 coming back is proof the network did."""
+    strategy, master, sub1 = build(master_succeeds_on=4, sub_connected=False)
+    sub1.last_message_age_s = 999.0   # so sub1 is healed too, and succeeds
+
+    assert await strategy.healed(DROPPED) is True
+    assert master.is_connected, "the master was left down and the run halted"
+    assert master.client.attempts == 4, "it was not tried again"
+
+
+async def test_nothing_is_retried_when_nothing_came_back():
+    """With no evidence the network returned, the extra attempts would be
+    spent against the same dead network -- and the halt is then correct."""
+    strategy, master, sub1 = build(master_succeeds_on=0, sub_connected=False)
+    sub1.client.succeed_on = 0
+    sub1.last_message_age_s = 999.0
+
+    assert await strategy.healed(DROPPED) is False
+    assert master.client.attempts == 3, "it kept trying a network that was down"
+
+
+async def test_the_retry_does_not_cost_extra_budget():
+    """The budget is charged per heal, not per attempt, so the second go is
+    free -- a flapping socket is still caught by the window."""
+    strategy, master, sub1 = build(master_succeeds_on=4, sub_connected=False)
+    sub1.last_message_age_s = 999.0
+
+    await strategy.healed(DROPPED)
+    assert len(strategy._reconnect_times) == 1
