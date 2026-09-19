@@ -299,3 +299,68 @@ async def test_a_book_that_throws_does_not_stop_the_hedge(caplog):
     assert sub1.orders, "an unhedged position, to save a log line"
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
     assert "bid=? ask=?" in line
+
+
+# -- how much was resting at that price ------------------------------------
+#
+# Knowing a hedge filled past the touch says it slipped; it does not say
+# whether the touch held nine tenths of the order or almost none of it. Those
+# point at opposite conclusions about capping the hedge price, because what a
+# price-bounded order leaves unfilled stops being slippage and becomes
+# exposure. The size is in the book the bot already holds; it was simply never
+# written down.
+
+
+class FakeDepthFeed:
+    def __init__(self, bid=99_999.0, ask=100_001.0, bid_size=0.5, ask_size=0.25):
+        self.args = (bid, ask, bid_size, ask_size)
+
+    def quote(self, symbol):
+        bid, ask, bid_size, ask_size = self.args
+        return type("Q", (), {
+            "best_bid": bid, "best_ask": ask,
+            "bid_size": bid_size, "ask_size": ask_size,
+        })()
+
+
+async def test_a_hedge_records_the_size_resting_at_the_touch(caplog):
+    book, hedger, _master, sub1 = build()
+    hedger.feed = FakeDepthFeed()
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+
+    with caplog.at_level("INFO", logger="bulkdn.hedger"):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
+    assert "bidsz=0.50000000" in line
+    assert "asksz=0.25000000" in line
+    assert sub1.orders
+
+
+async def test_a_book_without_sizes_still_logs_its_prices(caplog):
+    """The size is a nicety; the price is the reference the cost is measured
+    against, and losing it would cost the measurement entirely."""
+    book, hedger, _master, sub1 = build()
+    hedger.feed = FakeDepthFeed(bid_size=None, ask_size=None)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+
+    with caplog.at_level("INFO", logger="bulkdn.hedger"):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
+    assert "bid=99999.00000000" in line and "ask=100001.00000000" in line
+    assert "sz=" not in line, "an absent size was printed as a number"
+
+
+async def test_an_empty_level_is_left_out_rather_than_printed_as_zero(caplog):
+    """`bidsz=0` would read as a price level with nothing on it, which is a
+    different claim from not knowing."""
+    book, hedger, _master, sub1 = build()
+    hedger.feed = FakeDepthFeed(bid_size=0.0, ask_size=0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+
+    with caplog.at_level("INFO", logger="bulkdn.hedger"):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
+    assert "sz=" not in line

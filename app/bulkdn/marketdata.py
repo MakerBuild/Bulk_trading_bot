@@ -203,8 +203,19 @@ def touch_text(feed, symbol: str) -> str:
         quote = feed.quote(symbol)
         bid = getattr(quote, "best_bid", None)
         ask = getattr(quote, "best_ask", None)
+        bid_size = getattr(quote, "bid_size", None)
+        ask_size = getattr(quote, "ask_size", None)
     except Exception:  # noqa: BLE001 - logging must never break trading
         return "bid=? ask=?"
-    left = f"bid={bid:.8f}" if bid else "bid=?"
-    right = f"ask={ask:.8f}" if ask else "ask=?"
-    return f"{left} {right}"
+
+    def side(price, size, name):
+        if not price:
+            return f"{name}=?"
+        # The size is written next to its own price so the two cannot drift
+        # apart in a log line, and omitted rather than zeroed when the book
+        # does not carry it: a size of 0 would read as an empty level.
+        if not size:
+            return f"{name}={price:.8f}"
+        return f"{name}={price:.8f} {name}sz={size:.8f}"
+
+    return f"{side(bid, bid_size, 'bid')} {side(ask, ask_size, 'ask')}"

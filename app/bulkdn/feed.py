@@ -28,6 +28,17 @@ class Quote:
     best_ask: float | None
     mark_price: float | None
     age_s: float
+    # How much is resting AT the touch, on each side. Optional and defaulted so
+    # every existing construction of a Quote keeps working -- nothing decides
+    # anything on these, they exist to be written into the log.
+    #
+    # Without them a hedge that filled past the touch is known to have slipped
+    # but not why: it cannot be told whether the touch held nine tenths of the
+    # order and the rest walked, or held almost none of it. Those two point at
+    # opposite conclusions about capping the hedge price, because what an
+    # IOC leaves unfilled becomes exposure rather than saving.
+    bid_size: float | None = None
+    ask_size: float | None = None
 
     @property
     def usable(self) -> bool:
@@ -110,6 +121,7 @@ class MarketFeed:
     def quote(self, symbol: str) -> Quote:
         client = self.session.client
         best_bid = best_ask = None
+        bid_size = ask_size = None
 
         book = client.get_book(symbol)
         if book is not None:
@@ -117,6 +129,8 @@ class MarketFeed:
             ask_level = book.get_best_ask()
             best_bid = bid_level.price if bid_level else None
             best_ask = ask_level.price if ask_level else None
+            bid_size = bid_level.size if bid_level else None
+            ask_size = ask_level.size if ask_level else None
 
         ticker = client.get_ticker(symbol)
         mark_price = ticker.mark_price if ticker else None
@@ -131,6 +145,8 @@ class MarketFeed:
             best_ask=best_ask,
             mark_price=mark_price,
             age_s=age_s,
+            bid_size=bid_size,
+            ask_size=ask_size,
         )
 
     def reference_price(self, symbol: str) -> float | None:
