@@ -349,3 +349,69 @@ def test_no_venv_no_note(workspace, monkeypatch, capsys):
     _root, state, _key, _cache, _settings = workspace
     run(monkeypatch, state, ["0"])
     assert "Not removable from here" not in capsys.readouterr().out
+
+
+# -- update.bat tells the truth about why it failed --------------------------
+#
+# It ran `git pull` and reported every failure as a hand-edited file. github.com
+# answers on several addresses and one of them was unreachable from the
+# operator's network, so the update failed on about every other run while
+# telling them to throw away edits they had never made:
+#
+#     fatal: unable to access '...': Failed to connect to github.com port 443
+#     Update failed. Almost always this means a file that ships with the bot
+#     was edited by hand...
+
+
+def update_bat() -> str:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return (root / "update.bat").read_text(encoding="utf-8")
+
+
+def test_fetching_and_applying_are_separate_steps():
+    """One `git pull` cannot report which of the two went wrong."""
+    import re
+
+    text = update_bat()
+    assert "git fetch" in text
+    assert "git merge --ff-only" in text
+    # As a command, not as the comment explaining why it is gone.
+    assert not re.search(r"^\s*git pull", text, re.M), (
+        "a pull cannot tell the two failures apart"
+    )
+
+
+def test_an_unreachable_network_is_named_as_one():
+    text = update_bat()
+    fetch = text[text.index("git fetch"):text.index("git merge")]
+    assert "Could not reach GitHub" in fetch
+    assert "edited by hand" not in fetch, "it still blames the operator's files"
+
+
+def test_a_local_edit_is_named_as_one():
+    text = update_bat()
+    merge = text[text.index("git merge"):]
+    assert "edited by hand" in merge
+    assert "git checkout -- ." in merge, "no way out is offered"
+
+
+def test_a_failed_fetch_changes_nothing():
+    """It must not leave a half-applied update behind."""
+    text = update_bat()
+    fetch = text[text.index("git fetch"):text.index("git merge")]
+    assert "Nothing was changed" in fetch
+
+
+def test_the_block_is_still_one_parenthesised_unit():
+    """cmd.exe reads this file by byte offset while it runs, and the update
+    rewrites the file underneath it. The block is what makes that safe, and a
+    stray goto or label would abandon it."""
+    import re
+
+    text = update_bat()
+    body = text[text.index("\n(\n"):]
+    assert body.count("(") == body.count(")"), "unbalanced -- the block is broken"
+    assert not re.search(r"^\s*goto ", body, re.M), "a goto abandons the block"
+    assert not re.search(r"^:[a-zA-Z]", body, re.M), "a label abandons the block"

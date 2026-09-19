@@ -59,15 +59,37 @@ rem it did that.
     )
 
     if exist ".git" (
-        rem -- cloned copy: a pull is enough ------------------------------
+        rem -- cloned copy: fetch, then merge -----------------------------
+        rem
+        rem Deliberately not `git pull`. A pull fails for two unrelated
+        rem reasons and reports them identically, and the message this
+        rem printed blamed a hand-edited file for what was a dead network:
+        rem github.com resolves to several addresses and one of them was
+        rem unreachable, so the update failed about every other run while
+        rem telling the operator to throw away edits they had not made.
         echo.
         echo   Fetching...
-        git pull --ff-only
+        git fetch --quiet origin
         if errorlevel 1 (
             echo.
-            echo   Update failed. Almost always this means a file that ships
-            echo   with the bot was edited by hand, and git will not overwrite
-            echo   your edit without being told to. The line above names it.
+            echo   Could not reach GitHub, so there is nothing to update from.
+            echo   Nothing was changed.
+            echo.
+            echo   Try again -- github.com answers on several addresses and
+            echo   some networks can reach only some of them, which makes this
+            echo   fail on one run and work on the next.
+            echo.
+            pause
+            exit /b 1
+        )
+
+        git merge --ff-only FETCH_HEAD
+        if errorlevel 1 (
+            echo.
+            echo   Downloaded, but could not apply it. Almost always this means
+            echo   a file that ships with the bot was edited by hand, and git
+            echo   will not overwrite your edit without being told to. The line
+            echo   above names it.
             echo.
             echo   Your own files are never the cause: settings.yaml, your key,
             echo   app\state and logs.txt are not tracked, so an update has
@@ -101,7 +123,9 @@ rem it did that.
         git clone --depth 1 --quiet "!REPO!" "!TMPDIR!"
         if errorlevel 1 (
             echo.
-            echo   Could not reach the repository. Check your internet connection.
+            echo   Could not reach the repository. Check your connection, then
+            echo   try again -- github.com answers on several addresses and some
+            echo   networks can reach only some of them.
             echo.
             if exist "!TMPDIR!" rd /s /q "!TMPDIR!"
             pause
