@@ -397,6 +397,39 @@ def test_a_local_edit_is_named_as_one():
     assert "git checkout -- ." in merge, "no way out is offered"
 
 
+def test_the_fetch_is_retried_before_giving_up():
+    """A single attempt is not evidence. The same GitHub address timed out
+    after 21s and then answered in 1.3s, so one failure means nothing and
+    making the operator re-run by hand asks them to do what the script can."""
+    text = update_bat()
+    fetch = text[text.index("Fetching..."):text.index("git merge")]
+    assert "for /L" in fetch, "it still gives up on the first try"
+    assert "git fetch" in fetch
+    assert "Trying again" in fetch, "a silent retry looks like a hang"
+
+
+def test_the_retry_stops_once_it_works():
+    """Otherwise it fetches three times on every successful update."""
+    text = update_bat()
+    fetch = text[text.index("Fetching..."):text.index("git merge")]
+    # Twice: once guarding the loop body so later passes are skipped, once
+    # after it to decide whether to give up. Only the first is the early exit,
+    # and only counting both distinguishes it from the failure check.
+    assert fetch.count("if not defined FETCHED") == 2, "the loop has no early exit"
+    assert 'set "FETCHED=1"' in fetch
+
+
+def test_the_download_is_retried_too():
+    """The unzipped copy clones instead of fetching, over the same network."""
+    text = update_bat()
+    start = text.index("Downloading")
+    # The command, not the comment further up that mentions it by name.
+    section = text[start:text.index('robocopy "', start)]
+    assert "for /L" in section, "the download still gives up on the first try"
+    assert "git clone" in section
+    assert "CLONED" in section
+
+
 def test_a_failed_fetch_changes_nothing():
     """It must not leave a half-applied update behind."""
     text = update_bat()

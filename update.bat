@@ -67,17 +67,32 @@ rem it did that.
         rem github.com resolves to several addresses and one of them was
         rem unreachable, so the update failed about every other run while
         rem telling the operator to throw away edits they had not made.
+        rem Retried, because a single attempt is not evidence of anything.
+        rem github.com answers on several addresses and the route to some of
+        rem them drops packets on some networks: measured here, the same
+        rem address timed out after 21s and then answered in 1.3s. Making the
+        rem operator run this again by hand is asking them to do what the
+        rem script can do itself.
         echo.
         echo   Fetching...
-        git fetch --quiet origin
-        if errorlevel 1 (
+        set "FETCHED="
+        for /L %%i in (1,1,3) do (
+            if not defined FETCHED (
+                if %%i GTR 1 (
+                    echo   No answer. Trying again ^(%%i of 3^)...
+                    ping -n 3 127.0.0.1 >nul
+                )
+                git fetch --quiet origin
+                if not errorlevel 1 set "FETCHED=1"
+            )
+        )
+        if not defined FETCHED (
             echo.
-            echo   Could not reach GitHub, so there is nothing to update from.
-            echo   Nothing was changed.
+            echo   Could not reach GitHub after three tries, so there is
+            echo   nothing to update from. Nothing was changed.
             echo.
-            echo   Try again -- github.com answers on several addresses and
-            echo   some networks can reach only some of them, which makes this
-            echo   fail on one run and work on the next.
+            echo   Check your connection and run this again. The bot itself
+            echo   is unaffected -- this only fetches new code.
             echo.
             pause
             exit /b 1
@@ -120,8 +135,19 @@ rem it did that.
         set "TMPDIR=%TEMP%\bulkdn-update-!RANDOM!"
         echo.
         echo   Downloading the latest version...
-        git clone --depth 1 --quiet "!REPO!" "!TMPDIR!"
-        if errorlevel 1 (
+        set "CLONED="
+        for /L %%i in (1,1,3) do (
+            if not defined CLONED (
+                if %%i GTR 1 (
+                    echo   No answer. Trying again ^(%%i of 3^)...
+                    ping -n 3 127.0.0.1 >nul
+                    if exist "!TMPDIR!" rd /s /q "!TMPDIR!"
+                )
+                git clone --depth 1 --quiet "!REPO!" "!TMPDIR!"
+                if not errorlevel 1 set "CLONED=1"
+            )
+        )
+        if not defined CLONED (
             echo.
             echo   Could not reach the repository. Check your connection, then
             echo   try again -- github.com answers on several addresses and some
