@@ -286,3 +286,38 @@ def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = True) -> 
 def fill_trade_id(fill: Any) -> str | None:
     """Read the trade id off a parsed fill, if the patch supplied one."""
     return getattr(fill, "trade_id", None)
+
+
+# -- the SDK's own printing --------------------------------------------------
+
+
+def quieten_sdk_prints() -> int:
+    """Send the SDK's `print` calls to the debug log. Returns how many modules.
+
+    There are 128 of them across the package, and one fires on every HTTP
+    account read:
+
+        getting account info for 6r3jPT... from https://mainnet-api1...
+
+    On a run that reads positions every five seconds that is most of what is on
+    screen, and none of it is addressed to the operator. They are `print`, not
+    logging, so no logger level reaches them.
+
+    Shadowing the name inside each module is narrower than replacing the
+    builtin: nothing outside `bulk_api` changes, and anything the SDK wanted to
+    say is still in `logs.txt` at DEBUG rather than thrown away.
+    """
+    import sys
+
+    quiet = 0
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("bulk_api") or module is None:
+            continue
+        if getattr(module, "_bulkdn_quiet", False):
+            continue
+        module.print = lambda *a, **k: log.debug(
+            "sdk: %s", " ".join(str(x) for x in a)
+        )
+        module._bulkdn_quiet = True
+        quiet += 1
+    return quiet

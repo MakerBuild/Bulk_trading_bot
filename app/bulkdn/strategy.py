@@ -160,6 +160,9 @@ class Strategy:
         # keeps looking like our own doing cannot be deferred forever, while
         # incidents hours apart do not add up to one.
         self._doubt_deferrals: dict[str, list[float]] = {}
+        self._started_at = time.monotonic()
+        # burned, qualifying volume -- as of the last progress read.
+        self._progress: tuple[float, float] = (0.0, 0.0)
         # When each recent reconnect happened. Older entries fall out of the
         # window on their own, so a drop an hour ago says nothing about this one.
         self._reconnect_times: list[float] = []
@@ -1034,6 +1037,58 @@ class Strategy:
 
     # -- entry point -------------------------------------------------------
 
+    def status_lines(self) -> list[str]:
+        """What a person watching the run would want on screen.
+
+        Built from state already in memory -- phases, the position book, the
+        last progress read -- because this is redrawn every second and must not
+        cost a network round trip to do it.
+        """
+        from .screen import bar, humanise
+
+        legs = []
+        for symbol in self.symbols:
+            leg = self.state.leg(symbol)
+            phase = leg.phase.value.upper()
+            left = leg.hold_remaining_s()
+            note = f" {humanise(left)} left" if left > 0 else ""
+            legs.append(f"{symbol} {phase} cycle {leg.cycle_index}{note}")
+
+        burned, volume = self._progress
+        target = self.config.target
+        lines = ["  " + "     ".join(legs)]
+
+        if target.volume_usd > 0:
+            done = volume / target.volume_usd
+            lines.append(
+                f"  volume  {bar(done)}  ${volume:,.0f} / ${target.volume_usd:,.0f}"
+                f"  {done * 100:.1f}%"
+            )
+        if target.burn_usd > 0:
+            done = burned / target.burn_usd
+            lines.append(
+                f"  burn    {bar(done)}  ${burned:,.2f} / ${target.burn_usd:,.2f}"
+                f"  {done * 100:.1f}%"
+            )
+
+        exposure = sum(self.risk.net_exposure_usd(s) for s in self.symbols)
+        elapsed = humanise(time.monotonic() - self._started_at)
+        note = self._halt_reason or self._stop_requested or "S = stop and cancel"
+        lines.append(f"  burned ${burned:,.2f}   off-hedge ${exposure:,.0f}   "
+                     f"running {elapsed}   |   {note}")
+        return lines
+
+    async def _refresh_status(self, interval_s: float = 1.0) -> None:
+        """Keep the status block current while the legs work."""
+        from .screen import SCREEN
+
+        while not self._stop.is_set():
+            try:
+                SCREEN.update(self.status_lines())
+            except Exception as exc:  # noqa: BLE001 - never stop a run over a redraw
+                log.debug("could not redraw the status block: %s", describe(exc))
+            await asyncio.sleep(interval_s)
+
     async def run(self) -> None:
         """Run both legs, each on its own clock, until they finish or a halt.
 
@@ -1046,6 +1101,7 @@ class Strategy:
         self.install_handlers()
         worker = asyncio.create_task(self._hedge_worker())
         supervisor = asyncio.create_task(self._supervise())
+        status = asyncio.create_task(self._refresh_status())
         sizes = {
             self.config.master_account.symbol: self.config.master_account.size,
             self.config.sub_account.symbol: self.config.sub_account.size,
@@ -1103,8 +1159,13 @@ class Strategy:
             raise
         finally:
             self._stop.set()
-            for task in (*legs, supervisor, worker):
+            for task in (*legs, supervisor, worker, status):
                 task.cancel()
+            # The block stops being redrawn here, so whatever is under the
+            # cursor is what the operator is left looking at.
+            from .screen import SCREEN
+
+            SCREEN.close()
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(
                     *(*legs, supervisor, worker), return_exceptions=True
@@ -1140,6 +1201,10 @@ class Strategy:
             parts.append(f"burn ${burned:,.4f} / ${target.burn_usd:,.2f}")
         if target.volume_usd > 0:
             parts.append(f"volume ${volume:,.2f} / ${target.volume_usd:,.2f}")
+        # Cached for the status block, which redraws every second and must not
+        # pay for a fill-history walk to do it.
+        self._progress = (burned, volume)
+
         detail = "  ".join(parts)
         if detail:
             self.title.set_note(detail)

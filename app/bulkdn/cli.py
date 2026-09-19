@@ -32,6 +32,7 @@ from .impact import ImpactBook
 from .hedger import Hedger
 from .positions import PositionBook
 from . import proxy
+from . import screen as screen_mod
 from .reconcile import (
     cancel_all_orders,
     flatten,
@@ -43,7 +44,7 @@ from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
 from .sizing import plan_sizes, resolve_notionals
 from .state import Phase, StateStore
-from .ws_compat import apply_ws_compat
+from .ws_compat import apply_ws_compat, quieten_sdk_prints
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
 
 log = logging.getLogger("bulkdn")
@@ -60,17 +61,75 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 2
 
 
+# Loggers whose INFO output is bookkeeping rather than news: position reads,
+# exposure sums, every order placed and every fill. About ninety lines per five
+# minutes against twenty worth reading. All of it still goes to `logs.txt`,
+# which is where it is wanted when something has to be reconstructed.
+_QUIET_ON_SCREEN = (
+    "bulkdn.chaser",
+    "bulkdn.hedger",
+    "bulkdn.reconcile",
+    "bulkdn.risk",
+)
+# And the two from `strategy` that are the same kind of thing.
+_QUIET_MESSAGES = ("fill on ", "reconciler corrected ")
+
+
+class _ConsoleFilter(logging.Filter):
+    """Keeps the screen to what a person watching would want to see.
+
+    Anything WARNING or worse always passes: the point is to hide bookkeeping,
+    not to hide trouble.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        if record.name in _QUIET_ON_SCREEN:
+            return False
+        return not record.getMessage().startswith(_QUIET_MESSAGES)
+
+
+class _StatusHandler(logging.StreamHandler):
+    """Prints above the status block instead of over the top of it."""
+
+    def __init__(self, block):
+        super().__init__()
+        self.block = block
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.block.write_above(self.format(record))
+        except Exception:  # noqa: BLE001 - logging must not take down a run
+            self.handleError(record)
+
+
 def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     """Log to the console, and to `log_file` alongside it.
 
     The file gets full timestamps where the console gets clock time only: on
     screen the date is obvious, in a file read days later it is the point.
+
+    The console also gets far less of it -- see `_ConsoleFilter`.
     """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # basicConfig's own handler prints straight to the stream, which would
+    # scroll through the status block. Replaced rather than added to.
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if type(handler) is logging.StreamHandler:
+            root.removeHandler(handler)
+    console = _StatusHandler(screen_mod.SCREEN)
+    console.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
+    )
+    console.addFilter(_ConsoleFilter())
+    root.addHandler(console)
     if log_file:
         try:
             handler = logging.handlers.RotatingFileHandler(
@@ -97,6 +156,9 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     # The SDK logs every frame at DEBUG, which drowns out the strategy.
     logging.getLogger("bulk_api").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    # And it prints, which no logger level can reach. Called again once the
+    # SDK is fully imported -- this only reaches modules already loaded.
+    quieten_sdk_prints()
 
 
 class Runtime:
@@ -113,6 +175,8 @@ class Runtime:
             insecure_ssl=config.ws_insecure_ssl,
             auto_bypass=config.ws_ssl_auto_bypass,
         )
+        # Now that the SDK is fully imported, silence the rest of its printing.
+        quieten_sdk_prints()
 
         # Read off the master rather than configured: a sub-account has no key
         # of its own, so its pubkey is a fact about the master, not a choice
