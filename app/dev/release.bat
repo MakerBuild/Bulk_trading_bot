@@ -52,7 +52,13 @@ echo   Contains only committed files -- no app\.venv, no private_key.local,
 echo   no app\state, no caches. To look inside:
 echo     powershell -c "Expand-Archive -Force '%OUT%' tmp; dir tmp"
 echo.
-echo   Note that whoever unzips this cannot use update.bat -- that needs a
-echo   clone. Sending them the repository link instead is the better path.
+echo   Whoever unzips this can run update.bat: with no .git beside it, it
+echo   clones a fresh copy and lays it over the folder. What it cannot do
+echo   is overwrite itself -- cmd reads a batch file as it runs it -- so
+echo   they keep THIS build's update.bat for as long as they use the zip,
+echo   and a later fix to the updater never reaches them.
+echo.
+echo   Sending the repository link instead avoids that: in a clone the
+echo   merge updates update.bat along with everything else.
 echo.
 pause
