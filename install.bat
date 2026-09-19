@@ -2,7 +2,7 @@
 rem First-time setup: builds the virtualenv and installs everything.
 rem Safe to re-run; it upgrades an existing install in place.
 
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 rem This file stays pure ASCII. cmd reads a .bat through the console's
@@ -63,11 +63,33 @@ rem --no-deps is required: bulk-client declares bulk-keychain, which it never
 rem imports and which has no wheel for current Pythons, so pip would try to
 rem build it from Rust source and fail. Its real dependencies are installed in
 rem the next step.
+rem Retried, because pip fetches this by cloning from GitHub and that fetch
+rem fails on an unreliable route: the same address timed out after 21s and then
+rem answered in 1.3s on the network this was written for. One failure is not
+rem evidence of anything.
 echo   Installing the BULK SDK (from GitHub -- the PyPI build cannot sign)...
-"%VENV_PY%" -m pip install --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
-if errorlevel 1 (
+set "SDK_OK="
+for /L %%i in (1,1,3) do (
+    if not defined SDK_OK (
+        if %%i GTR 1 (
+            echo   That did not come through. Trying again ^(%%i of 3^)...
+            ping -n 3 127.0.0.1 >nul
+        )
+        "%VENV_PY%" -m pip install --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
+        if not errorlevel 1 set "SDK_OK=1"
+    )
+)
+if not defined SDK_OK (
     echo.
-    echo   SDK install failed. It needs git on PATH -- https://git-scm.com/downloads
+    rem Not "install git": that was checked at the top of this script, so by
+    rem here it is present and the message was telling the operator to install
+    rem something they already had.
+    echo   Could not install the BULK SDK after three tries.
+    echo.
+    echo   pip fetches it from github.com. If the error above mentions a
+    echo   connection or a timeout, that is the whole problem -- check your
+    echo   internet and run install.bat again.
+    echo.
     pause
     exit /b 1
 )
@@ -89,9 +111,23 @@ rem python-socks and PySocks are what let a SOCKS proxy work -- the first for th
 rem account stream, the second for HTTP. Neither library says anything useful at
 rem the point of failure without them, so they are installed for everyone rather
 rem than left for whoever turns out to need a proxy.
-"%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi python-socks PySocks
-if errorlevel 1 (
-    echo   Dependency install failed -- see the error above.
+set "DEPS_OK="
+for /L %%i in (1,1,3) do (
+    if not defined DEPS_OK (
+        if %%i GTR 1 (
+            echo   That did not come through. Trying again ^(%%i of 3^)...
+            ping -n 3 127.0.0.1 >nul
+        )
+        "%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi python-socks PySocks
+        if not errorlevel 1 set "DEPS_OK=1"
+    )
+)
+if not defined DEPS_OK (
+    echo.
+    echo   Could not install the dependencies after three tries -- see the
+    echo   error above. A connection or timeout message there means the
+    echo   download failed; run install.bat again.
+    echo.
     pause
     exit /b 1
 )

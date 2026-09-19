@@ -448,3 +448,54 @@ def test_the_block_is_still_one_parenthesised_unit():
     assert body.count("(") == body.count(")"), "unbalanced -- the block is broken"
     assert not re.search(r"^\s*goto ", body, re.M), "a goto abandons the block"
     assert not re.search(r"^:[a-zA-Z]", body, re.M), "a label abandons the block"
+
+
+# -- install.bat has the same two problems -----------------------------------
+#
+# pip fetches the SDK by cloning it from GitHub, over the same unreliable
+# route, and the failure said:
+#
+#     SDK install failed. It needs git on PATH
+#
+# git is checked at the top of that script, so by the time this fires it is
+# provably present. The operator was told to install something they had.
+
+
+def install_bat() -> str:
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    return (root / "install.bat").read_text(encoding="utf-8")
+
+
+def test_the_sdk_fetch_is_retried():
+    text = install_bat()
+    sdk = text[text.index("Installing the BULK SDK"):text.index("Installing dependencies")]
+    assert "for /L" in sdk, "it still gives up on the first try"
+    assert sdk.count("if not defined SDK_OK") == 2, "no early exit from the loop"
+
+
+def test_the_dependency_install_is_retried_too():
+    """PyPI is a network too."""
+    text = install_bat()
+    deps = text[text.index("Installing dependencies"):]
+    assert "for /L" in deps
+    assert "DEPS_OK" in deps
+
+
+def test_it_no_longer_blames_a_missing_git():
+    """It is checked at the top of the same script, so it cannot be the cause
+    down here."""
+    text = install_bat()
+    top = text.index("git is not installed")
+    sdk_failure = text.index("Could not install the BULK SDK")
+    assert top < sdk_failure, "the up-front check moved"
+    after = text[sdk_failure:sdk_failure + 600]
+    assert "git-scm.com" not in after, "it still sends them to install git"
+    assert "connection" in after, "it does not name the likely cause"
+
+
+def test_delayed_expansion_is_on():
+    """The retry flags are set inside a block and read in the same one."""
+    text = install_bat()
+    assert "setlocal enabledelayedexpansion" in text
