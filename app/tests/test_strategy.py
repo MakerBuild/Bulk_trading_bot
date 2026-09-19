@@ -374,3 +374,72 @@ async def test_full_cycle_keeps_the_pair_neutral(tmp_path):
     book.apply_fill(MASTER, BTC, is_buy=False, size=0.05)
     hedger.note_taker_fill(BTC, -0.05)
     assert book.net(MASTER, SUB1, BTC) == pytest.approx(0.0)
+
+
+# -- what a fill records about the market around it -------------------------
+#
+# Totals from the exchange say what a round trip cost. They cannot say WHY:
+# the gap between a passive fill and the hedge covering it is either spread
+# that was crossed or price that moved in between, and the two want opposite
+# fixes. Only the bot sees the book at the instant of the fill, so only the
+# bot can write it down.
+
+
+def test_a_fill_records_the_book_on_both_sides(tmp_path, caplog):
+    strategy, _book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+
+    with caplog.at_level("INFO", logger="bulkdn.strategy"):
+        master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+
+    line = next(r.getMessage() for r in caplog.records if "fill on " in r.getMessage())
+    assert "bid=100000.00000000" in line
+    assert "ask=100010.00000000" in line
+
+
+def test_a_fill_records_which_side_of_the_pair_it_was(tmp_path, caplog):
+    """Inferred afterwards, this cost 108 of 2,067 hedges: pairing by
+    timestamp leaves anything that lands out of order unmatched."""
+    strategy, _book, master, sub1 = build(tmp_path)
+    strategy.install_handlers()
+
+    with caplog.at_level("INFO", logger="bulkdn.strategy"):
+        master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+        sub1.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.SELL))
+
+    lines = [r.getMessage() for r in caplog.records if "fill on " in r.getMessage()]
+    assert "role=maker" in lines[0], "the account resting the order is the maker"
+    assert "role=taker" in lines[1], "the account hedging it is the taker"
+
+
+def test_a_quote_that_throws_does_not_lose_the_fill(tmp_path, caplog):
+    """This runs inside the socket handler. Logging less is acceptable;
+    dropping a fill means an unhedged position nobody knows about."""
+    strategy, book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+
+    def boom(symbol):
+        raise RuntimeError("book not ready")
+
+    strategy.feed.quote = boom
+
+    with caplog.at_level("INFO", logger="bulkdn.strategy"):
+        master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+
+    assert book.effective(MASTER, BTC) == 0.1, "the fill was lost"
+    line = next(r.getMessage() for r in caplog.records if "fill on " in r.getMessage())
+    assert "bid=? ask=?" in line
+
+
+def test_an_empty_book_is_said_so_rather_than_printed_as_zero(tmp_path, caplog):
+    """Right after a reconnect there is no book. A zero there would read as a
+    real price and quietly become a 100% move in any analysis of the log."""
+    strategy, _book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+    strategy.feed.quote = lambda symbol: Quote(symbol, None, None, None, age_s=0.0)
+
+    with caplog.at_level("INFO", logger="bulkdn.strategy"):
+        master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+
+    line = next(r.getMessage() for r in caplog.records if "fill on " in r.getMessage())
+    assert "bid=? ask=?" in line

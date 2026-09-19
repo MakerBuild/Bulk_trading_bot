@@ -468,11 +468,49 @@ def install_bat() -> str:
     return (root / "install.bat").read_text(encoding="utf-8")
 
 
-def test_the_sdk_fetch_is_retried():
+def sdk_section() -> str:
     text = install_bat()
-    sdk = text[text.index("Installing the BULK SDK"):text.index("Installing dependencies")]
+    return text[text.index("Installing the BULK SDK"):text.index("Installing dependencies")]
+
+
+def test_the_sdk_fetch_is_retried():
+    sdk = sdk_section()
     assert "for /L" in sdk, "it still gives up on the first try"
-    assert sdk.count("if not defined SDK_OK") == 2, "no early exit from the loop"
+    loop = sdk[sdk.index("for /L"):]
+    # Counting the guard was the old check, and it broke the moment the
+    # section grew a second way to install. What it was standing in for is
+    # this: the guard has to come before the attempt, or a loop that has
+    # already succeeded runs the install twice more.
+    assert "if not defined SDK_OK" in loop, "no early exit from the loop"
+    assert loop.index("if not defined SDK_OK") < loop.index("pip install"), \
+        "the guard falls after the attempt, so success is retried anyway"
+
+
+def test_the_sdk_comes_from_the_folder_before_the_network():
+    """github.com is unreachable from some of the networks this is handed out
+    on -- three pip clones in a row failed at 21 seconds each while PyPI
+    answered throughout. Shipping the wheel only helps if it is tried first."""
+    sdk = sdk_section()
+    assert sdk.index("SDK_WHEEL") < sdk.index("git+https://github.com/Bulk-trade"), \
+        "GitHub is tried before the copy that ships with the bot"
+    assert "--force-reinstall" in sdk, (
+        "the SDK's version string does not change between commits, so without "
+        "this pip keeps whatever an earlier run installed"
+    )
+
+
+def test_the_pinned_wheel_is_where_the_installer_says_it_is():
+    """A version bump that edits the pin and forgets to commit the file would
+    otherwise be found by the first operator to install, not here."""
+    import pathlib
+    import re
+
+    match = re.search(r'set "SDK_WHEEL=([^"]+)"', install_bat())
+    assert match, "the installer no longer pins a wheel by name"
+    root = pathlib.Path(__file__).resolve().parents[2]
+    wheel = root / match.group(1).replace("\\", "/")
+    assert wheel.is_file(), f"{match.group(1)} is pinned but not present"
+    assert wheel.stat().st_size > 1024, "the wheel is there but empty"
 
 
 def test_the_dependency_install_is_retried_too():
