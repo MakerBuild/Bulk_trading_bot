@@ -499,3 +499,65 @@ def test_delayed_expansion_is_on():
     """The retry flags are set inside a block and read in the same one."""
     text = install_bat()
     assert "setlocal enabledelayedexpansion" in text
+
+
+# -- both scripts can go through the bot's own proxy -------------------------
+#
+# GitHub is unreachable from the networks proxy.local exists for: measured on
+# one of them, four direct attempts to github.com failed while the exchange
+# answered in 0.8s. An update that cannot fetch leaves the operator as stuck as
+# a bot that cannot trade, and they have already configured a proxy that works.
+
+
+def test_both_scripts_read_the_proxy_the_bot_uses():
+    """Not a second place to configure it. There is already one file."""
+    for text in (update_bat(), install_bat()):
+        assert 'if exist "proxy.local"' in text
+        assert "BOT_PROXY" in text
+
+
+def test_the_proxy_line_is_never_echoed():
+    """It usually carries a password."""
+    import re
+
+    for text in (update_bat(), install_bat()):
+        for line in text.splitlines():
+            if line.strip().lower().startswith("echo") and "PROXY" in line.upper():
+                assert not re.search(r"![A-Z_]*PROXY[A-Z_]*!", line), line
+
+
+def test_comments_are_skipped_when_reading_it():
+    """The shipped file is all comments, and reading one as an address would
+    point every fetch at a sentence."""
+    for text in (update_bat(), install_bat()):
+        assert '"!LINE:~0,1!"=="#"' in text
+
+
+def test_git_gets_the_address_as_written():
+    """It works through SOCKS and aborts the CONNECT on an HTTP proxy."""
+    for text in (update_bat(), install_bat()):
+        assert 'set "ALL_PROXY=!BOT_PROXY!"' in text
+
+
+def test_pip_gets_an_http_address_instead():
+    """Any socks address makes pip's vendored urllib3 raise PoolKey.__new__()
+    got an unexpected keyword argument key_proxy_ssl_context."""
+    text = install_bat()
+    assert 'if /I "!BOT_PROXY:~0,5!"=="socks" set "PIP_PROXY=http://!BOT_PROXY:*//=!"' in text
+    assert "--proxy !PIP_PROXY!" in text
+
+
+def test_every_pip_call_is_given_it():
+    """One left out is one that cannot reach PyPI on such a network."""
+    text = install_bat()
+    calls = text.count('-m pip install')
+    assert calls >= 3
+    assert text.count("!PIPARG!") == calls, "a pip call was left without the proxy"
+
+
+def test_no_proxy_configured_passes_nothing():
+    """The shipped file configures none, which is the normal case, and an
+    empty --proxy is not a thing pip accepts."""
+    text = install_bat()
+    assert 'set "PIPARG="' in text
+    assert "if defined BOT_PROXY (" in text

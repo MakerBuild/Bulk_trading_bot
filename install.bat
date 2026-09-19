@@ -56,8 +56,39 @@ if not exist "app\.venv\Scripts\python.exe" (
 set "VENV_PY=app\.venv\Scripts\python.exe"
 
 echo.
+rem The bot already reads proxy.local, because BULK is unreachable from some
+rem countries. GitHub and PyPI are unreachable from the same ones, and an
+rem install that cannot fetch is as stuck as a bot that cannot trade.
+rem
+rem Two proxies, because the two tools disagree about what they accept:
+rem
+rem   git  works through SOCKS and aborts the CONNECT on an HTTP proxy, so it
+rem        gets the line as written, through ALL_PROXY.
+rem   pip  raises "PoolKey.__new__() got an unexpected keyword argument
+rem        key_proxy_ssl_context" on any socks address -- a fault in its own
+rem        vendored urllib3 -- so it gets the same host and port with an http
+rem        scheme, passed as --proxy rather than through the environment.
+rem
+rem Both verified end to end against a network where github.com is blocked.
+rem The line is never echoed: it usually carries a password.
+set "BOT_PROXY="
+if exist "proxy.local" (
+    for /f "usebackq tokens=* delims=" %%L in ("proxy.local") do (
+        set "LINE=%%L"
+        if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "BOT_PROXY=%%L"
+    )
+)
+set "PIPARG="
+if defined BOT_PROXY (
+    echo   Using the proxy from proxy.local.
+    set "ALL_PROXY=!BOT_PROXY!"
+    set "PIP_PROXY=!BOT_PROXY!"
+    if /I "!BOT_PROXY:~0,5!"=="socks" set "PIP_PROXY=http://!BOT_PROXY:*//=!"
+    set "PIPARG=--proxy !PIP_PROXY!"
+)
+
 echo   Updating pip...
-"%VENV_PY%" -m pip install --quiet --upgrade pip
+"%VENV_PY%" -m pip install !PIPARG! --quiet --upgrade pip
 
 rem --no-deps is required: bulk-client declares bulk-keychain, which it never
 rem imports and which has no wheel for current Pythons, so pip would try to
@@ -75,7 +106,7 @@ for /L %%i in (1,1,3) do (
             echo   That did not come through. Trying again ^(%%i of 3^)...
             ping -n 3 127.0.0.1 >nul
         )
-        "%VENV_PY%" -m pip install --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
+        "%VENV_PY%" -m pip install !PIPARG! --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
         if not errorlevel 1 set "SDK_OK=1"
     )
 )
@@ -118,7 +149,7 @@ for /L %%i in (1,1,3) do (
             echo   That did not come through. Trying again ^(%%i of 3^)...
             ping -n 3 127.0.0.1 >nul
         )
-        "%VENV_PY%" -m pip install --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi python-socks PySocks
+        "%VENV_PY%" -m pip install !PIPARG! --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi python-socks PySocks
         if not errorlevel 1 set "DEPS_OK=1"
     )
 )

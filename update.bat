@@ -58,6 +58,29 @@ rem it did that.
         exit /b 1
     )
 
+    rem The bot already reads proxy.local, because BULK is unreachable from
+    rem some countries. GitHub is unreachable from the same ones, and an update
+    rem that cannot fetch leaves the operator as stuck as a bot that cannot
+    rem trade. Measured on the network this was written for: three direct
+    rem attempts to github.com failed outright, two through the proxy answered
+    rem in 2.5 seconds.
+    rem
+    rem ALL_PROXY and nothing else. git reads it -- confirmed against a live
+    rem fetch with the other two unset -- and pip does not choke on a SOCKS
+    rem address it was never given. The line is never echoed: it usually
+    rem carries a password.
+    set "BOT_PROXY="
+    if exist "proxy.local" (
+        for /f "usebackq tokens=* delims=" %%L in ("proxy.local") do (
+            set "LINE=%%L"
+            if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "BOT_PROXY=%%L"
+        )
+    )
+    if defined BOT_PROXY (
+        echo   Using the proxy from proxy.local.
+        set "ALL_PROXY=!BOT_PROXY!"
+    )
+
     if exist ".git" (
         rem -- cloned copy: fetch, then merge -----------------------------
         rem
