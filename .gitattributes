@@ -3,9 +3,15 @@
 # missed, and `goto` then falls off the end of the file.
 *.bat text eol=crlf
 
-# Left out of `git archive`, which is how releases are built. Both of these are
-# git's own plumbing: they mean nothing in an unpacked copy, and on a machine
-# where they are not marked hidden they are just two files an operator has to
-# wonder about. The repository still has them; only the zip does not.
+# The vendored SDK. Git detects binary content on its own, but a wheel is a zip
+# and a single byte of line-ending conversion would produce an archive that
+# fails to open on someone else's machine, days later, with no clue as to why.
+# Cheap to say outright.
+*.whl binary
+
+# Left out of `git archive`. Releases are no longer built that way -- they are
+# built from a clone, which carries these two like any other file -- but the
+# rule costs nothing and keeps `git archive` producing what it used to. Both
+# are git's own plumbing: they mean nothing in an unpacked copy.
 .gitattributes export-ignore
 .gitignore export-ignore

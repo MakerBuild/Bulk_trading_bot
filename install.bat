@@ -94,20 +94,45 @@ rem --no-deps is required: bulk-client declares bulk-keychain, which it never
 rem imports and which has no wheel for current Pythons, so pip would try to
 rem build it from Rust source and fail. Its real dependencies are installed in
 rem the next step.
-rem Retried, because pip fetches this by cloning from GitHub and that fetch
-rem fails on an unreliable route: the same address timed out after 21s and then
-rem answered in 1.3s on the network this was written for. One failure is not
-rem evidence of anything.
-echo   Installing the BULK SDK (from GitHub -- the PyPI build cannot sign)...
+rem
+rem The SDK ships with the bot, in app\vendor. It is the only part of this
+rem install that does not come from PyPI, and github.com is unreachable from
+rem some of the networks this is handed out on: measured here, three pip clones
+rem of it failed at twenty-one seconds each while PyPI answered throughout. A
+rem new operator meets that failure before anything has worked once, and reads
+rem it as a broken bot rather than a bad route.
+rem
+rem The filename is pinned, like the commit below it. app\vendor\README.md says
+rem what has to move when the SDK does.
+set "SDK_WHEEL=app\vendor\bulk_client-0.1.2-py3-none-any.whl"
 set "SDK_OK="
-for /L %%i in (1,1,3) do (
-    if not defined SDK_OK (
-        if %%i GTR 1 (
-            echo   That did not come through. Trying again ^(%%i of 3^)...
-            ping -n 3 127.0.0.1 >nul
+if exist "!SDK_WHEEL!" (
+    echo   Installing the BULK SDK...
+    rem --force-reinstall because the SDK's version string does not change
+    rem between commits: without it pip sees 0.1.2 installed already and keeps
+    rem whatever an earlier run left behind. The file is local, so repeating
+    rem this costs nothing.
+    "%VENV_PY%" -m pip install !PIPARG! --quiet --no-deps --force-reinstall "!SDK_WHEEL!"
+    if not errorlevel 1 set "SDK_OK=1"
+    if not defined SDK_OK echo   The bundled copy would not install. Trying GitHub instead.
+)
+
+rem Fallback for a copy that predates the wheel, which has no app\vendor at
+rem all. Retried, because pip fetches this by cloning from GitHub and that
+rem fetch fails on an unreliable route: the same address timed out after 21s
+rem and then answered in 1.3s on the network this was written for. One failure
+rem is not evidence of anything.
+if not defined SDK_OK (
+    echo   Installing the BULK SDK ^(from GitHub -- the PyPI build cannot sign^)...
+    for /L %%i in (1,1,3) do (
+        if not defined SDK_OK (
+            if %%i GTR 1 (
+                echo   That did not come through. Trying again ^(%%i of 3^)...
+                ping -n 3 127.0.0.1 >nul
+            )
+            "%VENV_PY%" -m pip install !PIPARG! --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
+            if not errorlevel 1 set "SDK_OK=1"
         )
-        "%VENV_PY%" -m pip install !PIPARG! --quiet --no-deps "bulk-client @ git+https://github.com/Bulk-trade/bulk-client.git@3a6506e#subdirectory=crates/api-python"
-        if not errorlevel 1 set "SDK_OK=1"
     )
 )
 if not defined SDK_OK (
@@ -115,11 +140,12 @@ if not defined SDK_OK (
     rem Not "install git": that was checked at the top of this script, so by
     rem here it is present and the message was telling the operator to install
     rem something they already had.
-    echo   Could not install the BULK SDK after three tries.
+    echo   Could not install the BULK SDK.
     echo.
-    echo   pip fetches it from github.com. If the error above mentions a
-    echo   connection or a timeout, that is the whole problem -- check your
-    echo   internet and run install.bat again.
+    echo   A copy ships with the bot, in app\vendor. If it is missing, this
+    echo   falls back to fetching it from github.com -- and an error above
+    echo   about a connection or a timeout is then the whole problem. Check
+    echo   your internet and run install.bat again.
     echo.
     pause
     exit /b 1

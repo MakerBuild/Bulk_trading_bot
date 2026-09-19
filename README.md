@@ -15,10 +15,11 @@ pair stays close to market-neutral while it trades.
 1. **Install Python 3.10 or newer** from [python.org](https://www.python.org/downloads/).
    Tick **"Add python.exe to PATH"** in the installer — without it nothing else works.
 2. **Install git** from [git-scm.com](https://git-scm.com/downloads), keeping every
-   default. The BULK library is fetched from GitHub.
-3. **Get the code.** `git clone https://github.com/MakerBuild/Bulk_trading_bot.git` is the better route -- `update.bat`
-   then pulls new versions for you. A zip works too, and `update.bat` still
-   fetches updates for it.
+   default. `update.bat` needs it. The BULK library itself ships with the bot,
+   in `app/vendor`, so the install no longer waits on GitHub to answer.
+3. **Get the code.** Unzip the archive you were sent, or
+   `git clone https://github.com/MakerBuild/Bulk_trading_bot.git` — they come to
+   the same thing, because the zip is a clone. `update.bat` works either way.
 4. **Double-click `install.bat`.** It builds a local environment, installs
    everything, and checks that transaction signing works. Safe to re-run.
 
@@ -148,7 +149,8 @@ its owner's referral or invite.
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your key |
 | `logs.txt` | everything the bot has done; appears on the first run |
-| `app/dev/release.bat` | build a zip to hand out, from git rather than the folder |
+| `app/dev/release.bat` | build a zip to hand out, from a fresh clone rather than the folder |
+| `app/vendor/` | the BULK library, so the install does not depend on GitHub |
 | `app/docs/DESIGN.md` | how it works internally |
 
 Everything else lives in `app/`, which you can ignore: the code, the test suite,
