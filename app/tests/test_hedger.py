@@ -217,3 +217,85 @@ def test_in_flight_expires():
     in_flight = InFlight(ttl_ms=0)
     in_flight.add(BTC, -0.10)
     assert in_flight.total(BTC) == 0.0
+
+
+# -- what the book looked like before the order went out --------------------
+#
+# The cost of a hedge splits three ways: the spread it crossed, the depth it
+# ate past the touch, and the price moving while it was in flight. Only the
+# middle one is slippage, and only a reading taken BEFORE the order can
+# measure it -- afterwards the depth is already gone. The exchange publishes
+# no impact curve for these markets, so there is nothing to predict it from
+# either.
+
+
+class FakeQuoteFeed:
+    def __init__(self, bid=99_999.0, ask=100_001.0, explode=False):
+        self.bid, self.ask, self.explode = bid, ask, explode
+        self.asked_at = []
+
+    def quote(self, symbol):
+        if self.explode:
+            raise RuntimeError("book not ready")
+        self.asked_at.append(symbol)
+        return type("Q", (), {"best_bid": self.bid, "best_ask": self.ask})()
+
+
+async def test_a_hedge_records_the_book_before_it_trades(caplog):
+    book, hedger, _master, sub1 = build()
+    hedger.feed = FakeQuoteFeed()
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+
+    with caplog.at_level("INFO", logger="bulkdn.hedger"):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
+    assert "bid=99999.00000000" in line
+    assert "ask=100001.00000000" in line
+    assert sub1.orders, "the hedge itself still went out"
+
+
+async def test_the_touch_is_read_before_the_order_not_after():
+    """Read afterwards it would describe a book this very order has already
+    eaten into, which is the result rather than the reference."""
+    book, hedger, _master, sub1 = build()
+    feed = FakeQuoteFeed()
+    hedger.feed = feed
+
+    async def market(symbol, is_buy, size, reduce_only=False):
+        assert feed.asked_at, "the order went out before the book was read"
+        sub1.orders.append({"symbol": symbol, "size": size})
+        return []
+
+    sub1.market = market
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+    await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    assert sub1.orders
+
+
+async def test_a_hedger_without_a_feed_still_hedges(caplog):
+    """`flatten` and the reconciler build one without a feed. Losing a hedge
+    over a log line would be an absurd trade."""
+    book, hedger, _master, sub1 = build()
+
+    with caplog.at_level("INFO", logger="bulkdn.hedger"):
+        book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    assert sub1.orders
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
+    assert "bid=" not in line, "it invented a book it does not have"
+
+
+async def test_a_book_that_throws_does_not_stop_the_hedge(caplog):
+    book, hedger, _master, sub1 = build()
+    hedger.feed = FakeQuoteFeed(explode=True)
+
+    with caplog.at_level("INFO", logger="bulkdn.hedger"):
+        book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    assert sub1.orders, "an unhedged position, to save a log line"
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
+    assert "bid=? ask=?" in line

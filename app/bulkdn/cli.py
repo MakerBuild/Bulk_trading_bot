@@ -373,6 +373,7 @@ class Runtime:
             in_flight_ttl_ms=self.config.overlay_ttl_ms,
             impact=self.impact,
             max_impact_bps=self.config.risk.max_hedge_impact_bps,
+            feed=self.feed,
         )
         chaser = Chaser(
             sessions=self.sessions,

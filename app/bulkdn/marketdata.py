@@ -176,3 +176,35 @@ def distance_bps(price_a: float, price_b: float) -> float:
 def round_notional(value: float) -> float:
     """Two-decimal USD rounding, for logs and risk comparisons."""
     return float(Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def touch_text(feed, symbol: str) -> str:
+    """The book either side of the market, rendered for a log line.
+
+    Written beside a fill and beside the hedge that covers it, these two
+    readings are what turn a total into an explanation. A round trip that cost
+    more than its fees lost the money in one of three places -- the spread it
+    crossed, the depth it ate past the touch, or the price moving while the
+    hedge was in flight -- and the three want different remedies. The exchange's
+    fill history records none of it: it says what we traded at and nothing about
+    what was on offer instead. Only the bot is holding the book at that instant.
+
+    Slippage specifically needs the reading taken BEFORE the order is sent. By
+    the time a taker fill comes back the depth it consumed is already gone from
+    the book, so a touch read then is the result, not the reference.
+
+    Never raises. This runs on the path that sends orders and inside the
+    socket's fill handler; a book that is missing, half-formed or throwing
+    costs a line of detail in the log, never a fill or a hedge. An absent price
+    prints as `?` rather than 0, because a zero reads as real and becomes a
+    100% move in anything that parses this afterwards.
+    """
+    try:
+        quote = feed.quote(symbol)
+        bid = getattr(quote, "best_bid", None)
+        ask = getattr(quote, "best_ask", None)
+    except Exception:  # noqa: BLE001 - logging must never break trading
+        return "bid=? ask=?"
+    left = f"bid={bid:.8f}" if bid else "bid=?"
+    right = f"ask={ask:.8f}" if ask else "ask=?"
+    return f"{left} {right}"

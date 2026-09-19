@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass
 
 from .accounts import AccountSession
-from .marketdata import MarketSpec, round_notional, round_size
+from .marketdata import MarketSpec, round_notional, round_size, touch_text
 from .impact import ImpactBook
 from .positions import PositionBook
 
@@ -162,9 +162,14 @@ class Hedger:
         in_flight_ttl_ms: int = 2000,
         impact: ImpactBook | None = None,
         max_impact_bps: float = 0.0,
+        feed=None,
     ):
         self.book = book
         self.sessions = sessions
+        # Only ever read for the touch written into the hedge's log line, which
+        # is why it is optional: a Hedger built without one still hedges, it
+        # just cannot say what the book looked like beforehand.
+        self.feed = feed
         self.impact = impact
         self.max_impact_bps = max_impact_bps
         self.specs = specs
@@ -284,14 +289,24 @@ class Hedger:
                 )
 
             session = self.sessions[roles.taker]
+            # The book as it stands BEFORE the order goes out. Read here and
+            # not from the fill that comes back, because by then this order has
+            # eaten the depth it is about to eat: a touch taken afterwards is
+            # the result, not the reference it has to be compared against. The
+            # difference between this ask and the price the fill returns is the
+            # slippage, and nothing else in the system records it -- the
+            # exchange publishes no impact curve for these markets (404 on
+            # every one), so it cannot be predicted either.
+            touch = touch_text(self.feed, symbol) if self.feed is not None else ""
             log.info(
-                "hedge %s: net=%+.8f -> %s %.8f on %s%s",
+                "hedge %s: net=%+.8f -> %s %.8f on %s%s%s",
                 symbol,
                 net,
                 "BUY" if is_buy else "SELL",
                 size,
                 session.name,
                 " (reduce-only)" if roles.reduce_only else "",
+                f" {touch}" if touch else "",
             )
 
             signed = size if is_buy else -size

@@ -38,7 +38,7 @@ from .fees import burned_usd as _burned
 from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
 from .liquidation import LiquidationGuard, recent_liquidations
-from .marketdata import round_notional, round_size
+from .marketdata import round_notional, round_size, touch_text
 from .notify import Notifier
 from .positions import PositionBook, SeenTrades
 from .reconcile import (
@@ -56,33 +56,6 @@ from .ws_compat import fill_trade_id
 import contextlib
 
 log = logging.getLogger(__name__)
-
-
-def _touch_at(feed, symbol: str) -> str:
-    """The book either side of a fill, rendered for the log. Never raises.
-
-    A fill record says what we traded at; it does not say what the market was
-    at that instant, and the difference between those two is the whole question
-    when a run costs more than its fees. Without it a round trip can be totalled
-    but not attributed: the gap between a passive fill and the hedge covering it
-    is either spread that was crossed or price that moved in between, and those
-    two call for opposite remedies. Measured across a week of fills, the gap on
-    ETH ran fifty times the width of the book -- a number that says the
-    reasoning is wrong somewhere, not that the market is.
-
-    Defensive because this runs inside the socket's fill handler. A quote that
-    is missing, half-formed, or throwing is a reason to log less; it is never a
-    reason to lose a fill.
-    """
-    try:
-        quote = feed.quote(symbol)
-        bid = getattr(quote, "best_bid", None)
-        ask = getattr(quote, "best_ask", None)
-    except Exception:  # noqa: BLE001 - logging must not break the handler
-        return "bid=? ask=?"
-    left = f"bid={bid:.8f}" if bid else "bid=?"
-    right = f"ask={ask:.8f}" if ask else "ask=?"
-    return f"{left} {right}"
 
 
 # Reconnects tolerated before a dropped socket is treated as a persistent fault
@@ -356,7 +329,7 @@ class Strategy:
                 symbol,
                 float(fill.price or 0.0),
                 role,
-                _touch_at(self.feed, symbol),
+                touch_text(self.feed, symbol),
             )
             # Hand off to the worker rather than trading here -- awaiting an
             # order response inside this handler would deadlock the socket.
