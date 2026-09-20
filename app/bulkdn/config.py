@@ -375,7 +375,20 @@ class Config:
     # only after the phase ends. 0 disables it.
     max_phase_minutes: float = 30.0
     chase_interval_s: float = 1.0
+    # How often the hedge rule is re-run against the position book.
+    # Local arithmetic, so this costs nothing and stays brisk.
     reconcile_interval_s: float = 5.0
+    # How often positions are re-read from the exchange REGARDLESS of
+    # whether anything looks wrong. The read exists to catch a socket
+    # that has gone quiet without disconnecting -- and that condition is
+    # already measured, so it triggers the read directly. This is only
+    # the backstop underneath it, for a socket that chats but is wrong.
+    #
+    # It used to happen every reconcile_interval_s, which is one HTTP
+    # request per account every five seconds. At two accounts that was
+    # already enough to draw a 429 from the exchange; the pool this is
+    # being prepared for has a hundred.
+    position_sync_interval_s: float = 60.0
     cycles: int = 1
     hedge_tolerance_lots: float = 1.0
     overlay_ttl_ms: int = 2000
@@ -495,6 +508,8 @@ class Config:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
             raise ConfigError("reconcile_interval_s must be > 0")
+        if self.position_sync_interval_s <= 0:
+            raise ConfigError("position_sync_interval_s must be > 0")
         if self.cycles < 0:
             raise ConfigError("cycles must be >= 0 (0 means run forever)")
         # Below one lot the exchange cannot express the correction, so a
@@ -700,6 +715,9 @@ def load_config(
         max_phase_minutes=float(raw.get("max_phase_minutes", 30.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),
         reconcile_interval_s=float(raw.get("reconcile_interval_s", 5.0)),
+        position_sync_interval_s=float(
+            raw.get("position_sync_interval_s", 60.0)
+        ),
         cycles=target.cycles,
         target=target,
         hedge_tolerance_lots=float(raw.get("hedge_tolerance_lots", 1.0)),

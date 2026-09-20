@@ -241,7 +241,17 @@ max_phase_minutes: 30
 #  Execution timing
 # ---------------------------------------------------------------------------
 chase_interval_s: 1.0       # how often resting orders are re-evaluated
-reconcile_interval_s: 5.0   # how often positions are re-read from the exchange
+reconcile_interval_s: 5.0   # how often the hedge rule is re-run. Local
+                            # arithmetic, so this costs nothing.
+position_sync_interval_s: 60.0
+                            # how often positions are re-read from the
+                            # exchange with nothing looking wrong. The read
+                            # exists to catch a socket that goes quiet
+                            # without disconnecting, and that is measured
+                            # directly -- a session quiet for half of
+                            # ws_stale_timeout_s triggers a read at once.
+                            # This is only the backstop under it, for a
+                            # socket that talks and is still wrong.
 hedge_tolerance_lots: 1.0   # imbalance tolerated before hedging, in lots
 overlay_ttl_ms: 2000        # how long an unconfirmed fill is trusted
 

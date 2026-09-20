@@ -728,6 +728,7 @@ class Strategy:
         as often would buy nothing.
         """
         last_reconcile = 0.0
+        last_sync = 0.0
         while not self._stop.is_set():
             violations = self.risk.check()
             if violations and await self._healed(violations):
@@ -744,10 +745,13 @@ class Strategy:
                 # optimistic fill overlay expires -- so if those updates stall,
                 # the book decays toward zero and would otherwise make the bot
                 # believe it is flat while real positions are still open.
-                try:
-                    await self._sync_positions()
-                except Exception as exc:  # noqa: BLE001 - retried next tick
-                    log.error("position sync failed: %s", describe(exc))
+                reason = self._sync_reason(now, last_sync)
+                if reason:
+                    last_sync = now
+                    try:
+                        await self._sync_positions()
+                    except Exception as exc:  # noqa: BLE001 - retried next tick
+                        log.error("position sync failed: %s", describe(exc))
 
                 # Before hedging, not after. If a position was liquidated, the
                 # hedge rule's answer is to open a fresh one on the account that
@@ -771,6 +775,40 @@ class Strategy:
                 self._log_untradeable_residuals()
 
             await asyncio.sleep(self.config.chase_interval_s)
+
+    def _sync_reason(self, now: float, last_sync: float) -> str:
+        """Why positions should be re-read now, or "" for no reason to.
+
+        The read exists for one failure: a socket that stops delivering without
+        disconnecting. The book is fed by those deliveries and the optimistic
+        fill overlay expires, so a silent stall decays the book toward empty --
+        and the hedge rule, derived from an empty book, concludes the pair is
+        flat while real positions are still open.
+
+        That condition is measurable. Each session knows how long it has been
+        since it last heard anything, so the read is triggered by the evidence
+        rather than by a clock: a socket that is talking has nothing to be
+        checked against, and asking anyway is a request per account every few
+        seconds. Two accounts was already enough to draw a 429.
+
+        The quiet threshold is half of the risk limit that halts on a stale
+        socket, so the check happens while there is still time for it to mean
+        something rather than in the same breath as the halt.
+
+        The interval underneath is a backstop for the case the staleness clock
+        cannot see: a socket that delivers regularly and is nonetheless wrong.
+        """
+        quiet_after = self.config.risk.ws_stale_timeout_s / 2
+        for session in self.sessions.values():
+            try:
+                age = session.last_message_age_s
+            except Exception:  # noqa: BLE001 - a session that cannot say is one to check
+                return "a session could not report its age"
+            if age >= quiet_after:
+                return f"{session.name} has been quiet for {age:.0f}s"
+        if now - last_sync >= self.config.position_sync_interval_s:
+            return "periodic"
+        return ""
 
     async def _sync_positions(self, max_age_s: float = POSITION_FRESHNESS_S) -> None:
         """Read positions from the exchange, sharing one read between callers.
