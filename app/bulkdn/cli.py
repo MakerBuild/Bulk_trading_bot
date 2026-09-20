@@ -829,11 +829,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", help="override the log level in the config file")
     parser.add_argument(
         "--mode",
-        choices=("single", "multi"),
+        choices=("single", "multi", "pool"),
         help=(
-            "override the settings file: single trades only the master_account "
-            "leg, multi trades both. A leg is a complete delta-neutral pair on "
-            "its own, so single is the same strategy in one market"
+            "override the settings file: single trades one pair on one "
+            "market, multi trades two pairs on two. Both accounts trade in "
+            "either -- one opens the pair and the other hedges it"
         ),
     )
 

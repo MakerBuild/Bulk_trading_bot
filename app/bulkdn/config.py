@@ -351,19 +351,26 @@ class Config:
     # trades something else.
     master_account: LegConfig
     sub_account: LegConfig
-    # "multi" trades both legs, one symbol each. "single" trades only
-    # `master_account` and leaves `sub_account` alone.
+    # How many PAIRS trade at once, not how many accounts.
     #
-    # Single exists because the two legs are not equally cheap. Measured over
-    # a two-hour run, hedging cost 1.24 bps on BTC-USD against 3.59 on
-    # ETH-USD, and the difference survives excluding the self-trades that
-    # flatter the cheaper one. Concentrating on the better market is worth
-    # roughly a fifth to two fifths of the spread bill -- but it halves the
-    # number of legs earning volume at once, which is the trade being made.
+    #   multi    two pairs, one market each
+    #   single   one pair, on the market `master_account` names. The
+    #            `sub_account` block is unread -- it is a second leg, not a
+    #            second account.
+    #   pool     pairs drawn from every account under every key
     #
-    # Both legs remain delta-neutral on their own: one account opens, the
-    # other hedges, so a single leg is a complete pair rather than half of
-    # one. Nothing about neutrality depends on there being two.
+    # Both accounts trade in every one of them. The leg names invite the
+    # opposite reading: they say which account OPENS a leg, so "single trades
+    # only master_account" sounds like the sub-account sits idle. It does not.
+    # In single the master opens the pair and the sub-account hedges it,
+    # exactly as in multi -- there is one pair instead of two.
+    #
+    # Single exists because the markets are not equally cheap. Measured over a
+    # two-hour run, hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD,
+    # and the difference survives excluding the self-trades that flatter the
+    # cheaper one. Leaving out the dearer market is worth roughly a fifth to
+    # two fifths of the spread bill, against half as many pairs earning volume
+    # at a time.
     mode: str = "multi"
     # pool mode only. How many groups may be open at once, and how many
     # accounts may share one hedge.

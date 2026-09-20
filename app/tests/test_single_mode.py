@@ -183,10 +183,18 @@ def load(path, **kwargs):
     return load_config(path, require_credentials=False, require_sub1=False, **kwargs)
 
 
-def test_the_flag_exists_and_refuses_anything_else():
+@pytest.mark.parametrize("mode", ["single", "multi", "pool"])
+def test_the_flag_accepts_every_mode_there_is(mode):
+    """Every mode the config validates, or a flag exists that the settings
+    file accepts and the command line refuses."""
     from bulkdn.cli import build_parser
 
-    assert build_parser().parse_args(["--mode", "single", "run"]).mode == "single"
+    assert build_parser().parse_args(["--mode", mode, "run"]).mode == mode
+
+
+def test_the_flag_refuses_anything_else():
+    from bulkdn.cli import build_parser
+
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--mode", "solo", "run"])
 

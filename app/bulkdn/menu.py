@@ -780,10 +780,11 @@ def _write_mode(config_path: str, mode: str) -> None:
 def _markets(config: Config, config_path: str) -> None:
     """Switch between trading one market and two.
 
-    A leg is a complete delta-neutral pair on its own -- one account opens it,
-    the other hedges it -- so single is the same strategy in one market rather
-    than half a strategy. What it buys is the dearer market not being traded;
-    what it costs is half as many legs earning volume at a time.
+    Both accounts trade either way: one opens the pair, the other hedges it.
+    Single is one such pair on one market, multi is two pairs on two markets --
+    so single is not half a strategy, it is the same strategy with the dearer
+    market left out. What it costs is half as many pairs earning volume at a
+    time.
     """
     other = "multi" if config.mode == "single" else "single"
     live = ", ".join(leg.symbol for leg in config.active_legs)

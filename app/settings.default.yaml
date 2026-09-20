@@ -64,14 +64,22 @@
 #
 #  HOW MANY MARKETS: `mode`.
 #
-#    multi    both legs, one market each. Two markets earning volume at once.
-#    single   only `master_account`. `sub_account` is ignored entirely.
+#    multi    two pairs, one market each. Two markets at once.
+#    single   one pair, on the market named by `master_account`.
+#             The `sub_account` BLOCK below is unread -- that is a
+#             second leg, not a second account.
 #    pool     every account under every key in private_key.local, paired at
 #             random. See the `pool` block below.
 #
-#  Single is not a reduced version of the strategy: a leg is already a complete
-#  delta-neutral pair, because one account opens it and the other hedges it.
-#  Neutrality never depended on there being two legs, only on two accounts.
+#  BOTH ACCOUNTS TRADE IN EVERY MODE. The leg names are confusing about
+#  this: they say which account OPENS a leg, not which account the leg
+#  belongs to. In `single` the master opens the pair and the sub-account
+#  hedges it, exactly as it does in `multi` -- there is simply one pair
+#  instead of two.
+#
+#  So single is not a reduced strategy. A pair is already complete: one
+#  account long, the other short, netting to zero. What `multi` adds is a
+#  second pair on a second market, not a second account.
 #
 #  It is there because the markets are not equally cheap. Over a two-hour live
 #  run, hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD, and the gap
