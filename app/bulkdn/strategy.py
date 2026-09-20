@@ -90,6 +90,21 @@ RECONNECT_WINDOW_S = 600.0
 # enough that nobody acts on anything stale, long enough to collapse a burst.
 POSITION_FRESHNESS_S = 0.5
 
+# How long an execution-target reading stays good enough to reuse.
+#
+# The read walks the paginated fill history of every account the run
+# trades -- measured at 2.9-3.8 seconds against a single 575-fill account,
+# and a pool has a hundred of them. A configured leg asks once per cycle,
+# which is fine. The group dispatcher asks on every pass of its loop, and
+# that loop turns every chase_interval_s: without this it would start a
+# hundred paginated history walks twice a second, against an exchange that
+# answered 429 to two accounts polling every five seconds.
+#
+# The cost is overshooting a target by up to this much trading. The target
+# is already soft by design -- it is checked between cycles, never mid-
+# position -- so a late stop is the same kind of late it already was.
+TARGET_FRESHNESS_S = 30.0
+
 
 def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
     """How long a phase may run, in seconds. 0 means no limit.
@@ -175,6 +190,8 @@ class Strategy:
         self._reconnect_times: list[float] = []
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
+        # The last execution-target answer, and when it was read.
+        self._target_answer: tuple[float, str | None] = (0.0, None)
         # The largest size each leg may be drawn at, captured after the
         # margin plan has had its say. A range is written in the settings
         # file, but what the accounts can actually carry is decided at
@@ -1692,6 +1709,10 @@ class Strategy:
         if not target.measures_fills or not self.state.has_baseline:
             return None
 
+        read_at, answer = self._target_answer
+        if time.monotonic() - read_at < TARGET_FRESHNESS_S:
+            return answer
+
         try:
             totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - never block trading on this
@@ -1701,12 +1722,18 @@ class Strategy:
         burned = _burned(totals.fees_usd - self.state.baseline_fees_usd)
         volume = totals.qualifying_volume_usd - self.state.baseline_volume_usd
 
+        answer = None
         if target.burn_usd > 0 and burned >= target.burn_usd:
-            return f"burned ${burned:,.4f} of ${target.burn_usd:,.2f}"
-        if target.volume_usd > 0 and volume >= target.volume_usd:
-            return (
-                f"qualifying volume ${volume:,.2f} of ${target.volume_usd:,.2f}"
-            )
+            answer = f"burned ${burned:,.4f} of ${target.burn_usd:,.2f}"
+        elif target.volume_usd > 0 and volume >= target.volume_usd:
+            answer = f"qualifying volume ${volume:,.2f} of ${target.volume_usd:,.2f}"
+        # Cached only on a successful read. A failure is deliberately not
+        # remembered: it is reported as "not reached", and holding that for
+        # half a minute would turn one unreachable endpoint into a run that
+        # cannot notice its own goal.
+        self._target_answer = (time.monotonic(), answer)
+        if answer:
+            return answer
 
         if target.burn_usd > 0:
             log.info("burn progress: $%.4f / $%.2f", burned, target.burn_usd)

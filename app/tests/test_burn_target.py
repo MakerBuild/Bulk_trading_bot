@@ -58,6 +58,9 @@ class FakeStrategy:
         # them, not the first pair -- in pool mode that pair is two of a
         # hundred and ten.
         self.sessions = {self.master.pubkey: self.master, self.sub1.pubkey: self.sub1}
+        # No cached answer: each of these tests reads once and expects the
+        # read to happen.
+        self._target_answer = (0.0, None)
 
     async def reached(self):
         return await Strategy._target_reached(self)
@@ -76,7 +79,10 @@ def totals(monkeypatch):
     from bulkdn import strategy as strategy_module
 
     def fake(http, wallets):
+        fake.reads += 1
         return fake.value
+
+    fake.reads = 0
 
     monkeypatch.setattr(strategy_module, "realised_for_tree", fake)
     return fake
@@ -162,6 +168,10 @@ async def test_a_volume_target_also_counts_from_the_start(totals):
     assert await strategy.reached() is None
 
     totals.value = FakeTotals(0.0, volume=2000.0)
+    # The answer is cached for TARGET_FRESHNESS_S, because the read walks
+    # every account's paginated fill history. In a run these two checks are
+    # half a minute apart; here they are consecutive lines.
+    strategy._target_answer = (0.0, None)
     assert await strategy.reached()
 
 
@@ -221,3 +231,39 @@ def test_the_other_targets_refuse_a_negative_too():
         ExecutionTarget(cycles=-1).validate()
     with pytest.raises(ConfigError, match="volume_usd"):
         ExecutionTarget(volume_usd=-1.0).validate()
+
+
+# -- and it is not read on every tick ---------------------------------------
+
+
+async def test_a_second_check_inside_the_window_does_not_read_again(totals):
+    """The read walks every account's paginated fill history -- seconds, for a
+    pool of a hundred. The group dispatcher asks on every pass of its loop, so
+    without this it would start those walks twice a second against an exchange
+    that answered 429 to two accounts polling every five."""
+    totals.value = FakeTotals(0.0, volume=100.0)
+    strategy = FakeStrategy(
+        ExecutionTarget(volume_usd=1000.0), _started_at(0.0, volume=0.0)
+    )
+
+    await strategy.reached()
+    before = totals.reads
+    for _ in range(20):
+        await strategy.reached()
+
+    assert totals.reads == before, "the history was walked again inside the window"
+
+
+async def test_a_failed_read_is_not_remembered(totals, monkeypatch):
+    """Holding "not reached" for half a minute would turn one unreachable
+    endpoint into a run that cannot notice its own goal."""
+    strategy = FakeStrategy(
+        ExecutionTarget(volume_usd=1000.0), _started_at(0.0, volume=0.0)
+    )
+
+    async def boom():
+        raise RuntimeError("indexer down")
+
+    strategy._read_totals = boom
+    assert await strategy.reached() is None
+    assert strategy._target_answer == (0.0, None), "a failure was cached"
