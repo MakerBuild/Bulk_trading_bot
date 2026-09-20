@@ -39,6 +39,7 @@ from .fees import realised_for_tree
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
 from .liquidation import LiquidationGuard, recent_liquidations
 from .marketdata import round_notional, round_size, touch_text
+from .sizing import draw_sizes, resolve_notionals
 from .notify import Notifier
 from .positions import PositionBook, SeenTrades
 from .reconcile import (
@@ -168,6 +169,12 @@ class Strategy:
         self._reconnect_times: list[float] = []
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
+        # The largest size each leg may be drawn at, captured after the
+        # margin plan has had its say. A range is written in the settings
+        # file, but what the accounts can actually carry is decided at
+        # startup and may be smaller -- so a draw is clamped to what was
+        # planned rather than to what was asked for.
+        self._size_ceiling = {leg.symbol: leg.size for leg in config.active_legs}
 
     def _persist(self) -> None:
         """Save the state file, and survive not being able to.
@@ -907,6 +914,56 @@ class Strategy:
 
     # -- one leg's cycle ---------------------------------------------------
 
+    def _size_for_cycle(self, symbol: str, configured_size: float) -> float:
+        """This cycle's size for one leg, redrawn when it was written as a range.
+
+        A fixed size repeats exactly, and an exact repeat is a shape in the
+        fill history: the same notional, cycle after cycle, between the same
+        two accounts. Drawing inside a range removes that for the cost of one
+        `random.uniform` per cycle.
+
+        Returns `configured_size` untouched for a leg that is not a range, for
+        a price that is not available yet, or for anything that goes wrong in
+        the draw. A cycle at the configured size is a normal cycle; a cycle
+        that does not happen because the size could not be worked out is not.
+        """
+        config_leg = next(
+            (leg for leg in self.config.active_legs if leg.symbol == symbol), None
+        )
+        span = getattr(config_leg, "notional_span", None)
+        cap_span = getattr(config_leg, "max_order_span", None)
+        varies = (span is not None and span.is_range) or (
+            cap_span is not None and cap_span.is_range
+        )
+        if config_leg is None or not varies:
+            return configured_size
+
+        price = self.feed.reference_price(symbol)
+        if not price:
+            return configured_size
+        try:
+            draw_sizes([config_leg])
+            resolve_notionals(
+                legs=[config_leg], specs=self.feed.specs, prices={symbol: price}
+            )
+        except Exception as exc:  # noqa: BLE001 - a draw must not end the run
+            log.warning("%s: could not redraw the size (%s)", symbol, describe(exc))
+            return configured_size
+
+        ceiling = self._size_ceiling.get(symbol, config_leg.size)
+        drawn = min(config_leg.size, ceiling)
+        # The chaser reads its cap from this object on every step, so writing
+        # to it is what makes a redrawn cap take effect. Clamped for the same
+        # reason the size is.
+        params = getattr(self.chaser, "params", {}).get(symbol)
+        if params is not None:
+            params.max_order_size = min(config_leg.max_order_size, ceiling)
+        log.info(
+            "%s: this cycle %g (drawn from %s)",
+            symbol, drawn, span if span is not None else cap_span,
+        )
+        return drawn
+
     async def _run_leg(self, symbol: str, configured_size: float) -> None:
         """OPEN -> HOLD -> EXIT, repeatedly, for one leg on its own clock."""
         leg = self.state.leg(symbol)
@@ -930,7 +987,9 @@ class Strategy:
                 )
                 self.title.set_cycle(self.state.cycle_index)
                 log.info("=== %s cycle %d ===", symbol, leg.cycle_index)
-                await self._leg_open(symbol, configured_size)
+                await self._leg_open(
+                    symbol, self._size_for_cycle(symbol, configured_size)
+                )
 
             if self._stop.is_set():
                 return

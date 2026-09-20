@@ -135,6 +135,26 @@ def _why_it_did_not_fit(
     )
 
 
+def draw_sizes(legs: list) -> None:
+    """Redraw every leg written as a range. In place, before sizes are resolved.
+
+    Called once per cycle. A leg written as a plain number is untouched, so
+    this is a no-op for a config that asks for no variation.
+
+    Sizes drift within their range rather than repeating exactly, because an
+    exact repeat is a shape in the fill history: the same notional, cycle after
+    cycle, from the same pair of accounts, is the one thing a series of trades
+    cannot help but advertise about itself.
+    """
+    for leg in legs:
+        span = getattr(leg, "notional_span", None)
+        if span is not None and span.is_range:
+            leg.notional_usd = span.pick()
+        span = getattr(leg, "max_order_span", None)
+        if span is not None and span.is_range:
+            leg.max_order_notional_usd = span.pick()
+
+
 def resolve_notionals(
     *,
     legs: list,

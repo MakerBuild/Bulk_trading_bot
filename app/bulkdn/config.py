@@ -98,7 +98,12 @@ class LegConfig:
     symbol: str
     # Exactly one of these two carries the leg's size. See the class docstring.
     size: float = 0.0
+    # The value in force right now. A leg written as a range redraws this
+    # at the start of every cycle; a fixed one keeps the same number.
     notional_usd: float = 0.0
+    # How it was written, kept so the redraw has something to draw from.
+    # None means the setting was a plain number and never varies.
+    notional_span: Span | None = None
     offset_bps: float = 0.0
     max_distance_bps: float = 5.0
     # How long a resting order may go unfilled before it stops sitting
@@ -118,6 +123,7 @@ class LegConfig:
     # The per-order cap, in whichever unit suits; it defaults to the whole leg.
     max_order_size: float = 0.0
     max_order_notional_usd: float = 0.0
+    max_order_span: Span | None = None
     # None leaves whatever the account already has. The exchange's own ceiling
     # for the market is checked at startup, since it differs per symbol.
     leverage: float | None = None
@@ -235,45 +241,46 @@ class ExecutionTarget:
 
 
 @dataclass(frozen=True)
-class HoldTime:
-    """How long to stay fully open, drawn fresh at the start of every hold.
+class Span:
+    """A number that may be written as a range, and drawn from each time.
 
-    A fixed hold gives every cycle the same length, which is a shape anyone
-    reading the fill history can see. A range removes it at no cost, so the
-    config accepts both and a plain number is simply a range of zero width:
+    A fixed value repeats exactly, and an exact repeat is a pattern in the
+    fill history whether it is a hold length or an order size. A range
+    removes it at no cost, so anything that can be written as one accepts
+    all three spellings:
 
-        hold_minutes: 0.5          exactly 30 seconds, every cycle
-        hold_minutes: 0.5-1        somewhere between 30 and 60 seconds
-        hold_minutes: [0.5, 1]     the same thing, spelled as a list
+        4000            exactly that, every time
+        2000-6000       drawn uniformly between the two
+        [2000, 6000]    the same thing, spelled as a list
 
-    The draw happens once per cycle and is then stored as an absolute deadline
-    in the state file, so a restart mid-hold resumes the hold it was serving
-    rather than rolling a new one.
+    `name` is only ever used to say which setting was wrong; a message
+    naming `hold_minutes` when the operator mistyped `notional_usd` sends
+    them to the wrong line of the file.
     """
 
     low: float
     high: float
 
     @classmethod
-    def parse(cls, value: Any) -> HoldTime:
+    def parse(cls, value: Any, name: str = "value") -> Span:
         """Read a number, a `low-high` string, or a two-item list."""
-        if isinstance(value, HoldTime):
+        if isinstance(value, Span):
             return value
 
         if isinstance(value, bool):
-            # bool is an int subclass, and `hold_minutes: yes` is a mistake
-            # rather than a one-minute hold.
-            raise ConfigError(f"hold_minutes must be a number or a range, got {value!r}")
+            # bool is an int subclass, and `yes` is a mistake rather than a
+            # value of one.
+            raise ConfigError(f"{name} must be a number or a range, got {value!r}")
 
         if isinstance(value, (int, float)):
-            return cls._checked(value, value, value)
+            return cls._checked(value, value, value, name)
 
         if isinstance(value, (list, tuple)):
             if len(value) != 2:
                 raise ConfigError(
-                    f"hold_minutes as a list must hold exactly two values, got {list(value)!r}"
+                    f"{name} as a list must hold exactly two values, got {list(value)!r}"
                 )
-            return cls._checked(value[0], value[1], value)
+            return cls._checked(value[0], value[1], value, name)
 
         if isinstance(value, str):
             text = value.strip()
@@ -281,30 +288,30 @@ class HoldTime:
             # settings file documents, so it is the one that must work.
             low, sep, high = text.partition("-")
             if not sep:
-                return cls._checked(text, text, value)
-            return cls._checked(low, high, value)
+                return cls._checked(text, text, value, name)
+            return cls._checked(low, high, value, name)
 
-        raise ConfigError(f"hold_minutes must be a number or a range, got {value!r}")
+        raise ConfigError(f"{name} must be a number or a range, got {value!r}")
 
     @classmethod
-    def _checked(cls, low: Any, high: Any, original: Any) -> HoldTime:
+    def _checked(cls, low: Any, high: Any, original: Any, name: str) -> Span:
         try:
             lo, hi = float(str(low).strip()), float(str(high).strip())
         except (TypeError, ValueError) as exc:
             raise ConfigError(
-                f"hold_minutes must be a number or a range like 0.5-1, got {original!r}"
+                f"{name} must be a number or a range like 2000-6000, got {original!r}"
             ) from exc
         if lo < 0:
-            raise ConfigError(f"hold_minutes must be >= 0, got {original!r}")
+            raise ConfigError(f"{name} must be >= 0, got {original!r}")
         if hi < lo:
             raise ConfigError(
-                f"hold_minutes range runs backwards -- write the smaller number "
+                f"{name} range runs backwards -- write the smaller number "
                 f"first, got {original!r}"
             )
         return cls(lo, hi)
 
     def pick(self) -> float:
-        """Minutes to hold for one cycle."""
+        """One draw. A fixed value returns itself."""
         if self.high == self.low:
             return self.low
         return random.uniform(self.low, self.high)
@@ -317,6 +324,24 @@ class HoldTime:
         if self.is_range:
             return f"{self.low:g}-{self.high:g}"
         return f"{self.low:g}"
+
+
+@dataclass(frozen=True)
+class HoldTime(Span):
+    """How long to stay fully open, drawn fresh at the start of every hold.
+
+        hold_minutes: 0.5          exactly 30 seconds, every cycle
+        hold_minutes: 0.5-1        somewhere between 30 and 60 seconds
+        hold_minutes: [0.5, 1]     the same thing, spelled as a list
+
+    The draw happens once per cycle and is then stored as an absolute
+    deadline in the state file, so a restart mid-hold resumes the hold it
+    was serving rather than rolling a new one.
+    """
+
+    @classmethod
+    def parse(cls, value: Any, name: str = "hold_minutes") -> HoldTime:
+        return super().parse(value, name)
 
 
 @dataclass
@@ -480,19 +505,43 @@ class Config:
         self.risk.validate()
 
 
+def _span_from_raw(raw: dict[str, Any], key: str, name: str) -> Span | None:
+    """A leg size, which may be a range. None when the key is absent.
+
+    The margin plan at startup is built from the HIGH end, not from the first
+    draw: every later draw then fits inside a budget that was already checked,
+    so a cycle that happens to roll a big number cannot be the one that
+    discovers there was not enough margin for it.
+    """
+    if key not in raw or raw[key] is None:
+        return None
+    return Span.parse(raw[key], f"legs.{name}.{key}")
+
+
 def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"legs.{name} must be a mapping")
     size = float(raw.get("size") or 0.0)
-    notional_usd = float(raw.get("notional_usd") or 0.0)
     cap_size = float(raw.get("max_order_size") or 0.0)
-    cap_usd = float(raw.get("max_order_notional_usd") or 0.0)
+
+    # Both dollar settings may be written as a range. The value carried
+    # forward is the HIGH end, because the margin plan at startup is built
+    # from it: every later draw then fits inside a budget already checked,
+    # so the cycle that rolls a big number is not the one that discovers
+    # there was never margin for it.
+    notional_span = _span_from_raw(raw, "notional_usd", name)
+    cap_span = _span_from_raw(raw, "max_order_notional_usd", name)
+    notional_usd = notional_span.high if notional_span else 0.0
+    cap_usd = cap_span.high if cap_span else 0.0
 
     # An unset cap means "the whole leg", expressed in the unit the leg used.
     # Resolving it here keeps `size` and its cap in step when a dollar leg is
     # later converted.
     if cap_size <= 0 and cap_usd <= 0:
         cap_size, cap_usd = size, notional_usd
+        # A leg capped by its own size follows that size when it is drawn,
+        # rather than being pinned to the high end for the rest of the run.
+        cap_span = notional_span
 
     # Retired settings. Unknown keys are otherwise ignored in silence, which
     # would let someone tune a number that stopped being read and conclude the
@@ -510,6 +559,8 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             symbol=raw["symbol"],
             size=size,
             notional_usd=notional_usd,
+            notional_span=notional_span,
+            max_order_span=cap_span,
             offset_bps=float(raw.get("offset_bps", 0.0)),
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
             chase_patience_s=float(raw.get("chase_patience_s", 3.0)),

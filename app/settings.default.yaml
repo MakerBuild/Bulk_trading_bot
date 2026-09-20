@@ -31,6 +31,22 @@
 #  Dollars do not change meaning when you change `symbol`, which is the whole
 #  point: the bot converts to a quantity at the current price when it starts.
 #
+#  Either dollar setting may be written as a RANGE instead of one number,
+#  the same way hold_minutes is:
+#
+#    notional_usd: 4000             exactly that, every cycle
+#    notional_usd: 2000-6000        drawn fresh at the start of each cycle
+#    notional_usd: [2000, 6000]     the same thing, spelled as a list
+#
+#  A fixed size repeats exactly, and an exact repeat is a shape in the fill
+#  history: the same notional, cycle after cycle, between the same two
+#  accounts. A range removes that for nothing.
+#
+#  Margin is planned from the HIGH end at startup, so every later draw fits
+#  inside a budget that was already checked -- and a draw is clamped to what
+#  the plan allowed, which may be less than the range asks for when the
+#  accounts are thin.
+#
 #  The old way still works, one leg at a time, if you want an exact quantity:
 #
 #    size: 0.001           0.001 of the base coin, per cycle
