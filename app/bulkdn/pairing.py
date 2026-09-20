@@ -152,6 +152,18 @@ class Pairing:
         self.busy.update(group.accounts)
         return self._next_id, group
 
+    def reserve(self, group_id: int, group: Group) -> None:
+        """Put a group back as it was, without drawing it.
+
+        Used on restart: the positions already exist, so the accounts are
+        already busy whether or not this process knows it. Re-drawing them
+        instead would let a second group form on accounts that are mid-cycle,
+        and the two would compute their hedges from the same positions.
+        """
+        self.active[group_id] = group
+        self.busy.update(group.accounts)
+        self._next_id = max(self._next_id, group_id)
+
     def release(self, group_id: int) -> Group | None:
         """Hand a finished group's accounts back to the pool."""
         group = self.active.pop(group_id, None)

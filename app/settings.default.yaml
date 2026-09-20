@@ -66,6 +66,8 @@
 #
 #    multi    both legs, one market each. Two markets earning volume at once.
 #    single   only `master_account`. `sub_account` is ignored entirely.
+#    pool     every account under every key in private_key.local, paired at
+#             random. See the `pool` block below.
 #
 #  Single is not a reduced version of the strategy: a leg is already a complete
 #  delta-neutral pair, because one account opens it and the other hedges it.
@@ -84,6 +86,40 @@
 #  market.
 # ---------------------------------------------------------------------------
 mode: multi
+
+# ---------------------------------------------------------------------------
+#  POOL MODE
+#
+#  Only read when mode is `pool`. Every account under every key in
+#  private_key.local joins one pool, and groups are drawn from it per cycle:
+#  one account opens, one or more cover it, and they disband when the cycle
+#  ends. The next cycle draws different accounts, a different market and a
+#  different size.
+#
+#  The point is that a fixed pairing is the clearest signal a series of trades
+#  can give about itself -- the same two pubkeys, the same size, the same
+#  market, over and over. Splitting the hedge removes the rest of it: $4,000
+#  answered by one account of $4,000 is a line anyone can draw, and the same
+#  $4,000 answered by $1,800, $1,400 and $800 is not.
+#
+#    max_groups   how many groups may trade at once. A hundred accounts allow
+#                 fifty, which is fifty resting orders being chased and fifty
+#                 hedges chasing them -- against an exchange that answers 429
+#                 to two accounts polling every five seconds. Raise it slowly
+#                 and watch the log for rejections.
+#
+#    max_takers   how many accounts may share one hedge. 1 means no split.
+#                 A share that falls under the market's minimum order cannot
+#                 be sent at all, so the split is floored -- asking for more
+#                 pieces than the size can carry simply yields fewer.
+#
+#  An account is only ever in one group at a time. That is arithmetic, not
+#  tidiness: the hedge is derived from positions, so an account in two groups
+#  has one position serving two sums and both are wrong.
+# ---------------------------------------------------------------------------
+pool:
+  max_groups: 5
+  max_takers: 1
 
 legs:
   master_account:

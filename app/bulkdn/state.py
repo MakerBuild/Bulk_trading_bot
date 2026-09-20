@@ -79,6 +79,17 @@ class LegState:
     # and the flag was lost on restart, so a leg that had already given
     # up its offset went back to waiting out its patience again.
     tightened: bool = False
+    # The group that drew this leg, when one did. A restart has to be
+    # able to work out who opened what: the positions are on the
+    # exchange either way, and without this the accounts holding them
+    # cannot be identified and nothing would ever close them.
+    #
+    # Empty for a leg that came from the config, which is every leg
+    # outside pool mode.
+    group_id: int = 0
+    maker: str = ""
+    takers: list = field(default_factory=list)
+    shares: list = field(default_factory=list)
     cycle_index: int = 0
     # Order IDs that were replaced but whose cancels were never confirmed.
     # Swept on the next chase pass so a failed cancel can't leave a duplicate

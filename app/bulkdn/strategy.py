@@ -42,6 +42,7 @@ from .liquidation import LiquidationGuard, recent_liquidations
 from .marketdata import round_notional, round_size, touch_text
 from .sizing import draw_sizes, resolve_notionals
 from .notify import Notifier
+from .accounts import short_pubkey
 from .pairing import Group, Pairing
 from .positions import PositionBook, SeenTrades
 from .reconcile import (
@@ -1112,6 +1113,49 @@ class Strategy:
         )
         return drawn
 
+    def restore_groups(self) -> list[tuple[int, Group, str]]:
+        """Groups that were mid-cycle when the process stopped.
+
+        Their accounts are marked busy again rather than re-drawn: the
+        positions exist on the exchange whether or not this process remembers
+        them, so drawing those accounts into a second group would have two
+        groups computing their hedges from one set of positions.
+
+        A leg that had finished its cycle is left alone -- it holds nothing,
+        and resuming it would open a cycle nobody asked for.
+        """
+        resumed: list[tuple[int, Group, str]] = []
+        for key, leg in self.state.legs.items():
+            if not leg.group_id or not leg.maker or not leg.takers:
+                continue
+            if leg.phase in (Phase.IDLE, Phase.COMPLETE):
+                continue
+            group = Group(
+                symbol=leg.symbol,
+                maker=leg.maker,
+                takers=tuple(leg.takers),
+                shares=tuple(leg.shares) or (1.0,) * len(leg.takers),
+            )
+            missing = [a for a in group.accounts if a not in self.sessions]
+            if missing:
+                # The key that signs for it is no longer in the key file, so
+                # the position cannot be closed by this run. Said loudly
+                # rather than skipped quietly: it is real exposure.
+                log.error(
+                    "%s was opened by accounts this run cannot sign for (%s) "
+                    "-- its position is still open and needs the key that "
+                    "opened it",
+                    key, ", ".join(short_pubkey(a) for a in missing),
+                )
+                continue
+            self._groups[key] = group
+            self._group_ids[key] = leg.group_id
+            if self.pairing is not None:
+                self.pairing.reserve(leg.group_id, group)
+            resumed.append((leg.group_id, group, key))
+            log.warning("resuming group %d mid-%s: %s", leg.group_id, leg.phase.value, group)
+        return resumed
+
     def group_key(self, group_id: int, symbol: str) -> str:
         """What a drawn group's leg is filed under.
 
@@ -1132,6 +1176,16 @@ class Strategy:
         key = self.group_key(group_id, group.symbol)
         self._groups[key] = group
         self._group_ids[key] = group_id
+        # Written onto the leg before anything is opened, so a restart that
+        # lands mid-cycle can work out which accounts hold what. The positions
+        # are on the exchange either way; without this nobody can say whose
+        # they are, and nothing would close them.
+        leg = self.state.leg(key, group.symbol)
+        leg.group_id = group_id
+        leg.maker = group.maker
+        leg.takers = list(group.takers)
+        leg.shares = list(group.shares)
+        self._persist()
         log.info("=== group %d drawn: %s ===", group_id, group)
         try:
             await self._run_leg(key, size, once=True)
@@ -1163,6 +1217,13 @@ class Strategy:
         better by continuing to open positions.
         """
         running: set[asyncio.Task] = set()
+        # Groups that were mid-cycle when the process stopped go first, and
+        # before any new one is drawn: their accounts are already committed,
+        # and a fresh draw made while they are unaccounted for could hand the
+        # same accounts to a second group.
+        for group_id, group, _key in self.restore_groups():
+            size = self.state.leg(self.group_key(group_id, group.symbol)).target_size
+            running.add(asyncio.create_task(self._run_group(group_id, group, size)))
         try:
             while not self._stop.is_set():
                 for task in [t for t in running if t.done()]:
