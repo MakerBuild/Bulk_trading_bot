@@ -443,3 +443,32 @@ def test_an_empty_book_is_said_so_rather_than_printed_as_zero(tmp_path, caplog):
 
     line = next(r.getMessage() for r in caplog.records if "fill on " in r.getMessage())
     assert "bid=? ask=?" in line
+
+
+# -- the hedge queue carries a leg, not a market ----------------------------
+
+
+def test_a_fill_signals_the_leg_it_belongs_to(tmp_path):
+    """The same string as the market today. The indirection is what lets two
+    legs share a market later without the worker guessing which one filled."""
+    strategy, _book, master, _sub1 = build(tmp_path)
+    strategy.install_handlers()
+
+    master.handlers[Topic.FILL][0](FakeFill(symbol=BTC, size=0.1, side=Side.BUY))
+
+    assert strategy._hedge_queue.get_nowait() == BTC
+
+
+def test_the_worker_resolves_a_key_back_to_its_roles(tmp_path):
+    strategy, _book, _master, _sub1 = build(tmp_path)
+    roles = strategy._roles_for_key(BTC)
+    assert roles is not None
+    assert roles.symbol == BTC
+    assert roles.key == BTC
+
+
+def test_a_key_for_a_market_we_do_not_trade_resolves_to_nothing(tmp_path):
+    """A stale signal after a config change must not hedge something the run
+    is not holding."""
+    strategy, _book, _master, _sub1 = build(tmp_path)
+    assert strategy._roles_for_key("DOGE-USD") is None

@@ -341,7 +341,10 @@ class Strategy:
             )
             # Hand off to the worker rather than trading here -- awaiting an
             # order response inside this handler would deadlock the socket.
-            self._hedge_queue.put_nowait(symbol)
+            # By leg key, not by market: the two are the same string until a
+            # group owns the leg, and the worker must not have to guess which
+            # of two legs on one market a fill belonged to.
+            self._hedge_queue.put_nowait(roles.key if roles is not None else symbol)
 
         return handler
 
@@ -493,8 +496,22 @@ class Strategy:
 
     # -- workers -----------------------------------------------------------
 
+    def _roles_for_key(self, key: str) -> LegRoles | None:
+        """The roles of the leg filed under `key`, at whatever phase it is in.
+
+        A leg is keyed by its market until an account pool gives it a group of
+        its own, so today this resolves to the same leg `leg_roles` would --
+        the indirection is what lets two legs share a market later without the
+        hedge worker having to guess which of them a fill belonged to.
+        """
+        leg = self.state.legs.get(key)
+        symbol = leg.symbol if leg is not None else key
+        if symbol not in self.symbols:
+            return None
+        return self._roles_by_symbol(self.state.leg(key, symbol).phase).get(symbol)
+
     async def _hedge_worker(self) -> None:
-        """Drains fill signals and restores neutrality, one symbol at a time."""
+        """Drains fill signals and restores neutrality, one leg at a time."""
         while not self._stop.is_set():
             # Checked first and on every pass, including the idle one. A
             # liquidation leaves the survivor outright directional, so it must
@@ -505,21 +522,23 @@ class Strategy:
                 continue
 
             try:
-                symbol = await asyncio.wait_for(self._hedge_queue.get(), timeout=0.5)
+                key = await asyncio.wait_for(self._hedge_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
                 continue
 
-            if symbol not in self.symbols:
+            roles = self._roles_for_key(key)
+            if roles is None:
                 continue
-            roles = self.leg_roles(symbol)
             try:
-                await self.hedger.hedge(roles, mark_price=self.feed.reference_price(symbol))
+                await self.hedger.hedge(
+                    roles, mark_price=self.feed.reference_price(roles.symbol)
+                )
             except HedgeLimitExceeded as exc:
                 self._trigger_halt(f"hedge limit exceeded -- {exc}")
             except Exception as exc:
                 # The reconciler re-derives from position, so a single failure
                 # is recoverable; a persistent one trips the reject streak.
-                log.error("hedge for %s failed: %s", symbol, describe(exc))
+                log.error("hedge for %s failed: %s", key, describe(exc))
 
     def _trigger_halt(self, reason: str) -> None:
         if self._halt_reason is None:
