@@ -64,35 +64,22 @@
 #
 #  HOW MANY MARKETS: `mode`.
 #
-#    multi    two pairs, one market each. Two markets at once.
-#    single   one pair, on the market named by `master_account`.
-#             The `sub_account` BLOCK below is unread -- that is a
-#             second leg, not a second account.
-#    pool     every account under every key in private_key.local, paired at
-#             random. See the `pool` block below.
+#    single   one market  -- the one in the `master_account` block
+#    multi    two markets -- one per block
+#    pool     many, drawn at random from every key in private_key.local
 #
-#  BOTH ACCOUNTS TRADE IN EVERY MODE. The leg names are confusing about
-#  this: they say which account OPENS a leg, not which account the leg
-#  belongs to. In `single` the master opens the pair and the sub-account
-#  hedges it, exactly as it does in `multi` -- there is simply one pair
-#  instead of two.
+#  Both accounts trade in all three. `master_account` and `sub_account` name
+#  the two BLOCKS below, not the two accounts: each block sets a market and a
+#  size. `single` reads only the first one.
 #
-#  So single is not a reduced strategy. A pair is already complete: one
-#  account long, the other short, netting to zero. What `multi` adds is a
-#  second pair on a second market, not a second account.
+#  Which to pick: the markets are not equally cheap. Over a two-hour live run,
+#  hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD. Dropping the
+#  dearer one is worth roughly a fifth to two fifths of the spread bill, and
+#  costs half as many pairs earning volume at a time.
 #
-#  It is there because the markets are not equally cheap. Over a two-hour live
-#  run, hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD, and the gap
-#  survives excluding the self-trades that flatter the cheaper one. Dropping
-#  the dearer market is worth roughly a fifth to two fifths of what the spread
-#  costs -- against half as many legs earning volume at a time. Which of those
-#  matters more depends on whether you are chasing volume or minding the bill.
-#
-#  Two legs on the SAME symbol is refused in multi mode: roles are held per
-#  symbol, so the second leg would overwrite the first and one of them would
-#  silently stop trading. `mode: single` is the supported way to trade one
-#  market.
-# ---------------------------------------------------------------------------
+#  Two blocks may not name the same market in `multi`: roles are held per
+#  market, so one would overwrite the other and stop trading. Use `single`,
+#  or `pool`, to trade one market.
 mode: multi
 
 # ---------------------------------------------------------------------------
