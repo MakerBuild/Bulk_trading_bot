@@ -195,3 +195,57 @@ def test_a_deleted_file_is_rewritten_even_if_unchanged(tmp_path):
 
     store.save(state)
     assert path.exists()
+
+
+# -- a leg filed under something other than its market ----------------------
+#
+# Two groups trading one market at once is the point of the account pool, and
+# until now a leg WAS its market: both would have written over each other's
+# phase, order id and cycle count.
+
+
+def test_a_leg_is_still_filed_under_its_market_by_default():
+    """Every caller and every state file written so far means this."""
+    state = StrategyState()
+    leg = state.leg("BTC-USD")
+    assert leg.symbol == "BTC-USD"
+    assert leg.id == "BTC-USD"
+
+
+def test_two_legs_on_one_market_keep_separate_state():
+    state = StrategyState()
+    first = state.leg("g1:BTC-USD", symbol="BTC-USD")
+    second = state.leg("g2:BTC-USD", symbol="BTC-USD")
+
+    first.oid = "order-one"
+    first.cycle_index = 4
+
+    assert second.oid is None, "one leg's order leaked into the other"
+    assert second.cycle_index == 0
+    assert first.symbol == second.symbol == "BTC-USD"
+
+
+def test_asking_twice_returns_the_same_leg():
+    state = StrategyState()
+    assert state.leg("g1:BTC-USD", symbol="BTC-USD") is state.leg("g1:BTC-USD")
+
+
+def test_a_keyed_leg_survives_a_restart():
+    state = StrategyState()
+    state.leg("g1:BTC-USD", symbol="BTC-USD").target_size = 0.25
+
+    revived = StrategyState.from_dict(state.to_dict())
+    leg = revived.leg("g1:BTC-USD")
+    assert leg.target_size == 0.25
+    assert leg.symbol == "BTC-USD"
+    assert leg.id == "g1:BTC-USD"
+
+
+def test_a_state_file_written_before_ids_existed_still_loads():
+    """It was keyed by market, which is exactly what the id then was."""
+    revived = StrategyState.from_dict(
+        {"legs": {"BTC-USD": {"symbol": "BTC-USD", "target_size": 0.5}}}
+    )
+    leg = revived.leg("BTC-USD")
+    assert leg.id == "BTC-USD"
+    assert leg.target_size == 0.5

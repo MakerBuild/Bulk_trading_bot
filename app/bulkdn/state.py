@@ -50,6 +50,12 @@ class LegState:
     """
 
     symbol: str
+    # What this leg is filed under. Empty means the market, which is what
+    # every leg was until an account pool made two legs on one market
+    # possible -- at which point the market stopped being a name and
+    # became a property, and two legs trading BTC-USD would have written
+    # over each other's phase, order id and cycle count.
+    id: str = ""
     oid: str | None = None
     price: float | None = None
     size: float | None = None
@@ -117,10 +123,16 @@ class StrategyState:
         self.baseline_volume_usd = 0.0
         self.baseline_at = 0.0
 
-    def leg(self, symbol: str) -> LegState:
-        if symbol not in self.legs:
-            self.legs[symbol] = LegState(symbol=symbol)
-        return self.legs[symbol]
+    def leg(self, key: str, symbol: str | None = None) -> LegState:
+        """The leg filed under `key`, created on first ask.
+
+        `symbol` is the market it trades, and defaults to the key -- which is
+        what a leg keyed by its market has always meant, and keeps every
+        existing caller and every existing state file reading the same.
+        """
+        if key not in self.legs:
+            self.legs[key] = LegState(symbol=symbol or key, id=key)
+        return self.legs[key]
 
     def hold_remaining_s(self) -> float:
         return max(0.0, self.hold_until - time.time())
@@ -155,8 +167,11 @@ class StrategyState:
     @classmethod
     def from_dict(cls, data: dict) -> StrategyState:
         legs = {}
-        for symbol, stored in (data.get("legs") or {}).items():
+        for key, stored in (data.get("legs") or {}).items():
             fields = dict(stored)
+            # Files written before legs had ids of their own were keyed by
+            # market, which is exactly what the id then was.
+            fields.setdefault("id", key)
             # Written before legs had phases of their own. Inheriting the
             # cycle's phase is what that file meant.
             fields["phase"] = Phase(
@@ -164,7 +179,7 @@ class StrategyState:
             )
             fields.setdefault("hold_until", float(data.get("hold_until", 0.0)))
             fields.setdefault("cycle_index", int(data.get("cycle_index", 0)))
-            legs[symbol] = LegState(**fields)
+            legs[key] = LegState(**fields)
         return cls(
             phase=Phase(data.get("phase", Phase.IDLE.value)),
             cycle_index=int(data.get("cycle_index", 0)),
