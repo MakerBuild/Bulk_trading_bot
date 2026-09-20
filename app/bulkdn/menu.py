@@ -42,10 +42,19 @@ class NoAccountTree(Exception):
 
 
 def _box(title: str, lines: list[str]) -> str:
-    top = "+" + "-" * (BOX_WIDTH - 2) + "+"
-    out = [top, "|" + title.center(BOX_WIDTH - 2) + "|", top]
+    """A framed menu. Grows rather than letting a long line break the frame.
+
+    `ljust` pads but never truncates, so an entry wider than BOX_WIDTH hung
+    out past the right-hand border and left the box visibly broken -- which
+    is exactly what a menu looks like the day it gains a longer label. The
+    width follows the content instead, and every screen that already fits
+    keeps the size it always had.
+    """
+    width = max(BOX_WIDTH, max((len(line) for line in lines), default=0) + 4)
+    top = "+" + "-" * (width - 2) + "+"
+    out = [top, "|" + title.center(width - 2) + "|", top]
     for line in lines:
-        out.append("| " + line.ljust(BOX_WIDTH - 4) + " |")
+        out.append("| " + line.ljust(width - 4) + " |")
     out.append(top)
     return "\n".join(out)
 
@@ -133,6 +142,9 @@ def _http(config: Config):
 
 
 def _start(config: Config) -> None:
+    # Named here because the mode can also come from the command line, so the
+    # settings file is not proof of what this run will trade.
+    print(f"\n  {config.mode}: {', '.join(leg.symbol for leg in config.active_legs)}")
     print("\n  1. dry run  -- connects and logs, submits nothing")
     print("  2. live     -- REAL FUNDS")
     print("  0. back")
@@ -142,7 +154,9 @@ def _start(config: Config) -> None:
     if choice == "1":
         asyncio.run(cmd_run(config, dry_run=True))
     elif choice == "2":
-        if _confirm(f"Start a live cycle: {config.cycles or 'unlimited'} cycle(s), "
+        if _confirm(f"Start a live cycle on "
+                    f"{', '.join(leg.symbol for leg in config.active_legs)}: "
+                    f"{config.cycles or 'unlimited'} cycle(s), "
                     f"{config.hold_minutes} min hold."):
             asyncio.run(cmd_run(config, dry_run=False))
         else:
@@ -731,6 +745,68 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
     print(f"  {label} set to {_render_number(value)} in {config_path}")
 
 
+MODE_COMMENT = (
+    "# Which markets to trade. multi = both legs, single = master_account only."
+)
+
+
+def _write_mode(config_path: str, mode: str) -> None:
+    """Set the top-level `mode` key, keeping the rest of the file as it is.
+
+    Inserted above `legs:` when absent rather than appended, because that is
+    where it is documented and where someone reading the file will look for
+    it. Line-walking rather than a regex for the same reason the execution
+    target uses one: the file is full of comments that must survive.
+    """
+    with open(config_path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    at = next(
+        (i for i, line in enumerate(lines) if line.strip().startswith("mode:")
+         and not line.startswith((" ", "\t"))),
+        None,
+    )
+    if at is not None:
+        lines[at] = f"mode: {mode}"
+    else:
+        legs = next((i for i, line in enumerate(lines) if line.strip() == "legs:"), None)
+        block = [MODE_COMMENT, f"mode: {mode}", ""]
+        lines = [*lines, "", *block] if legs is None else [*lines[:legs], *block, *lines[legs:]]
+
+    with open(config_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def _markets(config: Config, config_path: str) -> None:
+    """Switch between trading one market and two.
+
+    A leg is a complete delta-neutral pair on its own -- one account opens it,
+    the other hedges it -- so single is the same strategy in one market rather
+    than half a strategy. What it buys is the dearer market not being traded;
+    what it costs is half as many legs earning volume at a time.
+    """
+    other = "multi" if config.mode == "single" else "single"
+    live = ", ".join(leg.symbol for leg in config.active_legs)
+    print(f"\n  now: {config.mode} -- trading {live}")
+    if other == "multi":
+        both = (config.master_account.symbol, config.sub_account.symbol)
+        if both[0] == both[1]:
+            print(f"\n  Cannot switch to multi: both legs name {both[0]}, and roles are")
+            print("  held per symbol, so one leg would overwrite the other. Give")
+            print("  sub_account a different symbol in the settings file first.")
+            return
+        print(f"  switching to multi would trade {both[0]} and {both[1]}")
+    else:
+        print(f"  switching to single would trade {config.master_account.symbol} only")
+
+    if not _confirm(f"Switch to {other}."):
+        print("  unchanged")
+        return
+    _write_mode(config_path, other)
+    config.mode = other
+    print(f"  mode set to {other} in {config_path}")
+
+
 def _target_progress(config: Config) -> None:
     """Realised spend and volume, for this run and for the account's lifetime.
 
@@ -798,8 +874,11 @@ def _configuration(config: Config, config_path: str) -> None:
             f"1. Number of Cycles      [{target.cycles or 'unlimited'}]",
             f"2. Total Amount to Burn  [${target.burn_usd:,.2f}]",
             f"3. Total Trading Volume  [${target.volume_usd:,.2f}]",
-            "4. Progress",
-            "5. Back",
+            "",
+            f"4. Markets               [{config.mode}]",
+            f"     {', '.join(leg.symbol for leg in config.active_legs)}",
+            "5. Progress",
+            "6. Back",
         ]))
         choice = _ask("\n  > ")
         if choice == "1":
@@ -809,8 +888,10 @@ def _configuration(config: Config, config_path: str) -> None:
         elif choice == "3":
             _edit_target(config, config_path, "volume_usd", "volume target (USD, qualifying)")
         elif choice == "4":
+            _markets(config, config_path)
+        elif choice == "5":
             _target_progress(config)
-        elif choice in ("5", "0"):
+        elif choice in ("6", "0"):
             return
 
 
