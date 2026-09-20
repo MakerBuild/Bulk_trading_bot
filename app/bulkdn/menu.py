@@ -777,35 +777,79 @@ def _write_mode(config_path: str, mode: str) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
-def _markets(config: Config, config_path: str) -> None:
-    """Switch between trading one market and two.
+MODE_CHOICES = ("single", "multi", "pool")
 
-    Both accounts trade either way: one opens the pair, the other hedges it.
-    Single is one such pair on one market, multi is two pairs on two markets --
-    so single is not half a strategy, it is the same strategy with the dearer
-    market left out. What it costs is half as many pairs earning volume at a
-    time.
+
+def _mode_summary(config: Config, mode: str) -> str:
+    """One line saying what a mode would actually trade.
+
+    Written per mode rather than once, because the interesting part is
+    different in each: which market for single, which two for multi, and how
+    many keys feed the pool.
     """
-    other = "multi" if config.mode == "single" else "single"
-    live = ", ".join(leg.symbol for leg in config.active_legs)
-    print(f"\n  now: {config.mode} -- trading {live}")
-    if other == "multi":
-        both = (config.master_account.symbol, config.sub_account.symbol)
-        if both[0] == both[1]:
-            print(f"\n  Cannot switch to multi: both legs name {both[0]}, and roles are")
-            print("  held per symbol, so one leg would overwrite the other. Give")
-            print("  sub_account a different symbol in the settings file first.")
-            return
-        print(f"  switching to multi would trade {both[0]} and {both[1]}")
-    else:
-        print(f"  switching to single would trade {config.master_account.symbol} only")
+    if mode == "single":
+        return f"one pair on {config.master_account.symbol}"
+    if mode == "multi":
+        first, second = config.master_account.symbol, config.sub_account.symbol
+        if first == second:
+            return f"REFUSED -- both legs name {first}"
+        return f"two pairs, on {first} and {second}"
+    keys = len(config.private_keys)
+    markets = " and ".join(
+        dict.fromkeys((config.master_account.symbol, config.sub_account.symbol))
+    )
+    if not keys:
+        return "REFUSED -- no keys in private_key.local"
+    return (
+        f"pairs drawn from every account under {keys} key(s), on {markets}; "
+        f"up to {config.max_groups} at once"
+    )
 
-    if not _confirm(f"Switch to {other}."):
+
+def _markets(config: Config, config_path: str) -> None:
+    """Choose how many pairs trade at once, and from which accounts.
+
+    Both accounts trade in every mode: one opens the pair, the other hedges
+    it. The modes differ in how many pairs run and where their accounts come
+    from -- the config file, or a pool drawn from every key.
+    """
+    print(f"\n  now: {config.mode}")
+    for index, mode in enumerate(MODE_CHOICES, start=1):
+        marker = "*" if mode == config.mode else " "
+        print(f"  {marker} {index}. {mode:<7} {_mode_summary(config, mode)}")
+    print("    0. back")
+
+    answer = _ask("\n  > ")
+    if answer in ("", "0"):
+        return
+    if answer not in [str(n) for n in range(1, len(MODE_CHOICES) + 1)]:
+        print("  not one of the choices")
+        return
+
+    chosen = MODE_CHOICES[int(answer) - 1]
+    if chosen == config.mode:
+        print(f"  already {chosen}")
+        return
+
+    # The summary carries the refusal, so it cannot say one thing on the menu
+    # and another here.
+    summary = _mode_summary(config, chosen)
+    if summary.startswith("REFUSED"):
+        print(f"\n  Cannot switch to {chosen}: {summary[10:]}.")
+        if chosen == "multi":
+            print("  Roles are held per symbol, so one leg would overwrite the")
+            print("  other and one of them would silently stop trading. Give")
+            print("  sub_account a different symbol in the settings file first.")
+        else:
+            print("  Put one base58 key per line in private_key.local first.")
+        return
+
+    if not _confirm(f"Switch to {chosen} -- {summary}."):
         print("  unchanged")
         return
-    _write_mode(config_path, other)
-    config.mode = other
-    print(f"  mode set to {other} in {config_path}")
+    _write_mode(config_path, chosen)
+    config.mode = chosen
+    print(f"  mode set to {chosen} in {config_path}")
 
 
 def _target_progress(config: Config) -> None:
