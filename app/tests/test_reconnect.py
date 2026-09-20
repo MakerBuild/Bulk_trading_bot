@@ -525,3 +525,47 @@ async def test_the_retry_does_not_cost_extra_budget():
 
     await strategy.healed(DROPPED)
     assert len(strategy._reconnect_times) == 1
+
+
+# -- a socket that drops while another is being repaired --------------------
+#
+# Taken from a subscriber's log. sub1's socket closed, the repair began, and
+# nine seconds into its reconnect the master's closed too. The pass had
+# already looked at the master and found it healthy, so it finished, the
+# re-check found the master down, and the run halted on a drop that was never
+# offered a retry. One flaky link carries both sockets, so the second drop
+# landing inside the first repair is the common case, not a rare one.
+
+
+def test_a_drop_during_a_repair_is_repaired_too():
+    from bulkdn.strategy import MAX_HEAL_PASSES
+
+    assert MAX_HEAL_PASSES > 1, "one pass cannot see a drop that arrives during it"
+
+
+async def test_the_second_pass_does_not_spend_the_flap_budget():
+    """One incident repaired in stages is not five incidents. Charging each
+    stage would halt the run for flapping it never did."""
+    from bulkdn.strategy import Strategy
+
+    strategy = FakeStrategy(FakeSession("master"), FakeSession("sub1"))
+
+    await strategy.healed(DROPPED)
+    after_first = len(strategy._reconnect_times)
+
+    await Strategy._healed(strategy, DROPPED, same_incident=True)
+    await Strategy._healed(strategy, DROPPED, same_incident=True)
+
+    assert len(strategy._reconnect_times) == after_first
+
+
+async def test_a_continuation_still_reconnects():
+    """It is a repair, not a bookkeeping no-op."""
+    from bulkdn.strategy import Strategy
+
+    master = FakeSession("master")
+    master.client.is_connected = False
+    strategy = FakeStrategy(master, FakeSession("sub1"))
+
+    assert await Strategy._healed(strategy, DROPPED, same_incident=True) is True
+    assert master.reconnects == 1

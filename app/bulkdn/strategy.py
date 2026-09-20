@@ -84,6 +84,22 @@ DEFERRAL_WINDOW_S = 900.0
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
 
+# How many times in a row the supervisor will try to heal before halting.
+#
+# One pass was not enough, and a live log showed why: sub1's socket closed,
+# the heal began, and nine seconds into its reconnect the master's socket
+# closed too. The pass had already looked at the master and found it
+# healthy, so it finished, the re-check found the master down, and the run
+# halted on a drop that had never been offered a retry.
+#
+# That is not a rare shape. One flaky link carries both sockets, so the
+# second drop lands DURING the first repair more often than not.
+#
+# Bounded rather than a loop: a pass that restores nothing ends it, and the
+# reconnect budget over RECONNECT_WINDOW_S still governs a socket that
+# flaps. This only covers drops arriving inside one repair.
+MAX_HEAL_PASSES = 3
+
 # How long a position read stays good enough to share. Three callers now want
 # one -- the supervisor and each leg confirming a phase -- and a live run showed
 # them fetching the same numbers three times within the same second. Short
@@ -715,7 +731,7 @@ class Strategy:
 
     # -- connection recovery -----------------------------------------------
 
-    async def _healed(self, violations) -> bool:
+    async def _healed(self, violations, *, same_incident: bool = False) -> bool:
         """Try to reconnect a dropped socket. True if anything was restored.
 
         A dropped socket was treated as fatal, which made a cycle only as long
@@ -749,6 +765,12 @@ class Strategy:
         "Keeps flapping" is measured over `RECONNECT_WINDOW_S`, so a socket that
         blips once an hour is forgiven each time and one that blips five times in
         ten minutes is not.
+
+        `same_incident` is set by the supervisor when it calls again to catch a
+        socket that dropped DURING the previous repair. Those passes do not
+        spend the flap budget: they are one incident being repaired in stages,
+        and charging each stage would turn a single bad minute into five and
+        halt the run for flapping it never did.
         """
         RECOVERABLE = ("disconnected", "stale_stream")
         dropped = [v for v in violations if v.kind in RECOVERABLE]
@@ -759,7 +781,11 @@ class Strategy:
         self._reconnect_times = [
             t for t in self._reconnect_times if now - t < RECONNECT_WINDOW_S
         ]
-        if len(self._reconnect_times) >= MAX_RECONNECTS:
+        if same_incident:
+            # Already charged for. The budget still governs: this pass only
+            # exists because the previous one was allowed.
+            pass
+        elif len(self._reconnect_times) >= MAX_RECONNECTS:
             log.error(
                 "the socket has dropped %d times in the last %g minutes -- "
                 "not reconnecting again",
@@ -767,7 +793,8 @@ class Strategy:
                 RECONNECT_WINDOW_S / 60,
             )
             return False
-        self._reconnect_times.append(now)
+        if not same_incident:
+            self._reconnect_times.append(now)
 
         restored = False
         failed = []
@@ -836,7 +863,11 @@ class Strategy:
         last_sync = 0.0
         while not self._stop.is_set():
             violations = self.risk.check()
-            if violations and await self._healed(violations):
+            for pass_number in range(MAX_HEAL_PASSES):
+                if not violations:
+                    break
+                if not await self._healed(violations, same_incident=pass_number > 0):
+                    break
                 violations = self.risk.check()
             if violations:
                 self._trigger_halt("; ".join(str(v) for v in violations))
