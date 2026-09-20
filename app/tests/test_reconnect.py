@@ -78,6 +78,11 @@ class FakeStrategy:
         self._reconnect_times = []
         self.risk = FakeRisk()
 
+    @property
+    def all_sessions(self):
+        """Stands in for Strategy's own: every account the run trades."""
+        return [self.master, self.sub1]
+
     async def healed(self, violations):
         from bulkdn.strategy import Strategy
 

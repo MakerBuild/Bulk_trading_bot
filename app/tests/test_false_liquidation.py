@@ -186,6 +186,11 @@ class FakeSession:
 class Bot:
     """Just enough Strategy to exercise the guard's decision."""
 
+    @property
+    def all_sessions(self):
+        """Stands in for Strategy's own: every account the run trades."""
+        return [self.master, self.sub1]
+
     def __init__(self, *, in_doubt=False, sync_fails=False, liquidated=False,
                  confirm_fails=False):
         from bulkdn.strategy import Strategy

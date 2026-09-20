@@ -122,6 +122,7 @@ class Strategy:
         state: StrategyState,
         notifier: Notifier | None = None,
         title: WindowTitle | None = None,
+        sessions: list[AccountSession] | None = None,
     ):
         self.config = config
         # Both default to inert objects rather than None, so every call site
@@ -138,15 +139,17 @@ class Strategy:
         self.store = store
         self.state = state
 
-        self.sessions: dict[str, AccountSession] = {
-            master.pubkey: master,
-            sub1.pubkey: sub1,
-        }
+        # Every account this run can trade. Two in single and multi mode --
+        # the master and its sub -- and every account under every key in pool
+        # mode. `master` and `sub1` stay named because the commands that act on
+        # one account still mean those two.
+        pool = sessions if sessions else [master, sub1]
+        self.sessions: dict[str, AccountSession] = {s.pubkey: s for s in pool}
         self.symbols = [leg.symbol for leg in config.active_legs]
         self._seen_trades = SeenTrades()
         self.guard = LiquidationGuard(
             specs=feed.specs,
-            names={master.pubkey: master.name, sub1.pubkey: sub1.name},
+            names={s.pubkey: s.name for s in self.sessions.values()},
         )
         # Set the instant a position update shows an external reduction, so
         # the response does not wait for the next reconcile tick.
@@ -188,6 +191,19 @@ class Strategy:
         # given a seed here without reaching into every other user of
         # `random` in the process.
         self._rng = random.Random()
+
+    @property
+    def all_sessions(self) -> list[AccountSession]:
+        """Every account this run trades, in pool order.
+
+        Falls back to the named pair when no session map has been built. That
+        is not only for tests: `_recover` and the halt path run before and
+        after the map exists, and both of them enumerate accounts.
+        """
+        sessions = getattr(self, "sessions", None)
+        if sessions:
+            return list(sessions.values())
+        return [s for s in (getattr(self, "master", None), getattr(self, "sub1", None)) if s]
 
     def _persist(self) -> None:
         """Save the state file, and survive not being able to.
@@ -291,7 +307,7 @@ class Strategy:
     # -- handlers (synchronous; see module docstring) ----------------------
 
     def install_handlers(self) -> None:
-        for session in (self.master, self.sub1):
+        for session in self.all_sessions:
             session.on(Topic.FILL, self._make_fill_handler(session))
             session.on(Topic.POSITION, self._make_position_handler(session))
             session.on(Topic.ACCOUNT, self._make_snapshot_handler(session))
@@ -401,7 +417,7 @@ class Strategy:
         # is broken either way, and a lone leg is outright exposure.
         affected = {event.symbol for event in events}
         for symbol in affected:
-            for session in (self.master, self.sub1):
+            for session in self.all_sessions:
                 size = self.book.authoritative(session.pubkey, symbol)
                 rounded = round_size(abs(size), self.feed.specs[symbol])
                 if rounded < self.feed.specs[symbol].lot_size:
@@ -433,7 +449,7 @@ class Strategy:
         point nothing is known -- not what happened, and not what is open.
         """
         in_doubt: set[str] = set()
-        for session in (self.master, self.sub1):
+        for session in self.all_sessions:
             in_doubt |= session.symbols_in_doubt(DOUBT_WINDOW_S)
 
         now = time.monotonic()
@@ -474,7 +490,7 @@ class Strategy:
                 DEFERRAL_WINDOW_S / 60,
             )
             self.guard.reset_symbol(event.symbol)
-            for session in (self.master, self.sub1):
+            for session in self.all_sessions:
                 session.settled(event.symbol)
         return True
 
@@ -603,7 +619,7 @@ class Strategy:
         costs a spread, while trading on into a real liquidation does not have
         a bounded cost.
         """
-        for session in (self.master, self.sub1):
+        for session in self.all_sessions:
             try:
                 events = await asyncio.to_thread(
                     recent_liquidations, self.config.http_url, session.pubkey
@@ -730,7 +746,7 @@ class Strategy:
         restored = False
         failed = []
         stale_after = self.risk.config.ws_stale_timeout_s
-        for session in (self.master, self.sub1):
+        for session in self.all_sessions:
             if session.dry_run:
                 continue
             # `is_connected` alone is not enough: a half-open socket reports
@@ -776,7 +792,7 @@ class Strategy:
             # next decision must be made on exchange truth rather than on a
             # book that stopped being updated. Read over HTTP, which did not
             # drop, rather than waiting for the stream to refill the book.
-            sync_positions_http([self.master, self.sub1], self.book)
+            sync_positions_http(self.all_sessions, self.book)
         return restored
 
     # -- phase driver ------------------------------------------------------
@@ -1322,7 +1338,7 @@ class Strategy:
             cycle = leg.cycle_index if leg else 0
             held = {
                 session.name: self.book.authoritative(session.pubkey, symbol)
-                for session in (self.master, self.sub1)
+                for session in self.all_sessions
             }
             net = sum(held.values())
             if any(abs(v) > 0 for v in held.values()):
@@ -1443,7 +1459,7 @@ class Strategy:
                 log.warning(
                     "stopped on %s -- cancelling resting orders", self._stop_requested
                 )
-                await cancel_all_orders([self.master, self.sub1], self.symbols)
+                await cancel_all_orders(self.all_sessions, self.symbols)
                 self._log_open_positions()
 
             if self._halt_reason:
@@ -1461,7 +1477,7 @@ class Strategy:
             raise
         except asyncio.CancelledError:
             log.warning("interrupted -- cancelling strategy orders")
-            await cancel_all_orders([self.master, self.sub1], self.symbols)
+            await cancel_all_orders(self.all_sessions, self.symbols)
             raise
         finally:
             self._stop.set()
@@ -1621,7 +1637,7 @@ class Strategy:
         snapshot may not have arrived, and acting on an empty book would look
         exactly like having no positions.
         """
-        sync_positions_http([self.master, self.sub1], self.book)
+        sync_positions_http(self.all_sessions, self.book)
 
         if self.state.phase == Phase.HALTED:
             # Deliberately not cleared automatically, even though the per-leg
@@ -1643,7 +1659,7 @@ class Strategy:
             spec = self.feed.specs[symbol]
             leg_has_positions = any(
                 abs(self.book.authoritative(session.pubkey, symbol)) >= spec.lot_size
-                for session in (self.master, self.sub1)
+                for session in self.all_sessions
             )
 
             if not leg_has_positions:
@@ -1672,7 +1688,7 @@ class Strategy:
 
         # Resting orders cannot be reliably matched to the recovered plan, and
         # an unrecognised order is an unhedged fill waiting to happen.
-        await cancel_all_orders([self.master, self.sub1], self.symbols)
+        await cancel_all_orders(self.all_sessions, self.symbols)
         for leg in self.state.legs.values():
             leg.oid = None
             leg.price = None
@@ -1694,7 +1710,7 @@ class Strategy:
         self.state.halted_reason = reason
         self._persist()
 
-        await cancel_all_orders([self.master, self.sub1], self.symbols)
+        await cancel_all_orders(self.all_sessions, self.symbols)
         await flatten(self.sessions, self.book, self.feed, self.symbols)
         self._persist()
 
