@@ -73,10 +73,35 @@ class LegRoles:
     # keyed by market, two groups trading BTC-USD would retire each
     # other's in-flight hedges and conclude they were already neutral.
     id: str = ""
+    # Every account covering this leg, and each one's share of the hedge.
+    # Empty means `taker` alone covers all of it, which is every leg that is
+    # not drawn from an account pool.
+    #
+    # Splitting is what keeps a pool unreadable even as the pairing moves: one
+    # maker of $4,000 answered by one taker of $4,000 is a line anyone can
+    # draw, and the same $4,000 answered by $1,800, $1,400 and $800 is not.
+    takers: tuple[str, ...] = ()
+    shares: tuple[float, ...] = ()
 
     @property
     def key(self) -> str:
         return self.id or self.symbol
+
+    @property
+    def hedgers(self) -> tuple[str, ...]:
+        """The accounts that cover this leg, in share order."""
+        return self.takers or (self.taker,)
+
+    @property
+    def weights(self) -> tuple[float, ...]:
+        """Each hedger's fraction of the hedge. Sums to one."""
+        if self.takers and self.shares:
+            return self.shares
+        return (1.0,) * len(self.hedgers)
+
+    @property
+    def accounts(self) -> tuple[str, ...]:
+        return (self.maker, *self.hedgers)
 
 
 @dataclass
@@ -200,15 +225,60 @@ class Hedger:
         return self.specs[symbol].lot_size * self.tolerance_lots
 
     def effective_net(self, roles: LegRoles) -> float:
-        """Net exposure including hedges that are already on their way."""
-        return (
-            self.book.net(roles.maker, roles.taker, roles.symbol)
-            + self.in_flight.total(roles.key)
-        )
+        """Net exposure including hedges that are already on their way.
+
+        Summed over every account in the leg, not just two. A hedge split
+        three ways is still one position that has to add up to zero, and
+        reading only the first hedger would report the other two's coverage as
+        missing -- and hedge it again.
+        """
+        total = self.book.effective(roles.maker, roles.symbol)
+        for pubkey in roles.hedgers:
+            total += self.book.effective(pubkey, roles.symbol)
+        return total + self.in_flight.total(roles.key)
 
     def note_taker_fill(self, key: str, signed_size: float) -> None:
         """Retire an in-flight reservation once its hedge fill lands."""
         self.in_flight.consume(key, signed_size)
+
+    def _slice(self, roles: LegRoles, size: float, spec) -> list[tuple[str, float]]:
+        """Split one hedge across the leg's hedgers, by their shares.
+
+        Rounding is settled by giving the remainder to the last slice, so the
+        pieces add up to exactly the hedge rather than to a lot less or a lot
+        more -- an under-hedge leaves the group directional by the difference,
+        and there is nothing to notice it until the reconciler runs.
+
+        A slice that rounds below one lot is dropped and its weight handed on:
+        an order the exchange will not accept is not a smaller hedge, it is a
+        missing one. With one hedger, or when the split cannot survive the lot
+        size, this returns the whole hedge to the first account -- which is
+        what every leg outside a pool does anyway.
+        """
+        hedgers, weights = roles.hedgers, roles.weights
+        if len(hedgers) == 1:
+            return [(hedgers[0], size)]
+
+        pieces: list[tuple[str, float]] = []
+        placed = 0.0
+        for pubkey, weight in zip(hedgers[:-1], weights[:-1], strict=False):
+            piece = round_size(size * weight, spec)
+            if piece < spec.lot_size:
+                continue
+            pieces.append((pubkey, piece))
+            placed += piece
+
+        remainder = round_size(size - placed, spec)
+        if remainder >= spec.lot_size:
+            pieces.append((hedgers[-1], remainder))
+        elif pieces:
+            # Too small to send on its own: fold it into the last real slice
+            # rather than leaving the hedge short by it.
+            pubkey, piece = pieces[-1]
+            pieces[-1] = (pubkey, round_size(piece + remainder, spec))
+        else:
+            return [(hedgers[0], size)]
+        return pieces
 
     def actionable_hedge(self, roles: LegRoles, mark_price: float | None = None) -> float:
         """Hedge size that could actually be submitted right now.
@@ -298,7 +368,8 @@ class Hedger:
                     f"{self.max_impact_bps:.1f} bps ceiling"
                 )
 
-            session = self.sessions[roles.taker]
+            slices = self._slice(roles, size, spec)
+            session = self.sessions[slices[0][0]]
             # The book as it stands BEFORE the order goes out. Read here and
             # not from the fill that comes back, because by then this order has
             # eaten the depth it is about to eat: a touch taken afterwards is
@@ -319,18 +390,34 @@ class Hedger:
                 f" {touch}" if touch else "",
             )
 
-            signed = size if is_buy else -size
-            # Reserve before sending. The fill for this order may arrive before
-            # `market()` returns, and the reservation has to already be there
-            # for the fill handler to retire it.
-            self.in_flight.add(roles.key, signed)
-            try:
-                await session.market(symbol, is_buy, size, reduce_only=roles.reduce_only)
-            except Exception:
-                # The order never made it, so the exposure is still real.
-                # Releasing the reservation lets the next trigger retry.
-                self.in_flight.consume(roles.key, signed)
-                raise
+            sent = 0.0
+            for pubkey, piece in slices:
+                signed = piece if is_buy else -piece
+                # Reserve before sending. The fill for this order may arrive
+                # before `market()` returns, and the reservation has to already
+                # be there for the fill handler to retire it.
+                self.in_flight.add(roles.key, signed)
+                try:
+                    await self.sessions[pubkey].market(
+                        symbol, is_buy, piece, reduce_only=roles.reduce_only
+                    )
+                except Exception:
+                    # This slice never made it, so its exposure is still real.
+                    # Releasing only its reservation lets the next trigger
+                    # retry exactly the part that failed -- the slices that did
+                    # go out are covered and must not be hedged twice.
+                    self.in_flight.consume(roles.key, signed)
+                    if sent > 0:
+                        # Some of it is covered. The reconciler re-derives the
+                        # remainder from positions, so the partial cover is not
+                        # lost; raising here still reports the failure.
+                        log.warning(
+                            "hedge %s: %d of %d slices sent before failing",
+                            symbol, len(slices), len(slices),
+                        )
+                    raise
+                sent += piece
+            size = sent
 
             if price > 0:
                 log.debug(

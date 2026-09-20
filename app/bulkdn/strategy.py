@@ -527,13 +527,25 @@ class Strategy:
             maker, taker = group.maker, group.takers[0]
             if exiting:
                 maker, taker = taker, maker
+            # The accounts do NOT swap on the way out, which is where a
+            # group differs from a configured pair. Two accounts can swap,
+            # because the one holding the short can rest the buy-back while
+            # the other hedges. Three hedgers cannot: swapping would make one
+            # of them the maker and leave the other two holding shorts that
+            # nothing closes.
+            #
+            # So the opener rests the close as well, selling what it bought,
+            # and the same hedgers cover it by buying back their own shares.
+            # Every account that opened something closes it.
             return LegRoles(
                 group.symbol,
-                maker=maker,
-                taker=taker,
-                maker_is_buy=True,
+                maker=group.maker,
+                taker=group.takers[0],
+                maker_is_buy=not exiting,
                 reduce_only=exiting,
                 id=key,
+                takers=group.takers,
+                shares=group.shares,
             )
 
         leg = self.state.legs.get(key)

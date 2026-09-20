@@ -67,18 +67,40 @@ def test_a_groups_roles_come_from_the_group(tmp_path):
     assert roles.reduce_only is False
 
 
-def test_the_two_swap_on_the_way_out(tmp_path):
-    """The account that hedged a long by going short holds the short to
-    cover, exactly as a configured leg does."""
+def test_the_accounts_do_not_swap_on_the_way_out(tmp_path):
+    """Where a group differs from a configured pair. Two accounts can swap --
+    the one holding the short rests the buy-back. Three hedgers cannot:
+    swapping would make one of them the maker and leave the other two holding
+    shorts that nothing closes. So the opener rests the close as well, and the
+    same hedgers buy back their own shares."""
     obj = strategy(tmp_path)
     key = obj.group_key(1, BTC)
     obj._groups[key] = GROUP
     obj.state.leg(key, BTC).phase = Phase.EXIT
 
     roles = obj._roles_for_key(key)
-    assert roles.maker == "taker-key"
-    assert roles.taker == "maker-key"
+    assert roles.maker == "maker-key", "the opener closes what it opened"
+    assert roles.hedgers == ("taker-key",)
+    assert roles.maker_is_buy is False, "it bought to open, so it sells to close"
     assert roles.reduce_only is True
+
+
+def test_every_hedger_of_a_split_entry_is_a_hedger_of_the_exit(tmp_path):
+    """The failure this prevents is two of three accounts left holding shorts
+    that no phase ever closes."""
+    obj = strategy(tmp_path)
+    key = obj.group_key(1, BTC)
+    obj._groups[key] = Group(
+        BTC, maker="opener", takers=("t1", "t2", "t3"), shares=(0.5, 0.3, 0.2)
+    )
+
+    entry = obj._roles_for_key(key)
+    obj.state.leg(key, BTC).phase = Phase.EXIT
+    exit_roles = obj._roles_for_key(key)
+
+    assert entry.hedgers == exit_roles.hedgers == ("t1", "t2", "t3")
+    assert entry.maker == exit_roles.maker == "opener"
+    assert entry.maker_is_buy is True and exit_roles.maker_is_buy is False
 
 
 def test_an_unknown_key_is_not_a_group(tmp_path):

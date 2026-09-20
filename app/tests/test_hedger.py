@@ -424,3 +424,73 @@ async def test_two_groups_on_one_market_hedge_independently():
     assert result.hedged_size == pytest.approx(0.01)
     assert sub1.orders, "the first group hedged"
     assert not master.orders, "the second group's accounts were not touched"
+
+
+# -- one hedge covered by several accounts ----------------------------------
+#
+# Splitting is what keeps a pool of accounts unreadable even as the pairing
+# moves: one maker of $4,000 answered by one taker of $4,000 is a line anyone
+# can draw, and the same $4,000 answered by $1,800, $1,400 and $800 is not.
+
+
+def split_roles(shares=(0.5, 0.3, 0.2), takers=("t1", "t2", "t3")):
+    return LegRoles(
+        BTC, maker=MASTER, taker=takers[0], maker_is_buy=True, reduce_only=False,
+        id="g1", takers=takers, shares=shares,
+    )
+
+
+def test_a_leg_without_a_split_still_has_one_hedger():
+    """Every leg outside a pool. It must behave exactly as it always has."""
+    assert OPEN_BTC.hedgers == (SUB1,)
+    assert OPEN_BTC.weights == (1.0,)
+
+
+def test_the_slices_add_up_to_the_hedge():
+    book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(), 0.1, SPEC)
+    assert sum(size for _pubkey, size in pieces) == pytest.approx(0.1)
+
+
+def test_each_slice_goes_to_its_own_account():
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(), 0.1, SPEC)
+    assert [pubkey for pubkey, _size in pieces] == ["t1", "t2", "t3"]
+    assert len({pubkey for pubkey, _ in pieces}) == 3
+
+
+def test_rounding_goes_to_the_last_slice_rather_than_being_lost():
+    """Under-hedging leaves the group directional by the difference, and
+    nothing notices until the reconciler runs."""
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(shares=(1 / 3, 1 / 3, 1 / 3)), 0.01, SPEC)
+    assert sum(size for _p, size in pieces) == pytest.approx(0.01)
+
+
+def test_a_slice_below_one_lot_is_not_sent_as_a_smaller_one():
+    """An order the exchange will not accept is a missing hedge, not a small
+    one. Its weight goes to the accounts that can carry it."""
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(shares=(0.98, 0.01, 0.01)), 0.01, SPEC)
+    assert all(size >= SPEC.lot_size for _p, size in pieces)
+    assert sum(size for _p, size in pieces) == pytest.approx(0.01)
+
+
+def test_a_hedge_too_small_to_split_goes_to_one_account_whole():
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(), SPEC.lot_size, SPEC)
+    assert len(pieces) == 1
+    assert pieces[0][1] == pytest.approx(SPEC.lot_size)
+
+
+def test_the_net_counts_every_account_in_the_leg():
+    """Reading only the first hedger reports the others' coverage as missing,
+    and hedges it a second time."""
+    book, hedger, _master, _sub1 = build()
+    roles = split_roles()
+    book.set_authoritative(MASTER, BTC, 0.09)
+    book.set_authoritative("t1", BTC, -0.05)
+    book.set_authoritative("t2", BTC, -0.03)
+    book.set_authoritative("t3", BTC, -0.01)
+
+    assert hedger.effective_net(roles) == pytest.approx(0.0)
