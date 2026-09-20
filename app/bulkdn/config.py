@@ -365,6 +365,16 @@ class Config:
     # other hedges, so a single leg is a complete pair rather than half of
     # one. Nothing about neutrality depends on there being two.
     mode: str = "multi"
+    # pool mode only. How many groups may be open at once, and how many
+    # accounts may share one hedge.
+    #
+    # The cap is a setting rather than a discovery: a hundred accounts
+    # allow fifty groups, which is fifty resting orders being chased and
+    # fifty hedges chasing them, against an exchange that answered 429 to
+    # two accounts polling every five seconds. Reaching that limit through
+    # rejections means finding out during a cycle rather than before one.
+    max_groups: int = 5
+    max_takers: int = 1
     hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(5.0, 5.0))
     # How long OPEN or EXIT may run before the cycle is called stuck.
     # HOLD is exempt: it ends on a clock it sets itself.
@@ -500,15 +510,25 @@ class Config:
                 "`bulkdn encrypt-key`"
             )
         self.target.validate()
-        if self.mode not in ("single", "multi"):
+        if self.mode not in ("single", "multi", "pool"):
             raise ConfigError(
-                f"mode must be 'single' or 'multi', got {self.mode!r}"
+                f"mode must be 'single', 'multi' or 'pool', got {self.mode!r}"
             )
+        if self.mode == "pool":
+            if self.max_groups < 1:
+                raise ConfigError("max_groups must be at least 1")
+            if self.max_takers < 1:
+                raise ConfigError("max_takers must be at least 1")
+            if not self.private_keys and require_credentials:
+                raise ConfigError(
+                    "pool mode trades every account under every key in "
+                    f"{PRIVATE_KEY_FILE}, and that file named none"
+                )
         self.master_account.validate("master_account")
         # Validated even when unused, so a typo in it is found now rather than
         # the day someone switches back to multi.
         self.sub_account.validate("sub_account")
-        if self.mode == "multi" and self.master_account.symbol == self.sub_account.symbol:
+        if self.mode == "multi" and self.master_account.symbol == self.sub_account.symbol:  # noqa: E501
             raise ConfigError(
                 "the two legs must use different symbols. Roles are held per "
                 "symbol, so two legs sharing one would overwrite each other and "
@@ -702,6 +722,10 @@ def load_config(
     except FileNotFoundError as exc:
         raise ConfigError(f"config file not found: {path}") from exc
 
+    pool_raw = raw.get("pool") or {}
+    if not isinstance(pool_raw, dict):
+        raise ConfigError("pool must be a mapping")
+
     legs = raw.get("legs")
     if not isinstance(legs, dict):
         raise ConfigError("legs must be a mapping")
@@ -738,6 +762,8 @@ def load_config(
         master_account=_leg_from_dict(legs["master_account"], "master_account"),
         sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
         mode=str(mode if mode is not None else raw.get("mode", "multi")).strip().lower(),
+        max_groups=int(pool_raw.get("max_groups", 5)),
+        max_takers=int(pool_raw.get("max_takers", 1)),
         hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
         max_phase_minutes=float(raw.get("max_phase_minutes", 30.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),

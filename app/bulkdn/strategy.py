@@ -41,6 +41,7 @@ from .liquidation import LiquidationGuard, recent_liquidations
 from .marketdata import round_notional, round_size, touch_text
 from .sizing import draw_sizes, resolve_notionals
 from .notify import Notifier
+from .pairing import Group, Pairing
 from .positions import PositionBook, SeenTrades
 from .reconcile import (
     cancel_all_orders,
@@ -175,6 +176,12 @@ class Strategy:
         # startup and may be smaller -- so a draw is clamped to what was
         # planned rather than to what was asked for.
         self._size_ceiling = {leg.symbol: leg.size for leg in config.active_legs}
+        # Groups currently trading, by the leg key each was given. Empty
+        # in single and multi mode, where the legs come from the config
+        # and never change hands.
+        self._groups: dict[str, Group] = {}
+        self._group_ids: dict[str, int] = {}
+        self.pairing: Pairing | None = None
 
     def _persist(self) -> None:
         """Save the state file, and survive not being able to.
@@ -499,11 +506,30 @@ class Strategy:
     def _roles_for_key(self, key: str) -> LegRoles | None:
         """The roles of the leg filed under `key`, at whatever phase it is in.
 
-        A leg is keyed by its market until an account pool gives it a group of
-        its own, so today this resolves to the same leg `leg_roles` would --
-        the indirection is what lets two legs share a market later without the
-        hedge worker having to guess which of them a fill belonged to.
+        A leg drawn from the account pool carries its own two accounts, so its
+        roles come from the group rather than from the config. The swap between
+        entry and exit is the same one the configured legs make: the account
+        that hedged a long by going short is the one holding the short to
+        cover.
+
+        A leg keyed by its market resolves the way it always did.
         """
+        group = self._groups.get(key)
+        if group is not None:
+            leg = self.state.leg(key, group.symbol)
+            exiting = leg.phase == Phase.EXIT
+            maker, taker = group.maker, group.takers[0]
+            if exiting:
+                maker, taker = taker, maker
+            return LegRoles(
+                group.symbol,
+                maker=maker,
+                taker=taker,
+                maker_is_buy=True,
+                reduce_only=exiting,
+                id=key,
+            )
+
         leg = self.state.legs.get(key)
         symbol = leg.symbol if leg is not None else key
         if symbol not in self.symbols:
@@ -1052,8 +1078,46 @@ class Strategy:
         )
         return drawn
 
-    async def _run_leg(self, key: str, configured_size: float) -> None:
-        """OPEN -> HOLD -> EXIT, repeatedly, for one leg on its own clock."""
+    def group_key(self, group_id: int, symbol: str) -> str:
+        """What a drawn group's leg is filed under.
+
+        The id leads so that two groups on one market sort apart in a log, and
+        the market is kept because every line that mentions a leg is read by
+        someone who wants to know which market it was.
+        """
+        return f"g{group_id}:{symbol}"
+
+    async def _run_group(self, group_id: int, group: Group, size: float) -> None:
+        """One cycle for one drawn group, then give the accounts back.
+
+        The accounts are released in a `finally`: a group that ends by halting,
+        by the operator stopping, or by raising would otherwise hold its
+        accounts out of the pool for the rest of the run, and a pool that leaks
+        accounts quietly stops being able to draw.
+        """
+        key = self.group_key(group_id, group.symbol)
+        self._groups[key] = group
+        self._group_ids[key] = group_id
+        log.info("=== group %d drawn: %s ===", group_id, group)
+        try:
+            await self._run_leg(key, size, once=True)
+        finally:
+            if self.pairing is not None:
+                self.pairing.release(group_id)
+            self._groups.pop(key, None)
+            self._group_ids.pop(key, None)
+            # The leg's state is kept, not dropped: a group that halted
+            # mid-cycle has positions, and the state file is what a restart
+            # reads to find them.
+            log.info("=== group %d released ===", group_id)
+
+    async def _run_leg(self, key: str, configured_size: float, once: bool = False) -> None:
+        """OPEN -> HOLD -> EXIT for one leg on its own clock.
+
+        `once` returns after a single cycle, which is what a drawn group wants:
+        it exists for one cycle and hands its accounts back. A configured leg
+        repeats until the run ends.
+        """
         leg = self.state.leg(key)
         symbol = leg.symbol
 
@@ -1104,6 +1168,8 @@ class Strategy:
                 of=self.config.cycles or None,
                 detail=f"{key}: {await self.progress_detail()}",
             )
+            if once:
+                return
 
     async def _confirm_done(self, is_done, label: str) -> bool:
         """Re-check a completion claim against freshly fetched positions.
