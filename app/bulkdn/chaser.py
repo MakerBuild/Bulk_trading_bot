@@ -121,7 +121,6 @@ class Chaser:
         # Legs that waited out their patience and now rest on the touch. By
         # symbol, not by order id: the decision belongs to the leg, and a
         # replacement should not start the wait over.
-        self._tightened: set[str] = set()
 
     # -- sizing ------------------------------------------------------------
 
@@ -161,7 +160,7 @@ class Chaser:
             if leg.oid:
                 await self._cancel(session, leg, symbol)
             leg.complete = True
-            self._tightened.discard(symbol)
+            leg.tightened = False
             return ChaseOutcome(symbol, "complete", f"remaining={remaining:.8f}")
 
         if quote.age_s > self.price_stale_timeout_s:
@@ -174,7 +173,7 @@ class Chaser:
             if leg.oid and leg.oid in self._placed_at
             else 0.0
         )
-        was_tightened = symbol in self._tightened
+        was_tightened = leg.tightened
         offset = effective_offset_bps(
             params.offset_bps, resting_for, params.chase_patience_s, was_tightened
         )
@@ -215,7 +214,7 @@ class Chaser:
             # Below max_distance_bps, so the drift rule would have held this
             # order where it was. That is the whole point: the market never
             # came to it, so it goes to the market instead.
-            self._tightened.add(symbol)
+            leg.tightened = True
             return await self._place(
                 session, roles, leg, target, desired, replace_oid=leg.oid,
                 reason=(
@@ -380,4 +379,4 @@ class Chaser:
         # The next phase gets its own patience: entry and exit are different
         # sides of the book and one having been slow says nothing about the
         # other.
-        self._tightened.discard(roles.symbol)
+        leg.tightened = False

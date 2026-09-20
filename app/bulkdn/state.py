@@ -62,6 +62,17 @@ class LegState:
     # was never anything to synchronise -- only an accident of one shared phase.
     phase: Phase = Phase.IDLE
     hold_until: float = 0.0
+    # Whether this leg has given up its offset and moved onto the touch.
+    # Sticky until the leg completes: letting it spring back would walk
+    # the order away from the market again, and it would only have to
+    # walk back after the next wait.
+    #
+    # Held here rather than in a set of symbols inside the chaser. Two
+    # legs on one market would have shared that set -- one tightening
+    # would tighten the other, which has not yet placed an order --
+    # and the flag was lost on restart, so a leg that had already given
+    # up its offset went back to waiting out its patience again.
+    tightened: bool = False
     cycle_index: int = 0
     # Order IDs that were replaced but whose cancels were never confirmed.
     # Swept on the next chase pass so a failed cancel can't leave a duplicate

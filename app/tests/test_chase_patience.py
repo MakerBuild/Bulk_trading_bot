@@ -207,3 +207,35 @@ def test_a_missing_book_side_is_not_guessed():
     """Without an ask there is no way to know the room, and guessing is how a
     'passive' order crosses. Falls back to the touch."""
     assert price(100_000.0, None, is_buy=True) == 100_000.0
+
+
+# -- the flag lives on the leg, not in a set of symbols ---------------------
+
+
+def test_two_legs_on_one_market_tighten_independently():
+    """A set keyed by symbol made one leg's patience run out for the other,
+    which has not necessarily placed an order yet. Two groups trading the same
+    market at once is the whole point of the account pool."""
+    from bulkdn.state import LegState
+
+    first, second = LegState(symbol="BTC-USD"), LegState(symbol="BTC-USD")
+    first.tightened = True
+    assert second.tightened is False
+
+
+def test_a_tightened_leg_stays_tightened_across_a_restart():
+    """It used to live in memory only, so a restart sent a leg that had
+    already given up its offset back to waiting out its patience again."""
+    from bulkdn.state import LegState, StrategyState
+
+    state = StrategyState()
+    state.leg("BTC-USD").tightened = True
+
+    revived = StrategyState.from_dict(state.to_dict())
+    assert revived.leg("BTC-USD").tightened is True
+
+
+def test_a_fresh_leg_has_not_tightened():
+    from bulkdn.state import LegState
+
+    assert LegState(symbol="BTC-USD").tightened is False
