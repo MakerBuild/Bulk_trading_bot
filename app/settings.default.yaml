@@ -45,7 +45,30 @@
 #
 #  If the sizes below need more margin than the accounts hold, every leg is
 #  scaled down together to fit -- see max_margin_fraction near the bottom.
+#
+#  HOW MANY MARKETS: `mode`.
+#
+#    multi    both legs, one market each. Two markets earning volume at once.
+#    single   only `master_account`. `sub_account` is ignored entirely.
+#
+#  Single is not a reduced version of the strategy: a leg is already a complete
+#  delta-neutral pair, because one account opens it and the other hedges it.
+#  Neutrality never depended on there being two legs, only on two accounts.
+#
+#  It is there because the markets are not equally cheap. Over a two-hour live
+#  run, hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD, and the gap
+#  survives excluding the self-trades that flatter the cheaper one. Dropping
+#  the dearer market is worth roughly a fifth to two fifths of what the spread
+#  costs -- against half as many legs earning volume at a time. Which of those
+#  matters more depends on whether you are chasing volume or minding the bill.
+#
+#  Two legs on the SAME symbol is refused in multi mode: roles are held per
+#  symbol, so the second leg would overwrite the first and one of them would
+#  silently stop trading. `mode: single` is the supported way to trade one
+#  market.
 # ---------------------------------------------------------------------------
+mode: multi
+
 legs:
   master_account:
     symbol: BTC-USD

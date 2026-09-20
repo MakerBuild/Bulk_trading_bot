@@ -326,6 +326,20 @@ class Config:
     # trades something else.
     master_account: LegConfig
     sub_account: LegConfig
+    # "multi" trades both legs, one symbol each. "single" trades only
+    # `master_account` and leaves `sub_account` alone.
+    #
+    # Single exists because the two legs are not equally cheap. Measured over
+    # a two-hour run, hedging cost 1.24 bps on BTC-USD against 3.59 on
+    # ETH-USD, and the difference survives excluding the self-trades that
+    # flatter the cheaper one. Concentrating on the better market is worth
+    # roughly a fifth to two fifths of the spread bill -- but it halves the
+    # number of legs earning volume at once, which is the trade being made.
+    #
+    # Both legs remain delta-neutral on their own: one account opens, the
+    # other hedges, so a single leg is a complete pair rather than half of
+    # one. Nothing about neutrality depends on there being two.
+    mode: str = "multi"
     hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(5.0, 5.0))
     # How long OPEN or EXIT may run before the cycle is called stuck.
     # HOLD is exempt: it ends on a clock it sets itself.
@@ -357,6 +371,19 @@ class Config:
     # are set -- the bot runs unattended, so a halt that only reaches the
     # console reaches nobody.
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+
+    @property
+    def active_legs(self) -> list[LegConfig]:
+        """The legs this run actually trades, in opener order.
+
+        Everything that used to name both legs reads this instead, so single
+        mode is one list being shorter rather than a branch in each of nine
+        places -- which is how one of them gets missed and a leg keeps being
+        sized, chased or capped after it stopped trading.
+        """
+        if self.mode == "single":
+            return [self.master_account]
+        return [self.master_account, self.sub_account]
 
     # Referral gating, checked once at startup. See bulkdn/referral.py for what
     # a client-side gate does and does not actually prevent.
@@ -417,10 +444,21 @@ class Config:
                 "`bulkdn encrypt-key`"
             )
         self.target.validate()
+        if self.mode not in ("single", "multi"):
+            raise ConfigError(
+                f"mode must be 'single' or 'multi', got {self.mode!r}"
+            )
         self.master_account.validate("master_account")
+        # Validated even when unused, so a typo in it is found now rather than
+        # the day someone switches back to multi.
         self.sub_account.validate("sub_account")
-        if self.master_account.symbol == self.sub_account.symbol:
-            raise ConfigError("the two legs must use different symbols")
+        if self.mode == "multi" and self.master_account.symbol == self.sub_account.symbol:
+            raise ConfigError(
+                "the two legs must use different symbols. Roles are held per "
+                "symbol, so two legs sharing one would overwrite each other and "
+                "one would silently stop trading. To trade a single market, set "
+                "mode: single instead."
+            )
         if not 0.0 < self.max_margin_fraction <= 1.0:
             raise ConfigError(
                 "max_margin_fraction must be between 0 and 1 "
@@ -598,6 +636,7 @@ def load_config(
         sub1_pubkey=raw.get("sub1_pubkey", ""),
         master_account=_leg_from_dict(legs["master_account"], "master_account"),
         sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
+        mode=str(raw.get("mode", "multi")).strip().lower(),
         hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
         max_phase_minutes=float(raw.get("max_phase_minutes", 30.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),

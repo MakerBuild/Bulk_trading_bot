@@ -167,7 +167,7 @@ class Runtime:
     def __init__(self, config: Config, dry_run: bool):
         self.config = config
         self.dry_run = dry_run
-        self.symbols = [config.master_account.symbol, config.sub_account.symbol]
+        self.symbols = [leg.symbol for leg in config.active_legs]
 
         # Must be installed before any client is constructed: it repairs fill
         # parsing and TLS handling inside the SDK itself.
@@ -275,7 +275,7 @@ class Runtime:
         the config, and a second source of truth for size is how the two end up
         disagreeing.
         """
-        legs = [self.config.master_account, self.config.sub_account]
+        legs = list(self.config.active_legs)
         # Priced over HTTP, not from the feed: this runs before the WebSocket
         # is connected, so the ticker cache is still empty and every price
         # would read as zero.
@@ -323,7 +323,7 @@ class Runtime:
         """
         wanted = {
             leg.symbol: leg.leverage
-            for leg in (self.config.master_account, self.config.sub_account)
+            for leg in self.config.active_legs
             if leg.leverage is not None
         }
         if not wanted:

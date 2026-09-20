@@ -139,7 +139,7 @@ class Strategy:
             master.pubkey: master,
             sub1.pubkey: sub1,
         }
-        self.symbols = [config.master_account.symbol, config.sub_account.symbol]
+        self.symbols = [leg.symbol for leg in config.active_legs]
         self._seen_trades = SeenTrades()
         self.guard = LiquidationGuard(
             specs=feed.specs,
@@ -231,26 +231,27 @@ class Strategy:
         buys to cover the shorts.
         """
         master, sub1 = self.master.pubkey, self.sub1.pubkey
+        exiting = phase == Phase.EXIT
+        roles = []
         # Each leg is named for the account that opens it, which is what the
-        # config keys mean. The master goes long `master_leg` and short
-        # `sub_leg`; the sub-account does the reverse.
-        master_leg = self.config.master_account.symbol
-        sub_leg = self.config.sub_account.symbol
-
-        if phase == Phase.EXIT:
-            return [
-                # Sub1 covers the short it took hedging the master's long.
-                LegRoles(master_leg, maker=sub1, taker=master, maker_is_buy=True, reduce_only=True),
-                # Master covers the short it took hedging sub1's long.
-                LegRoles(sub_leg, maker=master, taker=sub1, maker_is_buy=True, reduce_only=True),
-            ]
-
-        # OPEN, and HOLD reuses the same roles so any drift is corrected on the
-        # same account that was hedging during entry.
-        return [
-            LegRoles(master_leg, maker=master, taker=sub1, maker_is_buy=True, reduce_only=False),
-            LegRoles(sub_leg, maker=sub1, taker=master, maker_is_buy=True, reduce_only=False),
-        ]
+        # config keys mean: the master opens the first, the sub-account the
+        # second. In EXIT the two swap, because the account that hedged a long
+        # by going short is the one holding the short to cover. HOLD reuses the
+        # OPEN roles, so drift is corrected on the account that was hedging.
+        for index, leg in enumerate(self.config.active_legs):
+            opener, hedger = (master, sub1) if index == 0 else (sub1, master)
+            if exiting:
+                opener, hedger = hedger, opener
+            roles.append(
+                LegRoles(
+                    leg.symbol,
+                    maker=opener,
+                    taker=hedger,
+                    maker_is_buy=True,
+                    reduce_only=exiting,
+                )
+            )
+        return roles
 
     def _roles_by_symbol(self, phase: Phase) -> dict[str, LegRoles]:
         return {roles.symbol: roles for roles in self.roles_for(phase)}
@@ -1117,10 +1118,7 @@ class Strategy:
         worker = asyncio.create_task(self._hedge_worker())
         supervisor = asyncio.create_task(self._supervise())
         status = asyncio.create_task(self._refresh_status())
-        sizes = {
-            self.config.master_account.symbol: self.config.master_account.size,
-            self.config.sub_account.symbol: self.config.sub_account.size,
-        }
+        sizes = {leg.symbol: leg.size for leg in self.config.active_legs}
         legs: list[asyncio.Task] = []
 
         try:
@@ -1417,7 +1415,7 @@ def build_chase_params(config: Config) -> dict[str, ChaseParams]:
             chase_patience_s=leg.chase_patience_s,
             improve_ticks=leg.improve_ticks,
         )
-        for leg in (config.master_account, config.sub_account)
+        for leg in config.active_legs
     }
 
 
@@ -1428,4 +1426,4 @@ def build_hedge_ceilings(config: Config) -> dict[str, float]:
     diverged by more than the strategy can account for, and firing a very large
     market order on that basis would be worse than halting.
     """
-    return {leg.symbol: leg.size * 2.0 for leg in (config.master_account, config.sub_account)}
+    return {leg.symbol: leg.size * 2.0 for leg in config.active_legs}
