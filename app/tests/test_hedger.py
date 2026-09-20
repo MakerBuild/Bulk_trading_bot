@@ -364,3 +364,63 @@ async def test_an_empty_level_is_left_out_rather_than_printed_as_zero(caplog):
 
     line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("hedge "))
     assert "sz=" not in line
+
+
+# -- reservations belong to the leg, not to the market ----------------------
+#
+# In-flight hedges were keyed by symbol. Two groups trading BTC-USD at once
+# would have retired each other's reservations and concluded they were already
+# neutral -- which leaves a real position unhedged while the book says it is
+# covered. Two groups on one market is the point of the account pool.
+
+
+def other_pair():
+    """A second group on the same market, sharing no accounts with the first."""
+    return LegRoles(
+        BTC, maker="third", taker="fourth", maker_is_buy=True,
+        reduce_only=False, id="g2",
+    )
+
+
+def test_a_leg_defaults_to_being_keyed_by_its_market():
+    """Which is what every leg was before groups existed."""
+    assert OPEN_BTC.key == BTC
+
+
+def test_two_groups_on_one_market_do_not_share_reservations():
+    _book, hedger, _master, _sub1 = build()
+    first = LegRoles(BTC, maker=MASTER, taker=SUB1, maker_is_buy=True,
+                     reduce_only=False, id="g1")
+
+    hedger.in_flight.add(first.key, -0.01)
+    assert hedger.in_flight.total(other_pair().key) == 0.0
+    assert hedger.in_flight.total(first.key) == -0.01
+
+
+def test_one_groups_fill_does_not_retire_anothers_hedge():
+    """The failure this prevents is silent: the second group reads itself as
+    neutral and never sends the hedge it owes."""
+    _book, hedger, _master, _sub1 = build()
+    first = LegRoles(BTC, maker=MASTER, taker=SUB1, maker_is_buy=True,
+                     reduce_only=False, id="g1")
+    second = other_pair()
+
+    hedger.in_flight.add(first.key, -0.01)
+    hedger.in_flight.add(second.key, -0.02)
+    hedger.note_taker_fill(first.key, -0.01)
+
+    assert hedger.in_flight.total(first.key) == 0.0
+    assert hedger.in_flight.total(second.key) == -0.02, "the other group's hedge was retired"
+
+
+async def test_two_groups_on_one_market_hedge_independently():
+    book, hedger, master, sub1 = build()
+    first = LegRoles(BTC, maker=MASTER, taker=SUB1, maker_is_buy=True,
+                     reduce_only=False, id="g1")
+
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.01)
+    result = await hedger.hedge(first, mark_price=PRICE)
+
+    assert result.hedged_size == pytest.approx(0.01)
+    assert sub1.orders, "the first group hedged"
+    assert not master.orders, "the second group's accounts were not touched"

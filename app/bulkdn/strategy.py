@@ -314,7 +314,7 @@ class Strategy:
             if roles is not None and session.pubkey == roles.taker:
                 # This is one of our own hedge orders landing; retire its
                 # reservation so net exposure reads correctly.
-                self.hedger.note_taker_fill(symbol, size if is_buy else -size)
+                self.hedger.note_taker_fill(roles.key, size if is_buy else -size)
 
             # `role` and the touch are carried here rather than worked out
             # afterwards. Which side of the pair a fill belongs to was being

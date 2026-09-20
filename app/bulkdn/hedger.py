@@ -67,6 +67,16 @@ class LegRoles:
     taker: str
     maker_is_buy: bool
     reduce_only: bool
+    # What this leg is filed under. Empty means the market, which is
+    # what every leg was until an account pool made two legs on one
+    # market possible. Reservations and the hedge lock hang off it:
+    # keyed by market, two groups trading BTC-USD would retire each
+    # other's in-flight hedges and conclude they were already neutral.
+    id: str = ""
+
+    @property
+    def key(self) -> str:
+        return self.id or self.symbol
 
 
 @dataclass
@@ -193,12 +203,12 @@ class Hedger:
         """Net exposure including hedges that are already on their way."""
         return (
             self.book.net(roles.maker, roles.taker, roles.symbol)
-            + self.in_flight.total(roles.symbol)
+            + self.in_flight.total(roles.key)
         )
 
-    def note_taker_fill(self, symbol: str, signed_size: float) -> None:
+    def note_taker_fill(self, key: str, signed_size: float) -> None:
         """Retire an in-flight reservation once its hedge fill lands."""
-        self.in_flight.consume(symbol, signed_size)
+        self.in_flight.consume(key, signed_size)
 
     def actionable_hedge(self, roles: LegRoles, mark_price: float | None = None) -> float:
         """Hedge size that could actually be submitted right now.
@@ -244,7 +254,7 @@ class Hedger:
         symbol = roles.symbol
         spec = self.specs[symbol]
 
-        async with self._lock(symbol):
+        async with self._lock(roles.key):
             net = self.effective_net(roles)
             tolerance = self.tolerance(symbol)
 
@@ -313,13 +323,13 @@ class Hedger:
             # Reserve before sending. The fill for this order may arrive before
             # `market()` returns, and the reservation has to already be there
             # for the fill handler to retire it.
-            self.in_flight.add(symbol, signed)
+            self.in_flight.add(roles.key, signed)
             try:
                 await session.market(symbol, is_buy, size, reduce_only=roles.reduce_only)
             except Exception:
                 # The order never made it, so the exposure is still real.
                 # Releasing the reservation lets the next trigger retry.
-                self.in_flight.consume(symbol, signed)
+                self.in_flight.consume(roles.key, signed)
                 raise
 
             if price > 0:
