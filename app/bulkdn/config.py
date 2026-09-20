@@ -438,6 +438,16 @@ class Config:
     ws_url_override: str = ""
 
     # Populated at load time, not from the YAML file.
+    #
+    # Several master keys may be given, one per line. Every account under every
+    # one of them joins the pool the strategy draws pairs from; `private_key`
+    # remains the first of them, because the single-account commands -- status,
+    # transfer, create-subaccount -- act on one account and that one is it.
+    private_keys: list[str] = field(default_factory=list)
+    # The one a single-account command acts on. Kept as a field of its own
+    # rather than derived, because most of the bot and most of its tests name
+    # exactly one key and should not have to know a pool exists. The two are
+    # reconciled below so they cannot disagree.
     private_key: str = ""
 
     @property
@@ -465,6 +475,14 @@ class Config:
         # YAML path passes a HoldTime. Normalise so the rest of the code
         # only ever sees the range.
         self.hold_minutes = HoldTime.parse(self.hold_minutes)
+
+        # A caller naming one key and a caller naming a pool must both end up
+        # with the two agreeing. Most of the bot, and nearly all of its tests,
+        # name exactly one and should not have to know a pool exists.
+        if self.private_keys and not self.private_key:
+            self.private_key = self.private_keys[0]
+        elif self.private_key and not self.private_keys:
+            self.private_keys = [self.private_key]
 
     def validate(self, require_credentials: bool = True, require_sub1: bool = True) -> None:
         """Validate the configuration.
@@ -590,18 +608,27 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
         raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
 
 
-def _load_private_key(required: bool) -> str:
-    """The signing key, from the environment or the key file.
+def _load_private_keys(required: bool) -> list[str]:
+    """Every signing key, from the environment or the key file, in order.
 
-    The environment wins so an unattended run needs no password prompt. When
-    credentials are not required the key file is skipped entirely, which keeps
+    The environment wins so an unattended run needs no password prompt, and it
+    accepts several the same way the file does -- one per line, or separated by
+    commas for the shells where a newline in a variable is a fight.
+
+    When credentials are not required the file is skipped entirely, which keeps
     read-only commands from asking for a password they will not use.
+
+    Order is the operator's: the first key is the account that single-account
+    commands act on, so it must not be sorted or deduplicated into a different
+    first place.
     """
     from_env = os.environ.get(PRIVATE_KEY_ENV, "")
-    if from_env or not required:
-        return from_env
+    if from_env:
+        return keystore.read_plaintext_all(from_env.replace(",", "\n"))
+    if not required:
+        return []
     try:
-        return keystore.load(PRIVATE_KEY_FILE)
+        return keystore.load_all(PRIVATE_KEY_FILE)
     except keystore.KeystoreError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -739,7 +766,7 @@ def load_config(
         ws_ssl_auto_bypass=bool(raw.get("ws_ssl_auto_bypass", True)),
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
         access=_access_from_dict(raw.get("access") or {}),
-        private_key=_load_private_key(require_credentials),
+        private_keys=_load_private_keys(require_credentials),
     )
     config.validate(require_credentials=require_credentials, require_sub1=require_sub1)
     return config

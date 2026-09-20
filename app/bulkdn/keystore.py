@@ -134,13 +134,29 @@ def parse(text: str) -> dict | None:
     return envelope if isinstance(envelope, dict) and "box" in envelope else None
 
 
-def read_plaintext(text: str) -> str:
-    """First line that is neither blank nor a comment."""
+def read_plaintext_all(text: str) -> list[str]:
+    """Every line that is neither blank nor a comment, in file order.
+
+    One key per line. The order is kept because it is the operator's -- the
+    first key is the one a single-account command uses, and shuffling it would
+    silently change which account a `status` or a `transfer` talks about.
+
+    Duplicates are dropped rather than refused: the same key twice is a
+    copy-paste, not an instruction to trade an account against itself, and
+    that is exactly what a pool would do with it.
+    """
+    keys: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#"):
-            return stripped
-    return ""
+        if stripped and not stripped.startswith("#") and stripped not in keys:
+            keys.append(stripped)
+    return keys
+
+
+def read_plaintext(text: str) -> str:
+    """First line that is neither blank nor a comment."""
+    keys = read_plaintext_all(text)
+    return keys[0] if keys else ""
 
 
 def resolve_password(prompt: str = "Enter password to decrypt private key") -> str:
@@ -165,22 +181,43 @@ def resolve_password(prompt: str = "Enter password to decrypt private key") -> s
     return entered or DEFAULT_PASSWORD
 
 
-def load(path: str, password: str | None = None) -> str:
-    """Read a key file, decrypting it when it is an envelope.
+def load_all(path: str, password: str | None = None) -> list[str]:
+    """Every key in the file, decrypting it when it is an envelope.
 
-    Returns "" when the file is absent, which is not an error: the key may be
+    Returns [] when the file is absent, which is not an error: keys may be
     coming from the environment instead.
+
+    One envelope covers all of them rather than one envelope each. A file of
+    keys where some are encrypted and some are not is a file whose protection
+    is whatever the weakest line offers, and it invites the reading where a
+    missing password prompt means the key was safe.
     """
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
     except FileNotFoundError:
-        return ""
+        return []
 
     envelope = parse(text)
     if envelope is None:
-        return read_plaintext(text)
-    return decrypt(envelope, password if password is not None else resolve_password())
+        return read_plaintext_all(text)
+    opened = decrypt(envelope, password if password is not None else resolve_password())
+    return read_plaintext_all(opened)
+
+
+def load(path: str, password: str | None = None) -> str:
+    """The first key in the file, or "" when there is none.
+
+    Kept because most commands act on one account. `load_all` is what the
+    account pool uses.
+    """
+    keys = load_all(path, password)
+    return keys[0] if keys else ""
+
+
+def save_all(path: str, secrets: list[str], password: str) -> None:
+    """Encrypt several keys into one envelope."""
+    save(path, "\n".join(secrets), password)
 
 
 def save(path: str, secret: str, password: str) -> None:

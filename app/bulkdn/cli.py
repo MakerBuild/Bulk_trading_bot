@@ -678,7 +678,7 @@ def cmd_encrypt_key(config: Config) -> int:
     from . import keystore
     from .config import PRIVATE_KEY_FILE
 
-    if not config.private_key:
+    if not config.private_keys:
         print("no key to encrypt")
         return 1
 
@@ -689,9 +689,11 @@ def cmd_encrypt_key(config: Config) -> int:
         return 1
 
     was_encrypted = keystore.is_encrypted(PRIVATE_KEY_FILE)
+    count = len(config.private_keys)
     print(
         f"\n{PRIVATE_KEY_FILE} is currently "
-        f"{'encrypted' if was_encrypted else 'PLAINTEXT'}."
+        f"{'encrypted' if was_encrypted else 'PLAINTEXT'} and holds "
+        f"{count} key{'s' if count != 1 else ''}."
     )
     print("An empty password uses a default that is published in the source:")
     print("it keeps the key off the screen and out of a backup, nothing more.\n")
@@ -706,7 +708,11 @@ def cmd_encrypt_key(config: Config) -> int:
         print("\nusing the default password")
 
     try:
-        keystore.save(PRIVATE_KEY_FILE, config.private_key, password)
+        # Every key, not only the first. Writing one back would encrypt
+        # the file and silently discard the rest of it -- the worst shape
+        # a bug about key files can take, because it reports success and
+        # the other accounts are simply gone.
+        keystore.save_all(PRIVATE_KEY_FILE, config.private_keys, password)
     except keystore.KeystoreError as exc:
         print(f"failed: {exc}")
         return 1

@@ -164,13 +164,18 @@ def test_no_terminal_and_no_environment_is_an_error(monkeypatch):
 
 
 class KeyOnly:
-    """Stands in for Config: cmd_encrypt_key reads only this field."""
+    """Stands in for Config: cmd_encrypt_key reads only these two fields.
 
-    def __init__(self, key=SEED):
+    Both, because the file may hold several keys and encrypting only the
+    first would report success while discarding the rest.
+    """
+
+    def __init__(self, key=SEED, keys=None):
         self.private_key = key
+        self.private_keys = keys if keys is not None else ([key] if key else [])
 
 
-def run_encrypt(monkeypatch, tmp_path, answers, key=SEED):
+def run_encrypt(monkeypatch, tmp_path, answers, key=SEED, keys=None):
     """Drive cmd_encrypt_key with scripted passwords, in a scratch directory."""
     from bulkdn import cli
 
@@ -179,7 +184,7 @@ def run_encrypt(monkeypatch, tmp_path, answers, key=SEED):
     monkeypatch.setattr(keystore.sys.stdin, "isatty", lambda: True)
     supplied = iter(answers)
     monkeypatch.setattr("getpass.getpass", lambda *a, **k: next(supplied))
-    return cli.cmd_encrypt_key(KeyOnly(key))
+    return cli.cmd_encrypt_key(KeyOnly(key, keys))
 
 
 def test_mismatched_passwords_write_nothing(monkeypatch, tmp_path):
@@ -213,3 +218,14 @@ def test_without_a_terminal_it_refuses_rather_than_echoing(monkeypatch, tmp_path
     monkeypatch.setattr(keystore.sys.stdin, "isatty", lambda: False)
     assert cli.cmd_encrypt_key(KeyOnly()) == 1
     assert not (tmp_path / "private_key.local").exists()
+
+
+def test_encrypting_a_file_of_several_keys_keeps_all_of_them(monkeypatch, tmp_path):
+    """The worst shape a key-file bug can take is reporting success while the
+    other accounts are gone. Encryption must cover the whole file."""
+    from bulkdn import keystore as ks
+
+    others = [SEED, "second-key", "third-key"]
+    run_encrypt(monkeypatch, tmp_path, ["pw", "pw"], key=SEED, keys=others)
+
+    assert ks.load_all(str(tmp_path / "private_key.local"), "pw") == others
