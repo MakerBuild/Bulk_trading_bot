@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
 
 from bulk_api.common import Side, Topic
@@ -182,6 +183,11 @@ class Strategy:
         self._groups: dict[str, Group] = {}
         self._group_ids: dict[str, int] = {}
         self.pairing: Pairing | None = None
+        # Seeded from the system clock, and held rather than using the
+        # module-level generator: a run that has to be reproduced can be
+        # given a seed here without reaching into every other user of
+        # `random` in the process.
+        self._rng = random.Random()
 
     def _persist(self) -> None:
         """Save the state file, and survive not being able to.
@@ -1111,6 +1117,61 @@ class Strategy:
             # reads to find them.
             log.info("=== group %d released ===", group_id)
 
+    async def _dispatch_groups(self, sizes: dict[str, float]) -> None:
+        """Keep up to `max_groups` groups trading until the run ends.
+
+        Groups are started and not waited on: that is the whole point of a
+        pool. A group whose market is slow must not hold up four others, in
+        the same way and for the same reason that two configured legs stopped
+        waiting on each other.
+
+        A draw that comes back empty is the normal state of a busy run -- the
+        cap is reached, or every free account is already in a group -- so it
+        waits a beat rather than treating it as a fault.
+
+        The first group to raise takes the run down with it, which is what
+        already happens when a configured leg raises: an exception here means
+        the exchange, the network or an invariant, and none of those get
+        better by continuing to open positions.
+        """
+        running: set[asyncio.Task] = set()
+        try:
+            while not self._stop.is_set():
+                for task in [t for t in running if t.done()]:
+                    running.discard(task)
+                    # Raises here, inside the try, so the finally below still
+                    # cancels the groups that are still trading.
+                    task.result()
+
+                reached = await self._target_reached()
+                if reached:
+                    log.info("execution target reached: %s", reached)
+                    break
+
+                drawn = None
+                if self.pairing is not None:
+                    symbol = self._rng.choice(self.symbols)
+                    drawn = self.pairing.draw(symbol)
+                if drawn is None:
+                    await asyncio.sleep(self.config.chase_interval_s)
+                    continue
+
+                group_id, group = drawn
+                size = self._size_for_cycle(group.symbol, sizes[group.symbol])
+                running.add(
+                    asyncio.create_task(self._run_group(group_id, group, size))
+                )
+
+            # Stopped or spent: let what is open finish its cycle rather than
+            # abandoning positions mid-phase.
+            if running:
+                log.info("waiting for %d group(s) to finish their cycle", len(running))
+                await asyncio.gather(*running)
+        finally:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+
     async def _run_leg(self, key: str, configured_size: float, once: bool = False) -> None:
         """OPEN -> HOLD -> EXIT for one leg on its own clock.
 
@@ -1341,10 +1402,16 @@ class Strategy:
             # keeps the count it already had.
             await self.capture_target_baseline()
 
-            legs = [
-                asyncio.create_task(self._run_leg(symbol, sizes[symbol]))
-                for symbol in self.symbols
-            ]
+            if self.config.mode == "pool":
+                # One task, which starts and reaps the groups itself. The legs
+                # here are not known in advance: they are drawn, traded and
+                # disbanded for as long as the run lasts.
+                legs = [asyncio.create_task(self._dispatch_groups(sizes))]
+            else:
+                legs = [
+                    asyncio.create_task(self._run_leg(symbol, sizes[symbol]))
+                    for symbol in self.symbols
+                ]
             # One leg raising must not leave the other trading on alone, so the
             # first exception cancels the rest before it propagates.
             done, pending = await asyncio.wait(
