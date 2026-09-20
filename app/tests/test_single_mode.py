@@ -143,3 +143,69 @@ def test_single_does_not_care_what_the_unused_leg_names():
 def test_an_unknown_mode_is_refused_rather_than_assumed():
     with pytest.raises(ConfigError, match="single"):
         make("solo").validate(require_credentials=False)
+
+
+# -- and from the command line ----------------------------------------------
+#
+# The flag is applied before validation rather than assigned to a loaded
+# config, so a command line asking for something contradictory is refused by
+# the same rules a settings file would be, instead of running under a config
+# nothing ever checked.
+
+
+SETTINGS = """
+legs:
+  master_account:
+    symbol: BTC-USD
+    notional_usd: 4000
+    offset_bps: 2.0
+    max_distance_bps: 3.0
+    max_order_notional_usd: 500
+  sub_account:
+    symbol: {sub}
+    notional_usd: 1500
+    offset_bps: 3.0
+    max_distance_bps: 4.0
+    max_order_notional_usd: 500
+{mode}
+"""
+
+
+def write(tmp_path, mode_line="", sub="ETH-USD"):
+    path = tmp_path / "settings.yaml"
+    path.write_text(SETTINGS.format(mode=mode_line, sub=sub), encoding="utf-8")
+    return str(path)
+
+
+def load(path, **kwargs):
+    from bulkdn.config import load_config
+
+    return load_config(path, require_credentials=False, require_sub1=False, **kwargs)
+
+
+def test_the_flag_exists_and_refuses_anything_else():
+    from bulkdn.cli import build_parser
+
+    assert build_parser().parse_args(["--mode", "single", "run"]).mode == "single"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--mode", "solo", "run"])
+
+
+def test_no_flag_leaves_the_settings_file_in_charge(tmp_path):
+    assert load(write(tmp_path, "mode: single")).mode == "single"
+    assert load(write(tmp_path)).mode == "multi"
+
+
+def test_the_flag_overrides_the_file_both_ways(tmp_path):
+    assert load(write(tmp_path, "mode: multi"), mode="single").mode == "single"
+    assert load(write(tmp_path, "mode: single"), mode="multi").mode == "multi"
+
+
+def test_overriding_to_multi_is_still_checked(tmp_path):
+    """A file written for single may name one symbol twice, which multi cannot
+    run. Asking for multi from the command line has to hit that rule, not slip
+    past it because the file was loaded first."""
+    path = write(tmp_path, "mode: single", sub="BTC-USD")
+    assert load(path).mode == "single"
+    with pytest.raises(ConfigError, match="different symbols"):
+        load(path, mode="multi")

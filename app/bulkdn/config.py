@@ -593,8 +593,16 @@ def load_config(
     path: str,
     require_credentials: bool = True,
     require_sub1: bool = True,
+    mode: str | None = None,
 ) -> Config:
-    """Load, merge, and validate configuration."""
+    """Load, merge, and validate configuration.
+
+    `mode` overrides the file, for the command line flag of the same name. It
+    is applied before validation rather than assigned afterwards, so a command
+    line that asks for something contradictory is refused by the same rules as
+    a settings file that does -- rather than running with a config nothing ever
+    checked.
+    """
     try:
         with open(path, encoding="utf-8") as handle:
             raw = yaml.safe_load(handle) or {}
@@ -636,7 +644,7 @@ def load_config(
         sub1_pubkey=raw.get("sub1_pubkey", ""),
         master_account=_leg_from_dict(legs["master_account"], "master_account"),
         sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
-        mode=str(raw.get("mode", "multi")).strip().lower(),
+        mode=str(mode if mode is not None else raw.get("mode", "multi")).strip().lower(),
         hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
         max_phase_minutes=float(raw.get("max_phase_minutes", 30.0)),
         chase_interval_s=float(raw.get("chase_interval_s", 1.0)),

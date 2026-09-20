@@ -204,10 +204,15 @@ class Runtime:
 
     async def start(self, verify: bool = True) -> None:
         log.info(
-            "mainnet mode=%s master=%s sub1=%s",
+            # The markets are named here because the mode can come from the
+            # command line, so the settings file is no longer proof of what a
+            # run actually traded. This line is.
+            "mainnet mode=%s master=%s sub1=%s legs=%s (%s)",
             "DRY-RUN" if self.dry_run else "LIVE",
             self.master.pubkey,
             self.sub1.pubkey,
+            ",".join(self.symbols),
+            self.config.mode,
         )
         # Before anything is placed. A gate that tripped later would abandon
         # open positions and leave the pair directional.
@@ -768,6 +773,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", default="settings.yaml", help="path to the settings file")
     parser.add_argument("--log-level", help="override the log level in the config file")
+    parser.add_argument(
+        "--mode",
+        choices=("single", "multi"),
+        help=(
+            "override the settings file: single trades only the master_account "
+            "leg, multi trades both. A leg is a complete delta-neutral pair on "
+            "its own, so single is the same strategy in one market"
+        ),
+    )
 
     sub = parser.add_subparsers(dest="command", required=False)
     sub.add_parser("menu", help="interactive menu (default with no subcommand)")
@@ -832,6 +846,7 @@ def main(argv: list[str] | None = None) -> int:
             # `create-subaccount` produces sub1_pubkey rather than assuming it.
             require_sub1=args.command
             not in (None, "menu", "create-subaccount", "transfer", "encrypt-key"),
+            mode=args.mode,
         )
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
