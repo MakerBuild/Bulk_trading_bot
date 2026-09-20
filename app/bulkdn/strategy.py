@@ -647,8 +647,8 @@ class Strategy:
         )
         return False
 
-    async def _clear_orphans(self, symbol: str) -> None:
-        """Cancel anything resting in `symbol` after a submission with no answer.
+    async def _clear_orphans(self, key: str) -> None:
+        """Cancel anything resting in this leg's market after a silent submission.
 
         A placement that times out may still have been accepted. The chaser
         never learns the order id -- the exception is raised before it is
@@ -668,7 +668,15 @@ class Strategy:
         losing only queue position -- which is worth less than the risk of a
         leg opening at a multiple of its size.
         """
-        session = self.sessions[self.leg_roles(symbol).maker]
+        # By leg, not by market. `leg_roles(symbol)` resolves the CONFIGURED
+        # pair, so for a leg drawn from the pool it named the wrong account
+        # entirely -- cancelling orders on an account that has none, and
+        # leaving the orphan it was called about resting.
+        roles = self._roles_for_key(key)
+        if roles is None:
+            return
+        symbol = roles.symbol
+        session = self.sessions[roles.maker]
         if symbol not in session.symbols_in_doubt(DOUBT_WINDOW_S):
             # The submission was answered -- a rejection is an answer -- so
             # nothing of ours can be resting unaccounted for.
@@ -942,7 +950,7 @@ class Strategy:
                     await self.chaser.step(roles, leg)
                 except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("chase step for %s failed: %s", key, describe(exc))
-                    await self._clear_orphans(symbol)
+                    await self._clear_orphans(key)
 
             self._persist()
 
@@ -982,9 +990,13 @@ class Strategy:
         if roles is None:
             return True
         spec = self.feed.specs[roles.symbol]
+        # Every account in the leg. `roles.taker` is only the first hedger, so
+        # a split leg would have read as flat while the second and third still
+        # held the shorts they opened -- the exact failure the exit roles were
+        # shaped to prevent, one function further on.
         return all(
             abs(self.book.authoritative(pubkey, roles.symbol)) < spec.lot_size
-            for pubkey in (roles.maker, roles.taker)
+            for pubkey in roles.accounts
         )
 
     # -- one leg's phases --------------------------------------------------
@@ -1059,7 +1071,16 @@ class Strategy:
 
         if not self._stop.is_set() and not self._leg_is_flat(key):
             log.info("%s: closing residual left after the exit leg", key)
-            await flatten(self.sessions, self.book, self.feed, [symbol])
+            # This leg's accounts, not every account. `self.sessions` is the
+            # whole pool, and a sweep across it would market-close the
+            # positions of every other group trading this market -- mid-hold,
+            # from a cycle that has nothing to do with them.
+            await flatten(
+                {pubkey: self.sessions[pubkey] for pubkey in roles.accounts},
+                self.book,
+                self.feed,
+                [symbol],
+            )
 
     # -- one leg's cycle ---------------------------------------------------
 

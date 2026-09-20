@@ -187,3 +187,91 @@ def test_the_legs_state_survives_the_release(tmp_path):
     asyncio.run(obj._run_group(group_id, group, 1.0))
 
     assert obj.state.legs[key].target_size == 0.3
+
+
+# -- and one group never reaches into another -------------------------------
+#
+# Three places still resolved a leg by its market after the pool arrived, and
+# all three would have crossed between groups trading the same one.
+
+
+def split_strategy(tmp_path):
+    obj = strategy(tmp_path)
+    key = obj.group_key(1, BTC)
+    obj._groups[key] = Group(
+        BTC, maker="opener", takers=("t1", "t2", "t3"), shares=(0.5, 0.3, 0.2)
+    )
+    return obj, key
+
+
+def test_a_split_leg_is_not_flat_while_a_later_hedger_holds_something(tmp_path):
+    """`roles.taker` is only the FIRST hedger. Reading it alone declared the
+    leg flat while the second and third still held the shorts they opened."""
+    from bulkdn.marketdata import MarketSpec
+    from bulkdn.positions import PositionBook
+
+    obj, key = split_strategy(tmp_path)
+    obj.book = PositionBook()
+    obj.feed = type("F", (), {"specs": {
+        BTC: MarketSpec(symbol=BTC, tick_size=0.5, lot_size=0.001, min_notional=10.0)
+    }})()
+
+    obj.book.set_authoritative("opener", BTC, 0.0)
+    obj.book.set_authoritative("t1", BTC, 0.0)
+    obj.book.set_authoritative("t3", BTC, -0.05)
+
+    assert obj._leg_is_flat(key) is False, "the third hedger's short was ignored"
+
+
+def test_a_split_leg_is_flat_only_when_every_account_is(tmp_path):
+    from bulkdn.marketdata import MarketSpec
+    from bulkdn.positions import PositionBook
+
+    obj, key = split_strategy(tmp_path)
+    obj.book = PositionBook()
+    obj.feed = type("F", (), {"specs": {
+        BTC: MarketSpec(symbol=BTC, tick_size=0.5, lot_size=0.001, min_notional=10.0)
+    }})()
+
+    assert obj._leg_is_flat(key) is True
+
+
+def test_the_residual_sweep_touches_only_this_legs_accounts(tmp_path):
+    """`self.sessions` is the whole pool. Sweeping it would market-close every
+    other group's position in this market, mid-hold, from a cycle that has
+    nothing to do with them."""
+    import bulkdn.strategy as strategy_mod
+    from bulkdn.marketdata import MarketSpec
+    from bulkdn.positions import PositionBook
+
+    obj, key = split_strategy(tmp_path)
+    obj.sessions = {name: object() for name in
+                    ("opener", "t1", "t2", "t3", "stranger-a", "stranger-b")}
+    obj.book = PositionBook()
+    obj.feed = type("F", (), {"specs": {
+        BTC: MarketSpec(symbol=BTC, tick_size=0.5, lot_size=0.001, min_notional=10.0)
+    }})()
+    obj.book.set_authoritative("t3", BTC, -0.05)
+    obj.state.leg(key, BTC).complete = True
+    obj.chaser = type("C", (), {})()
+
+    async def straight_through(_key, _is_done, _label):
+        return None
+
+    obj._drive_leg = straight_through
+    obj._persist = lambda: None
+
+    swept = {}
+
+    async def fake_flatten(sessions, book, feed, symbols):
+        swept.update(sessions)
+
+    original = strategy_mod.flatten
+    strategy_mod.flatten = fake_flatten
+    try:
+        asyncio.run(obj._leg_exit(key))
+    finally:
+        strategy_mod.flatten = original
+
+    assert set(swept) == {"opener", "t1", "t2", "t3"}
+    assert "stranger-a" not in swept, "another group's account was swept"

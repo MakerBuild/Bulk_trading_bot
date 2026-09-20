@@ -48,8 +48,14 @@ class Bot:
         self.sessions = {session.pubkey: session}
         self._clear_orphans = Strategy._clear_orphans.__get__(self)
 
-    def leg_roles(self, symbol):
-        return type("R", (), {"maker": self.session.pubkey})()
+    def _roles_for_key(self, key):
+        """Stands in for Strategy's own.
+
+        Keyed by leg now, not by market: for a leg drawn from the account pool
+        the configured pair is the wrong pair, so the sweep has to ask which
+        accounts THIS leg is using.
+        """
+        return type("R", (), {"maker": self.session.pubkey, "symbol": key})()
 
 
 def test_a_possibly_resting_order_is_cancelled():
