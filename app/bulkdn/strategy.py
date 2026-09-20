@@ -850,13 +850,18 @@ class Strategy:
 
     # -- one leg's chase loop ----------------------------------------------
 
-    async def _drive_leg(self, symbol: str, is_done, label: str) -> None:
+    async def _drive_leg(self, key: str, is_done, label: str) -> None:
         """Keep one leg's order near the market until `is_done()`.
 
-        Only this leg. The other is a separate task at its own phase, which is
-        the whole point: a filled leg must not wait on an unfilled one.
+        Only this leg. The others are separate tasks at their own phases, which
+        is the whole point: a filled leg must not wait on an unfilled one.
+
+        Addressed by leg key rather than by market, because two legs may trade
+        one market once groups are drawn from the account pool, and each has
+        its own order, phase and clock.
         """
-        leg = self.state.leg(symbol)
+        leg = self.state.leg(key)
+        symbol = leg.symbol
         started = time.monotonic()
         budget = phase_budget_s(leg.phase, self.config.max_phase_minutes)
 
@@ -869,10 +874,13 @@ class Strategy:
                 return
 
             if leg.phase != Phase.HOLD and not leg.complete:
+                roles = self._roles_for_key(key)
+                if roles is None:
+                    return
                 try:
-                    await self.chaser.step(self.leg_roles(symbol), leg)
+                    await self.chaser.step(roles, leg)
                 except Exception as exc:  # noqa: BLE001 - retried next tick
-                    log.error("chase step for %s failed: %s", symbol, describe(exc))
+                    log.error("chase step for %s failed: %s", key, describe(exc))
                     await self._clear_orphans(symbol)
 
             self._persist()
@@ -883,7 +891,7 @@ class Strategy:
 
             await asyncio.sleep(self.config.chase_interval_s)
 
-    def _leg_is_neutral(self, symbol: str) -> bool:
+    def _leg_is_neutral(self, key: str) -> bool:
         """Whether this leg has no hedge left that could actually be placed.
 
         A residual smaller than one lot or below the market's minimum notional
@@ -892,44 +900,59 @@ class Strategy:
         submitted. Such residuals are real exposure and are reported by
         `_log_untradeable_residuals`; the USD risk limits still police them.
         """
-        roles = self.leg_roles(symbol)
-        if abs(self.hedger.in_flight.total(symbol)) > 0:
+        roles = self._roles_for_key(key)
+        if roles is None:
+            return True
+        # By leg, not by market: another group's pending hedge on the same
+        # market says nothing about whether this one is neutral.
+        if abs(self.hedger.in_flight.total(roles.key)) > 0:
             return False
-        price = self.feed.reference_price(symbol)
+        price = self.feed.reference_price(roles.symbol)
         return self.hedger.actionable_hedge(roles, price) <= 0
 
-    def _leg_is_flat(self, symbol: str) -> bool:
-        spec = self.feed.specs[symbol]
+    def _leg_is_flat(self, key: str) -> bool:
+        """Whether this leg's own accounts hold nothing in its market.
+
+        Its own, not every account: a second group trading the same market has
+        positions of its own, and reading those would keep this leg waiting on
+        a position it does not own and cannot close.
+        """
+        roles = self._roles_for_key(key)
+        if roles is None:
+            return True
+        spec = self.feed.specs[roles.symbol]
         return all(
-            abs(self.book.authoritative(session.pubkey, symbol)) < spec.lot_size
-            for session in (self.master, self.sub1)
+            abs(self.book.authoritative(pubkey, roles.symbol)) < spec.lot_size
+            for pubkey in (roles.maker, roles.taker)
         )
 
     # -- one leg's phases --------------------------------------------------
 
-    async def _leg_open(self, symbol: str, target_size: float) -> None:
-        leg = self.state.leg(symbol)
+    async def _leg_open(self, key: str, target_size: float) -> None:
+        leg = self.state.leg(key)
         leg.phase = Phase.OPEN
         leg.complete = False
         leg.oid = None
         leg.target_size = target_size
         leg.hold_until = 0.0
-        roles = self.leg_roles(symbol)
+        roles = self._roles_for_key(key)
+        if roles is None:
+            return
         log.info(
             "=== %s OPEN: maker=%s taker=%s target=%g ===",
-            symbol, self.sessions[roles.maker].name,
+            key, self.sessions[roles.maker].name,
             self.sessions[roles.taker].name, target_size,
         )
         self._persist()
 
         await self._drive_leg(
-            symbol,
-            lambda: leg.complete and self._leg_is_neutral(symbol),
+            key,
+            lambda: leg.complete and self._leg_is_neutral(key),
             "open",
         )
 
-    async def _leg_hold(self, symbol: str) -> None:
-        leg = self.state.leg(symbol)
+    async def _leg_hold(self, key: str) -> None:
+        leg = self.state.leg(key)
         if not leg.hold_until:
             # Drawn per leg and stored as a deadline, so a restart mid-hold
             # resumes this hold rather than rolling a fresh one -- and so a leg
@@ -938,23 +961,31 @@ class Strategy:
         leg.phase = Phase.HOLD
         self._persist()
 
-        log.info("=== %s HOLD: %.1f minutes ===", symbol, leg.hold_remaining_s() / 60)
-        await self._drive_leg(symbol, lambda: leg.hold_remaining_s() <= 0, "hold")
+        log.info("=== %s HOLD: %.1f minutes ===", key, leg.hold_remaining_s() / 60)
+        await self._drive_leg(key, lambda: leg.hold_remaining_s() <= 0, "hold")
 
-    async def _leg_exit(self, symbol: str) -> None:
-        leg = self.state.leg(symbol)
+    async def _leg_exit(self, key: str) -> None:
+        leg = self.state.leg(key)
+        symbol = leg.symbol
         # Pull the entry order before reversing roles: it would fight the close.
         if leg.oid:
-            await self.chaser.cancel_leg(self.leg_roles(symbol), leg)
+            entry_roles = self._roles_for_key(key)
+            if entry_roles is not None:
+                await self.chaser.cancel_leg(entry_roles, leg)
 
         leg.phase = Phase.EXIT
         leg.complete = False
         leg.oid = None
         # The exit target is whatever is actually held, not the configured size:
         # the entry may have filled only partially.
-        roles = self.leg_roles(symbol)
+        #
+        # Read after the phase flips, because the roles swap with it and the
+        # maker of the exit is the account holding the short to cover.
+        roles = self._roles_for_key(key)
+        if roles is None:
+            return
         leg.target_size = abs(self.book.effective(roles.maker, symbol))
-        log.info("=== %s EXIT: %g to close ===", symbol, leg.target_size)
+        log.info("=== %s EXIT: %g to close ===", key, leg.target_size)
         self._persist()
 
         # The closing limit order only unwinds the maker side. The taker side is
@@ -963,10 +994,10 @@ class Strategy:
         # less than one lot while both are still non-zero, no hedge will ever
         # fire and the taker's residual would sit there forever. Completion
         # therefore waits on the maker leg, then sweeps the rest.
-        await self._drive_leg(symbol, lambda: leg.complete, "exit")
+        await self._drive_leg(key, lambda: leg.complete, "exit")
 
-        if not self._stop.is_set() and not self._leg_is_flat(symbol):
-            log.info("%s: closing residual left after the exit leg", symbol)
+        if not self._stop.is_set() and not self._leg_is_flat(key):
+            log.info("%s: closing residual left after the exit leg", key)
             await flatten(self.sessions, self.book, self.feed, [symbol])
 
     # -- one leg's cycle ---------------------------------------------------
@@ -1021,16 +1052,17 @@ class Strategy:
         )
         return drawn
 
-    async def _run_leg(self, symbol: str, configured_size: float) -> None:
+    async def _run_leg(self, key: str, configured_size: float) -> None:
         """OPEN -> HOLD -> EXIT, repeatedly, for one leg on its own clock."""
-        leg = self.state.leg(symbol)
+        leg = self.state.leg(key)
+        symbol = leg.symbol
 
         while not self._stop.is_set():
             if self.config.cycles and leg.cycle_index >= self.config.cycles:
                 return
             reached = await self._target_reached()
             if reached:
-                log.info("%s: execution target reached: %s", symbol, reached)
+                log.info("%s: execution target reached: %s", key, reached)
                 return
 
             # A restart lands mid-cycle, so each phase is entered only if this
@@ -1043,34 +1075,34 @@ class Strategy:
                     *(self.state.leg(s).cycle_index for s in self.symbols),
                 )
                 self.title.set_cycle(self.state.cycle_index)
-                log.info("=== %s cycle %d ===", symbol, leg.cycle_index)
+                log.info("=== %s cycle %d ===", key, leg.cycle_index)
                 await self._leg_open(
-                    symbol, self._size_for_cycle(symbol, configured_size)
+                    key, self._size_for_cycle(symbol, configured_size)
                 )
 
             if self._stop.is_set():
                 return
             if leg.phase == Phase.OPEN:
-                await self._leg_hold(symbol)
+                await self._leg_hold(key)
 
             if self._stop.is_set():
                 return
             if leg.phase == Phase.HOLD:
-                await self._leg_exit(symbol)
+                await self._leg_exit(key)
 
             if self._stop.is_set():
                 return
             leg.phase = Phase.COMPLETE
             leg.hold_until = 0.0
             self._persist()
-            log.info("=== %s cycle %d complete ===", symbol, leg.cycle_index)
+            log.info("=== %s cycle %d complete ===", key, leg.cycle_index)
             # This leg legitimately went to zero, so its peaks would read as an
             # external close on the next entry.
             self.guard.reset_symbol(symbol)
             await self.notifier.cycle_complete(
                 cycle=leg.cycle_index,
                 of=self.config.cycles or None,
-                detail=f"{symbol}: {await self.progress_detail()}",
+                detail=f"{key}: {await self.progress_detail()}",
             )
 
     async def _confirm_done(self, is_done, label: str) -> bool:

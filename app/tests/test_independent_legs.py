@@ -188,3 +188,36 @@ def test_a_leg_holding_an_order_is_not_idle():
     """What flatten keys off. An order id with an IDLE pair is the bug."""
     state = StrategyState(legs={BTC: LegState(symbol=BTC, oid="still-resting")})
     assert state.legs, "flatten must see the leg even when the phase reads IDLE"
+
+
+# -- two legs on one market, each with its own everything -------------------
+#
+# The phase helpers took a market and looked the leg up by it. Two groups on
+# BTC-USD would have shared one phase, one order id, one target size and one
+# cycle count -- so the second group's entry would have cancelled the first's
+# order and reported its own fills against the first's exposure.
+
+
+def test_two_legs_on_one_market_keep_their_own_order_and_phase():
+    from bulkdn.state import Phase, StrategyState
+
+    state = StrategyState()
+    first = state.leg("g1:BTC-USD", symbol="BTC-USD")
+    second = state.leg("g2:BTC-USD", symbol="BTC-USD")
+
+    first.phase = Phase.EXIT
+    first.oid = "order-one"
+    first.target_size = 0.4
+
+    assert second.phase == Phase.IDLE
+    assert second.oid is None
+    assert second.target_size == 0.0
+    assert first.symbol == second.symbol == "BTC-USD"
+
+
+def test_a_leg_key_still_names_the_market_when_that_is_all_there_is():
+    """Which is every leg that has ever run, and every state file on disk."""
+    from bulkdn.state import StrategyState
+
+    leg = StrategyState().leg("BTC-USD")
+    assert leg.id == "BTC-USD" and leg.symbol == "BTC-USD"
