@@ -226,7 +226,7 @@ def test_two_legs_on_one_market_tighten_independently():
 def test_a_tightened_leg_stays_tightened_across_a_restart():
     """It used to live in memory only, so a restart sent a leg that had
     already given up its offset back to waiting out its patience again."""
-    from bulkdn.state import LegState, StrategyState
+    from bulkdn.state import StrategyState
 
     state = StrategyState()
     state.leg("BTC-USD").tightened = True
