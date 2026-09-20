@@ -257,6 +257,15 @@ class ReferralStatus:
         return ", ".join(parts) or "no referral or invite"
 
 
+def _owner_label(status: ReferralStatus) -> str:
+    """How to name the build owner in a line other people will read.
+
+    Their referral code when the indexer reports one -- it is a name they
+    chose to publish. Never their wallet: that is an address they did not.
+    """
+    return status.referred_by_code or "the owner of this build"
+
+
 def _as_str(value) -> str | None:
     return None if value is None else str(value)
 
@@ -339,14 +348,18 @@ def check_access(
 
     # Wallets are matched against both routes: one address, whether it referred
     # the account or invited it.
+    #
+    # The address is NOT put in the reason. This line is logged on every start
+    # by everyone the build was handed to, and the wallet it would name is
+    # always the same one -- the owner's -- so printing it publishes their
+    # address to every operator and into every log file they send on. The code
+    # is named instead when the indexer reports one, and otherwise the route
+    # alone, which is all the operator needs: it says they are admitted and by
+    # which door.
     if status.referred_by_wallet and wallet_digest(status.referred_by_wallet) in allowed.wallets:
-        return AccessDecision(
-            True, f"referred by wallet {status.referred_by_wallet}", status
-        )
+        return AccessDecision(True, f"referred by {_owner_label(status)}", status)
     if status.invited_by_wallet and wallet_digest(status.invited_by_wallet) in allowed.wallets:
-        return AccessDecision(
-            True, f"invited by wallet {status.invited_by_wallet}", status
-        )
+        return AccessDecision(True, f"invited by {_owner_label(status)}", status)
 
     if status.referred_by_code and code_digest(status.referred_by_code) in allowed.codes:
         return AccessDecision(

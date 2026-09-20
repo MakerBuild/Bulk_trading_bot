@@ -188,8 +188,8 @@ def test_one_wallet_admits_both_referred_and_invited(monkeypatch):
     _serve(monkeypatch, FakeResponse(200, INVITED))
     invited = check_access(WALLET, config)
 
-    assert referred.allowed and "referred by wallet" in referred.reason
-    assert invited.allowed and "invited by wallet" in invited.reason
+    assert referred.allowed and "referred by" in referred.reason
+    assert invited.allowed and "invited by" in invited.reason
 
 
 def test_invited_wallet_is_denied_for_a_different_inviter(monkeypatch):
@@ -212,7 +212,8 @@ def test_an_invite_is_matched_on_the_inviter_not_the_code(monkeypatch):
         WALLET, AccessConfig(require_referral=True, wallets=[REFERRER])
     )
     assert by_wallet.allowed
-    assert "invited by wallet" in by_wallet.reason
+    assert "invited by" in by_wallet.reason
+    assert REFERRER not in by_wallet.reason, "the owner's address was printed"
 
     # Neither spelling of the code opens it.
     for code in ("inv-3-031806", "BULK-EDA-QQF"):
@@ -345,3 +346,34 @@ def test_non_mapping_is_an_error():
 def test_either_route_counts_as_an_origin(payload, expected):
     status = referral.ReferralStatus.from_api("EXAMPLE-WALLET", payload)
     assert status.has_origin is expected
+
+
+# -- and the owner's address stays out of it --------------------------------
+
+
+def test_the_granted_line_never_names_a_wallet(monkeypatch):
+    """This line is logged on every start by everyone the build was handed
+    to, and the wallet it would name is always the same one -- the owner's.
+    Printing it publishes their address into every log file they send on."""
+    _serve(monkeypatch, FakeResponse(200, INVITED))
+
+    decision = check_access(
+        WALLET, AccessConfig(require_referral=True, wallets=[REFERRER])
+    )
+
+    assert decision.allowed
+    assert REFERRER not in decision.reason
+
+
+def test_a_code_is_named_because_it_was_published_on_purpose(monkeypatch):
+    """A referral code is something the owner chose to publish. Their wallet
+    is not."""
+    _serve(monkeypatch, FakeResponse(200, REFERRED))
+
+    decision = check_access(
+        WALLET, AccessConfig(require_referral=True, wallets=[REFERRER])
+    )
+
+    assert decision.allowed
+    assert REFERRER not in decision.reason
+    assert "referred by" in decision.reason
