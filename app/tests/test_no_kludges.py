@@ -75,6 +75,9 @@ async def test_the_loop_keeps_turning_during_a_history_read(monkeypatch):
             pubkey = "EXAMPLE"
 
         master = sub1 = _S()
+        # Read across every account the run trades, so the stub needs the map
+        # rather than just the pair.
+        sessions = {"EXAMPLE": _S()}
 
     ticks = 0
 

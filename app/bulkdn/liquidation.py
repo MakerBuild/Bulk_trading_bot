@@ -92,14 +92,23 @@ class LiquidationGuard:
     # long.
     _peak: dict[tuple[str, str], float] = field(default_factory=dict)
 
-    def reset_symbol(self, symbol: str) -> None:
-        """Forget one symbol's peaks, leaving the other leg's intact.
+    def reset_symbol(self, symbol: str, accounts=None) -> None:
+        """Forget peaks in one symbol, for one leg's accounts.
 
-        Legs finish their cycles independently, so clearing both would erase the
-        high-water mark of a leg that is still holding a position -- and its
-        next real shrink would then go unnoticed.
+        Legs finish their cycles independently, so clearing more than the
+        finishing leg's own would erase the high-water mark of a leg still
+        holding a position -- and its next real shrink would then go unnoticed,
+        which is the one thing this whole guard exists to see.
+
+        That was true of the other leg when legs meant markets. With an account
+        pool two legs can share a market, so the accounts have to be named:
+        `accounts=None` still clears the whole symbol, which is what the halt
+        path and a single configured pair both mean by it.
         """
-        for key in [k for k in self._peak if k[1] == symbol]:
+        for key in [
+            k for k in self._peak
+            if k[1] == symbol and (accounts is None or k[0] in accounts)
+        ]:
             del self._peak[key]
 
     def reset(self) -> None:

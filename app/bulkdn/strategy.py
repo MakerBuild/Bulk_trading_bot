@@ -1331,9 +1331,14 @@ class Strategy:
             leg.hold_until = 0.0
             self._persist()
             log.info("=== %s cycle %d complete ===", key, leg.cycle_index)
-            # This leg legitimately went to zero, so its peaks would read as an
-            # external close on the next entry.
-            self.guard.reset_symbol(symbol)
+            # This leg legitimately went to zero, so its peaks would read as
+            # an external close on the next entry. Only its own accounts: a
+            # second group on this market may still be holding, and clearing
+            # its high-water mark would hide the next real shrink.
+            finished = self._roles_for_key(key)
+            self.guard.reset_symbol(
+                symbol, accounts=finished.accounts if finished else None
+            )
             await self.notifier.cycle_complete(
                 cycle=leg.cycle_index,
                 of=self.config.cycles or None,
@@ -1628,8 +1633,11 @@ class Strategy:
         A thread keeps the loop turning. The same pattern `reconcile` already
         uses for its HTTP position read.
         """
+        # Every account the run trades, not the first two. In pool mode
+        # those two are two of a hundred and ten, so a volume or burn target
+        # would have counted a fiftieth of the trading and never been reached.
         return await asyncio.to_thread(
-            realised_for_tree, self.master.http, [self.master.pubkey, self.sub1.pubkey]
+            realised_for_tree, self.master.http, list(self.sessions)
         )
 
     async def capture_target_baseline(self) -> None:

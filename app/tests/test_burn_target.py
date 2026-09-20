@@ -54,6 +54,10 @@ class FakeStrategy:
 
         self.master = Session()
         self.sub1 = Session()
+        # Every account the run trades. The history is read across all of
+        # them, not the first pair -- in pool mode that pair is two of a
+        # hundred and ten.
+        self.sessions = {self.master.pubkey: self.master, self.sub1.pubkey: self.sub1}
 
     async def reached(self):
         return await Strategy._target_reached(self)

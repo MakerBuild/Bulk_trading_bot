@@ -202,3 +202,42 @@ def test_unconfirmed_fills_do_not_trigger_it():
     book.apply_fill(MASTER, BTC, is_buy=False, size=0.9)
     assert book.effective(MASTER, BTC) < 0.2
     assert g.check(book, Phase.HOLD, ACCOUNTS) == []
+
+
+# -- resetting peaks for one leg, not for a market --------------------------
+
+
+def test_a_finishing_leg_does_not_clear_another_groups_peaks():
+    """Two groups can share a market once accounts are pooled. Clearing the
+    whole symbol would erase the high-water mark of a group still holding a
+    position, and its next real shrink -- a liquidation -- would go unseen,
+    which is the one thing this guard exists to catch."""
+    from bulkdn.liquidation import LiquidationGuard
+    from bulkdn.marketdata import MarketSpec
+
+    spec = MarketSpec(symbol="BTC-USD", tick_size=0.5, lot_size=0.001, min_notional=10.0)
+    guard = LiquidationGuard(specs={"BTC-USD": spec}, names={})
+    guard._peak[("mine", "BTC-USD")] = 0.5
+    guard._peak[("theirs", "BTC-USD")] = 0.7
+
+    guard.reset_symbol("BTC-USD", accounts=("mine",))
+
+    assert ("mine", "BTC-USD") not in guard._peak
+    assert guard._peak[("theirs", "BTC-USD")] == 0.7, "another group's peak was cleared"
+
+
+def test_without_accounts_it_still_clears_the_whole_symbol():
+    """Which is what the halt path and a single configured pair both mean."""
+    from bulkdn.liquidation import LiquidationGuard
+    from bulkdn.marketdata import MarketSpec
+
+    spec = MarketSpec(symbol="BTC-USD", tick_size=0.5, lot_size=0.001, min_notional=10.0)
+    guard = LiquidationGuard(specs={"BTC-USD": spec}, names={})
+    guard._peak[("a", "BTC-USD")] = 0.5
+    guard._peak[("b", "BTC-USD")] = 0.7
+    guard._peak[("a", "ETH-USD")] = 0.9
+
+    guard.reset_symbol("BTC-USD")
+
+    assert not [k for k in guard._peak if k[1] == "BTC-USD"]
+    assert guard._peak[("a", "ETH-USD")] == 0.9, "another market was cleared"
