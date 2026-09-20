@@ -55,16 +55,35 @@ class OrderRejected(Exception):
 
 
 class RoutedWsClient(BulkWebSocketClient):
-    """A WS client bound to one account, which may differ from the signer.
+    """A WS client for the accounts one key signs for.
 
-    `account_pubkey` is the account being traded. For the master session it
-    equals the signer's pubkey; for a sub-account session it is the child's
-    pubkey and the master signs on its behalf.
+    `account_pubkey` is the default account being traded. For the master it
+    equals the signer's pubkey; for a sub-account it is the child's pubkey and
+    the master signs on its behalf.
+
+    `accounts` names every account this socket carries, and it is what makes a
+    pool of a hundred accounts possible at all: the traded account travels in
+    each transaction rather than being a property of the connection, so one
+    master key needs one socket no matter how many sub-accounts hang off it.
+    Ten masters is ten sockets; a socket per account would have been a hundred
+    and ten, against an exchange that answered 429 to two accounts polling
+    every five seconds.
     """
 
-    def __init__(self, *args, account_pubkey: str | None = None, dry_run: bool = False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        account_pubkey: str | None = None,
+        accounts: list[str] | None = None,
+        dry_run: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.account_pubkey = account_pubkey or (self.signer.public_key if self.signer else None)
+        # Deduplicated, because subscribing twice to one account delivers every
+        # fill on it twice and the fill path is only idempotent by trade id.
+        wanted = list(accounts or ([self.account_pubkey] if self.account_pubkey else []))
+        self.accounts = list(dict.fromkeys(pubkey for pubkey in wanted if pubkey))
         self.dry_run = dry_run
         self.last_message_at: float = time.monotonic()
         # Set only while `connect` has the signer hidden from the base class.
@@ -104,8 +123,9 @@ class RoutedWsClient(BulkWebSocketClient):
             # that no longer existed, and the kill switch fired anyway.
             self.last_message_at = time.monotonic()
 
-        if connected and not had_subscriptions and self.account_pubkey:
-            await self.subscribe_account(self.account_pubkey)
+        if connected and not had_subscriptions:
+            for pubkey in self.accounts:
+                await self.subscribe_account(pubkey)
         return connected
 
     async def _handle_message(self, data: dict) -> None:
@@ -126,22 +146,34 @@ class RoutedWsClient(BulkWebSocketClient):
         actions: Sequence[Action],
         timeout: float | None = None,
         nonce: int | None = None,
+        account: str | None = None,
     ) -> list[OrderResponse]:
-        """Sign and submit a batch of actions against this client's account.
+        """Sign and submit a batch of actions for one account.
 
-        Mirrors the SDK's `place_orders` but sets `account` to the routed
+        Mirrors the SDK's `place_orders` but sets `account` to the traded
         account while leaving `signer` as the key that actually signs. Actions
         also carry `pubkey`, which feeds the client-side order-ID hash -- it
-        must be the routed account or the computed IDs won't match the
+        must be the traded account or the computed IDs won't match the
         exchange's.
+
+        `account` defaults to this client's own, which is every caller that
+        predates the pool. A shared socket passes it per call, because with
+        several accounts on one connection the alternative is a mutable
+        "current account" and orders landing on whichever one was set last.
         """
         signer = self._signing_key
         if not signer:
             raise RuntimeError("signer not configured")
-        if not self.account_pubkey:
+        account = account or self.account_pubkey
+        if not account:
             raise RuntimeError("account_pubkey not configured")
-
-        account = self.account_pubkey
+        if self.accounts and account not in self.accounts:
+            # A socket signs only for the accounts its key was built for.
+            # Sending for another would be rejected by the exchange, but the
+            # useful moment to notice is here, where the account is named.
+            raise RuntimeError(
+                f"this connection does not carry {short_pubkey(account)}"
+            )
         if nonce is None:
             nonce = int(time.time_ns())
 
@@ -307,6 +339,9 @@ class AccountSession:
         it would let an active market trip the kill switch.
         """
         try:
+            # Named explicitly: one socket may carry several accounts, and the
+            # session is the only thing that knows which of them this is.
+            kwargs.setdefault("account", self.pubkey)
             responses = await self.client.submit(actions, **kwargs)
         except Exception:
             # No answer came back. The actions may have executed anyway, so
@@ -474,6 +509,72 @@ def build_sessions(
     return make("master", master_pubkey), make("sub1", sub1_pubkey)
 
 
+def build_pool(
+    *,
+    private_keys: Sequence[str],
+    ws_url: str,
+    http_url: str,
+    domain: SignatureDomain,
+    symbols: Sequence[str],
+    dry_run: bool,
+    discover=None,
+) -> list[AccountSession]:
+    """A session for every account under every key, in key order.
+
+    One socket per key, shared by all of that key's accounts. The traded
+    account travels in each transaction rather than being a property of the
+    connection, so ten masters with ten sub-accounts apiece need ten sockets
+    and not a hundred and ten -- against an exchange that answered 429 to two
+    accounts polling every five seconds.
+
+    Sessions are named for where they sit rather than for what they are:
+    `m2s3` is the third sub-account of the second key. A pool of a hundred
+    accounts is read in a log, and "sub1" repeated ten times is unreadable.
+
+    Key order is the operator's, taken from the file. An account that appears
+    under two keys is kept once, at its first appearance: the same account
+    twice in a pool is an account that can be paired with itself, which is not
+    a hedge.
+    """
+    discover = discover or discover_accounts
+    sessions: list[AccountSession] = []
+    seen: set[str] = set()
+
+    for index, private_key in enumerate(private_keys, start=1):
+        master_pubkey, children = discover(
+            private_key=private_key, http_url=http_url
+        )
+        signer = TransactionSigner(private_key)
+        # Takes the raw key, not the signer, and names the endpoint `base_url`.
+        http = BulkHttpClient(
+            base_url=http_url, private_key=private_key, signature_domain=domain
+        )
+        owned = [(f"m{index}", master_pubkey)] + [
+            (f"m{index}s{n}", pubkey) for n, pubkey in enumerate(children, start=1)
+        ]
+        fresh = [(name, pubkey) for name, pubkey in owned if pubkey not in seen]
+        if not fresh:
+            continue
+        client = RoutedWsClient(
+            url=ws_url,
+            symbols=list(symbols),
+            signer=signer,
+            signature_domain=domain,
+            account_pubkey=master_pubkey,
+            accounts=[pubkey for _name, pubkey in fresh],
+            dry_run=dry_run,
+        )
+        for name, pubkey in fresh:
+            seen.add(pubkey)
+            sessions.append(
+                AccountSession(
+                    name=name, pubkey=pubkey, client=client, http=http, dry_run=dry_run
+                )
+            )
+
+    return sessions
+
+
 class NoSubAccount(Exception):
     """The master has no sub-account to trade against."""
 
@@ -492,6 +593,32 @@ def discover_sub_account(
     The first child is taken when several exist. The strategy trades exactly
     one, and picking the first keeps repeat runs on the same account rather
     than moving positions around between them.
+    """
+    _master, children = discover_accounts(
+        private_key=private_key, http_url=http_url, timeout=timeout
+    )
+    if len(children) > 1:
+        log.info(
+            "master has %d sub-accounts; trading the first (%s)",
+            len(children),
+            short_pubkey(children[0]),
+        )
+    return children[0]
+
+
+def discover_accounts(
+    *, private_key: str, http_url: str, timeout: int = 25
+) -> tuple[str, list[str]]:
+    """The master this key signs for, and every sub-account under it.
+
+    A sub-account has no key of its own -- it is created by, and signed for by,
+    the master -- so the master's own record is the authority on which accounts
+    a key can trade. Reading it means a pool can never contain an account the
+    key cannot sign for, which is a failure that would otherwise surface as a
+    rejected order in the middle of a cycle.
+
+    Order is the exchange's. It is stable across runs, which matters because
+    the names built from it end up in the log.
     """
     master_pubkey = TransactionSigner(private_key).public_key
     response = requests.post(
@@ -516,14 +643,7 @@ def discover_sub_account(
             f"master {short_pubkey(master_pubkey)} has no sub-account. "
             "Create one from the menu: Accounts Management -> Create New Subaccount."
         )
-
-    if len(children) > 1:
-        log.info(
-            "master has %d sub-accounts; trading the first (%s)",
-            len(children),
-            short_pubkey(children[0]),
-        )
-    return children[0]
+    return master_pubkey, children
 
 
 def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:

@@ -434,6 +434,9 @@ def routed_client(silent_for=0.0):
     client.last_message_at = time.monotonic() - silent_for
     client.subscriptions = []
     client.account_pubkey = None
+    # Every account this socket carries. Empty here: the test is about the
+    # staleness clock, and a socket with no accounts subscribes to nothing.
+    client.accounts = []
     client.signer = None
     client._hidden_signer = None
     return client
