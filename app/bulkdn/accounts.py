@@ -274,7 +274,7 @@ class AccountSession:
             raise RuntimeError(f"{self.name}: failed to connect to WebSocket")
         log.info("%s connected (account=%s)", self.name, short_pubkey(self.pubkey))
 
-    async def reconnect(self, attempts: int = 3, delay: float = 2.0) -> bool:
+    async def reconnect(self, attempts: int = 6, delay: float = 2.0) -> bool:
         """Try to restore a dropped socket. True if the stream is back.
 
         Safe to call mid-cycle because nothing here depends on the socket
@@ -283,6 +283,19 @@ class AccountSession:
         is derived from those positions rather than from the fills it missed.
         A fill that landed while the socket was down therefore shows up as a
         position difference and is corrected once, not twice.
+
+        The delay doubles, so six attempts span about a minute rather than the
+        seven seconds three flat ones did. That came from a subscriber's log:
+        the socket dropped, and all three reconnects were refused by the
+        exchange's own front end with `HTTP 502` inside seven seconds. A
+        gateway is rarely back that quickly, and the run halted on an outage
+        it had barely waited out -- cancelling its orders and leaving the
+        operator to restart it by hand.
+
+        Patience is nearly free here and impatience is not. The pair stays
+        hedged while the socket is down -- the reconciler works over HTTP -- so
+        a minute of trying costs a minute of not trading, while giving up costs
+        a halt.
         """
         for attempt in range(1, attempts + 1):
             # Closing a socket that is already broken is expected to fail.
@@ -300,7 +313,10 @@ class AccountSession:
                     self.name, attempt, attempts, describe(exc),
                 )
             if attempt < attempts:
-                await asyncio.sleep(delay)
+                # Doubling, capped: a gateway that is down stays down for
+                # longer than a socket that merely blipped, and hammering it
+                # every two seconds neither helps it nor us.
+                await asyncio.sleep(min(delay * 2 ** (attempt - 1), 30.0))
         return False
 
     async def disconnect(self) -> None:

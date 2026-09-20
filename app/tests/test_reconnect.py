@@ -53,10 +53,15 @@ class FakeSession:
     def is_connected(self):
         return self.client.is_connected
 
-    async def reconnect(self, attempts=3, delay=0.0):
+    async def reconnect(self, attempts=None, delay=0.0):
+        # `attempts` follows production unless a test pins it. It used to be
+        # pinned at 3 here, which quietly kept the fake on the old patience
+        # after the real one grew.
         self.reconnects += 1
         from bulkdn.accounts import AccountSession
 
+        if attempts is None:
+            return await AccountSession.reconnect(self, delay=delay)
         return await AccountSession.reconnect(self, attempts=attempts, delay=delay)
 
 
@@ -513,8 +518,13 @@ async def test_nothing_is_retried_when_nothing_came_back():
     sub1.client.succeed_on = 0
     sub1.last_message_age_s = 999.0
 
+    from bulkdn.accounts import AccountSession
+
     assert await strategy.healed(DROPPED) is False
-    assert master.client.attempts == 3, "it kept trying a network that was down"
+    # One round of attempts, not a second round after the first gave up.
+    assert master.client.attempts == AccountSession.reconnect.__defaults__[0], (
+        "it kept trying a network that was down"
+    )
 
 
 async def test_the_retry_does_not_cost_extra_budget():
@@ -569,3 +579,44 @@ async def test_a_continuation_still_reconnects():
 
     assert await Strategy._healed(strategy, DROPPED, same_incident=True) is True
     assert master.reconnects == 1
+
+
+# -- and an outage longer than a few seconds --------------------------------
+
+
+async def test_it_keeps_trying_past_the_first_few_seconds():
+    """From a subscriber's log: the socket dropped and all three reconnects
+    were refused by the exchange's own front end with HTTP 502 inside seven
+    seconds. A gateway is rarely back that quickly, so the run halted on an
+    outage it had barely waited out."""
+    session = FakeSession("master", succeed_on=5)
+    session.client.is_connected = False
+
+    assert await session.reconnect(delay=0.0) is True
+    assert session.client.attempts >= 5, "it gave up before the outage ended"
+
+
+async def test_the_wait_grows_rather_than_repeating():
+    """Hammering a gateway that is down every two seconds helps neither of
+    us. Six attempts should span about a minute, not seven seconds."""
+    import bulkdn.accounts as accounts_mod
+    from bulkdn.accounts import AccountSession
+
+    waits = []
+
+    async def record(seconds):
+        waits.append(seconds)
+
+    original = accounts_mod.asyncio.sleep
+    accounts_mod.asyncio.sleep = record
+    try:
+        session = FakeSession("master", succeed_on=99)
+        session.client.is_connected = False
+        # The real method with its real delay: the fake passes 0.0 so tests
+        # stay fast, and that is exactly what must not be measured here.
+        await AccountSession.reconnect(session)
+    finally:
+        accounts_mod.asyncio.sleep = original
+
+    assert waits == sorted(waits), "the wait did not grow"
+    assert sum(waits) > 30, f"six attempts spanned only {sum(waits):.0f}s"
