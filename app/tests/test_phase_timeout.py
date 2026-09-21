@@ -113,7 +113,6 @@ def test_the_setting_refuses_a_negative():
         ],
         max_phase_minutes=-1.0,
         private_key="x",
-        sub1_pubkey="y",
     )
     with pytest.raises(ConfigError, match="max_phase_minutes"):
-        config.validate(require_credentials=False, require_sub1=False)
+        config.validate(require_credentials=False)

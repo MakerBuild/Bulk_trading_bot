@@ -125,7 +125,7 @@ class LiquidationGuard:
     def check(
         self,
         book: PositionBook,
-        phase: Phase | dict[str, Phase],
+        phase: Phase | dict[str, Phase] | dict[tuple[str, str], Phase],
         accounts: list[str],
     ) -> list[Liquidation]:
         """Return any position that shrank externally since the last check.
@@ -134,14 +134,35 @@ class LiquidationGuard:
         hedging fast and can briefly show a fill the exchange has not applied;
         deciding a liquidation happened on that basis would be a false alarm
         with an expensive response.
+
+        `phase` may be given three ways, and the third is the one that is
+        right once accounts are drawn from a pool:
+
+        * one phase for everything, which is what a single pair had;
+        * by symbol, from when two configured legs ran on their own clocks;
+        * by (account, symbol), which is the only spelling that survives
+          several groups trading ONE market at once.
+
+        Why the middle one stopped working: a group's phase belongs to its
+        accounts, not to the market. Two groups on BTC-USD can have one
+        opening while the other unwinds, and asking "what phase is BTC-USD
+        in?" has no answer -- take the opener's and the unwinder's deliberate
+        shrink reads as a liquidation; take the unwinder's and a real one goes
+        unseen. Asking per account has an answer, because an account is in at
+        most one group.
         """
-        # Legs run their own phases, so `phase` may be a mapping of symbol to
-        # phase. One leg exiting must not stop the other being watched.
-        def accumulating(symbol: str) -> bool:
-            per_leg = phase[symbol] if isinstance(phase, dict) else phase
+        def accumulating(account: str, symbol: str) -> bool:
+            if isinstance(phase, dict):
+                per_leg = phase.get((account, symbol), phase.get(symbol, Phase.IDLE))
+            else:
+                per_leg = phase
             return per_leg in _ACCUMULATING
 
-        if not any(accumulating(symbol) for symbol in self.specs):
+        if not any(
+            accumulating(account, symbol)
+            for account in accounts
+            for symbol in self.specs
+        ):
             # Still track peaks, so a later phase starts from the real high.
             for account in accounts:
                 for symbol in self.specs:
@@ -152,7 +173,7 @@ class LiquidationGuard:
         for account in accounts:
             for symbol, spec in self.specs.items():
                 current = book.authoritative(account, symbol)
-                if not accumulating(symbol):
+                if not accumulating(account, symbol):
                     # This leg is unwinding, so shrinking is the plan. Keep the
                     # peak current or its next entry would start from a high
                     # that belongs to the position it just closed.

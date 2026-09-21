@@ -172,6 +172,3 @@ class Pairing:
         self.busy.difference_update(group.accounts)
         return group
 
-    def release_all(self) -> None:
-        for group_id in list(self.active):
-            self.release(group_id)

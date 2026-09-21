@@ -41,10 +41,6 @@ class Quote:
     ask_size: float | None = None
 
     @property
-    def usable(self) -> bool:
-        return bool(self.mark_price or self.best_bid or self.best_ask)
-
-    @property
     def reference_price(self) -> float | None:
         """Best available price for notional maths."""
         if self.mark_price:

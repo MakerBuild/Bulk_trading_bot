@@ -241,3 +241,72 @@ def test_without_accounts_it_still_clears_the_whole_symbol():
 
     assert not [k for k in guard._peak if k[1] == "BTC-USD"]
     assert guard._peak[("a", "ETH-USD")] == 0.9, "another market was cleared"
+
+
+# -- and the phase has to reach it ------------------------------------------
+#
+# The guard asks "is this position in a phase where shrinking is unexpected?"
+# It used to ask that of the SYMBOL. Once every mode drew its accounts from a
+# pool, the leg keyed by the symbol was no longer driven by anything: it sat
+# at IDLE for the life of the run, IDLE is not an accumulating phase, and the
+# guard answered "nothing to see" on every call of every pool run it made.
+#
+# Per account is the spelling that survives several groups trading one market,
+# because an account is in at most one group and so has exactly one phase.
+
+
+def test_a_per_account_phase_is_honoured():
+    g = guard()
+    book = book_with({(MASTER, BTC): 1.0})
+    phases = {(MASTER, BTC): Phase.HOLD, (SUB1, BTC): Phase.HOLD}
+
+    assert g.check(book, phases, ACCOUNTS) == []
+
+    wiped = book_with({(MASTER, BTC): 0.0})
+    found = g.check(wiped, phases, ACCOUNTS)
+
+    assert [f.account for f in found] == [MASTER]
+
+
+def test_an_idle_symbol_no_longer_silences_a_live_account():
+    """The exact shape of the fault: the symbol reads IDLE while the accounts
+    trading it are mid-cycle."""
+    g = guard()
+    live = {(MASTER, BTC): Phase.HOLD, (SUB1, BTC): Phase.HOLD}
+    g.check(book_with({(MASTER, BTC): 1.0}), live, ACCOUNTS)
+
+    found = g.check(book_with({(MASTER, BTC): 0.0}), live, ACCOUNTS)
+
+    assert found, "a wiped position went unreported"
+
+
+def test_one_group_unwinding_does_not_accuse_itself():
+    """Two groups on one market, one holding and one exiting. Asking by
+    symbol had no answer here: the exiting group's deliberate shrink either
+    read as a liquidation, or silenced the holding one."""
+    g = guard()
+    phases = {(MASTER, BTC): Phase.EXIT, (SUB1, BTC): Phase.HOLD}
+    g.check(book_with({(MASTER, BTC): 1.0, (SUB1, BTC): -1.0}), phases, ACCOUNTS)
+
+    # The exiting account closes on purpose; the holding one is wiped.
+    found = g.check(
+        book_with({(MASTER, BTC): 0.0, (SUB1, BTC): 0.0}), phases, ACCOUNTS
+    )
+
+    assert [f.account for f in found] == [SUB1], [f.account for f in found]
+
+
+def test_one_phase_for_everything_still_works():
+    """The plain spelling a single pair used."""
+    g = guard()
+    g.check(book_with({(MASTER, BTC): 1.0}), Phase.HOLD, ACCOUNTS)
+
+    assert g.check(book_with({(MASTER, BTC): 0.0}), Phase.HOLD, ACCOUNTS)
+
+
+def test_the_symbol_spelling_still_works():
+    """Older callers, and the configured legs, name it by market."""
+    g = guard()
+    g.check(book_with({(MASTER, BTC): 1.0}), {BTC: Phase.HOLD, SOL: Phase.IDLE}, ACCOUNTS)
+
+    assert g.check(book_with({(MASTER, BTC): 0.0}), {BTC: Phase.HOLD}, ACCOUNTS)

@@ -76,7 +76,6 @@ class FakeFeed:
 
 def make_config():
     return Config(
-        sub1_pubkey=SUB1,
         markets=[
             LegConfig(symbol=BTC, size=1.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=1.0),
             LegConfig(symbol=SOL, size=10.0, offset_bps=1.0, max_distance_bps=5.0, max_order_size=10.0),

@@ -452,3 +452,74 @@ def test_a_second_hedger_is_not_labelled_unknown(tmp_path, caplog):
     printed = " | ".join(caplog.messages)
     assert "role=taker" in printed, printed
     assert "role=?" not in printed
+
+
+# -- and the phase the guard is given comes from the group ------------------
+
+
+def test_the_guard_is_told_each_accounts_own_phase(tmp_path):
+    """It used to be told the SYMBOL's phase, read off a leg that nothing
+    drove once accounts came from a pool -- so it was told IDLE, always."""
+    from bulkdn.state import Phase
+
+    strategy, _book, _sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+    strategy.state.leg(f"g1:{btc}", btc).phase = Phase.HOLD
+
+    phases = strategy._phases_by_account()
+
+    assert phases == {("m1s2", btc): Phase.HOLD, ("m1", btc): Phase.HOLD}
+
+
+def test_an_account_in_no_group_is_not_watched(tmp_path):
+    strategy, _book, _sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+
+    assert ("m1s1", btc) not in strategy._phases_by_account()
+
+
+def test_no_groups_means_nothing_to_watch(tmp_path):
+    """A position opened by this run cannot exist before a group exists to
+    open it."""
+    strategy, _book, _sessions, _client, _btc = three_on_one_socket(tmp_path)
+
+    assert strategy._phases_by_account() == {}
+
+
+# -- and the status block shows the legs that exist -------------------------
+
+
+class _FlatRisk:
+    """The status block asks risk for a dollar figure; here it is zero."""
+
+    def net_exposure_usd(self, _symbol):
+        return 0.0
+
+
+
+def test_the_status_block_names_the_groups(tmp_path):
+    """It read the leg keyed by the SYMBOL, which nothing drives once the
+    accounts come from a pool -- so it said `BTC-USD IDLE cycle 0` for an
+    hour while fifteen cycles completed underneath it."""
+    from bulkdn.state import Phase
+
+    strategy, _book, _sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+    leg = strategy.state.leg(f"g1:{btc}", btc)
+    leg.phase = Phase.HOLD
+    leg.cycle_index = 15
+    strategy._progress = (0.78, 0.0)
+    strategy.risk = _FlatRisk()
+
+    printed = "\n".join(strategy.status_lines())
+
+    assert f"g1:{btc} HOLD cycle 15" in printed, printed
+    assert "IDLE cycle 0" not in printed
+
+
+def test_with_no_group_it_says_waiting(tmp_path):
+    """Rather than reporting a phase for a leg that is not being traded."""
+    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
+    strategy._progress = (0.0, 0.0)
+    strategy.risk = _FlatRisk()
+
+    printed = "\n".join(strategy.status_lines())
+
+    assert f"{btc} waiting" in printed, printed

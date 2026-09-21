@@ -425,9 +425,6 @@ class Config:
     # `markets[0]`, and an error has to name the one the operator will find
     # when they open the file.
     market_names: list[str] = field(default_factory=list)
-    # Normally discovered from the master at startup; set only to pin one
-    # specific sub-account when the master has several.
-    sub1_pubkey: str = ""
     risk: RiskConfig = field(default_factory=RiskConfig)
     target: ExecutionTarget = field(default_factory=ExecutionTarget)
     state_file: str = "./app/state/strategy_state.json"
@@ -458,10 +455,6 @@ class Config:
         not care which.
         """
         return self.markets[0]
-
-    @property
-    def sub_account(self) -> LegConfig | None:
-        return self.markets[1] if len(self.markets) > 1 else None
 
     # Referral gating, checked once at startup. See bulkdn/referral.py for what
     # a client-side gate does and does not actually prevent.
@@ -530,12 +523,8 @@ class Config:
         elif self.private_key and not self.private_keys:
             self.private_keys = [self.private_key]
 
-    def validate(self, require_credentials: bool = True, require_sub1: bool = True) -> None:
-        """Validate the configuration.
-
-        `require_sub1` is relaxed for `create-subaccount`, which exists to
-        produce that pubkey rather than assume it already exists.
-        """
+    def validate(self, require_credentials: bool = True) -> None:
+        """Validate the configuration."""
         if not self.http_url or not self.ws_url:
             raise ConfigError("http_url and ws_url must not be empty")
         if require_credentials and not self.private_key:
@@ -818,7 +807,6 @@ def _access_from_dict(raw: Any) -> AccessConfig:
 def load_config(
     path: str,
     require_credentials: bool = True,
-    require_sub1: bool = True,
     mode: str | None = None,
 ) -> Config:
     """Load, merge, and validate configuration.
@@ -862,7 +850,6 @@ def load_config(
     )
 
     config = Config(
-        sub1_pubkey=raw.get("sub1_pubkey", ""),
         markets=markets,
         market_names=market_names,
         mode=_mode_from_raw(mode if mode is not None else raw.get("mode", "multi")),
@@ -901,5 +888,5 @@ def load_config(
         access=_access_from_dict(raw.get("access") or {}),
         private_keys=_load_private_keys(require_credentials),
     )
-    config.validate(require_credentials=require_credentials, require_sub1=require_sub1)
+    config.validate(require_credentials=require_credentials)
     return config

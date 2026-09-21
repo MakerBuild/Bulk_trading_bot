@@ -1083,9 +1083,6 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(
             args.config,
             require_credentials=True,
-            # `create-subaccount` produces sub1_pubkey rather than assuming it.
-            require_sub1=args.command
-            not in (None, "menu", "create-subaccount", "transfer", "encrypt-key"),
             mode=args.mode,
         )
     except ConfigError as exc:

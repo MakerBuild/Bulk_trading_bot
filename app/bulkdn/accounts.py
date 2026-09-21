@@ -556,48 +556,6 @@ class AccountSession:
         return self.http.get_open_orders(self.pubkey)
 
 
-def build_sessions(
-    *,
-    private_key: str,
-    sub1_pubkey: str,
-    ws_url: str,
-    http_url: str,
-    domain: SignatureDomain,
-    symbols: Sequence[str],
-    dry_run: bool,
-) -> tuple[AccountSession, AccountSession]:
-    """Construct the master and Sub1 sessions from a single signing key.
-
-    Both sessions share the master's key. They differ in `account_pubkey`,
-    which is what routes orders to the right account.
-    """
-    signer = TransactionSigner(private_key)
-    master_pubkey = signer.public_key
-
-    if sub1_pubkey == master_pubkey:
-        raise ValueError("sub1_pubkey must differ from the master account pubkey")
-
-    # Takes the raw key, not the signer, and names the endpoint `base_url`.
-    http = BulkHttpClient(
-        base_url=http_url, private_key=private_key, signature_domain=domain
-    )
-
-    def make(name: str, pubkey: str) -> AccountSession:
-        client = RoutedWsClient(
-            url=ws_url,
-            symbols=list(symbols),
-            signer=signer,
-            signature_domain=domain,
-            account_pubkey=pubkey,
-            dry_run=dry_run,
-        )
-        return AccountSession(
-            name=name, pubkey=pubkey, client=client, http=http, dry_run=dry_run
-        )
-
-    return make("master", master_pubkey), make("sub1", sub1_pubkey)
-
-
 def build_pool(
     *,
     private_keys: Sequence[str],
@@ -704,34 +662,7 @@ def _owner_of(message: dict, accounts: Sequence[str] = ()) -> str | None:
 
 
 class NoSubAccount(Exception):
-    """The master has no sub-account to trade against."""
-
-
-def discover_sub_account(
-    *, private_key: str, http_url: str, timeout: int = 25
-) -> str:
-    """Find the master's sub-account, so it need not be configured by hand.
-
-    A sub-account has no private key of its own -- it is created by, and signed
-    for by, the master. Asking the operator to paste its pubkey is therefore
-    busywork: the master's own account record already lists it, and that record
-    is the authority. Reading it also means a config can never name a
-    sub-account that does not belong to the key in use.
-
-    The first child is taken when several exist. The strategy trades exactly
-    one, and picking the first keeps repeat runs on the same account rather
-    than moving positions around between them.
-    """
-    _master, children = discover_accounts(
-        private_key=private_key, http_url=http_url, timeout=timeout
-    )
-    if len(children) > 1:
-        log.info(
-            "master has %d sub-accounts; trading the first (%s)",
-            len(children),
-            short_pubkey(children[0]),
-        )
-    return children[0]
+    """The master has no sub-account, so a pair cannot be formed."""
 
 
 def discover_accounts(

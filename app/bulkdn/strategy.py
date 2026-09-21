@@ -368,6 +368,10 @@ class Strategy:
         session = self.sessions.get(pubkey) if hasattr(self, "sessions") else None
         return session.name if session is not None else short_pubkey(pubkey)
 
+    def _live_keys(self) -> list[str]:
+        """The legs that are trading: the drawn groups, else the configured."""
+        return list(self._groups) or list(self.symbols)
+
     def _key_for_account(self, pubkey: str, symbol: str) -> str | None:
         """Which leg this account is trading in this market, if any.
 
@@ -657,7 +661,7 @@ class Strategy:
             # account of a pool is a liquidation.
             if self.guard.check(
                 self.book,
-                self._phases_by_symbol(),
+                self._phases_by_account(),
                 [s.pubkey for s in self.all_sessions],
             ):
                 self._liquidation_seen.set()
@@ -740,7 +744,7 @@ class Strategy:
             # not queue behind a hedge -- and it makes any pending hedge moot.
             if self._liquidation_seen.is_set():
                 self._liquidation_seen.clear()
-                await self._guard_liquidation(self._phases_by_symbol())
+                await self._guard_liquidation(self._phases_by_account())
                 continue
 
             try:
@@ -1043,7 +1047,7 @@ class Strategy:
                 # Before hedging, not after. If a position was liquidated, the
                 # hedge rule's answer is to open a fresh one on the account that
                 # still holds something -- exactly the wrong response.
-                if await self._guard_liquidation(self._phases_by_symbol()):
+                if await self._guard_liquidation(self._phases_by_account()):
                     return
 
                 try:
@@ -1113,8 +1117,29 @@ class Strategy:
             await sync_positions(self.sessions.values(), self.book)
             self._synced_at = time.monotonic()
 
-    def _phases_by_symbol(self) -> dict[str, Phase]:
-        return {symbol: self.state.leg(symbol).phase for symbol in self.symbols}
+    def _phases_by_account(self) -> dict[tuple[str, str], Phase]:
+        """Each account's phase in each market it is trading.
+
+        By account, because a phase belongs to the leg an account is in and
+        several legs can share a market. The old answer was by SYMBOL, read
+        off the leg keyed by the symbol itself -- and once every mode drew its
+        accounts from the pool, nothing ever drove that leg. It sat at IDLE
+        for the life of the run, IDLE is not an accumulating phase, and the
+        liquidation guard therefore returned "nothing to see" on every call
+        of every pool run it has ever made.
+
+        Accounts in no group are left out rather than reported IDLE: they hold
+        nothing, and a guard that watches them is a guard watching zero. When
+        no group is drawn at all the map is empty, which says the same thing
+        about the whole run -- a position opened by this run cannot exist
+        before a group exists to open it.
+        """
+        phases: dict[tuple[str, str], Phase] = {}
+        for key, group in self._groups.items():
+            phase = self.state.leg(key, group.symbol).phase
+            for pubkey in group.accounts:
+                phases[(pubkey, group.symbol)] = phase
+        return phases
 
     # -- one leg's chase loop ----------------------------------------------
 
@@ -1656,13 +1681,22 @@ class Strategy:
         """
         from .screen import bar, humanise
 
+        # The legs that are trading, which are the drawn groups. It used to
+        # read the leg keyed by the SYMBOL -- and once every mode drew its
+        # accounts from the pool, nothing drove that leg. The block reported
+        # `BTC-USD IDLE cycle 0` for an hour while fifteen cycles completed
+        # underneath it.
         legs = []
-        for symbol in self.symbols:
-            leg = self.state.leg(symbol)
+        for key in self._live_keys():
+            leg = self.state.legs.get(key)
+            if leg is None:
+                continue
             phase = leg.phase.value.upper()
             left = leg.hold_remaining_s()
             note = f" {humanise(left)} left" if left > 0 else ""
-            legs.append(f"{symbol} {phase} cycle {leg.cycle_index}{note}")
+            legs.append(f"{key} {phase} cycle {leg.cycle_index}{note}")
+        if not legs:
+            legs = [f"{symbol} waiting" for symbol in self.symbols]
 
         burned, volume = self._progress
         target = self.config.target

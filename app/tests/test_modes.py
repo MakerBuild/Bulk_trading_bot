@@ -31,7 +31,6 @@ def market(symbol, enabled=True):
 
 def make(mode="multi", markets=(BTC, ETH), keys=("k1",), single_master=1):
     return Config(
-        sub1_pubkey="SUB",
         markets=[m if isinstance(m, LegConfig) else market(m) for m in markets],
         mode=mode,
         single_master=single_master,
@@ -168,7 +167,7 @@ def load(tmp_path, text):
 
     path = tmp_path / "settings.yaml"
     path.write_text(text, encoding="utf-8")
-    return load_config(str(path), require_credentials=False, require_sub1=False)
+    return load_config(str(path), require_credentials=False)
 
 
 def test_a_markets_list_is_read_in_order(tmp_path):
@@ -232,7 +231,7 @@ def test_the_flags_old_name_lands_on_multi(tmp_path):
     path = tmp_path / "settings.yaml"
     path.write_text(LEGACY_FILE.format(mode="single"), encoding="utf-8")
     config = load_config(
-        str(path), require_credentials=False, require_sub1=False, mode="pool"
+        str(path), require_credentials=False, mode="pool"
     )
 
     assert config.mode == "multi"
