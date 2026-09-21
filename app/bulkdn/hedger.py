@@ -32,7 +32,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from .accounts import AccountSession
+from .accounts import AccountSession, short_pubkey
 from .marketdata import MarketSpec, round_notional, round_size, touch_text
 from .impact import ImpactBook
 from .positions import PositionBook
@@ -259,6 +259,11 @@ class Hedger:
             return spec.lot_size
         return max(spec.lot_size, round_size(spec.min_notional / price, spec))
 
+    def _name(self, pubkey: str) -> str:
+        """An account's short name for a message, or its pubkey."""
+        session = self.sessions.get(pubkey)
+        return session.name if session is not None else short_pubkey(pubkey)
+
     def _slice(
         self, roles: LegRoles, size: float, spec, price: float | None = None
     ) -> list[tuple[str, float]]:
@@ -359,10 +364,18 @@ class Hedger:
 
             ceiling = self.max_hedge_size.get(symbol)
             if ceiling is not None and abs(net) > ceiling:
+                # Every account in the leg, because this message is the one an
+                # operator reads at a halt and it has to add up to `net`. It
+                # used to print `roles.taker`, the FIRST hedger, so a leg with
+                # three of them reported a maker and a taker whose sum was not
+                # the number in the same sentence.
+                held = " ".join(
+                    f"{self._name(pubkey)}={self.book.effective(pubkey, symbol):+.8f}"
+                    for pubkey in roles.accounts
+                )
                 raise HedgeLimitExceeded(
                     f"{symbol}: required hedge {abs(net):.8f} exceeds ceiling "
-                    f"{ceiling:.8f} (maker={self.book.effective(roles.maker, symbol):.8f}, "
-                    f"taker={self.book.effective(roles.taker, symbol):.8f})"
+                    f"{ceiling:.8f} ({held})"
                 )
 
             # net > 0 means the pair is net long, so the taker sells.

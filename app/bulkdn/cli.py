@@ -726,12 +726,17 @@ async def cmd_status(config: Config) -> int:
     runtime = Runtime(config, dry_run=True)
     runtime.feed.load_specs()
 
-    sync_positions_http([runtime.master, runtime.sub1], runtime.book)
+    # Every account, not the named pair. `status` is what an operator reads
+    # to decide whether anything is open, and answering for two accounts out
+    # of six is answering the wrong question confidently.
+    sync_positions_http(runtime.pool, runtime.book)
     state = runtime.store.load()
 
     print(f"endpoint     : {config.http_url}")
-    print(f"master       : {runtime.master.pubkey}")
-    print(f"sub1         : {runtime.sub1.pubkey}")
+    print(f"mode         : {config.mode}")
+    print(f"accounts     : {len(runtime.pool)} on {len({id(s.client) for s in runtime.pool})} socket(s)")
+    for session in runtime.pool:
+        print(f"  {session.name:<6} {session.pubkey}")
     # Per leg, because they no longer move together: one can be holding while
     # the other is still filling, and a single phase would hide that.
     print(f"phase        : {state.summary_phase.value}")
@@ -747,15 +752,17 @@ async def cmd_status(config: Config) -> int:
 
     print("\npositions:")
     for symbol in runtime.symbols:
-        master_size = runtime.book.authoritative(runtime.master.pubkey, symbol)
-        sub_size = runtime.book.authoritative(runtime.sub1.pubkey, symbol)
-        print(
-            f"  {symbol:<10} master={master_size:+.8f}  sub1={sub_size:+.8f}  "
-            f"net={master_size + sub_size:+.8f}"
+        sizes = {
+            session.name: runtime.book.authoritative(session.pubkey, symbol)
+            for session in runtime.pool
+        }
+        held = " ".join(
+            f"{name}={size:+.8f}" for name, size in sizes.items() if size
         )
+        print(f"  {symbol:<10} net={sum(sizes.values()):+.8f}  {held or 'all flat'}")
 
     print("\nopen orders:")
-    for session in (runtime.master, runtime.sub1):
+    for session in runtime.pool:
         try:
             orders = session.open_orders()
         except Exception as exc:
@@ -798,6 +805,28 @@ async def cmd_check(config: Config) -> int:
     return 0
 
 
+def _tree_holding(config: Config, pubkey: str) -> tuple[str, list[str]] | None:
+    """The key whose tree holds this account, and that tree's accounts.
+
+    Read from the exchange rather than configured, for the reason every other
+    account listing is: a sub-account is a fact about its master, and a list
+    typed into a file is a list that can be wrong.
+    """
+    from .accounts import discover_accounts
+
+    for key in config.private_keys or ([config.private_key] if config.private_key else []):
+        try:
+            master, children = discover_accounts(
+                private_key=key, http_url=config.http_url
+            )
+        except Exception:  # noqa: BLE001 - a key with no account owns nothing
+            continue
+        accounts = [master, *children]
+        if pubkey in accounts:
+            return key, accounts
+    return None
+
+
 async def cmd_transfer(
     config: Config, to_pubkey: str, amount: float, from_pubkey: str | None
 ) -> int:
@@ -816,6 +845,26 @@ async def cmd_transfer(
     from .subaccounts import submit_transfer
 
     source = from_pubkey or TransactionSigner(config.private_key).public_key
+
+    # Which key signs this. Not the first in the file: a transfer is signed by
+    # the key owning BOTH ends, so one inside the second master's tree signed
+    # by the first master's key is simply refused -- and refused after the
+    # operator has been told it was submitted.
+    tree = _tree_holding(config, source)
+    if tree is None:
+        print(f"\nno key in the file owns {source}. Nothing was submitted.")
+        return 1
+    key, accounts = tree
+    if to_pubkey not in accounts:
+        # Margin cannot cross from one master to another without an on-chain
+        # withdrawal and deposit, which this bot cannot do. Better said here
+        # than discovered from a rejection.
+        print(
+            f"\n{to_pubkey} is not under the same master as {source}, and "
+            "margin cannot move between masters. Nothing was submitted."
+        )
+        return 1
+
     print(
         f"\ntransferring {amount} USDC\n"
         f"  from {source}\n"
@@ -825,7 +874,7 @@ async def cmd_transfer(
 
     result = submit_transfer(
         http_url=config.http_url,
-        private_key=config.private_key,
+        private_key=key,
         domain=SignatureDomain[config.signature_domain_name],
         from_pubkey=source,
         to_pubkey=to_pubkey,

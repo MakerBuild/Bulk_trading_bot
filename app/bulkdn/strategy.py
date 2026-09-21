@@ -363,6 +363,11 @@ class Strategy:
             ]
         return [self.leg_roles(symbol) for symbol in self.symbols]
 
+    def _name_of(self, pubkey: str) -> str:
+        """An account's short name, or its pubkey when it has no session."""
+        session = self.sessions.get(pubkey) if hasattr(self, "sessions") else None
+        return session.name if session is not None else short_pubkey(pubkey)
+
     def _key_for_account(self, pubkey: str, symbol: str) -> str | None:
         """Which leg this account is trading in this market, if any.
 
@@ -526,7 +531,12 @@ class Strategy:
         read works, the guess is replaced by the exchange's own answer and the
         ordinary hedge rule can correct from there.
         """
-        events = self.guard.check(self.book, phase, [self.master.pubkey, self.sub1.pubkey])
+        # Every account. A position closed out from under us on the fifth
+        # account of a pool is the same event as one on the first, and the
+        # response -- stop rebuilding the pair -- is the same too.
+        events = self.guard.check(
+            self.book, phase, [s.pubkey for s in self.all_sessions]
+        )
         if not events:
             return False
 
@@ -1201,9 +1211,14 @@ class Strategy:
         if roles is None:
             return
         log.info(
-            "=== %s OPEN: maker=%s taker=%s target=%g ===",
-            key, self.sessions[roles.maker].name,
-            self.sessions[roles.taker].name, target_size,
+            # Every hedger, not `roles.taker` -- which is the first of them.
+            # A split hedge announced one account and used three, so the line
+            # that says what a cycle is doing named two thirds of it wrong.
+            "=== %s OPEN: maker=%s takers=%s target=%g ===",
+            key,
+            self.sessions[roles.maker].name,
+            ",".join(self._name_of(pubkey) for pubkey in roles.hedgers),
+            target_size,
         )
         self._persist()
 
