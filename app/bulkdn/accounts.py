@@ -151,7 +151,7 @@ class RoutedWsClient(BulkWebSocketClient):
         # attribute is enough to carry this -- there is no interleaving to
         # lose it to.
         if isinstance(data, dict) and data.get("type") == "account":
-            self._dispatch_owner = _owner_of(data)
+            self._dispatch_owner = _owner_of(data, self.accounts)
             if self._dispatch_owner is None:
                 self._warn_unattributable(data)
             try:
@@ -176,10 +176,11 @@ class RoutedWsClient(BulkWebSocketClient):
         log.warning(
             "account updates on this socket do not name their account, and it "
             "carries %d of them -- falling back to HTTP position reads. "
-            "Fields seen: outer=%s inner=%s",
+            "Fields seen: outer=%s inner=%s topic=%r",
             len(self.accounts),
             sorted(data),
             sorted(inner) if isinstance(inner, dict) else type(inner).__name__,
+            data.get("topic"),
         )
 
     @property
@@ -663,15 +664,33 @@ def build_pool(
     return sessions
 
 
-# Where the exchange names the account an update is about. Several
-# spellings because the field is not in the SDK's model at all -- it parses
-# fills into a dataclass that has no room for it -- so this reads the raw
-# message, and the raw message's spelling is the exchange's business.
+# Where the exchange names the account an update is about. The field is not
+# in the SDK's model at all -- it parses fills into a dataclass with no room
+# for it -- so this reads the raw message before parsing.
+#
+# In practice it is `topic`, and none of the payload spellings appear: a live
+# socket carrying three accounts sent outer=[data, topic, type] and an inner
+# payload of position and margin fields naming nobody. The others are kept
+# because they cost nothing and a second endpoint may differ.
 ACCOUNT_OWNER_KEYS = ("user", "account", "subAccount", "pubkey", "owner", "u")
 
 
-def _owner_of(message: dict) -> str | None:
-    """The account an account-update names, or None if it names none."""
+def _owner_of(message: dict, accounts: Sequence[str] = ()) -> str | None:
+    """The account an account-update is about, or None if it cannot be told.
+
+    `topic` is what the exchange actually answers with, and it is matched
+    against the accounts this socket subscribed to rather than parsed. The
+    subscription is `{"type": "account", "user": <pubkey>}`, so the pubkey is
+    in there; how it is wrapped -- a prefix, a separator, a case -- is the
+    exchange's business and not something to encode a guess about. Matching
+    what we asked for is exact where it matters and indifferent to the rest.
+    """
+    topic = message.get("topic")
+    if isinstance(topic, str) and topic:
+        for pubkey in accounts:
+            if pubkey and pubkey in topic:
+                return pubkey
+
     layers = [message]
     inner = message.get("data")
     if isinstance(inner, dict):

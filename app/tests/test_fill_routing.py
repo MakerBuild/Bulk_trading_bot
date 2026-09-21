@@ -204,12 +204,118 @@ def test_an_unattributable_fill_leaves_the_book_alone(tmp_path):
     is worse than one applied late: nothing disagrees with it until the
     reconciler runs."""
     strategy, book, sessions, _client, btc = three_on_one_socket(tmp_path)
-    strategy._synced_at = 12345.0
 
     deliver(strategy, sessions, Fill(btc, True, 0.000697, "t1"), owner=None)
 
     assert book.effective("m1", btc) == 0.0
     assert book.effective("m1s1", btc) == 0.0
     assert book.effective("m1s2", btc) == 0.0
-    assert strategy._synced_at == 0.0, "it did not ask for a fresh read"
+    assert strategy._book_suspect is True, "it did not mark the book"
     assert strategy._unattributed_fills == 3
+
+
+# -- the topic is where the exchange actually names it ----------------------
+#
+# Learned from a live socket, which answered:
+#
+#   outer=['data', 'topic', 'type']
+#   inner=['authorizedAgentWallets', 'feeTiers', 'kind', 'leverageSettings',
+#          'margin', 'name', 'openOrders', 'positions', 'reserve',
+#          'subAccounts', 'type']
+#
+# Not one of the payload spellings, and `name` is the account's label rather
+# than its pubkey. The subscription is `{"type": "account", "user": <pubkey>}`,
+# so the pubkey is in the topic; how it is wrapped is the exchange's business.
+
+
+def test_the_topic_names_the_account():
+    message = {"type": "account", "topic": f"account:{SUB1}", "data": {}}
+
+    assert _owner_of(message, [MASTER, SUB1, SUB2]) == SUB1
+
+
+@pytest.mark.parametrize("topic", [
+    "account:{pubkey}", "account.{pubkey}", "{pubkey}", "account|{pubkey}|v1",
+])
+def test_the_wrapping_around_it_does_not_matter(topic):
+    """Matched against what we subscribed to, rather than parsed. A format
+    this does not anticipate is a format it still reads."""
+    message = {"type": "account", "topic": topic.format(pubkey=SUB2), "data": {}}
+
+    assert _owner_of(message, [MASTER, SUB1, SUB2]) == SUB2
+
+
+def test_a_topic_naming_none_of_our_accounts_is_not_a_match():
+    message = {"type": "account", "topic": "account:SOMEONE-ELSE", "data": {}}
+
+    assert _owner_of(message, [MASTER, SUB1, SUB2]) is None
+
+
+def test_the_payload_still_wins_where_it_says_so():
+    """A second endpoint may name it in the payload, as the first did not."""
+    message = {"type": "account", "topic": "account", "data": {"user": SUB1}}
+
+    assert _owner_of(message, [MASTER, SUB1, SUB2]) == SUB1
+
+
+# -- and a book we know is wrong is not traded on ---------------------------
+
+
+async def test_no_hedge_is_sent_while_the_book_is_suspect(tmp_path):
+    """What $375 off-hedge cost: the worker hedges straight off the queue and
+    never consulted the freshness clock, so marking the book stale-dated did
+    nothing. Six market orders went out against a book that never moved, each
+    one enlarging the imbalance it was correcting."""
+    import asyncio
+
+    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
+    strategy._book_suspect = True
+
+    hedged = []
+    strategy.hedger.hedge = lambda *a, **k: hedged.append(a)
+
+    reads = []
+
+    async def failing_read(max_age_s=0.0):
+        reads.append(max_age_s)
+        raise RuntimeError("exchange unreachable")
+
+    strategy._sync_positions = failing_read
+    strategy._hedge_queue.put_nowait(btc)
+
+    worker = asyncio.create_task(strategy._hedge_worker())
+    await asyncio.sleep(0.05)
+    strategy._stop.set()
+    await worker
+
+    assert reads, "it did not even try to re-read"
+    assert not hedged, "it hedged off a book it had been told was wrong"
+    assert strategy._book_suspect is True, "the suspicion was cleared anyway"
+
+
+async def test_the_hedge_resumes_once_the_read_succeeds(tmp_path):
+    import asyncio
+
+    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
+    strategy._book_suspect = True
+
+    hedged = []
+
+    async def hedge(roles, mark_price=None):
+        hedged.append(roles.symbol)
+
+    strategy.hedger.hedge = hedge
+
+    async def good_read(max_age_s=0.0):
+        return None
+
+    strategy._sync_positions = good_read
+    strategy._hedge_queue.put_nowait(btc)
+
+    worker = asyncio.create_task(strategy._hedge_worker())
+    await asyncio.sleep(0.05)
+    strategy._stop.set()
+    await worker
+
+    assert hedged == [btc]
+    assert strategy._book_suspect is False

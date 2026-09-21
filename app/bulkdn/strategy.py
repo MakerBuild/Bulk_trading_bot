@@ -210,6 +210,10 @@ class Strategy:
         # Counted rather than merely logged: if this is not zero at the end of
         # a run, the book was being rebuilt from HTTP rather than followed.
         self._unattributed_fills = 0
+        # Set when something happened that the book did not see. Cleared only
+        # by a successful read from the exchange, and no hedge is sent while
+        # it stands.
+        self._book_suspect = False
         # The last execution-target answer, and when it was read.
         self._target_answer: tuple[float, str | None] = (0.0, None)
         # The largest size each leg may be drawn at, captured after the
@@ -372,12 +376,17 @@ class Strategy:
                         session.name, len(session.client.accounts),
                     )
                 self._unattributed_fills += 1
-                # Force the next read to actually go to the exchange, and let
-                # the hedge be derived from what it says. The book is left
-                # untouched: a fill applied to the wrong account is worse than
-                # a fill applied late, because nothing afterwards disagrees
-                # with it until the reconciler runs.
-                self._synced_at = 0.0
+                # The book is now behind the exchange by an unknown amount, so
+                # it is marked rather than merely stale-dated. The worker will
+                # not hedge until it has been re-read.
+                #
+                # Marking it was not enough on its own the first time: this
+                # used to only reset the freshness clock, and the worker does
+                # not consult it -- it hedges straight off the queue. So the
+                # hedge ran six times against a book that never moved, each
+                # order making the imbalance it was trying to correct larger,
+                # until the ceiling stopped it $375 off-hedge.
+                self._book_suspect = True
                 self._hedge_queue.put_nowait(symbol)
                 return
 
@@ -571,7 +580,7 @@ class Strategy:
                 # replaces the position outright rather than adjusting it --
                 # so a guess here would overwrite the truth for two accounts
                 # out of three.
-                self._synced_at = 0.0
+                self._book_suspect = True
                 return
 
             self.book.set_authoritative(session.pubkey, symbol, float(update.size or 0.0))
@@ -601,7 +610,7 @@ class Strategy:
                 # one account's to another does not merely add a wrong number:
                 # it declares the other account flat in every symbol the
                 # snapshot does not mention.
-                self._synced_at = 0.0
+                self._book_suspect = True
                 return
 
             positions = [
@@ -675,6 +684,13 @@ class Strategy:
             except asyncio.TimeoutError:
                 continue
 
+            if self._book_suspect and not await self._refreshed():
+                # Reading failed, so the book is still wrong. Hedging off it
+                # would size the order from a number we have just been told
+                # not to trust -- and a hedge is a market order, so the cost
+                # of being wrong is paid immediately and in full.
+                continue
+
             roles = self._roles_for_key(key)
             if roles is None:
                 continue
@@ -688,6 +704,22 @@ class Strategy:
                 # The reconciler re-derives from position, so a single failure
                 # is recoverable; a persistent one trips the reject streak.
                 log.error("hedge for %s failed: %s", key, describe(exc))
+
+    async def _refreshed(self) -> bool:
+        """Re-read positions because the book is known to be behind.
+
+        Clears the suspicion only on success. The caller declines to hedge
+        while it stands, so a failure here costs a delayed hedge -- and the
+        pair stays hedged in the meantime, because what made the book
+        suspect was an event it did not see, not a position it does not have.
+        """
+        try:
+            await self._sync_positions(max_age_s=0.0)
+        except Exception as exc:  # noqa: BLE001 - retried on the next signal
+            log.error("could not re-read positions: %s", describe(exc))
+            return False
+        self._book_suspect = False
+        return True
 
     def _trigger_halt(self, reason: str) -> None:
         if self._halt_reason is None:
