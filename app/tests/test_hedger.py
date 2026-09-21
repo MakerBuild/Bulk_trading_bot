@@ -553,3 +553,35 @@ def test_without_a_price_the_lot_is_still_the_floor():
     pieces = hedger._slice(split_roles(), 0.03, SPEC, None)
 
     assert len(pieces) == 3, "nothing should have been dropped"
+
+
+# -- and the line that announces it says where it went ----------------------
+
+
+def test_a_single_hedge_reads_as_it_always_did():
+    """By the session's short name, which is what a log is read with."""
+    _book, hedger, _master, sub1 = build()
+
+    assert hedger._destination([(SUB1, 0.001)]) == f"on {sub1.name}"
+
+
+def test_a_split_hedge_names_every_account_and_its_share():
+    """The three fills under this line should need no adding up."""
+    _book, hedger, _master, _sub1 = build()
+
+    said = hedger._destination([("t1", 0.000083), ("t2", 0.000229), ("t3", 0.000126)])
+
+    assert said.startswith("across ")
+    for name, piece in (("t1", "0.00008300"), ("t2", "0.00022900"), ("t3", "0.00012600")):
+        assert f"{name} {piece}" in said, said
+
+
+def test_an_account_with_no_session_is_named_by_its_pubkey():
+    """A message about an account is worth printing even when the session
+    map has nothing to call it."""
+    _book, hedger, _master, _sub1 = build()
+
+    said = hedger._destination([("STRANGER-PUBKEY-1234", 0.001)])
+
+    assert said.startswith("on ")
+    assert "STRANG" in said and "1234" in said, said

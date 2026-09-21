@@ -259,6 +259,19 @@ class Hedger:
             return spec.lot_size
         return max(spec.lot_size, round_size(spec.min_notional / price, spec))
 
+    def _destination(self, slices: list[tuple[str, float]]) -> str:
+        """Where a hedge is going, named so the fills under it can be matched.
+
+        One slice reads as it always did. Several name each account and its
+        own size, because that is what the next three log lines will say and
+        a reader should not have to add them up to believe the first one.
+        """
+        if len(slices) == 1:
+            return f"on {self._name(slices[0][0])}"
+        return "across " + ", ".join(
+            f"{self._name(pubkey)} {piece:.8f}" for pubkey, piece in slices
+        )
+
     def _name(self, pubkey: str) -> str:
         """An account's short name for a message, or its pubkey."""
         session = self.sessions.get(pubkey)
@@ -408,7 +421,6 @@ class Hedger:
                 )
 
             slices = self._slice(roles, size, spec, price)
-            session = self.sessions[slices[0][0]]
             # The book as it stands BEFORE the order goes out. Read here and
             # not from the fill that comes back, because by then this order has
             # eaten the depth it is about to eat: a touch taken afterwards is
@@ -419,12 +431,16 @@ class Hedger:
             # every one), so it cannot be predicted either.
             touch = touch_text(self.feed, symbol) if self.feed is not None else ""
             log.info(
-                "hedge %s: net=%+.8f -> %s %.8f on %s%s%s",
+                "hedge %s: net=%+.8f -> %s %.8f %s%s%s",
                 symbol,
                 net,
                 "BUY" if is_buy else "SELL",
                 size,
-                session.name,
+                # Every account it is going to, with its share. This used to
+                # name `slices[0]` alone, so a hedge split three ways was
+                # announced as one order on one account and the line under it
+                # showed three fills the reader had to reconcile by hand.
+                self._destination(slices),
                 " (reduce-only)" if roles.reduce_only else "",
                 f" {touch}" if touch else "",
             )
