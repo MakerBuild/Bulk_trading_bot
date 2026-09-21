@@ -36,7 +36,7 @@ from .chaser import ChaseParams, Chaser
 from .config import Config
 from .feed import MarketFeed
 from .fees import burned_usd as _burned
-from .fees import realised_for_tree
+from .fees import realised_for_trees
 from .hedger import Hedger, HedgeLimitExceeded, LegRoles
 from .liquidation import LiquidationGuard, recent_liquidations
 from .marketdata import round_notional, round_size, touch_text
@@ -1670,7 +1670,7 @@ class Strategy:
     async def _read_totals(self):
         """The fill history, read without stopping everything else.
 
-        `realised_for_tree` is synchronous `requests`, and this is called from
+        `realised_for_trees` is synchronous `requests`, and this is called from
         inside the event loop -- between cycles, and once at the start of a run.
         Called directly it froze the loop for the length of the walk: measured
         at 2.9-3.8s against a 575-fill account, during which the chaser placed
@@ -1685,8 +1685,27 @@ class Strategy:
         # those two are two of a hundred and ten, so a volume or burn target
         # would have counted a fiftieth of the trading and never been reached.
         return await asyncio.to_thread(
-            realised_for_tree, self.master.http, list(self.sessions)
+            realised_for_trees, self.master.http, self._trees()
         )
+
+    def _trees(self) -> list[list[str]]:
+        """The run's accounts, grouped by the key that signs for them.
+
+        Grouped rather than pooled because of what a self-trade is: a fill the
+        exchange can see both sides of as one account holder. It can see that
+        within a master's tree, and it cannot see it across two keys -- which
+        is the reason for running more than one. Pooling them would score
+        every cross-key hedge as self-trade volume and subtract it from the
+        fee-tier figure the target is read against, understating the run by
+        however much of its trading the pool did with itself.
+
+        Sessions under one key share a socket, so the client identity is the
+        grouping -- the same fact `build_pool` used to build them.
+        """
+        trees: dict[int, list[str]] = {}
+        for session in self.all_sessions:
+            trees.setdefault(id(session.client), []).append(session.pubkey)
+        return list(trees.values())
 
     async def capture_target_baseline(self) -> None:
         """Record where the fill history stood, so the target counts from now.

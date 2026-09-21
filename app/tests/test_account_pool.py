@@ -128,3 +128,42 @@ def test_a_key_whose_accounts_are_all_already_present_opens_no_socket():
     sessions = pool({"k1": ["a"], "k1-dup": ["a"]}, keys=["k1", "k1"])
     assert [s.pubkey for s in sessions] == ["k1-pub", "a"]
     assert len({id(s.client) for s in sessions}) == 1
+
+
+# -- what the totals need from it -------------------------------------------
+
+
+def _trees_of(sessions):
+    """`Strategy._trees` over a pool, without building a whole Strategy."""
+    from bulkdn.strategy import Strategy
+
+    class Fake:
+        _trees = Strategy._trees
+        all_sessions = Strategy.all_sessions
+
+    fake = Fake()
+    fake.sessions = {s.pubkey: s for s in sessions}
+    return fake._trees()
+
+
+def test_the_run_groups_its_accounts_by_signing_key():
+    """The fill history is totalled per tree, and the socket is what says which.
+
+    A self-trade is one the exchange can see both sides of as one holder. It
+    can see that inside a master's tree and it cannot see it across two keys,
+    so totalling the pool as a single tree would subtract every cross-key
+    hedge from the volume the fee tier is read against -- which is most of
+    the trading pool mode exists to do.
+    """
+    sessions = pool({"k1": ["k1-s1"], "k2": ["k2-s1", "k2-s2"]})
+
+    assert _trees_of(sessions) == [
+        ["k1-pub", "k1-s1"],
+        ["k2-pub", "k2-s1", "k2-s2"],
+    ]
+
+
+def test_one_key_is_one_tree():
+    sessions = pool({"k1": ["k1-s1", "k1-s2"]})
+
+    assert _trees_of(sessions) == [["k1-pub", "k1-s1", "k1-s2"]]

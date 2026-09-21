@@ -35,12 +35,12 @@ def test_the_fill_history_is_read_off_the_event_loop():
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
-            if name == "realised_for_tree":
+            if name == "realised_for_trees":
                 line = source.splitlines()[node.lineno - 1]
                 if "to_thread" not in line:
                     direct.append(node.lineno)
     assert not direct, (
-        f"strategy.py:{direct} calls realised_for_tree directly. It is "
+        f"strategy.py:{direct} calls realised_for_trees directly. It is "
         "synchronous requests; route it through asyncio.to_thread."
     )
 
@@ -61,18 +61,23 @@ async def test_the_loop_keeps_turning_during_a_history_read(monkeypatch):
 
     from bulkdn import strategy as strategy_module
 
-    def slow(http, wallets):
+    def slow(http, trees):
         real_time.sleep(0.3)  # a blocking read, as requests would be
         raise RuntimeError("not the point of this test")
 
-    monkeypatch.setattr(strategy_module, "realised_for_tree", slow)
+    monkeypatch.setattr(strategy_module, "realised_for_trees", slow)
 
     class Fake:
         _read_totals = strategy.Strategy._read_totals
+        _trees = strategy.Strategy._trees
+        all_sessions = strategy.Strategy.all_sessions
 
         class _S:
             http = None
             pubkey = "EXAMPLE"
+            # Which key signs for this account, which is how `_trees` tells
+            # one master's accounts from another's.
+            client = None
 
         master = sub1 = _S()
         # Read across every account the run trades, so the stub needs the map

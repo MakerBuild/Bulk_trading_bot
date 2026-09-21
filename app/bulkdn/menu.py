@@ -16,6 +16,7 @@ import logging
 import pathlib
 import shutil
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import requests
 
@@ -81,15 +82,48 @@ def _pause() -> None:
 # -- helpers ----------------------------------------------------------------
 
 
-def _accounts(config: Config) -> list[tuple[str, str]]:
-    """(label, pubkey) for the master and every sub-account it owns.
+@dataclass(frozen=True)
+class Tree:
+    """One signing key, its master account, and the subs that master owns.
 
-    Read from the exchange rather than the config: the config names one sub,
-    but the master may own others, and balancing has to see all of them.
+    Trees are kept apart rather than pooled into one list of accounts because
+    the key is what makes them separate. A transfer is signed by the key that
+    owns both ends, so margin cannot cross from one tree to another; and the
+    exchange can only call a fill a self-trade when it can see that both sides
+    belong to the same master, which across two keys it cannot.
+    """
+
+    index: int
+    private_key: str
+    master: str
+    subs: tuple[str, ...]
+
+    @property
+    def accounts(self) -> tuple[str, ...]:
+        return (self.master, *self.subs)
+
+    def title(self, alone: bool) -> str:
+        return "master" if alone else f"master {self.index}"
+
+    def labelled(self, alone: bool) -> list[tuple[str, str]]:
+        """(label, pubkey) for this tree, numbered only when there are others.
+
+        One key is still the common case, and numbering its only master
+        `master 1` would be noise about a choice the operator never made.
+        """
+        tag = "" if alone else f" {self.index}"
+        return [(f"master{tag}", self.master)] + [(f"sub{tag}", pk) for pk in self.subs]
+
+
+def _tree(config: Config, private_key: str, index: int) -> Tree:
+    """Read one key's account tree from the exchange.
+
+    Read rather than configured: the config names one sub, but the master may
+    own others, and balancing has to see all of them.
     """
     from bulk_api.common.signer import TransactionSigner
 
-    master = TransactionSigner(config.private_key).public_key
+    master = TransactionSigner(private_key).public_key
     body = requests.post(
         f"{config.http_url}/account",
         json={"type": "fullAccount", "user": master},
@@ -97,19 +131,43 @@ def _accounts(config: Config) -> list[tuple[str, str]]:
     )
     if body.status_code == 404:
         # The usual case for a fresh key, and the raw 404 explains none of it.
+        # The key is named because with several in the file, "which one" is
+        # the first thing the operator has to work out.
         raise NoAccountTree(
-            f"no account exists on mainnet for master {short_pubkey(master)}.\n"
+            f"no account exists on mainnet for master {short_pubkey(master)}"
+            f" (key {index} in private_key.local).\n"
             "  A BULK account is created by an on-chain USDC deposit into the\n"
             "  Solana vault -- this bot cannot do that. Deposit first, then\n"
             "  Accounts Management -> Create New Subaccount."
         )
     body.raise_for_status()
     account = unwrap_full_account(body.json())
-    out = [("master", master)]
-    for entry in account.get("subAccounts") or []:
-        if isinstance(entry, dict) and entry.get("pubkey"):
-            out.append(("sub", entry["pubkey"]))
-    return out
+    subs = tuple(
+        entry["pubkey"]
+        for entry in (account.get("subAccounts") or [])
+        if isinstance(entry, dict) and entry.get("pubkey")
+    )
+    return Tree(index=index, private_key=private_key, master=master, subs=subs)
+
+
+def _trees(config: Config) -> list[Tree]:
+    """Every key's tree, in the order the keys appear in the file.
+
+    One HTTP call per key. That is the whole cost of the menu having noticed
+    the other keys at all: before this it read `config.private_key`, which is
+    the first line of the file, and an operator who had added a second master
+    saw no sign of it anywhere -- not in the balance table, not in the history,
+    not in the progress figures it was being judged against.
+    """
+    keys = config.private_keys or ([config.private_key] if config.private_key else [])
+    return [_tree(config, key, index) for index, key in enumerate(keys, start=1)]
+
+
+def _accounts(config: Config) -> list[tuple[str, str]]:
+    """(label, pubkey) for every account under every key."""
+    trees = _trees(config)
+    alone = len(trees) == 1
+    return [pair for tree in trees for pair in tree.labelled(alone)]
 
 
 def _transferable(config: Config, pubkey: str) -> float:
@@ -220,11 +278,21 @@ def _history(config: Config) -> None:
     from .fees import Realised, burned_usd, fills_page
 
     http = _http(config)
-    accounts = _accounts(config)
-    tree = {pubkey for _, pubkey in accounts}
+    trees = _trees(config)
+    alone = len(trees) == 1
+    # Each account carries the set the exchange can see it belongs to: its own
+    # master's tree, and not the accounts under some other key.
+    walk = [
+        (set(tree.accounts), label, pubkey)
+        for tree in trees
+        for label, pubkey in tree.labelled(alone)
+    ]
     grand = Realised()
+    # Spans every account of every key: a trade we were both sides of appears
+    # in both histories, and the grand total must count it once.
+    seen: set = set()
 
-    for label, pubkey in accounts:
+    for kin, label, pubkey in walk:
         print(f"\n  {label} {short_pubkey(pubkey)}")
         try:
             # Raw dicts, not the SDK's parsed model -- see fees.fills_page.
@@ -246,8 +314,12 @@ def _history(config: Config) -> None:
                 f"{float(fill.get('price') or 0):>12.3f} "
                 f"{float(fill.get('fee') or 0):>10.4f}"
             )
-        totals = Realised.from_fills(rows, tree)
-        grand = grand + totals
+        # Twice, deliberately. The printed line is this account's own view
+        # of its fills; the grand total is the deduplicated walk. Handing the
+        # `seen` set to the line as well would make the second account of a
+        # self-trade report volume its history plainly shows.
+        totals = Realised.from_fills(rows, kin)
+        grand = grand + Realised.from_fills(rows, kin, seen)
         print(
             f"    -- {totals.fills} fills, volume ${totals.volume_usd:,.2f}, "
             f"burned ${burned_usd(totals.fees_usd):,.4f}"
@@ -258,48 +330,55 @@ def _history(config: Config) -> None:
     print(f"  qualifying  ${grand.qualifying_volume_usd:,.2f}  (referral window)")
     print(f"  fee tier    ${grand.tier_volume_usd:,.2f}  (docs say self-trades do not count)")
     print(f"  burned      ${burned_usd(grand.fees_usd):,.4f}")
+    if not alone:
+        print(
+            f"\n  {len(trees)} masters. A trade between two of them is not a "
+            "self-trade:\n  nothing on the exchange links one master to another."
+        )
     print("\n  (last 20 fills per account -- Configuration -> Progress walks it all)")
     _pause()
 
 
+def _pick_tree(config: Config, what: str) -> Tree | None:
+    """Which master to act on. Asks only when there is a choice to make."""
+    trees = _trees(config)
+    if len(trees) == 1:
+        return trees[0]
+
+    print(f"\n  under which master? ({what})")
+    for tree in trees:
+        owned = f"{len(tree.subs)} sub-account(s)" if tree.subs else "no sub-accounts"
+        print(f"    {tree.index}. {short_pubkey(tree.master)}  {owned}")
+    answer = _ask("\n  > ")
+    for tree in trees:
+        if answer == str(tree.index):
+            return tree
+    print("  aborted")
+    return None
+
+
 def _create_subaccount(config: Config) -> None:
+    tree = _pick_tree(config, "the new sub-account belongs to one of them")
+    if tree is None:
+        _pause()
+        return
     name = _ask("\n  name (1-32 chars, A-Z a-z 0-9 - _): ")
     if not name:
         print("  aborted")
         _pause()
         return
-    asyncio.run(cmd_create_subaccount(config, name, None))
+    asyncio.run(cmd_create_subaccount(config, name, None, private_key=tree.private_key))
     print("\n  ready to use -- the bot finds it from your master on startup")
     _pause()
 
 
-def _balance_subaccounts(config: Config) -> None:
-    """Even out transferable margin across the master and its sub-accounts."""
-    from .subaccounts import submit_transfer
-    from bulk_api.common import SignatureDomain
-
-    accounts = _accounts(config)
-    if len(accounts) < 2:
-        print("\n  the master owns no sub-accounts yet")
-        _pause()
-        return
-
-    balances = [(label, pk, _transferable(config, pk)) for label, pk in accounts]
-    total = sum(b for _, _, b in balances)
-    target = total / len(balances)
-
-    print(f"\n  {'account':<22} {'transferable':>14} {'delta':>12}")
-    for label, pk, bal in balances:
-        print(f"  {label + ' ' + short_pubkey(pk):<22} {bal:>14.2f} {bal - target:>12.2f}")
-    print(f"\n  total {total:,.2f} across {len(balances)} accounts -> {target:,.2f} each")
+def _settle(balances: list[tuple[str, str, float]]) -> list[tuple[str, str, float]]:
+    """The transfers that bring a set of balances level, greedily matched."""
+    target = sum(bal for _, _, bal in balances) / len(balances)
 
     # Anything below a cent is noise; moving it costs a transaction for nothing.
     senders = [(pk, bal - target) for _, pk, bal in balances if bal - target > 0.01]
     receivers = [(pk, target - bal) for _, pk, bal in balances if target - bal > 0.01]
-    if not senders or not receivers:
-        print("\n  already balanced")
-        _pause()
-        return
 
     moves = []
     si = ri = 0
@@ -314,20 +393,74 @@ def _balance_subaccounts(config: Config) -> None:
             si += 1
         if receivers[ri][1] <= 0.01:
             ri += 1
+    return moves
+
+
+def _balance_subaccounts(config: Config) -> None:
+    """Even out transferable margin inside each master's own tree.
+
+    Inside each tree, not across all of them. A margin transfer is signed by
+    the key that owns both ends, so nothing can move from one master to
+    another without an on-chain withdrawal and deposit -- which this bot
+    cannot do. Levelling the whole pool to one figure is therefore not on
+    offer here, and pretending otherwise would only produce transfers the
+    exchange rejects.
+    """
+    from .subaccounts import submit_transfer
+    from bulk_api.common import SignatureDomain
+
+    trees = _trees(config)
+    alone = len(trees) == 1
+    plan: list[tuple[Tree, str, str, float]] = []
+
+    for tree in trees:
+        accounts = tree.labelled(alone)
+        if len(accounts) < 2:
+            print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)} "
+                  "owns no sub-accounts yet")
+            continue
+
+        balances = [(label, pk, _transferable(config, pk)) for label, pk in accounts]
+        total = sum(bal for _, _, bal in balances)
+        target = total / len(balances)
+
+        print(f"\n  {'account':<22} {'transferable':>14} {'delta':>12}")
+        for label, pk, bal in balances:
+            print(
+                f"  {label + ' ' + short_pubkey(pk):<22} "
+                f"{bal:>14.2f} {bal - target:>12.2f}"
+            )
+        print(
+            f"\n  total {total:,.2f} across {len(balances)} accounts "
+            f"-> {target:,.2f} each"
+        )
+
+        moves = _settle(balances)
+        if not moves:
+            print("  already balanced")
+            continue
+        plan.extend((tree, src, dst, amount) for src, dst, amount in moves)
+
+    if not plan:
+        _pause()
+        return
 
     print("\n  planned transfers:")
-    for src, dst, amount in moves:
+    for _, src, dst, amount in plan:
         print(f"    {short_pubkey(src)} -> {short_pubkey(dst)}  {amount:,.2f}")
 
-    if not _confirm(f"Submit {len(moves)} transfer(s)."):
+    if not _confirm(f"Submit {len(plan)} transfer(s)."):
         print("  aborted")
         _pause()
         return
 
-    for src, dst, amount in moves:
+    for tree, src, dst, amount in plan:
         result = submit_transfer(
             http_url=config.http_url,
-            private_key=config.private_key,
+            # The owning key, not the first one in the file. A transfer signed
+            # by a key that owns neither end is a transfer the exchange
+            # refuses, and it would refuse it one account at a time.
+            private_key=tree.private_key,
             domain=SignatureDomain[config.signature_domain_name],
             from_pubkey=src,
             to_pubkey=dst,
@@ -632,6 +765,11 @@ def _accounts_menu(config: Config, config_path: str) -> None:
     from .config import PRIVATE_KEY_FILE
 
     state = _key_state(PRIVATE_KEY_FILE)
+    # Counted from the file, not from the exchange: this line has to be right
+    # before any account is read, and it is the answer to "I added a second
+    # master -- did it take?" A screen that acts on every key should say how
+    # many it found.
+    keys = len(config.private_keys) or 1
     while True:
         print("\n" + _box("ACCOUNTS MANAGEMENT", [
             "1. Create New Subaccount",
@@ -640,6 +778,7 @@ def _accounts_menu(config: Config, config_path: str) -> None:
             "4. Erase Local Data",
             "5. Back",
         ]))
+        print(f"  {keys} master key(s) in private_key.local")
         choice = _ask("\n  > ")
         if choice == "1":
             _create_subaccount(config)
@@ -858,12 +997,12 @@ def _target_progress(config: Config) -> None:
     Both, because they answer different questions and showing only the lifetime
     figure is what made a finished target look permanent.
     """
-    from .fees import account_fee_tier, burned_usd, fee_state, realised_for_tree
+    from .fees import account_fee_tier, burned_usd, fee_state, realised_for_trees
     from .state import StateStore
 
-    accounts = [pk for _, pk in _accounts(config)]
+    trees = _trees(config)
     http = _http(config)
-    totals = realised_for_tree(http, accounts)
+    totals = realised_for_trees(http, [tree.accounts for tree in trees])
     state = StateStore(config.state_file).load()
 
     print(f"\n  fills {totals.fills}")
@@ -892,18 +1031,28 @@ def _target_progress(config: Config) -> None:
         else:
             print("  (no volume target)")
 
-    quote = account_fee_tier(config.http_url, accounts[0])
-    if quote:
+    # One line per master. The tier is a fact about a master account, so
+    # with several keys there is no single "the" tier to print -- and the
+    # cheapest of them tells the operator nothing about what the others pay.
+    alone = len(trees) == 1
+    print()
+    quoted = False
+    for tree in trees:
+        quote = account_fee_tier(config.http_url, tree.master)
+        if not quote:
+            continue
+        quoted = True
         print(
-            f"\n  master tier {quote.tier_index} in the {quote.window_days}-day window: "
+            f"  {tree.title(alone)} tier {quote.tier_index} in the "
+            f"{quote.window_days}-day window: "
             f"maker {quote.maker_bps} bps, taker {quote.taker_bps} bps"
         )
-    else:
+    if not quoted:
         schedule = fee_state(config.http_url).get("global")
         if schedule:
             tier = schedule.tier_for(0.0)
             print(
-                f"\n  no tier quote yet; the {schedule.window_days}-day schedule starts at "
+                f"  no tier quote yet; the {schedule.window_days}-day schedule starts at "
                 f"maker {tier.maker_bps} bps, taker {tier.taker_bps} bps"
             )
     _pause()

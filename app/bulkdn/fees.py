@@ -21,6 +21,7 @@ progress.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import requests
@@ -310,9 +311,28 @@ def realised_for_tree(http, accounts: list[str], **kwargs) -> Realised:
     what made the goal read 5.7% short of the exchange's own figure. Its fees
     still come from both views, because both sides were charged.
     """
-    tree = set(accounts)
+    return realised_for_trees(http, [accounts], **kwargs)
+
+
+def realised_for_trees(http, trees: Sequence[Sequence[str]], **kwargs) -> Realised:
+    """Totals across several master trees, deduplicated as a single walk.
+
+    Self-trades are judged inside each tree rather than across the lot. The
+    exchange links a sub-account to the master that created it and nothing
+    links two masters to each other, so a trade between accounts under
+    different keys is, as far as the fee tier can tell, a trade with a
+    stranger -- which is the entire reason for running more than one key.
+    Scoring those as self-trades would under-report qualifying volume by
+    however much of the trading the pool did with itself.
+
+    `seen` still spans every tree. Deduplication is about a trade appearing
+    twice because we can see both sides of it, and we can see both sides of a
+    cross-key trade just as plainly as of a cross-account one.
+    """
     seen: set = set()
     total = Realised()
-    for user in accounts:
-        total = total + realised_for_account(http, user, tree, seen=seen, **kwargs)
+    for accounts in trees:
+        kin = set(accounts)
+        for user in accounts:
+            total = total + realised_for_account(http, user, kin, seen=seen, **kwargs)
     return total

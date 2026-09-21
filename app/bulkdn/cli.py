@@ -553,7 +553,11 @@ async def cmd_flatten(
     await runtime.start(verify=False)
     closed = True
     try:
-        await cancel_all_orders([runtime.master, runtime.sub1], runtime.symbols)
+        # Every account, not the first two. This is the panic button, and in
+        # pool mode those two are two of however many the keys produced --
+        # leaving a resting order on the rest is leaving an unhedged fill
+        # waiting to happen on an account nobody is watching any more.
+        await cancel_all_orders(runtime.pool, runtime.symbols)
         if limit:
             closed = await flatten_limit(
                 runtime.sessions,
@@ -773,12 +777,19 @@ def cmd_encrypt_key(config: Config) -> int:
 
 
 async def cmd_create_subaccount(
-    config: Config, name: str, margin_amount: float | None
+    config: Config, name: str, margin_amount: float | None,
+    *, private_key: str | None = None,
 ) -> int:
     """Create a sub-account with a hand-serialized `createSubAccount` transaction.
 
     The Python SDK has no signer for this action, so the wincode bytes are built
     in bulkdn/subaccounts.py.
+
+    `private_key` picks which master owns the result. It defaults to the first
+    key in the file, which is the only one there is for most operators; the
+    menu passes a chosen one when the file holds several, because a
+    sub-account belongs to exactly one master and there is no way to move it
+    afterwards.
     """
     from bulk_api.common import SignatureDomain
 
@@ -791,7 +802,7 @@ async def cmd_create_subaccount(
 
     result = build_and_submit(
         http_url=config.http_url,
-        private_key=config.private_key,
+        private_key=private_key or config.private_key,
         domain=SignatureDomain[config.signature_domain_name],
         name=name,
         margin_amount=margin_amount,

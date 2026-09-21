@@ -33,9 +33,13 @@ class FakeTotals:
 class FakeStrategy:
     """Only what _target_reached touches."""
 
-    # The real one, so the test drives the actual code path: the history read
-    # is handed to a worker thread rather than run on the event loop.
+    # The real ones, so the test drives the actual code path: the history read
+    # is handed to a worker thread rather than run on the event loop, and the
+    # accounts it reads are grouped by signing key the way the real run
+    # groups them.
     _read_totals = Strategy._read_totals
+    _trees = Strategy._trees
+    all_sessions = Strategy.all_sessions
 
     def __init__(self, target, state=None):
         class Config:
@@ -51,6 +55,9 @@ class FakeStrategy:
         class Session:
             http = None
             pubkey = "EXAMPLE-PUBKEY"
+            # Accounts under one key share a socket, and that is what tells
+            # `_trees` which of them the exchange can see as related.
+            client = None
 
         self.master = Session()
         self.sub1 = Session()
@@ -78,13 +85,13 @@ def totals(monkeypatch):
     """Replace the fill-history read with the number under test."""
     from bulkdn import strategy as strategy_module
 
-    def fake(http, wallets):
+    def fake(http, trees):
         fake.reads += 1
         return fake.value
 
     fake.reads = 0
 
-    monkeypatch.setattr(strategy_module, "realised_for_tree", fake)
+    monkeypatch.setattr(strategy_module, "realised_for_trees", fake)
     return fake
 
 

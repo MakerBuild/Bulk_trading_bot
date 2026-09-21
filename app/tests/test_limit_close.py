@@ -301,6 +301,9 @@ class FakeRuntime:
         self.sub1 = object()
         self.symbols = [BTC]
         self.sessions = {}
+        # What the flatten cancels orders on: every account the run holds,
+        # which in pool mode is more than the named pair.
+        self.pool = [self.master, self.sub1]
         self.book = PositionBook()
         self.feed = FakeFeed()
         self.store = FakeStore(StrategyState())
