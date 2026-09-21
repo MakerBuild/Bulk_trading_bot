@@ -291,6 +291,7 @@ class FakeRuntime:
     """Stands in for the real one, which would open sockets and sign requests."""
 
     instances = []
+    store_override = None
 
     def __init__(self, config, dry_run):
         from bulkdn.state import StrategyState
@@ -306,7 +307,7 @@ class FakeRuntime:
         self.pool = [self.master, self.sub1]
         self.book = PositionBook()
         self.feed = FakeFeed()
-        self.store = FakeStore(StrategyState())
+        self.store = FakeRuntime.store_override or FakeStore(StrategyState())
         self.stopped = False
         FakeRuntime.instances.append(self)
 
@@ -317,10 +318,13 @@ class FakeRuntime:
         self.stopped = True
 
 
-def run_cmd_flatten(monkeypatch, closed, **kwargs):
+def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, **kwargs):
     from bulkdn import cli
 
     FakeRuntime.instances = []
+    # A real store when the test is about what lands in the file; the fake
+    # one otherwise, so nothing touches the disk that does not need to.
+    FakeRuntime.store_override = store
     monkeypatch.setattr(cli, "Runtime", FakeRuntime)
 
     async def no_cancel(sessions, symbols):
@@ -342,7 +346,7 @@ def run_cmd_flatten(monkeypatch, closed, **kwargs):
     class Cfg:
         master_account = Account()
 
-    return asyncio.run(cli.cmd_flatten(Cfg(), dry_run=False, **kwargs))
+    return asyncio.run(cli.cmd_flatten(Cfg(), dry_run=dry_run, **kwargs))
 
 
 def test_a_finished_limit_close_exits_zero(monkeypatch):
@@ -365,3 +369,36 @@ def test_a_market_close_still_exits_zero(monkeypatch):
 def test_the_runtime_is_stopped_even_when_the_close_times_out(monkeypatch):
     run_cmd_flatten(monkeypatch, closed=False, limit=True, timeout_s=1.0)
     assert FakeRuntime.instances[0].stopped, "the socket was left open"
+
+
+# -- and what a dry run is allowed to change --------------------------------
+
+
+def test_a_dry_flatten_leaves_the_state_alone(monkeypatch, tmp_path):
+    """It says it submits nothing, and the state file is something. Clearing
+    the halt is the one change that mattered: it is what stops the bot from
+    starting, so a "dry" run that cleared it changed the only thing anybody
+    was running the command for."""
+    from bulkdn.state import Phase, StateStore, StrategyState
+
+    store = StateStore(str(tmp_path / "state.json"))
+    store.save(StrategyState(phase=Phase.HALTED, halted_reason="hedge limit"))
+
+    run_cmd_flatten(monkeypatch, closed=True, dry_run=True, store=store)
+
+    after = store.load()
+    assert after.phase == Phase.HALTED
+    assert after.halted_reason == "hedge limit"
+
+
+def test_a_live_flatten_clears_it(monkeypatch, tmp_path):
+    from bulkdn.state import Phase, StateStore, StrategyState
+
+    store = StateStore(str(tmp_path / "state.json"))
+    store.save(StrategyState(phase=Phase.HALTED, halted_reason="hedge limit"))
+
+    run_cmd_flatten(monkeypatch, closed=True, dry_run=False, store=store)
+
+    after = store.load()
+    assert after.phase == Phase.IDLE
+    assert after.halted_reason is None

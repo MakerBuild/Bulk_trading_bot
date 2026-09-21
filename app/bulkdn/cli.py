@@ -311,8 +311,7 @@ class Runtime:
         if not self.dry_run:
             self.apply_leverage()
 
-        await self.master.connect()
-        await self.sub1.connect()
+        await self._connect_all()
         await self.feed.subscribe()
         # Let the initial account snapshots and book updates land before any
         # decision is made on them.
@@ -334,6 +333,38 @@ class Runtime:
             raise AccessDenied(decision.reason)
         log.info("access granted: %s", decision.reason)
 
+    async def _connect_all(self) -> None:
+        """Open every socket, which is one per key rather than one per account.
+
+        By client, so a key's accounts do not each dial the same connection.
+
+        It used to connect `master` and `sub1`, which in a pool are BOTH on
+        the first key's socket -- so every other key was never dialled at all.
+        A live flatten showed it plainly: `m2: cancel-all failed: not
+        connected to WebSocket`, with no drop before it, because that socket
+        had never come up.
+
+        A trading run hid it. The risk check notices a disconnected session
+        and heals it, so the second socket arrived a few seconds late by way
+        of the reconnect path -- spending a reconnect from the flap budget on
+        a socket that had simply never been asked to connect, and leaving a
+        window in which its accounts could be drawn into a group and fail
+        their first order.
+        """
+        for session in self._one_per_socket():
+            await session.connect()
+
+    def _one_per_socket(self) -> list:
+        """One session for each distinct socket, in pool order."""
+        seen: set[int] = set()
+        chosen = []
+        for session in self.pool:
+            if id(session.client) in seen:
+                continue
+            seen.add(id(session.client))
+            chosen.append(session)
+        return chosen
+
     async def stop(self) -> None:
         """Close every socket, which is one per key rather than one per account.
 
@@ -343,11 +374,7 @@ class Runtime:
         so every key after the first was left connected, with its
         subscriptions live and nothing reading them.
         """
-        seen: set[int] = set()
-        for session in self.pool:
-            if id(session.client) in seen:
-                continue
-            seen.add(id(session.client))
+        for session in self._one_per_socket():
             await session.disconnect()
 
     def apply_sizing(self) -> None:
@@ -655,7 +682,20 @@ async def cmd_flatten(
         # Legs, not the summary: a leg can hold an order id with the pair
         # reading IDLE, and leaving that behind is what made a flatten look
         # like it had done nothing.
-        if state.summary_phase != Phase.IDLE or state.legs or state.has_baseline:
+        needs_reset = (
+            state.summary_phase != Phase.IDLE or state.legs or state.has_baseline
+        )
+        if dry_run and needs_reset:
+            # A dry run submits nothing, and the state file is something. It
+            # used to be cleared anyway, so `flatten` without `--live` said it
+            # would change nothing and then cleared the halt that was stopping
+            # the bot from starting -- which is the one change that mattered.
+            log.info(
+                "dry run -- the state still records %s. Re-run with --live to "
+                "clear it.",
+                state.halted_reason or state.summary_phase.name,
+            )
+        elif needs_reset:
             state.phase = Phase.IDLE
             state.halted_reason = None
             state.hold_until = 0.0

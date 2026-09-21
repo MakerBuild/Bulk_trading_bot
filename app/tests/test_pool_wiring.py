@@ -290,3 +290,32 @@ async def test_stopping_closes_every_socket_once():
     await cli.Runtime.stop(runtime)
 
     assert closed == ["m1", "m2"], "one close per socket, and every socket"
+
+
+async def test_starting_opens_every_socket_once():
+    """`master` and `sub1` are BOTH on the first key's socket in a pool, so
+    connecting those two never dialled any other key. A live flatten said so:
+    `m2: cancel-all failed: not connected to WebSocket`, with no drop before
+    it, because that socket had never come up."""
+    from bulkdn import cli
+
+    opened = []
+
+    class Session:
+        def __init__(self, name, client):
+            self.name = name
+            self.client = client
+
+        async def connect(self):
+            opened.append(self.name)
+
+    one, two = FakeClient("k1-master"), FakeClient("k2-master")
+    runtime = object.__new__(cli.Runtime)
+    runtime.pool = [
+        Session("m1", one), Session("m1s1", one), Session("m1s2", one),
+        Session("m2", two), Session("m2s1", two), Session("m2s2", two),
+    ]
+
+    await cli.Runtime._connect_all(runtime)
+
+    assert opened == ["m1", "m2"], "one dial per socket, and every socket"
