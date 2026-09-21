@@ -206,6 +206,10 @@ class Strategy:
         self._reconnect_times: list[float] = []
         self._sync_lock = asyncio.Lock()
         self._synced_at = 0.0
+        # How many fills arrived that could not be attributed to an account.
+        # Counted rather than merely logged: if this is not zero at the end of
+        # a run, the book was being rebuilt from HTTP rather than followed.
+        self._unattributed_fills = 0
         # The last execution-target answer, and when it was read.
         self._target_answer: tuple[float, str | None] = (0.0, None)
         # The largest size each leg may be drawn at, captured after the
@@ -350,6 +354,31 @@ class Strategy:
         def handler(fill) -> None:
             symbol = getattr(fill, "symbol", None)
             if symbol not in self.symbols:
+                return
+
+            mine = session.owns_this_update()
+            if mine is False:
+                # Another account on the same socket. Every account under one
+                # key shares a socket, and the client fires every registered
+                # handler for every message, so without this a $60 buy on one
+                # account was booked on all three of them.
+                return
+            if mine is None:
+                if self._unattributed_fills == 0:
+                    log.warning(
+                        "%s: a fill arrived without naming its account and this "
+                        "socket carries %d -- re-reading positions instead of "
+                        "guessing whose it was",
+                        session.name, len(session.client.accounts),
+                    )
+                self._unattributed_fills += 1
+                # Force the next read to actually go to the exchange, and let
+                # the hedge be derived from what it says. The book is left
+                # untouched: a fill applied to the wrong account is worse than
+                # a fill applied late, because nothing afterwards disagrees
+                # with it until the reconciler runs.
+                self._synced_at = 0.0
+                self._hedge_queue.put_nowait(symbol)
                 return
 
             is_buy = fill.side == Side.BUY
@@ -533,15 +562,30 @@ class Strategy:
             symbol = getattr(update, "symbol", None)
             if symbol not in self.symbols:
                 return
+
+            mine = session.owns_this_update()
+            if mine is False:
+                return
+            if mine is None:
+                # `set_authoritative` is the strongest write there is -- it
+                # replaces the position outright rather than adjusting it --
+                # so a guess here would overwrite the truth for two accounts
+                # out of three.
+                self._synced_at = 0.0
+                return
+
             self.book.set_authoritative(session.pubkey, symbol, float(update.size or 0.0))
 
             # Cheap and synchronous -- no I/O, just arithmetic on the book.
             # Closing the survivor happens in the worker; a handler that
             # awaited an order would deadlock the socket it arrived on.
+            #
+            # Every account, not the named pair: a liquidation on the fourth
+            # account of a pool is a liquidation.
             if self.guard.check(
                 self.book,
                 self._phases_by_symbol(),
-                [self.master.pubkey, self.sub1.pubkey],
+                [s.pubkey for s in self.all_sessions],
             ):
                 self._liquidation_seen.set()
 
@@ -549,6 +593,17 @@ class Strategy:
 
     def _make_snapshot_handler(self, session: AccountSession):
         def handler(snapshot) -> None:
+            mine = session.owns_this_update()
+            if mine is False:
+                return
+            if mine is None:
+                # A snapshot is every position this account holds, so applying
+                # one account's to another does not merely add a wrong number:
+                # it declares the other account flat in every symbol the
+                # snapshot does not mention.
+                self._synced_at = 0.0
+                return
+
             positions = [
                 p for p in (getattr(snapshot, "positions", None) or [])
                 if p.symbol in self.symbols

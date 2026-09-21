@@ -48,9 +48,15 @@ class FakeSession:
         self.last_message_age_s = 0.0
         self.handlers = {}
         self.orders = []
+        # One account per socket here, so every update on it is this
+        # account's -- which is what a real single-account socket answers.
+        self.owns = True
 
     def on(self, topic, handler):
         self.handlers.setdefault(topic, []).append(handler)
+
+    def owns_this_update(self):
+        return self.owns
 
     async def market(self, symbol, is_buy, size, reduce_only=False):
         self.orders.append((symbol, is_buy, size, reduce_only))

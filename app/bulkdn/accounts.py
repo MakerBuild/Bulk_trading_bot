@@ -86,6 +86,10 @@ class RoutedWsClient(BulkWebSocketClient):
         self.accounts = list(dict.fromkeys(pubkey for pubkey in wanted if pubkey))
         self.dry_run = dry_run
         self.last_message_at: float = time.monotonic()
+        # Set only while an account update is being dispatched. See
+        # `_handle_message`.
+        self._dispatch_owner: str | None = None
+        self._owner_warned = False
         # Set only while `connect` has the signer hidden from the base class.
         self._hidden_signer = None
 
@@ -132,7 +136,56 @@ class RoutedWsClient(BulkWebSocketClient):
         # Liveness is tracked off raw traffic so the risk layer can tell a quiet
         # market from a dead socket.
         self.last_message_at = time.monotonic()
+
+        # Which account this update is about, for as long as it is being
+        # dispatched. One socket carries every account under a key, and the
+        # SDK was written when it carried one: handlers are registered per
+        # account but the client fires all of them for every message, so a
+        # fill on one account arrived as a fill on all of them.
+        #
+        # A live run with three accounts on a socket booked one $60 buy three
+        # times, read the pair as long on both sides, and halted on a hedge
+        # ceiling that was doing its job.
+        #
+        # Handlers run synchronously inside the dispatch below, so a plain
+        # attribute is enough to carry this -- there is no interleaving to
+        # lose it to.
+        if isinstance(data, dict) and data.get("type") == "account":
+            self._dispatch_owner = _owner_of(data)
+            if self._dispatch_owner is None:
+                self._warn_unattributable(data)
+            try:
+                await super()._handle_message(data)
+            finally:
+                self._dispatch_owner = None
+            return
+
         await super()._handle_message(data)
+
+    def _warn_unattributable(self, data: dict) -> None:
+        """Say once that account updates arrive without naming their account.
+
+        Only the field NAMES are logged. If this ever fires, those names say
+        which spelling to add to `ACCOUNT_OWNER_KEYS`, and the run meanwhile
+        falls back to re-reading positions over HTTP rather than guessing.
+        """
+        if self._owner_warned or len(self.accounts) <= 1:
+            return
+        self._owner_warned = True
+        inner = data.get("data")
+        log.warning(
+            "account updates on this socket do not name their account, and it "
+            "carries %d of them -- falling back to HTTP position reads. "
+            "Fields seen: outer=%s inner=%s",
+            len(self.accounts),
+            sorted(data),
+            sorted(inner) if isinstance(inner, dict) else type(inner).__name__,
+        )
+
+    @property
+    def message_owner(self) -> str | None:
+        """The account the update being dispatched belongs to, if it says."""
+        return self._dispatch_owner
 
     # -- routed submission -------------------------------------------------
 
@@ -335,6 +388,25 @@ class AccountSession:
 
     def on(self, topic: Topic, handler: Callable) -> None:
         self.client.on(topic, handler)
+
+    def owns_this_update(self) -> bool | None:
+        """Is the account update being dispatched this account's?
+
+        True or False when the exchange names the account, and None when it
+        does not and the socket carries more than one -- which is a genuine
+        "cannot tell", not a no. A caller that treats None as either answer
+        is guessing; the handlers re-read positions over HTTP instead.
+
+        A socket carrying a single account has nothing to confuse: whatever
+        arrives on it is that account's, which is how every run before pools
+        worked and why this was never noticed.
+        """
+        owner = getattr(self.client, "message_owner", None)
+        if owner is not None:
+            return owner == self.pubkey
+        if len(getattr(self.client, "accounts", None) or ()) <= 1:
+            return True
+        return None
 
     # -- order helpers -----------------------------------------------------
 
@@ -589,6 +661,27 @@ def build_pool(
             )
 
     return sessions
+
+
+# Where the exchange names the account an update is about. Several
+# spellings because the field is not in the SDK's model at all -- it parses
+# fills into a dataclass that has no room for it -- so this reads the raw
+# message, and the raw message's spelling is the exchange's business.
+ACCOUNT_OWNER_KEYS = ("user", "account", "subAccount", "pubkey", "owner", "u")
+
+
+def _owner_of(message: dict) -> str | None:
+    """The account an account-update names, or None if it names none."""
+    layers = [message]
+    inner = message.get("data")
+    if isinstance(inner, dict):
+        layers.append(inner)
+    for layer in layers:
+        for key in ACCOUNT_OWNER_KEYS:
+            value = layer.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
 
 
 class NoSubAccount(Exception):
