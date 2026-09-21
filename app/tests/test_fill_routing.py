@@ -395,3 +395,60 @@ def test_without_groups_it_is_still_the_configured_legs(tmp_path):
     strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
 
     assert [roles.symbol for roles in strategy._live_roles()] == strategy.symbols
+
+
+# -- and a split hedge has more than one hedger -----------------------------
+#
+# `roles.taker` is the FIRST of them. Retiring only its reservation left the
+# other slices in `in_flight` for ever: net exposure read as short by the
+# leftovers, the hedger corrected it, that order reserved and was not retired
+# either, and the leg thrashed -- 700 alternating fills of about a dollar
+# each on one account in five minutes, every one paying a taker fee.
+
+
+def split_group(tmp_path):
+    """One maker covered by three hedgers, as `max_takers: 3` draws."""
+    from bulkdn.pairing import Group
+
+    strategy, book, sessions, _client, btc = three_on_one_socket(tmp_path)
+    strategy._groups["g1:" + btc] = Group(
+        symbol=btc, maker="m1", takers=("m1s1", "m1s2", "m2s1"),
+        shares=(0.5, 0.3, 0.2),
+    )
+    return strategy, book, sessions, btc
+
+
+def test_every_hedger_retires_its_own_reservation(tmp_path):
+    strategy, _book, sessions, btc = split_group(tmp_path)
+    key = f"g1:{btc}"
+
+    # Three slices reserved, as `_slice` would when the hedge goes out.
+    for signed in (-0.0005, -0.0003, -0.0002):
+        strategy.hedger.in_flight.add(key, signed)
+    assert strategy.hedger.in_flight.total(key) == pytest.approx(-0.001)
+
+    # Each lands on its own account.
+    sessions["m1s1"].owns = True
+    strategy._make_fill_handler(sessions["m1s1"])(Fill(btc, False, 0.0005, "a"))
+    sessions["m1s2"].owns = True
+    strategy._make_fill_handler(sessions["m1s2"])(Fill(btc, False, 0.0003, "b"))
+
+    assert strategy.hedger.in_flight.total(key) == pytest.approx(-0.0002), (
+        "a hedger other than the first left its reservation standing"
+    )
+
+
+def test_a_second_hedger_is_not_labelled_unknown(tmp_path, caplog):
+    """`role=?` against an account doing exactly its job is how the thrash
+    stayed invisible in a log full of it."""
+    import logging
+
+    strategy, _book, sessions, btc = split_group(tmp_path)
+    sessions["m1s2"].owns = True
+
+    with caplog.at_level(logging.INFO, logger="bulkdn.strategy"):
+        strategy._make_fill_handler(sessions["m1s2"])(Fill(btc, False, 0.0003, "b"))
+
+    printed = " | ".join(caplog.messages)
+    assert "role=taker" in printed, printed
+    assert "role=?" not in printed

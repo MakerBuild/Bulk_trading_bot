@@ -453,9 +453,18 @@ class Strategy:
                 self._roles_for_key(key) if key is not None
                 else self._roles_by_symbol(self.state.leg(symbol).phase).get(symbol)
             )
-            if roles is not None and session.pubkey == roles.taker:
+            if roles is not None and session.pubkey in roles.hedgers:
                 # This is one of our own hedge orders landing; retire its
                 # reservation so net exposure reads correctly.
+                #
+                # Any hedger, not `roles.taker` -- which is only the FIRST of
+                # them. A hedge split three ways reserved three slices and
+                # retired one, so the other two sat in `in_flight` for ever.
+                # Net exposure then read as short by the leftovers, the
+                # hedger corrected it, that order reserved again and was not
+                # retired either, and the leg thrashed: 700 alternating fills
+                # of about a dollar each on one account in five minutes, each
+                # one paying a taker fee for the privilege.
                 self.hedger.note_taker_fill(roles.key, size if is_buy else -size)
 
             # `role` and the touch are carried here rather than worked out
@@ -465,7 +474,11 @@ class Strategy:
             # that lands out of order. The handler already knows.
             if roles is None:
                 role = "?"
-            elif session.pubkey == roles.taker:
+            elif session.pubkey in roles.hedgers:
+                # Every hedger, for the same reason: with a split there are
+                # several, and reading `role=?` against an account that was
+                # doing exactly its job is how the thrash above stayed
+                # invisible in a log full of it.
                 role = "taker"
             elif session.pubkey == roles.maker:
                 role = "maker"
