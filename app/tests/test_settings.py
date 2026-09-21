@@ -113,18 +113,22 @@ def test_current_leverage_tolerates_absence_and_junk():
     assert current_leverage({"leverageSettings": [{"symbol": "X"}, 5, []]}) == {}
 
 
-# -- leg key rename ---------------------------------------------------------
+# -- what a leg block may be called -----------------------------------------
 
 
-def test_old_leg_keys_are_rejected_with_a_pointer(tmp_path):
-    """Silently ignoring them would start the bot with default sizes.
+def test_coin_named_leg_blocks_are_read_rather_than_refused(tmp_path):
+    """`legs.btc`/`legs.sol` was the spelling before the blocks were named
+    after accounts, and it used to be refused outright -- a file using it
+    would otherwise have started with default sizes.
 
-    `legs.btc`/`legs.sol` named coins, but the symbols are configurable, so the
-    keys now name the account that opens each leg instead.
+    Nothing defaults now: every block in the mapping is read, whatever it is
+    called, because the name stopped meaning anything when accounts began
+    being drawn per cycle. The refusal had become a trap of its own, since a
+    market added from the menu was named after its coin.
     """
     import yaml
 
-    from bulkdn.config import ConfigError, load_config
+    from bulkdn.config import load_config
 
     path = tmp_path / "settings.yaml"
     path.write_text(
@@ -139,14 +143,17 @@ def test_old_leg_keys_are_rejected_with_a_pointer(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ConfigError, match="master_account"):
-        load_config(str(path), require_credentials=False)
+    config = load_config(str(path), require_credentials=False)
+
+    assert [leg.symbol for leg in config.active_legs] == ["BTC-USD", "SOL-USD"]
 
 
-def test_a_missing_leg_is_named(tmp_path):
+def test_one_leg_is_a_complete_config(tmp_path):
+    """It used to be refused for naming no `sub_account`. One market is
+    ordinary now -- which is what the old single mode was for."""
     import yaml
 
-    from bulkdn.config import ConfigError, load_config
+    from bulkdn.config import load_config
 
     path = tmp_path / "settings.yaml"
     path.write_text(
@@ -157,5 +164,6 @@ def test_a_missing_leg_is_named(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ConfigError, match="sub_account"):
-        load_config(str(path), require_credentials=False)
+    config = load_config(str(path), require_credentials=False)
+
+    assert [leg.symbol for leg in config.active_legs] == ["BTC-USD"]

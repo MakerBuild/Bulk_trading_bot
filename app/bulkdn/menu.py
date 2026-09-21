@@ -1024,8 +1024,10 @@ def _append_market(config_path: str, symbol: str, template: LegConfig) -> None:
         at = _end_of_block(lines, mapped)
         # A name of its own, because the mapping spelling needs one and the
         # two it ships with are named after accounts that no longer pick
-        # anything. The symbol is the only name that stays true.
-        name = symbol.split("-", maxsplit=1)[0].lower()
+        # anything. The whole symbol, not the coin: `sol` was the spelling
+        # this file used two versions ago, and naming a block that walked
+        # straight into the check that refuses it.
+        name = symbol.lower().replace("-", "_")
         # The symbol is a field here rather than part of the header: the
         # mapping spelling names a block and puts the market inside it.
         block = [f"  {name}:"] + [

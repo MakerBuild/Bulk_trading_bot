@@ -723,13 +723,20 @@ def _markets_from_raw(
             markets.append(_leg_from_dict(entry, name))
         return markets, names
 
-    missing = [k for k in ("master_account", "sub_account") if k not in legs]
-    if missing:
-        raise ConfigError(
-            f"config must define `markets`, or legs.{' and legs.'.join(missing)}"
-        )
-    # File order, not the order they are named here: an operator who swapped
-    # the two blocks meant to swap them.
+    if not legs:
+        raise ConfigError("config must define `markets`, or a `legs` block")
+    # Every block, whatever it is called, in file order. The names used to
+    # mean something -- they said which account opened which leg -- and they
+    # have not for a while: accounts are drawn per cycle now. So a block is
+    # named whatever its author found clearest, and two files naming their
+    # markets differently are the same file.
+    #
+    # This is also why `legs.btc` is no longer refused. It was, on the
+    # grounds that a file using the old names would silently start with
+    # default legs; nothing defaults now, so the old names load as what they
+    # plainly say. Refusing them had become a trap of its own -- a market
+    # added from the menu was named after its coin, and a `sol:` block was
+    # turned away by a message about a rename from two versions ago.
     names = [f"legs.{name}" for name in legs]
     return [_leg_from_dict(legs[name], f"legs.{name}") for name in legs], names
 
@@ -837,16 +844,6 @@ def load_config(
     legs = raw.get("legs") or {}
     if not isinstance(legs, dict):
         raise ConfigError("legs must be a mapping")
-    if "btc" in legs or "sol" in legs:
-        # Renamed rather than silently ignored: a config still using the old
-        # keys would otherwise start with default legs and trade the wrong
-        # sizes.
-        raise ConfigError(
-            "legs.btc and legs.sol were renamed to legs.master_account and "
-            "legs.sub_account -- they name the account that opens each leg, "
-            "not a coin. Rename the two keys; the fields inside are unchanged."
-        )
-
     markets, market_names = _markets_from_raw(raw, legs)
 
     risk_raw = raw.get("risk") or {}

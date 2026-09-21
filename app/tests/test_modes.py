@@ -236,3 +236,69 @@ def test_the_flags_old_name_lands_on_multi(tmp_path):
     )
 
     assert config.mode == "multi"
+
+
+# -- and a block may be called anything -------------------------------------
+#
+# The names used to mean something: they said which account opened which leg.
+# They have not for a while -- accounts are drawn per cycle -- so a block is
+# named whatever its author found clearest.
+#
+# `legs.btc` and `legs.sol` used to be refused outright, on the grounds that a
+# file using them would silently start with default legs. Nothing defaults
+# now, and the refusal had become a trap: a market added from the menu was
+# named after its coin, so adding SOL-USD wrote a `sol:` block and the next
+# start was turned away by a message about a rename from two versions ago.
+
+
+COIN_NAMED = """
+mode: multi
+legs:
+  btc:
+    symbol: BTC-USD
+    notional_usd: 100
+  sol:
+    symbol: SOL-USD
+    notional_usd: 100
+"""
+
+THREE_MARKETS = """
+mode: multi
+legs:
+  master_account:
+    symbol: BTC-USD
+    notional_usd: 100
+  sub_account:
+    symbol: ETH-USD
+    notional_usd: 100
+  sol_usd:
+    symbol: SOL-USD
+    notional_usd: 100
+    enabled: false
+"""
+
+
+def test_a_block_named_after_its_coin_is_read(tmp_path):
+    config = load(tmp_path, COIN_NAMED)
+
+    assert [leg.symbol for leg in config.active_legs] == [BTC, SOL]
+
+
+def test_a_third_market_can_be_added_to_a_legs_block(tmp_path):
+    """Which is what the menu does to a file it did not write."""
+    config = load(tmp_path, THREE_MARKETS)
+
+    assert [leg.symbol for leg in config.markets] == [BTC, ETH, SOL]
+    assert [leg.symbol for leg in config.active_legs] == [BTC, ETH]
+
+
+def test_an_error_names_the_block_the_operator_will_find(tmp_path):
+    broken = THREE_MARKETS.replace("    symbol: SOL-USD\n", "")
+
+    with pytest.raises(ConfigError, match="legs.sol_usd"):
+        load(tmp_path, broken)
+
+
+def test_an_empty_legs_block_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="markets"):
+        load(tmp_path, "mode: multi\nlegs: {}\n")
