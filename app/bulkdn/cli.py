@@ -224,6 +224,14 @@ class Runtime:
         )
 
         self.sessions = {session.pubkey: session for session in self.pool}
+        # Which key signs for which account. Derived here rather than carried
+        # on the session, so the raw key stays in the few places that already
+        # hold it.
+        from bulk_api.common.signer import TransactionSigner
+
+        self._key_by_master = {
+            TransactionSigner(key).public_key: key for key in keys
+        }
         self.notifier = Notifier(config.telegram)
         self.title = WindowTitle(cycles=config.cycles)
         self.book = PositionBook(overlay_ttl_ms=config.overlay_ttl_ms)
@@ -327,8 +335,20 @@ class Runtime:
         log.info("access granted: %s", decision.reason)
 
     async def stop(self) -> None:
-        await self.master.disconnect()
-        await self.sub1.disconnect()
+        """Close every socket, which is one per key rather than one per account.
+
+        By session would close the same socket once for each account riding
+        on it; by client closes each exactly once. It used to close
+        `master` and `sub1`, and in a pool those two sit on the SAME socket --
+        so every key after the first was left connected, with its
+        subscriptions live and nothing reading them.
+        """
+        seen: set[int] = set()
+        for session in self.pool:
+            if id(session.client) in seen:
+                continue
+            seen.add(id(session.client))
+            await session.disconnect()
 
     def apply_sizing(self) -> None:
         """Turn the configured sizes into sizes both accounts can carry.
@@ -354,8 +374,13 @@ class Runtime:
         # weighs them against margin. After this every leg has a `size`.
         resolve_notionals(legs=legs, specs=self.feed.specs, prices=prices)
 
+        # Every account in the pool. Any of them can be drawn as the maker
+        # of the next group, so the thinnest one is what the cycle has to fit
+        # inside -- and reading only the named pair meant the plan was blind
+        # to the account that would actually run out. Six accounts were in
+        # play and two were consulted.
         margin = {}
-        for session in (self.master, self.sub1):
+        for session in self.pool:
             account = session.full_account().get("margin") or {}
             margin[session.name] = float(account.get("availableMargin") or 0.0)
 
@@ -373,14 +398,34 @@ class Runtime:
             # capping anything.
             leg.max_order_size = min(leg.max_order_size, sized.actual)
 
+        # Named, because with a pool the interesting figure is which account
+        # is holding everyone back, and a list of ten is read by nobody.
+        thinnest = min(margin, key=margin.get)
         log.info(
-            "sizing: %s  (margin available: %s)",
+            "sizing: %s  (thinnest of %d accounts: %s $%s)",
             plan.describe(),
-            ", ".join(f"{name} ${value:,.2f}" for name, value in margin.items()),
+            len(margin),
+            thinnest,
+            f"{margin[thinnest]:,.2f}",
         )
 
+    def _key_for(self, session) -> str:
+        """The signing key that owns this account.
+
+        Accounts under one key share a socket, and that socket knows the
+        master it was opened for -- which is the public half of the key that
+        signs for every account on it.
+        """
+        return self._key_by_master[session.client.account_pubkey]
+
     def apply_leverage(self) -> None:
-        """Set each leg's configured leverage on both accounts.
+        """Set each leg's configured leverage on every account in the pool.
+
+        Every account, because any of them can be drawn as the maker or a
+        hedger of the next group. Setting only the named pair left the rest
+        at whatever they happened to carry, and leverage is what decides how
+        much margin a position ties up: the plan and the accounts were then
+        working from different numbers.
 
         Sub-accounts copy the master's settings at creation and are independent
         afterwards, so each account is set explicitly rather than assuming the
@@ -405,14 +450,20 @@ class Runtime:
                     f"legs leverage {value} exceeds {symbol}'s maximum of {ceiling}"
                 )
 
-        for session in (self.master, self.sub1):
+        for session in self.pool:
             current = current_leverage(session.full_account())
             for symbol, value in wanted.items():
                 if current.get(symbol) == value:
                     continue
                 result = set_leverage(
                     http_url=self.config.http_url,
-                    private_key=self.config.private_key,
+                    # The key that owns this account, not the first in the
+                    # file. Leverage decides how much margin a position ties
+                    # up, so an account left at whatever it happened to have
+                    # is an account whose share of the cycle was planned
+                    # against the wrong number -- and a request signed by a
+                    # key that does not own it would simply be refused.
+                    private_key=self._key_for(session),
                     domain=SignatureDomain[self.config.signature_domain_name],
                     symbol=symbol,
                     leverage=value,
