@@ -25,10 +25,11 @@ BTC = "BTC-USD"
 def strategy(tmp_path, pool_size=8, max_groups=3, cycles_each=None):
     obj = object.__new__(Strategy)
     obj.config = Config(
-        master_account=LegConfig(symbol=BTC, size=1.0, offset_bps=1.0,
-                                 max_distance_bps=5.0),
-        sub_account=LegConfig(symbol="ETH-USD", size=1.0, offset_bps=1.0,
-                              max_distance_bps=5.0),
+        markets=[
+            LegConfig(symbol=BTC, size=1.0, offset_bps=1.0, max_distance_bps=5.0),
+            LegConfig(symbol="ETH-USD", size=1.0, offset_bps=1.0,
+                      max_distance_bps=5.0),
+        ],
         mode="pool",
         chase_interval_s=0.001,
         risk=RiskConfig(),

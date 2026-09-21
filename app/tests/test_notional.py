@@ -86,11 +86,25 @@ def test_an_omitted_cap_defaults_to_the_whole_leg():
     assert leg.max_order_size == leg.size
 
 
-def test_a_cap_below_one_lot_floors_at_one_lot():
-    """A cap rounded down to nothing would block every order."""
+def test_a_cap_below_the_markets_minimum_floors_at_the_minimum():
+    """Not at one lot: the lot is not the smallest order SOL-USD accepts.
+
+    A lot of SOL is $10 and its minimum notional is $50, so a cap floored at
+    the lot sized every resting order at $10 and had each one rejected. Five
+    in a row is the kill switch, so the whole run ended on a cap somebody
+    typed too small.
+    """
     leg = LegConfig(symbol=SOL, notional_usd=500.0, max_order_notional_usd=1.0)
     resolve(leg)
-    assert leg.max_order_size == SPECS[SOL].lot_size
+    spec = SPECS[SOL]
+    assert leg.max_order_size == spec.min_notional / PRICES[SOL]
+    assert leg.max_order_size > spec.lot_size
+
+
+def test_a_cap_the_market_accepts_is_left_alone():
+    leg = LegConfig(symbol=SOL, notional_usd=500.0, max_order_notional_usd=200.0)
+    resolve(leg)
+    assert leg.max_order_size == 200.0 / PRICES[SOL]
 
 
 # -- refusals --------------------------------------------------------------

@@ -494,3 +494,62 @@ def test_the_net_counts_every_account_in_the_leg():
     book.set_authoritative("t3", BTC, -0.01)
 
     assert hedger.effective_net(roles) == pytest.approx(0.0)
+
+
+# -- and the pieces have to be ones the exchange will take -------------------
+#
+# The lot is not the floor that bites. ETH-USD takes a lot of 0.0001 -- about
+# forty cents -- and refuses any order under $50. Measuring a slice against
+# the lot alone therefore produced pieces the exchange rejected, one order at
+# a time, until the reject streak halted the run. A split that cannot clear
+# the market's own minimum should yield FEWER pieces, which is what the
+# settings file has always said `max_takers` does.
+
+
+def test_a_slice_under_the_markets_minimum_notional_is_not_sent():
+    """Every piece has to be an order the exchange would accept."""
+    _book, hedger, _master, _sub1 = build()
+    price = 1000.0  # so SPEC's $10 minimum is 0.01 -- ten lots
+    pieces = hedger._slice(split_roles(), 0.03, SPEC, price)
+
+    assert pieces, "the hedge has to go somewhere"
+    for _pubkey, size in pieces:
+        assert size * price >= SPEC.min_notional, "the exchange would reject this"
+
+
+def test_the_hedge_is_still_covered_in_full():
+    """Dropping a piece must not drop its exposure with it."""
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(), 0.03, SPEC, 1000.0)
+
+    assert sum(size for _p, size in pieces) == pytest.approx(0.03)
+
+
+def test_asking_for_more_pieces_than_the_size_carries_yields_fewer():
+    """Not rejected ones. This is the promise `max_takers` makes."""
+    _book, hedger, _master, _sub1 = build()
+    price = 1000.0
+
+    roomy = hedger._slice(split_roles(), 0.09, SPEC, price)
+    tight = hedger._slice(split_roles(), 0.021, SPEC, price)
+
+    assert len(roomy) == 3
+    assert len(tight) < 3, "a size this small cannot carry three orders"
+    assert sum(size for _p, size in tight) == pytest.approx(0.021)
+
+
+def test_a_hedge_that_cannot_be_split_at_all_goes_whole():
+    """One account, one order, which is what a pair does anyway."""
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(), 0.011, SPEC, 1000.0)
+
+    assert len(pieces) == 1
+    assert pieces[0][1] == pytest.approx(0.011)
+
+
+def test_without_a_price_the_lot_is_still_the_floor():
+    """The old behaviour, and all that is left when the feed has no quote."""
+    _book, hedger, _master, _sub1 = build()
+    pieces = hedger._slice(split_roles(), 0.03, SPEC, None)
+
+    assert len(pieces) == 3, "nothing should have been dropped"

@@ -107,8 +107,10 @@ def test_the_setting_refuses_a_negative():
     from bulkdn.config import Config, LegConfig
 
     config = Config(
-        master_account=LegConfig(symbol="BTC-USD", size=1.0, max_order_size=1.0),
-        sub_account=LegConfig(symbol="ETH-USD", size=1.0, max_order_size=1.0),
+        markets=[
+            LegConfig(symbol="BTC-USD", size=1.0, max_order_size=1.0),
+            LegConfig(symbol="ETH-USD", size=1.0, max_order_size=1.0),
+        ],
         max_phase_minutes=-1.0,
         private_key="x",
         sub1_pubkey="y",

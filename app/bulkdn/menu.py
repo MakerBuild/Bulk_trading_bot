@@ -29,7 +29,7 @@ from .cli import (
     cmd_run,
     cmd_status,
 )
-from .config import Config, ConfigError
+from .config import Config, ConfigError, LegConfig
 from . import proxy
 
 BOX_WIDTH = 46
@@ -884,111 +884,395 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
     print(f"  {label} set to {_render_number(value)} in {config_path}")
 
 
-MODE_COMMENT = (
-    "# Which markets to trade. multi = both legs, single = master_account only."
-)
+def _write_scalar(config_path: str, key: str, value: str) -> None:
+    """Set a top-level key, keeping the rest of the file as it is.
 
-
-def _write_mode(config_path: str, mode: str) -> None:
-    """Set the top-level `mode` key, keeping the rest of the file as it is.
-
-    Inserted above `legs:` when absent rather than appended, because that is
-    where it is documented and where someone reading the file will look for
-    it. Line-walking rather than a regex for the same reason the execution
-    target uses one: the file is full of comments that must survive.
+    Inserted above the markets block when absent rather than appended,
+    because that is where it is documented and where someone reading the file
+    will look for it. Line-walking rather than a regex for the same reason
+    the execution target uses one: the file is full of comments that must
+    survive.
     """
     with open(config_path, encoding="utf-8") as handle:
         lines = handle.read().splitlines()
 
     at = next(
-        (i for i, line in enumerate(lines) if line.strip().startswith("mode:")
+        (i for i, line in enumerate(lines) if line.strip().startswith(f"{key}:")
          and not line.startswith((" ", "\t"))),
         None,
     )
     if at is not None:
-        lines[at] = f"mode: {mode}"
+        lines[at] = f"{key}: {value}"
     else:
-        legs = next((i for i, line in enumerate(lines) if line.strip() == "legs:"), None)
-        block = [MODE_COMMENT, f"mode: {mode}", ""]
-        lines = [*lines, "", *block] if legs is None else [*lines[:legs], *block, *lines[legs:]]
+        anchor = next(
+            (i for i, line in enumerate(lines) if line.rstrip() in ("markets:", "legs:")),
+            None,
+        )
+        block = [f"{key}: {value}", ""]
+        lines = [*lines, "", *block] if anchor is None else [
+            *lines[:anchor], *block, *lines[anchor:]
+        ]
 
     with open(config_path, "w", encoding="utf-8", newline="") as handle:
         handle.write("\n".join(lines) + "\n")
 
 
-MODE_CHOICES = ("single", "multi", "pool")
+def _write_mode(config_path: str, mode: str) -> None:
+    _write_scalar(config_path, "mode", mode)
 
 
-def _mode_summary(config: Config, mode: str) -> str:
-    """One line saying what a mode would actually trade.
+def _block_at(lines: list[str], symbol: str) -> tuple[int, int] | None:
+    """The line range of the market block naming `symbol`, or None.
 
-    Written per mode rather than once, because the interesting part is
-    different in each: which market for single, which two for multi, and how
-    many keys feed the pool.
+    Found by the symbol rather than by the block's name, because the file has
+    two spellings and the symbol is the one thing both of them carry. A
+    `markets:` list writes `- symbol: BTC-USD`; a `legs:` mapping writes
+    `symbol: BTC-USD` under a named block. Either way that line is the block,
+    and the block runs until a line at or above its own indentation.
     """
-    if mode == "single":
-        return f"one pair on {config.master_account.symbol}"
-    if mode == "multi":
-        first, second = config.master_account.symbol, config.sub_account.symbol
-        if first == second:
-            return f"REFUSED -- both legs name {first}"
-        return f"two pairs, on {first} and {second}"
+    for index, line in enumerate(lines):
+        stripped = line.strip().lstrip("- ").strip()
+        if stripped != f"symbol: {symbol}":
+            continue
+        indent = len(line) - len(line.lstrip())
+        if line.lstrip().startswith("- "):
+            # The dash sits at the block's own indentation; its fields are
+            # indented past it.
+            indent += 2
+        end = len(lines)
+        for after in range(index + 1, len(lines)):
+            body = lines[after]
+            if not body.strip() or body.lstrip().startswith("#"):
+                continue
+            if len(body) - len(body.lstrip()) < indent:
+                end = after
+                break
+        return index, end
+    return None
+
+
+def _write_market_enabled(config_path: str, symbol: str, enabled: bool) -> None:
+    """Turn one market on or off, leaving the rest of the file alone.
+
+    Line-walking rather than loading and re-dumping the YAML, for the reason
+    every other writer here does it: the file is mostly comments, and a
+    round trip through a YAML library throws all of them away. Someone who
+    turns ETH off for a week should find their notes about it when they turn
+    it back on.
+    """
+    with open(config_path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    found = _block_at(lines, symbol)
+    if found is None:
+        raise ConfigError(f"{symbol} is not in {config_path}")
+    at, block_end = found
+    value = "true" if enabled else "false"
+    indent = " " * (len(lines[at]) - len(lines[at].lstrip()))
+    if lines[at].lstrip().startswith("- "):
+        indent += "  "
+
+    for index in range(at, block_end):
+        if lines[index].strip().startswith("enabled:"):
+            lines[index] = f"{indent}enabled: {value}"
+            break
+    else:
+        lines.insert(at + 1, f"{indent}enabled: {value}")
+
+    with open(config_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def _append_market(config_path: str, symbol: str, template: LegConfig) -> None:
+    """Add a market to the file, copying its numbers from an existing one.
+
+    Copied rather than asked for one field at a time: the numbers that matter
+    are the size and the caps, and a market added with somebody's best guess
+    at seven settings is a market that trades wrong. The copy is a starting
+    point the operator can edit, and the screen says which market it came
+    from.
+    """
+    with open(config_path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    listed = next(
+        (i for i, line in enumerate(lines) if line.rstrip() == "markets:"), None
+    )
+    mapped = next((i for i, line in enumerate(lines) if line.rstrip() == "legs:"), None)
+    if listed is None and mapped is None:
+        raise ConfigError(f"{config_path} has neither a markets: nor a legs: block")
+
+    fields = [
+        f"notional_usd: {_render_span(template.notional_span, template.notional_usd)}",
+        f"leverage: {_render_number(template.leverage or 0)}"
+        if template.leverage
+        else None,
+        f"offset_bps: {_render_number(template.offset_bps)}",
+        f"max_distance_bps: {_render_number(template.max_distance_bps)}",
+        f"chase_patience_s: {_render_number(template.chase_patience_s)}",
+        f"improve_ticks: {template.improve_ticks}",
+        "max_order_notional_usd: "
+        f"{_render_span(template.max_order_span, template.max_order_notional_usd)}",
+        "enabled: true",
+    ]
+    fields = [field for field in fields if field]
+
+    if listed is not None:
+        at = _end_of_block(lines, listed)
+        block = [f"  - symbol: {symbol}"] + [f"    {field}" for field in fields]
+    else:
+        at = _end_of_block(lines, mapped)
+        # A name of its own, because the mapping spelling needs one and the
+        # two it ships with are named after accounts that no longer pick
+        # anything. The symbol is the only name that stays true.
+        name = symbol.split("-", maxsplit=1)[0].lower()
+        # The symbol is a field here rather than part of the header: the
+        # mapping spelling names a block and puts the market inside it.
+        block = [f"  {name}:"] + [
+            f"    {field}" for field in [f"symbol: {symbol}", *fields]
+        ]
+
+    lines[at:at] = [f"  # added from the menu, copied from {template.symbol}", *block]
+
+    with open(config_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def _end_of_block(lines: list[str], header: int) -> int:
+    """Where a top-level block ends, skipping the comments that trail it.
+
+    The trailing comments belong to whatever comes NEXT -- they are the
+    header of the following section -- so a market inserted after them would
+    appear underneath somebody else's heading.
+    """
+    end = len(lines)
+    for index in range(header + 1, len(lines)):
+        line = lines[index]
+        if line.strip() and not line.startswith((" ", "\t")):
+            end = index
+            break
+    while end > header + 1 and (
+        not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")
+    ):
+        end -= 1
+    return end
+
+
+def _render_span(span, fallback: float) -> str:
+    """A size as the file spells it: `50-100` for a range, `100` otherwise."""
+    if span is not None and span.low != span.high:
+        return f"{_render_number(span.low)}-{_render_number(span.high)}"
+    value = span.high if span is not None else fallback
+    return _render_number(value)
+
+
+def _market_line(leg: LegConfig) -> str:
+    """One market, as the chooser shows it."""
+    if leg.notional_usd > 0 or leg.notional_span is not None:
+        size = f"${_render_span(leg.notional_span, leg.notional_usd)}"
+    else:
+        size = f"{_render_number(leg.size)} {leg.symbol.split('-')[0]}"
+    state = "on " if leg.enabled else "off"
+    return f"[{state}] {leg.symbol:<10} {size} per cycle"
+
+
+def _listed_symbols(config: Config) -> list[str]:
+    """Every market the exchange lists, for the add screen."""
+    info = _http(config).get_exchange_info()
+    markets = info if isinstance(info, list) else info.get("symbols", [])
+    return sorted(m["symbol"] for m in markets if isinstance(m, dict) and "symbol" in m)
+
+
+def _min_notional(config: Config, symbol: str) -> float:
+    info = _http(config).get_exchange_info()
+    markets = info if isinstance(info, list) else info.get("symbols", [])
+    for entry in markets:
+        if isinstance(entry, dict) and entry.get("symbol") == symbol:
+            return float(entry.get("minNotional") or 0.0)
+    return 0.0
+
+
+def _add_market(config: Config, config_path: str) -> None:
+    """Add one of the exchange's markets, copied from a market already set up."""
+    have = {leg.symbol for leg in config.markets}
+    try:
+        available = [s for s in _listed_symbols(config) if s not in have]
+    except Exception as exc:  # noqa: BLE001 - the menu must survive the exchange
+        print(f"\n  could not read the market list: {exc}")
+        return
+    if not available:
+        print("\n  every market the exchange lists is already in the file")
+        return
+
+    print()
+    for index, symbol in enumerate(available, start=1):
+        print(f"    {index}. {symbol}")
+    answer = _ask("\n  which market? (0 aborts) > ")
+    if not answer.isdigit() or not 1 <= int(answer) <= len(available):
+        print("  aborted")
+        return
+    symbol = available[int(answer) - 1]
+
+    template = config.markets[0]
+    floor = _min_notional(config, symbol)
+    smallest = (
+        template.notional_span.low
+        if template.notional_span is not None
+        else template.notional_usd
+    )
+    if floor and smallest and smallest < floor:
+        # Said before it is written, not discovered as a rejected order an
+        # hour into a run.
+        print(
+            f"\n  !! {symbol} will not accept an order under ${floor:g}, and the "
+            f"size copied from {template.symbol} starts at ${smallest:g}."
+        )
+        print("     It will be added switched off. Raise notional_usd for it,")
+        print("     then turn it on here.")
+
+    _append_market(config_path, symbol, template)
+    if floor and smallest and smallest < floor:
+        _write_market_enabled(config_path, symbol, False)
+    print(f"\n  {symbol} added to {config_path}, copied from {template.symbol}")
+    print("  Restart from the menu for it to take effect.")
+
+
+def _markets_screen(config: Config, config_path: str) -> None:
+    """Which markets trade. Every mode trades all of the ones switched on."""
+    while True:
+        print("\n  markets in the settings file:")
+        for index, leg in enumerate(config.markets, start=1):
+            print(f"    {index}. {_market_line(leg)}")
+        live = [leg for leg in config.markets if leg.enabled]
+        print(f"\n  {len(live)} of {len(config.markets)} switched on")
+        print("\n  1-9  turn one on or off")
+        print("  a    add a market")
+        print("  0    back")
+
+        answer = _ask("\n  > ").strip().lower()
+        if answer in ("", "0"):
+            return
+        if answer == "a":
+            _add_market(config, config_path)
+            continue
+        if not answer.isdigit() or not 1 <= int(answer) <= len(config.markets):
+            print("  not one of the choices")
+            continue
+
+        leg = config.markets[int(answer) - 1]
+        if leg.enabled and len(live) == 1:
+            print("\n  that is the only market switched on -- there would be")
+            print("  nothing left to trade. Turn another on first.")
+            continue
+        _write_market_enabled(config_path, leg.symbol, not leg.enabled)
+        leg.enabled = not leg.enabled
+        print(f"  {leg.symbol} is now {'on' if leg.enabled else 'off'}")
+
+
+MODE_CHOICES = ("multi", "single")
+
+MODE_SUMMARY = {
+    "multi": "every master and every sub, in one pool",
+    "single": "one master and its own sub-accounts",
+}
+
+
+def _accounts_summary(config: Config) -> str:
+    """One line saying which accounts the current mode puts in play."""
     keys = len(config.private_keys)
-    markets = " and ".join(
-        dict.fromkeys((config.master_account.symbol, config.sub_account.symbol))
-    )
-    if not keys:
-        return "REFUSED -- no keys in private_key.local"
-    return (
-        f"pairs drawn from every account under {keys} key(s), on {markets}; "
-        f"up to {config.max_groups} at once"
-    )
+    if config.mode == "single":
+        return f"single -- master {config.single_master} of {keys}"
+    return f"multi -- every master ({keys} key(s))"
 
 
-def _markets(config: Config, config_path: str) -> None:
-    """Choose how many pairs trade at once, and from which accounts.
+def _pick_master(config: Config, config_path: str) -> bool:
+    """Which master single mode trades. True when one was chosen."""
+    try:
+        trees = _trees(config)
+    except NoAccountTree as exc:
+        print(f"\n  {exc}")
+        return False
 
-    Both accounts trade in every mode: one opens the pair, the other hedges
-    it. The modes differ in how many pairs run and where their accounts come
-    from -- the config file, or a pool drawn from every key.
+    print("\n  which master?")
+    for tree in trees:
+        marker = "*" if tree.index == config.single_master else " "
+        owned = f"{len(tree.subs)} sub-account(s)" if tree.subs else "no sub-accounts"
+        print(f"  {marker} {tree.index}. {short_pubkey(tree.master)}  {owned}")
+    answer = _ask("\n  > ")
+    chosen = next((t for t in trees if answer == str(t.index)), None)
+    if chosen is None:
+        print("  aborted")
+        return False
+    if len(chosen.subs) < 1:
+        # A group needs two accounts, and single mode has only this tree to
+        # draw them from.
+        print(f"\n  {short_pubkey(chosen.master)} owns no sub-accounts, so there")
+        print("  is nothing for it to pair with. Create one first.")
+        return False
+
+    _write_scalar(config_path, "single_master", str(chosen.index))
+    config.single_master = chosen.index
+    return True
+
+
+def _accounts_screen(config: Config, config_path: str) -> None:
+    """Which accounts trade together -- one master's, or everyone's.
+
+    The difference is what the exchange can see. A trade between two accounts
+    under one master is a self-trade to it, and its own fee documentation
+    excludes those from qualifying volume. A trade between accounts under two
+    different masters is not a self-trade to anyone, because nothing on the
+    exchange links one master to another.
     """
-    print(f"\n  now: {config.mode}")
+    print(f"\n  now: {_accounts_summary(config)}")
     for index, mode in enumerate(MODE_CHOICES, start=1):
         marker = "*" if mode == config.mode else " "
-        print(f"  {marker} {index}. {mode:<7} {_mode_summary(config, mode)}")
+        print(f"  {marker} {index}. {mode:<7} {MODE_SUMMARY[mode]}")
     print("    0. back")
 
     answer = _ask("\n  > ")
     if answer in ("", "0"):
         return
-    if answer not in [str(n) for n in range(1, len(MODE_CHOICES) + 1)]:
+    if not answer.isdigit() or not 1 <= int(answer) <= len(MODE_CHOICES):
         print("  not one of the choices")
         return
 
     chosen = MODE_CHOICES[int(answer) - 1]
-    if chosen == config.mode:
-        print(f"  already {chosen}")
+    if not config.private_keys:
+        print("\n  no keys in private_key.local -- nothing can trade yet")
         return
+    if chosen == "single" and not _pick_master(config, config_path):
+        return
+    if chosen != config.mode:
+        _write_mode(config_path, chosen)
+        config.mode = chosen
+    print(f"  accounts: {_accounts_summary(config)}")
 
-    # The summary carries the refusal, so it cannot say one thing on the menu
-    # and another here.
-    summary = _mode_summary(config, chosen)
-    if summary.startswith("REFUSED"):
-        print(f"\n  Cannot switch to {chosen}: {summary[10:]}.")
-        if chosen == "multi":
-            print("  Roles are held per symbol, so one leg would overwrite the")
-            print("  other and one of them would silently stop trading. Give")
-            print("  sub_account a different symbol in the settings file first.")
-        else:
-            print("  Put one base58 key per line in private_key.local first.")
-        return
 
-    if not _confirm(f"Switch to {chosen} -- {summary}."):
-        print("  unchanged")
-        return
-    _write_mode(config_path, chosen)
-    config.mode = chosen
-    print(f"  mode set to {chosen} in {config_path}")
+def _markets(config: Config, config_path: str) -> None:
+    """Markets and accounts: what is traded, and by whom.
+
+    One screen because they are the two halves of the same question and used
+    to be one setting. They were separated when it became clear they had
+    never been the same thing: how many markets are open says nothing about
+    which accounts are on either side of a trade.
+    """
+    while True:
+        traded = ", ".join(leg.symbol for leg in config.active_legs) or "none"
+        print("\n" + _box("MARKETS & ACCOUNTS", [
+            f"1. Accounts   [{_accounts_summary(config)}]",
+            f"2. Markets    [{traded}]",
+            "3. Back",
+        ]))
+        print(f"  up to {config.max_groups} group(s) at once, "
+              f"{config.max_takers} account(s) per hedge")
+        choice = _ask("\n  > ")
+        if choice == "1":
+            _accounts_screen(config, config_path)
+        elif choice == "2":
+            _markets_screen(config, config_path)
+        elif choice in ("3", "0", ""):
+            return
 
 
 def _target_progress(config: Config) -> None:
@@ -1069,7 +1353,7 @@ def _configuration(config: Config, config_path: str) -> None:
             f"2. Total Amount to Burn  [${target.burn_usd:,.2f}]",
             f"3. Total Trading Volume  [${target.volume_usd:,.2f}]",
             "",
-            f"4. Markets               [{config.mode}]",
+            f"4. Markets & Accounts    [{config.mode}]",
             f"     {', '.join(leg.symbol for leg in config.active_legs)}",
             "5. Progress",
             "6. Back",

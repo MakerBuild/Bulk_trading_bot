@@ -127,6 +127,11 @@ class LegConfig:
     # None leaves whatever the account already has. The exchange's own ceiling
     # for the market is checked at startup, since it differs per symbol.
     leverage: float | None = None
+    # Whether this market trades at all. Off rather than deleted, so the
+    # menu can turn a market off without throwing away the size, the offset
+    # and the cap someone tuned for it -- and turn it back on next week with
+    # those numbers intact.
+    enabled: bool = True
 
     @property
     def priced_in_usd(self) -> bool:
@@ -346,34 +351,35 @@ class HoldTime(Span):
 
 @dataclass
 class Config:
-    # Named for the account that OPENS each leg, not for a coin: the symbols
-    # are configurable, so `btc`/`sol` would be a lie the moment someone
-    # trades something else.
-    master_account: LegConfig
-    sub_account: LegConfig
-    # How many PAIRS trade at once, not how many accounts.
+    # Every market this config knows about, in file order. Which of them
+    # actually trade is each one's `enabled`, so a market can be turned off
+    # from the menu without losing the numbers tuned for it.
     #
-    #   multi    two pairs, one market each
-    #   single   one pair, on the market `master_account` names. The
-    #            `sub_account` block is unread -- it is a second leg, not a
-    #            second account.
-    #   pool     pairs drawn from every account under every key
+    # A list rather than two named blocks: the two names said which account
+    # opened which leg, and accounts are no longer chosen that way -- they are
+    # drawn from the pool per cycle. What is left is a set of markets, and
+    # there is no reason for that set to be exactly two.
+    markets: list[LegConfig]
+    # WHICH ACCOUNTS trade together. Not how many markets -- that is the list
+    # above, and every mode trades all of the enabled ones.
     #
-    # Both accounts trade in every one of them. The leg names invite the
-    # opposite reading: they say which account OPENS a leg, so "single trades
-    # only master_account" sounds like the sub-account sits idle. It does not.
-    # In single the master opens the pair and the sub-account hedges it,
-    # exactly as in multi -- there is one pair instead of two.
+    #   single   one master and its own sub-accounts. Every trade is between
+    #            accounts the exchange can see belong to each other.
+    #   multi    every master and every sub-account, in one pool. A group is
+    #            drawn from all of them, so most cycles put two masters on
+    #            opposite sides of a trade -- and nothing on the exchange
+    #            links those two to each other.
     #
-    # Single exists because the markets are not equally cheap. Measured over a
-    # two-hour run, hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD,
-    # and the difference survives excluding the self-trades that flatter the
-    # cheaper one. Leaving out the dearer market is worth roughly a fifth to
-    # two fifths of the spread bill, against half as many pairs earning volume
-    # at a time.
+    # That difference is the whole reason for the setting. Self-trades inside
+    # one tree earn referral volume but no fee-tier volume, because the
+    # documentation excludes them; a trade between two masters is not a
+    # self-trade at all, to anyone looking.
     mode: str = "multi"
-    # pool mode only. How many groups may be open at once, and how many
-    # accounts may share one hedge.
+    # Which master trades in single mode: its line number in the key file,
+    # counting from 1. Ignored in multi, where every key is in play.
+    single_master: int = 1
+    # How many groups may be open at once, and how many accounts may share
+    # one hedge.
     #
     # The cap is a setting rather than a discovery: a hundred accounts
     # allow fifty groups, which is fifty resting orders being chased and
@@ -414,6 +420,11 @@ class Config:
     # smaller account's available margin. Sizes that already fit are used
     # as written.
     max_margin_fraction: float = 0.25
+    # How each market is spelled in the settings file, same order as
+    # `markets`. An old file says `legs.master_account`, a new one says
+    # `markets[0]`, and an error has to name the one the operator will find
+    # when they open the file.
+    market_names: list[str] = field(default_factory=list)
     # Normally discovered from the master at startup; set only to pin one
     # specific sub-account when the master has several.
     sub1_pubkey: str = ""
@@ -429,16 +440,28 @@ class Config:
 
     @property
     def active_legs(self) -> list[LegConfig]:
-        """The legs this run actually trades, in opener order.
+        """The markets this run actually trades, in file order.
 
-        Everything that used to name both legs reads this instead, so single
-        mode is one list being shorter rather than a branch in each of nine
-        places -- which is how one of them gets missed and a leg keeps being
-        sized, chased or capped after it stopped trading.
+        Everything that used to name both legs reads this instead, so turning
+        a market off is one list being shorter rather than a branch in each of
+        nine places -- which is how one of them gets missed and a market keeps
+        being sized, chased or capped after it stopped trading.
         """
-        if self.mode == "single":
-            return [self.master_account]
-        return [self.master_account, self.sub_account]
+        return [market for market in self.markets if market.enabled]
+
+    @property
+    def master_account(self) -> LegConfig:
+        """The first market. Kept for the callers that only need any market.
+
+        There is nothing master-ish about it any more -- the name survives
+        because a handful of places want one market's chase settings and do
+        not care which.
+        """
+        return self.markets[0]
+
+    @property
+    def sub_account(self) -> LegConfig | None:
+        return self.markets[1] if len(self.markets) > 1 else None
 
     # Referral gating, checked once at startup. See bulkdn/referral.py for what
     # a client-side gate does and does not actually prevent.
@@ -481,11 +504,17 @@ class Config:
 
     @property
     def legs(self) -> dict[str, LegConfig]:
-        """Legs keyed by symbol, which is how the rest of the bot looks them up."""
-        return {
-            self.master_account.symbol: self.master_account,
-            self.sub_account.symbol: self.sub_account,
-        }
+        """Markets keyed by symbol, which is how the rest of the bot finds them."""
+        return {market.symbol: market for market in self.markets}
+
+    def _market_name(self, index: int) -> str:
+        """How a market is addressed in an error message.
+
+        An old file spells its markets `legs.master_account`; a new one
+        spells them `markets[0]`. The error has to name the one the operator
+        will actually find when they open the file.
+        """
+        return self.market_names[index] if index < len(self.market_names) else str(index)
 
     def __post_init__(self) -> None:
         # Callers that build a Config directly pass a plain number; the
@@ -517,30 +546,51 @@ class Config:
                 "`bulkdn encrypt-key`"
             )
         self.target.validate()
-        if self.mode not in ("single", "multi", "pool"):
+        if self.mode not in ("single", "multi"):
             raise ConfigError(
-                f"mode must be 'single', 'multi' or 'pool', got {self.mode!r}"
+                f"mode must be 'single' or 'multi', got {self.mode!r}"
             )
-        if self.mode == "pool":
-            if self.max_groups < 1:
-                raise ConfigError("max_groups must be at least 1")
-            if self.max_takers < 1:
-                raise ConfigError("max_takers must be at least 1")
-            if not self.private_keys and require_credentials:
-                raise ConfigError(
-                    "pool mode trades every account under every key in "
-                    f"{PRIVATE_KEY_FILE}, and that file named none"
-                )
-        self.master_account.validate("master_account")
-        # Validated even when unused, so a typo in it is found now rather than
-        # the day someone switches back to multi.
-        self.sub_account.validate("sub_account")
-        if self.mode == "multi" and self.master_account.symbol == self.sub_account.symbol:  # noqa: E501
+        if self.max_groups < 1:
+            raise ConfigError("max_groups must be at least 1")
+        if self.max_takers < 1:
+            raise ConfigError("max_takers must be at least 1")
+        if not self.private_keys and require_credentials:
             raise ConfigError(
-                "the two legs must use different symbols. Roles are held per "
-                "symbol, so two legs sharing one would overwrite each other and "
-                "one would silently stop trading. To trade a single market, set "
-                "mode: single instead."
+                "the bot trades the accounts under the keys in "
+                f"{PRIVATE_KEY_FILE}, and that file named none"
+            )
+        if self.mode == "single" and self.single_master < 1:
+            raise ConfigError(
+                f"single_master is the key's line number counting from 1, got "
+                f"{self.single_master}"
+            )
+        if (
+            self.mode == "single"
+            and self.private_keys
+            and self.single_master > len(self.private_keys)
+        ):
+            raise ConfigError(
+                f"single_master is {self.single_master} but {PRIVATE_KEY_FILE} "
+                f"holds {len(self.private_keys)} key(s). Pick one of them from "
+                "Configuration -> Markets & Accounts."
+            )
+        if not self.markets:
+            raise ConfigError("config must define at least one market")
+        # Validated even when switched off, so a typo in a market someone
+        # turned off is found now rather than the day they turn it back on.
+        for index, market in enumerate(self.markets):
+            market.validate(self._market_name(index))
+        if not self.active_legs:
+            raise ConfigError(
+                "every market is switched off, so there is nothing to trade. "
+                "Turn one on from Configuration -> Markets & Accounts."
+            )
+        traded = [market.symbol for market in self.active_legs]
+        if len(set(traded)) != len(traded):
+            raise ConfigError(
+                "two markets name the same symbol. A leg is held per symbol, "
+                "so the second would overwrite the first and one of them would "
+                "silently stop trading."
             )
         if not 0.0 < self.max_margin_fraction <= 1.0:
             raise ConfigError(
@@ -630,9 +680,58 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             leverage=(
                 float(raw["leverage"]) if raw.get("leverage") is not None else None
             ),
+            enabled=bool(raw.get("enabled", True)),
         )
     except KeyError as exc:
         raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
+
+
+def _mode_from_raw(value: Any) -> str:
+    """The mode, accepting what older settings files called it.
+
+    `pool` was this mode's name while it was the third of three. It is now
+    the only way accounts are chosen, so it is simply `multi`, and a file
+    still saying `pool` keeps working rather than refusing to start over a
+    word.
+    """
+    mode = str(value).strip().lower()
+    if mode == "pool":
+        return "multi"
+    return mode
+
+
+def _markets_from_raw(
+    raw: dict[str, Any], legs: dict[str, Any]
+) -> tuple[list[LegConfig], list[str]]:
+    """The markets to trade, from either spelling of the settings file.
+
+    `markets:` is a list, which is the spelling the menu writes. `legs:` is
+    the older mapping of two named blocks, and it is still read as written --
+    a subscriber's file must not stop working because the shape it uses was
+    superseded. The two names it uses are kept in the error messages, so an
+    operator reading a complaint about `legs.sub_account` can find that line.
+    """
+    raw_markets = raw.get("markets")
+    if raw_markets is not None:
+        if not isinstance(raw_markets, list) or not raw_markets:
+            raise ConfigError("markets must be a non-empty list")
+        markets = []
+        names = []
+        for index, entry in enumerate(raw_markets):
+            name = f"markets[{index}]"
+            names.append(name)
+            markets.append(_leg_from_dict(entry, name))
+        return markets, names
+
+    missing = [k for k in ("master_account", "sub_account") if k not in legs]
+    if missing:
+        raise ConfigError(
+            f"config must define `markets`, or legs.{' and legs.'.join(missing)}"
+        )
+    # File order, not the order they are named here: an operator who swapped
+    # the two blocks meant to swap them.
+    names = [f"legs.{name}" for name in legs]
+    return [_leg_from_dict(legs[name], f"legs.{name}") for name in legs], names
 
 
 def _load_private_keys(required: bool) -> list[str]:
@@ -733,7 +832,9 @@ def load_config(
     if not isinstance(pool_raw, dict):
         raise ConfigError("pool must be a mapping")
 
-    legs = raw.get("legs")
+    # A file written by the menu carries `markets:` and no `legs:` at all,
+    # so an absent one is only an error when nothing else names a market.
+    legs = raw.get("legs") or {}
     if not isinstance(legs, dict):
         raise ConfigError("legs must be a mapping")
     if "btc" in legs or "sol" in legs:
@@ -745,9 +846,8 @@ def load_config(
             "legs.sub_account -- they name the account that opens each leg, "
             "not a coin. Rename the two keys; the fields inside are unchanged."
         )
-    missing = [k for k in ("master_account", "sub_account") if k not in legs]
-    if missing:
-        raise ConfigError(f"config must define legs.{' and legs.'.join(missing)}")
+
+    markets, market_names = _markets_from_raw(raw, legs)
 
     risk_raw = raw.get("risk") or {}
     if not isinstance(risk_raw, dict):
@@ -766,9 +866,12 @@ def load_config(
 
     config = Config(
         sub1_pubkey=raw.get("sub1_pubkey", ""),
-        master_account=_leg_from_dict(legs["master_account"], "master_account"),
-        sub_account=_leg_from_dict(legs["sub_account"], "sub_account"),
-        mode=str(mode if mode is not None else raw.get("mode", "multi")).strip().lower(),
+        markets=markets,
+        market_names=market_names,
+        mode=_mode_from_raw(mode if mode is not None else raw.get("mode", "multi")),
+        single_master=int(
+            raw.get("single_master", pool_raw.get("single_master", 1))
+        ),
         max_groups=int(pool_raw.get("max_groups", 5)),
         max_takers=int(pool_raw.get("max_takers", 1)),
         hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),

@@ -29,10 +29,12 @@ class FakeSession:
 def strategy(ages, sync_interval=60.0):
     obj = object.__new__(Strategy)
     obj.config = Config(
-        master_account=LegConfig(symbol="BTC-USD", size=1.0, offset_bps=1.0,
-                                 max_distance_bps=5.0),
-        sub_account=LegConfig(symbol="ETH-USD", size=1.0, offset_bps=1.0,
-                              max_distance_bps=5.0),
+        markets=[
+            LegConfig(symbol="BTC-USD", size=1.0, offset_bps=1.0,
+                      max_distance_bps=5.0),
+            LegConfig(symbol="ETH-USD", size=1.0, offset_bps=1.0,
+                      max_distance_bps=5.0),
+        ],
         risk=RiskConfig(ws_stale_timeout_s=QUIET),
         position_sync_interval_s=sync_interval,
         private_key="x",

@@ -14,15 +14,15 @@
 # ---------------------------------------------------------------------------
 #  WHAT TO TRADE
 #
-#  Two legs, opposite directions, so the pair nets out to roughly zero.
-#  Each leg is named for the account that OPENS it:
+#  Each market below is one leg: an account opens a position in it, and one
+#  or more other accounts take the opposite side, so the pair nets out to
+#  roughly zero. Every market switched on runs at the same time.
 #
-#    master_account   the master buys this, the sub-account shorts it
-#    sub_account      the sub-account buys this, the master shorts it
+#  WHICH accounts do that is not set here -- see `mode` below. They are drawn
+#  from the pool per cycle, so the two block names are only names.
 #
-#  Both run at the same time, and each fill is hedged on the other account.
-#  Any market the exchange lists works -- the names below are just which
-#  account trades what, not a coin the bot is tied to.
+#  Any market the exchange lists works. Add one from the menu rather than by
+#  hand and it arrives with the numbers of a market already set up.
 #
 #  HOW MUCH: write it in dollars.
 #
@@ -62,40 +62,56 @@
 #  If the sizes below need more margin than the accounts hold, every leg is
 #  scaled down together to fit -- see max_margin_fraction near the bottom.
 #
-#  HOW MANY MARKETS: `mode`.
+#  WHICH MARKETS: every block below with `enabled: true`.
 #
-#    single   one market  -- the one in the `master_account` block
-#    multi    two markets -- one per block
-#    pool     many, drawn at random from every key in private_key.local
+#  Add, remove and switch them from the menu -- Configuration -> Markets &
+#  Accounts -> Markets. `enabled: false` keeps a market's numbers in the file
+#  while it is not trading, so turning it back on next week restores them.
 #
-#  Both accounts trade in all three. `master_account` and `sub_account` name
-#  the two BLOCKS below, not the two accounts: each block sets a market and a
-#  size. `single` reads only the first one.
+#  There may be more than two. The two names below are historical: they used
+#  to say which account opened which leg, and accounts are no longer chosen
+#  that way -- they are drawn per cycle from the pool. What is left is a set
+#  of markets, and nothing requires that set to be exactly two.
 #
-#  Which to pick: the markets are not equally cheap. Over a two-hour live run,
-#  hedging cost 1.24 bps on BTC-USD against 3.59 on ETH-USD. Dropping the
-#  dearer one is worth roughly a fifth to two fifths of the spread bill, and
-#  costs half as many pairs earning volume at a time.
+#  The markets are not equally cheap. Over a two-hour live run, hedging cost
+#  1.24 bps on BTC-USD against 3.59 on ETH-USD. Switching the dearer one off
+#  is worth roughly a fifth to two fifths of the spread bill, and costs half
+#  as many pairs earning volume at a time.
 #
-#  Two blocks may not name the same market in `multi`: roles are held per
-#  market, so one would overwrite the other and stop trading. Use `single`,
-#  or `pool`, to trade one market.
+#  Two enabled markets may not name the same symbol: a leg is held per
+#  symbol, so one would overwrite the other and stop trading.
+#
+#  WHICH ACCOUNTS: `mode`.
+#
+#    single   one master and its own sub-accounts. `single_master` says
+#             which one, by its line number in private_key.local.
+#    multi    every master and every sub-account, in one pool.
+#
+#  This is not about markets -- both modes trade every market switched on.
+#  It is about who is on the other side of a trade, and that shows.
+#
+#  A trade between two accounts under one master is a self-trade: the
+#  exchange sees one owner on both sides, and its own fee documentation
+#  excludes those from qualifying volume. A trade between accounts under two
+#  DIFFERENT masters is not a self-trade to anybody, because nothing on the
+#  exchange links one master to another. That is the whole of the
+#  difference, and with one key in the file the two modes are identical.
 mode: multi
+single_master: 1
 
 # ---------------------------------------------------------------------------
-#  POOL MODE
+#  HOW MANY AT ONCE
 #
-#  Only read when mode is `pool`. Every account under every key in
-#  private_key.local joins one pool, and groups are drawn from it per cycle:
-#  one account opens, one or more cover it, and they disband when the cycle
-#  ends. The next cycle draws different accounts, a different market and a
-#  different size.
+#  Whichever accounts the mode put in play, they form one pool, and groups
+#  are drawn from it per cycle: one account opens, one or more cover it, and
+#  they disband when the cycle ends. The next cycle draws different accounts,
+#  a different market and a different size.
 #
-#  The point is that a fixed pairing is the clearest signal a series of trades
-#  can give about itself -- the same two pubkeys, the same size, the same
-#  market, over and over. Splitting the hedge removes the rest of it: $4,000
-#  answered by one account of $4,000 is a line anyone can draw, and the same
-#  $4,000 answered by $1,800, $1,400 and $800 is not.
+#  The point is that a fixed pairing is the clearest signal a series of
+#  trades can give about itself -- the same two pubkeys, the same size, the
+#  same market, over and over. Splitting the hedge removes the rest of it:
+#  $4,000 answered by one account of $4,000 is a line anyone can draw, and
+#  the same $4,000 answered by $1,800, $1,400 and $800 is not.
 #
 #    max_groups   how many groups may trade at once. A hundred accounts allow
 #                 fifty, which is fifty resting orders being chased and fifty
@@ -104,9 +120,23 @@ mode: multi
 #                 and watch the log for rejections.
 #
 #    max_takers   how many accounts may share one hedge. 1 means no split.
-#                 A share that falls under the market's minimum order cannot
-#                 be sent at all, so the split is floored -- asking for more
-#                 pieces than the size can carry simply yields fewer.
+#                 A share under the market's minimum order cannot be sent at
+#                 all, so the split is floored: asking for more pieces than
+#                 the size can carry yields FEWER pieces, not rejected ones.
+#
+#  Both settings are capped by the accounts themselves, and they compete for
+#  them. A group is one opener plus its takers, and an account is in at most
+#  one group, so six accounts give three groups of two, or two groups of
+#  three, or one group of six. Raising max_takers lowers how many groups fit.
+#
+#  Splitting has a size floor worth knowing before you set it. No share is
+#  ever smaller than 15% of the cycle, so a split needs
+#
+#      cycle size x 0.15  >=  the market's minimum order
+#
+#  BTC-USD accepts $1, so $7 a cycle is enough. ETH-USD accepts $50, so
+#  splitting it needs $333 a cycle. Under that the split simply does not
+#  happen -- the hedge goes to one account whole.
 #
 #  An account is only ever in one group at a time. That is arithmetic, not
 #  tidiness: the hedge is derived from positions, so an account in two groups

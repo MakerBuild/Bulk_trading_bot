@@ -98,10 +98,12 @@ def test_a_missing_file_is_no_keys_rather_than_an_error(tmp_path):
 
 def config(**kwargs):
     return Config(
-        master_account=LegConfig(symbol="BTC-USD", size=1.0, offset_bps=1.0,
-                                 max_distance_bps=5.0),
-        sub_account=LegConfig(symbol="ETH-USD", size=1.0, offset_bps=1.0,
-                              max_distance_bps=5.0),
+        markets=[
+            LegConfig(symbol="BTC-USD", size=1.0, offset_bps=1.0,
+                      max_distance_bps=5.0),
+            LegConfig(symbol="ETH-USD", size=1.0, offset_bps=1.0,
+                      max_distance_bps=5.0),
+        ],
         **kwargs,
     )
 

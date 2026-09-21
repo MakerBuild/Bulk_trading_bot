@@ -199,10 +199,28 @@ def resolve_notionals(
 
         if leg.max_order_notional_usd > 0:
             # A cap rounded down to nothing would stop every order, so it
-            # floors at one lot -- the smallest order the market accepts.
-            leg.max_order_size = max(
-                round_size(leg.max_order_notional_usd / price, spec), spec.lot_size
+            # floors at the smallest order the market actually accepts --
+            # which is the larger of its lot and its minimum notional.
+            #
+            # The notional is the one that bites. ETH-USD takes a lot of
+            # 0.0001, around forty cents, but refuses any order under $50: a
+            # $25 cap passed the lot test, sized every resting order at $25,
+            # and had all of them rejected. Five in a row is the kill switch.
+            floor = max(
+                spec.lot_size,
+                round_size(spec.min_notional / price, spec) if spec.min_notional else 0.0,
             )
+            asked = round_size(leg.max_order_notional_usd / price, spec)
+            leg.max_order_size = max(asked, floor)
+            if asked < floor:
+                log.warning(
+                    "%s: max_order_notional_usd of $%s is under the market's $%s "
+                    "minimum, so orders will be $%s -- the smallest it accepts",
+                    leg.symbol,
+                    f"{leg.max_order_notional_usd:,.2f}",
+                    f"{spec.min_notional:g}",
+                    f"{floor * price:,.2f}",
+                )
 
     # Outside the loop above, because a leg written in the base coin skips it
     # entirely and still needs a cap.

@@ -241,7 +241,27 @@ class Hedger:
         """Retire an in-flight reservation once its hedge fill lands."""
         self.in_flight.consume(key, signed_size)
 
-    def _slice(self, roles: LegRoles, size: float, spec) -> list[tuple[str, float]]:
+    def _floor(self, spec, price: float | None) -> float:
+        """The smallest order this market accepts, in base units.
+
+        Two floors, and the notional one is usually the binding one. BTC-USD
+        admits a lot of 0.000001 and a notional of $1; ETH-USD admits a lot of
+        0.0001 -- about forty cents -- and a notional of $50. Measuring a
+        slice against the lot alone therefore passes pieces the exchange
+        refuses, and it refuses them one order at a time until the reject
+        streak halts the run.
+
+        Without a price the notional floor cannot be expressed in base units,
+        so the lot stands alone. That is the old behaviour, and it is only
+        reached when the feed has no reference price at all.
+        """
+        if not price or price <= 0 or spec.min_notional <= 0:
+            return spec.lot_size
+        return max(spec.lot_size, round_size(spec.min_notional / price, spec))
+
+    def _slice(
+        self, roles: LegRoles, size: float, spec, price: float | None = None
+    ) -> list[tuple[str, float]]:
         """Split one hedge across the leg's hedgers, by their shares.
 
         Rounding is settled by giving the remainder to the last slice, so the
@@ -249,27 +269,33 @@ class Hedger:
         more -- an under-hedge leaves the group directional by the difference,
         and there is nothing to notice it until the reconciler runs.
 
-        A slice that rounds below one lot is dropped and its weight handed on:
-        an order the exchange will not accept is not a smaller hedge, it is a
-        missing one. With one hedger, or when the split cannot survive the lot
-        size, this returns the whole hedge to the first account -- which is
-        what every leg outside a pool does anyway.
+        A slice below what the market accepts is dropped and its weight handed
+        on: an order the exchange will not take is not a smaller hedge, it is
+        a missing one. Asking for more pieces than the size can carry
+        therefore yields fewer pieces, not rejected ones -- which is what the
+        settings file has always promised `max_takers` does.
+
+        With one hedger, or when the split cannot survive that floor, this
+        returns the whole hedge to the first account. The hedge itself was
+        already checked against the same floor before we got here, so the
+        undivided order is one the exchange will take.
         """
         hedgers, weights = roles.hedgers, roles.weights
         if len(hedgers) == 1:
             return [(hedgers[0], size)]
 
+        floor = self._floor(spec, price)
         pieces: list[tuple[str, float]] = []
         placed = 0.0
         for pubkey, weight in zip(hedgers[:-1], weights[:-1], strict=False):
             piece = round_size(size * weight, spec)
-            if piece < spec.lot_size:
+            if piece < floor:
                 continue
             pieces.append((pubkey, piece))
             placed += piece
 
         remainder = round_size(size - placed, spec)
-        if remainder >= spec.lot_size:
+        if remainder >= floor:
             pieces.append((hedgers[-1], remainder))
         elif pieces:
             # Too small to send on its own: fold it into the last real slice
@@ -368,7 +394,7 @@ class Hedger:
                     f"{self.max_impact_bps:.1f} bps ceiling"
                 )
 
-            slices = self._slice(roles, size, spec)
+            slices = self._slice(roles, size, spec, price)
             session = self.sessions[slices[0][0]]
             # The book as it stands BEFORE the order goes out. Read here and
             # not from the fill that comes back, because by then this order has

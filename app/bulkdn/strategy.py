@@ -1565,16 +1565,12 @@ class Strategy:
             # keeps the count it already had.
             await self.capture_target_baseline()
 
-            if self.config.mode == "pool":
-                # One task, which starts and reaps the groups itself. The legs
-                # here are not known in advance: they are drawn, traded and
-                # disbanded for as long as the run lasts.
-                legs = [asyncio.create_task(self._dispatch_groups(sizes))]
-            else:
-                legs = [
-                    asyncio.create_task(self._run_leg(symbol, sizes[symbol]))
-                    for symbol in self.symbols
-                ]
+            # One task, which starts and reaps the groups itself. The legs
+            # here are not known in advance: they are drawn, traded and
+            # disbanded for as long as the run lasts. Both modes come through
+            # here -- they differ in which accounts reached the pool, and
+            # that was settled before this point.
+            legs = [asyncio.create_task(self._dispatch_groups(sizes))]
             # One leg raising must not leave the other trading on alone, so the
             # first exception cancels the rest before it propagates.
             done, pending = await asyncio.wait(

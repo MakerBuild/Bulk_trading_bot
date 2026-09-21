@@ -21,8 +21,6 @@ from bulk_api.common import SignatureDomain
 
 from .accounts import (
     build_pool,
-    build_sessions,
-    discover_sub_account,
     verify_sub_account,
 )
 from .chaser import Chaser
@@ -189,47 +187,41 @@ class Runtime:
         # the operator should have to copy by hand.
         domain = SignatureDomain[config.signature_domain_name]
 
-        if config.mode == "pool":
-            # Every account under every key, on one socket per key. Discovery
-            # is an HTTP call per key rather than something the operator
-            # copies by hand: a sub-account is a fact about its master, and a
-            # list typed into a file is a list that can be wrong.
-            self.pool = build_pool(
-                private_keys=config.private_keys,
-                ws_url=config.ws_url,
-                http_url=config.http_url,
-                domain=domain,
-                symbols=self.symbols,
-                dry_run=dry_run,
+        # The mode is a choice of KEYS, and nothing downstream of here needs
+        # to know which was made. `single` narrows the pool to one master's
+        # own accounts, so every group drawn from it is inside that tree;
+        # `multi` hands over every key, so a group can span two masters. The
+        # drawing, the trading and the accounting are the same code either
+        # way -- which is why there is no second path to keep in step.
+        keys = self._keys_in_play(config)
+        # Every account under every key in play, on one socket per key.
+        # Discovery is an HTTP call per key rather than something the operator
+        # copies by hand: a sub-account is a fact about its master, and a list
+        # typed into a file is a list that can be wrong.
+        self.pool = build_pool(
+            private_keys=keys,
+            ws_url=config.ws_url,
+            http_url=config.http_url,
+            domain=domain,
+            symbols=self.symbols,
+            dry_run=dry_run,
+        )
+        if len(self.pool) < 2:
+            raise ConfigError(
+                f"{config.mode} mode needs at least two accounts to pair, and "
+                f"the key(s) it uses produced {len(self.pool)}. Create a "
+                "sub-account from Accounts Management."
             )
-            if len(self.pool) < 2:
-                raise ConfigError(
-                    "pool mode needs at least two accounts to pair, and the "
-                    f"keys given produced {len(self.pool)}"
-                )
-            # The first two keep their old names for the commands that act on
-            # one account -- status, transfer, the market feed's socket.
-            self.master, self.sub1 = self.pool[0], self.pool[1]
-            log.info(
-                "pool: %d accounts under %d key(s) on %d socket(s)",
-                len(self.pool),
-                len(config.private_keys),
-                len({id(s.client) for s in self.pool}),
-            )
-        else:
-            sub1_pubkey = config.sub1_pubkey or discover_sub_account(
-                private_key=config.private_key, http_url=config.http_url
-            )
-            self.master, self.sub1 = build_sessions(
-                private_key=config.private_key,
-                sub1_pubkey=sub1_pubkey,
-                ws_url=config.ws_url,
-                http_url=config.http_url,
-                domain=domain,
-                symbols=self.symbols,
-                dry_run=dry_run,
-            )
-            self.pool = [self.master, self.sub1]
+        # The first two keep their old names for the commands that act on
+        # one account -- status, transfer, the market feed's socket.
+        self.master, self.sub1 = self.pool[0], self.pool[1]
+        log.info(
+            "%s: %d accounts under %d key(s) on %d socket(s)",
+            config.mode,
+            len(self.pool),
+            len(keys),
+            len({id(s.client) for s in self.pool}),
+        )
 
         self.sessions = {session.pubkey: session for session in self.pool}
         self.notifier = Notifier(config.telegram)
@@ -238,6 +230,41 @@ class Runtime:
         self.impact = ImpactBook(config.http_url)
         self.feed = MarketFeed(self.master, self.symbols)
         self.store = StateStore(config.state_file)
+
+    @staticmethod
+    def _same_tree(one, other) -> bool:
+        """Whether these two accounts are signed for by the same key.
+
+        Accounts under one key share a socket, so the client identity says
+        it. The parent-child check below only means something inside a tree:
+        in multi mode the second account of the pool can be another MASTER,
+        and demanding that one master be a sub-account of another would fail
+        a correctly configured run at startup.
+        """
+        return one.client is other.client
+
+    @staticmethod
+    def _keys_in_play(config: Config) -> list[str]:
+        """The signing keys this run trades, which is what the mode decides.
+
+        In single mode that is one key -- the one the operator picked, by its
+        line number in the key file. Narrowing here rather than when a group
+        is drawn means the other masters have no session at all: nothing
+        subscribes on their behalf, nothing polls for them, and no later code
+        has to remember that some accounts are present but off limits.
+        """
+        keys = config.private_keys or (
+            [config.private_key] if config.private_key else []
+        )
+        if config.mode != "single":
+            return keys
+        index = max(1, config.single_master) - 1
+        if index >= len(keys):
+            raise ConfigError(
+                f"single mode is set to master {config.single_master}, but only "
+                f"{len(keys)} key(s) were loaded"
+            )
+        return [keys[index]]
 
     async def start(self, verify: bool = True) -> None:
         log.info(
@@ -256,7 +283,7 @@ class Runtime:
         self.check_access()
 
         self.feed.load_specs()
-        if verify:
+        if verify and self._same_tree(self.master, self.sub1):
             verify_sub_account(self.master, self.sub1)
 
         # Curves are executor-published and change slowly, so they are read
@@ -446,15 +473,16 @@ class Runtime:
             title=self.title,
             sessions=self.pool,
         )
-        if self.config.mode == "pool":
-            # Built here rather than inside Strategy so the accounts it draws
-            # from are exactly the sessions that exist -- a pool listing an
-            # account with no session would draw a group nothing could trade.
-            strategy.pairing = Pairing(
-                pool=[session.pubkey for session in self.pool],
-                max_groups=self.config.max_groups,
-                max_takers=self.config.max_takers,
-            )
+        # Built here rather than inside Strategy so the accounts it draws
+        # from are exactly the sessions that exist -- a pool listing an
+        # account with no session would draw a group nothing could trade.
+        # The mode already narrowed those sessions, so this is the same call
+        # whichever mode is running.
+        strategy.pairing = Pairing(
+            pool=[session.pubkey for session in self.pool],
+            max_groups=self.config.max_groups,
+            max_takers=self.config.max_takers,
+        )
         return strategy
 
 
@@ -659,6 +687,11 @@ async def cmd_check(config: Config) -> int:
     runtime = Runtime(config, dry_run=True)
     runtime.feed.load_specs()
     print("market specs OK")
+    if not Runtime._same_tree(runtime.master, runtime.sub1):
+        # Nothing is wrong: in multi mode the pool's first two accounts can be
+        # two different masters, and neither is the other's child.
+        print("sub-account relationship: n/a -- these two are separate masters")
+        return 0
     try:
         verify_sub_account(runtime.master, runtime.sub1)
         print("sub-account relationship OK")
@@ -840,11 +873,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-level", help="override the log level in the config file")
     parser.add_argument(
         "--mode",
+        # `pool` is what multi was called while it was the third of three.
+        # Accepted so a script written against that name keeps running.
         choices=("single", "multi", "pool"),
         help=(
-            "override the settings file: single trades one pair on one "
-            "market, multi trades two pairs on two. Both accounts trade in "
-            "either -- one opens the pair and the other hedges it"
+            "override the settings file: single trades one master and its own "
+            "sub-accounts, multi trades every master and sub in one pool. "
+            "Which markets are traded is a separate setting"
         ),
     )
 
