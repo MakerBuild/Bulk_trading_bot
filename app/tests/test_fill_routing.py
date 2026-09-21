@@ -319,3 +319,79 @@ async def test_the_hedge_resumes_once_the_read_succeeds(tmp_path):
 
     assert hedged == [btc]
     assert strategy._book_suspect is False
+
+
+# -- and the leg a fill belongs to is the one its ACCOUNT is trading --------
+#
+# Roles looked up by SYMBOL are the configured pair's. A group's accounts are
+# drawn from the pool, so a fill on a group maker matched neither side of that
+# pair: it logged `role=?` and queued the bare symbol, the worker resolved
+# that back to the configured pair, found it flat, and hedged nothing.
+#
+# A live run:
+#
+#   === g1:BTC-USD OPEN: maker=m2 taker=m1s2 ===
+#   === g2:BTC-USD OPEN: maker=m2s2 taker=m2s1 ===
+#   fill on m2:   BUY 0.00062700 role=?
+#   fill on m2s2: BUY 0.00062700 role=?
+#   exposure: m2=+0.00073400 m2s2=+0.00087600 net=+0.00161000 $138.16
+#
+# and that $138 sat directional for three minutes with no hedge ever sent.
+# It only ever worked when a group happened to contain the named pair.
+
+
+def with_group(tmp_path, maker, takers):
+    from bulkdn.pairing import Group
+
+    strategy, book, sessions, client, btc = three_on_one_socket(tmp_path)
+    group = Group(
+        symbol=btc, maker=maker, takers=tuple(takers),
+        shares=tuple([1.0 / len(takers)] * len(takers)),
+    )
+    strategy._groups["g1:" + btc] = group
+    return strategy, book, sessions, btc
+
+
+def test_an_account_resolves_to_the_group_it_is_in(tmp_path):
+    strategy, _book, _sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+
+    assert strategy._key_for_account("m1s2", btc) == f"g1:{btc}"
+    assert strategy._key_for_account("m1", btc) == f"g1:{btc}"
+
+
+def test_an_account_in_no_group_resolves_to_nothing(tmp_path):
+    strategy, _book, _sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+
+    assert strategy._key_for_account("m1s1", btc) is None
+
+
+def test_a_fill_on_a_group_maker_queues_that_group(tmp_path):
+    """Not the bare symbol. The worker resolves the bare symbol to the
+    configured pair, which in a pool holds nothing."""
+    strategy, _book, sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+
+    deliver(strategy, sessions, Fill(btc, True, 0.000734, "t1"), owner="m1s2")
+
+    queued = []
+    while not strategy._hedge_queue.empty():
+        queued.append(strategy._hedge_queue.get_nowait())
+    assert queued == [f"g1:{btc}"], "the fill was filed under the wrong leg"
+
+
+def test_the_reconciler_looks_at_the_groups(tmp_path):
+    """It runs off `_live_roles`, which was the configured pair by symbol --
+    two accounts out of however many, and usually not the two holding
+    anything."""
+    strategy, _book, _sessions, btc = with_group(tmp_path, "m1s2", ["m1"])
+
+    live = strategy._live_roles()
+
+    assert [roles.maker for roles in live] == ["m1s2"]
+    assert [roles.key for roles in live] == [f"g1:{btc}"]
+
+
+def test_without_groups_it_is_still_the_configured_legs(tmp_path):
+    """Nothing about a pool changes what a plain pair does."""
+    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
+
+    assert [roles.symbol for roles in strategy._live_roles()] == strategy.symbols

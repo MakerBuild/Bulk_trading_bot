@@ -343,8 +343,38 @@ class Strategy:
         return self._roles_by_symbol(self.state.leg(symbol).phase)[symbol]
 
     def _live_roles(self) -> list[LegRoles]:
-        """Roles for every leg, each at its own phase."""
+        """Roles for every leg actually trading, each at its own phase.
+
+        The drawn groups, and the configured legs only when there are no
+        groups. This used to be the configured legs always -- the named pair,
+        by symbol -- which in a pool is two accounts out of however many and
+        usually not the two that hold anything.
+
+        The reconciler runs off this list. A live run opened $138 on two group
+        makers, and the reconciler looked at the named pair, found it flat,
+        and reported nothing to correct for three minutes while the pair sat
+        directional.
+        """
+        if self._groups:
+            return [
+                roles
+                for roles in (self._roles_for_key(key) for key in self._groups)
+                if roles is not None
+            ]
         return [self.leg_roles(symbol) for symbol in self.symbols]
+
+    def _key_for_account(self, pubkey: str, symbol: str) -> str | None:
+        """Which leg this account is trading in this market, if any.
+
+        An account is in at most one group, so this is a lookup and not a
+        search for the best answer. Returns None for an account that is not
+        in a group -- which, when no group exists at all, means the caller
+        should fall back to the configured leg named by the symbol.
+        """
+        for key, group in self._groups.items():
+            if group.symbol == symbol and pubkey in group.accounts:
+                return key
+        return None
 
     # -- handlers (synchronous; see module docstring) ----------------------
 
@@ -411,7 +441,18 @@ class Strategy:
 
             self.book.apply_fill(session.pubkey, symbol, is_buy, size)
 
-            roles = self._roles_by_symbol(self.state.leg(symbol).phase).get(symbol)
+            # By the account that filled, not by the market. Roles looked up
+            # by symbol are the CONFIGURED pair's, and a group's accounts are
+            # drawn from the pool -- so a fill on a group maker matched
+            # neither side, logged `role=?`, and queued the bare symbol. The
+            # worker then resolved that to the configured pair, found it flat,
+            # and hedged nothing. Two groups opened $138 and no hedge was ever
+            # sent.
+            key = self._key_for_account(session.pubkey, symbol)
+            roles = (
+                self._roles_for_key(key) if key is not None
+                else self._roles_by_symbol(self.state.leg(symbol).phase).get(symbol)
+            )
             if roles is not None and session.pubkey == roles.taker:
                 # This is one of our own hedge orders landing; retire its
                 # reservation so net exposure reads correctly.
