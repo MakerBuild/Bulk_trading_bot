@@ -706,9 +706,6 @@ class Strategy:
         if group is not None:
             leg = self.state.leg(key, group.symbol)
             exiting = leg.phase == Phase.EXIT
-            maker, taker = group.maker, group.takers[0]
-            if exiting:
-                maker, taker = taker, maker
             # The accounts do NOT swap on the way out, which is where a
             # group differs from a configured pair. Two accounts can swap,
             # because the one holding the short can rest the buy-back while
@@ -723,7 +720,10 @@ class Strategy:
                 group.symbol,
                 maker=group.maker,
                 taker=group.takers[0],
-                maker_is_buy=not exiting,
+                # The group's own side on the way in, its mirror on the way
+                # out. This used to be `not exiting`, which made every maker in
+                # every group a buyer for the life of the run.
+                maker_is_buy=group.maker_is_buy != exiting,
                 reduce_only=exiting,
                 id=key,
                 takers=group.takers,
@@ -1385,6 +1385,7 @@ class Strategy:
                 maker=leg.maker,
                 takers=tuple(leg.takers),
                 shares=tuple(leg.shares) or (1.0,) * len(leg.takers),
+                maker_is_buy=leg.maker_is_buy,
             )
             missing = [a for a in group.accounts if a not in self.sessions]
             if missing:
@@ -1435,6 +1436,7 @@ class Strategy:
         leg.maker = group.maker
         leg.takers = list(group.takers)
         leg.shares = list(group.shares)
+        leg.maker_is_buy = group.maker_is_buy
         self._persist()
         log.info("=== group %d drawn: %s ===", group_id, group)
         try:
@@ -1496,9 +1498,14 @@ class Strategy:
                     continue
 
                 group_id, group = drawn
-                size = self._size_for_cycle(group.symbol, sizes[group.symbol])
+                # The configured size, not a draw from it. `_run_leg` draws
+                # once when it opens the leg, so drawing here too spent a draw
+                # that was immediately overwritten -- and logged it as the
+                # cycle's size, so the log named a number nothing traded.
                 running.add(
-                    asyncio.create_task(self._run_group(group_id, group, size))
+                    asyncio.create_task(
+                        self._run_group(group_id, group, sizes[group.symbol])
+                    )
                 )
 
             # Stopped or spent: let what is open finish its cycle rather than
@@ -1916,6 +1923,7 @@ class Strategy:
 
         self.state.baseline_fees_usd = totals.fees_usd
         self.state.baseline_volume_usd = totals.qualifying_volume_usd
+        self.state.baseline_self_trade_usd = totals.self_trade_volume_usd
         self.state.baseline_at = time.time()
         self._persist()
         log.info(
@@ -1979,7 +1987,7 @@ class Strategy:
                 "(of which $%.2f traded between your own accounts)",
                 volume,
                 target.volume_usd,
-                totals.self_trade_volume_usd,
+                totals.self_trade_volume_usd - self.state.baseline_self_trade_usd,
             )
         return None
 

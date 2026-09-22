@@ -196,3 +196,43 @@ def test_reaching_the_target_stops_drawing(tmp_path):
     obj._run_group = run_group
     asyncio.run(asyncio.wait_for(obj._dispatch_groups({BTC: 1.0}), timeout=5))
     assert obj.started == []
+
+
+# -- one draw per cycle -----------------------------------------------------
+
+
+def test_the_dispatcher_does_not_draw_a_size_run_leg_will_redraw(tmp_path):
+    """`_run_leg` draws when it opens the leg. Drawing here as well spent a
+    draw that was immediately overwritten -- and logged it as the cycle's
+    size, so a run with two groups printed four `this cycle` lines of which
+    only two were ever traded.
+    """
+    obj = strategy(tmp_path, max_groups=1)
+    drawn = []
+
+    def record(symbol, size):
+        drawn.append((symbol, size))
+        return size
+
+    obj._size_for_cycle = record
+    held = asyncio.Event()
+
+    async def run_group(group_id, group, size):
+        obj.started.append(size)
+        await held.wait()
+
+    obj._run_group = run_group
+
+    async def drive():
+        task = asyncio.create_task(obj._dispatch_groups({BTC: 7.5}))
+        for _ in range(2000):
+            if obj.started:
+                break
+            await asyncio.sleep(0)
+        obj._stop.set()
+        held.set()
+        await asyncio.wait_for(task, timeout=5)
+
+    asyncio.run(drive())
+    assert drawn == [], "the dispatcher drew a size that _run_leg redraws"
+    assert obj.started == [7.5], "the configured size must arrive untouched"

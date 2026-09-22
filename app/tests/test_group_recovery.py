@@ -37,12 +37,41 @@ def remember(obj, phase=Phase.OPEN, group=GROUP, group_id=4):
     leg.maker = group.maker
     leg.takers = list(group.takers)
     leg.shares = list(group.shares)
+    leg.maker_is_buy = group.maker_is_buy
     leg.phase = phase
     leg.target_size = 0.25
     return key
 
 
 # -- what survives ----------------------------------------------------------
+
+
+def test_the_side_the_group_opened_is_read_back(tmp_path):
+    """Without this the exit is guessed, and a guess that comes up wrong
+    sells more of a short instead of closing it."""
+    selling = Group(
+        BTC, maker="opener", takers=("t1", "t2"), shares=(0.6, 0.4),
+        maker_is_buy=False,
+    )
+    obj = strategy(tmp_path)
+    remember(obj, group=selling)
+
+    _group_id, restored, _key = obj.restore_groups()[0]
+    assert restored.maker_is_buy is False
+
+
+def test_a_file_written_before_the_side_was_drawn_reads_as_buying(tmp_path):
+    """Which is what those runs did, so a cycle resumed out of an older file
+    closes the way it opened rather than the other way about."""
+    obj = strategy(tmp_path)
+    key = obj.group_key(4, BTC)
+    remember(obj)
+
+    stored = obj.state.to_dict()
+    del stored["legs"][key]["maker_is_buy"]
+    obj.state = StrategyState.from_dict(stored)
+
+    assert obj.restore_groups()[0][1].maker_is_buy is True
 
 
 def test_the_membership_is_written_down_and_read_back(tmp_path):

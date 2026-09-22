@@ -56,6 +56,16 @@ class Group:
     maker: str
     takers: tuple[str, ...]
     shares: tuple[float, ...]
+    # Which way the maker opens. Drawn with the group, because a fixed side is
+    # the one shape a rotating pool does not remove: every cycle resting on the
+    # bid, every hedge selling, for as long as the run lasts. Two groups drawn
+    # at once sat at the same price on the same side of the book.
+    #
+    # Held on the group rather than decided per phase, so the exit is the
+    # mirror of whatever this cycle opened. It is persisted with the group for
+    # the same reason the accounts are: a restart that guessed the side afresh
+    # would "close" a short by selling more of it.
+    maker_is_buy: bool = True
 
     @property
     def accounts(self) -> tuple[str, ...]:
@@ -74,7 +84,8 @@ class Group:
         # maker as one of its own takers sends whoever reads it looking for a
         # bug that is not there. Keys sharing a prefix is the normal case for
         # accounts derived from one master.
-        return f"{self.symbol} {short_pubkey(self.maker)} -> " + ", ".join(
+        side = "BUY" if self.maker_is_buy else "SELL"
+        return f"{self.symbol} {short_pubkey(self.maker)} {side} -> " + ", ".join(
             f"{short_pubkey(t)}@{s:.0%}"
             for t, s in zip(self.takers, self.shares, strict=True)
         )
@@ -146,6 +157,7 @@ class Pairing:
             maker=maker,
             takers=takers_drawn,
             shares=split_shares(len(takers_drawn), self.rng),
+            maker_is_buy=self.rng.random() < 0.5,
         )
         self._next_id += 1
         self.active[self._next_id] = group

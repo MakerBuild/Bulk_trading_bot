@@ -15,6 +15,8 @@ second with `execution target reached: burned $-3.0795 of $3.00`. The target is
 now the distance travelled since the run began.
 """
 
+import logging
+
 import pytest
 
 from bulkdn.config import ConfigError, ExecutionTarget
@@ -24,10 +26,10 @@ from bulkdn.strategy import Strategy
 
 
 class FakeTotals:
-    def __init__(self, fees, volume=0.0):
+    def __init__(self, fees, volume=0.0, self_trade=0.0):
         self.fees_usd = fees
         self.qualifying_volume_usd = volume
-        self.self_trade_volume_usd = 0.0
+        self.self_trade_volume_usd = self_trade
 
 
 class FakeStrategy:
@@ -73,10 +75,13 @@ class FakeStrategy:
         return await Strategy._target_reached(self)
 
 
-def _started_at(fees, volume=0.0):
+def _started_at(fees, volume=0.0, self_trade=0.0):
     """A state whose run began with this much already on the account."""
     return StrategyState(
-        baseline_fees_usd=fees, baseline_volume_usd=volume, baseline_at=1.0
+        baseline_fees_usd=fees,
+        baseline_volume_usd=volume,
+        baseline_self_trade_usd=self_trade,
+        baseline_at=1.0,
     )
 
 
@@ -182,16 +187,58 @@ async def test_a_volume_target_also_counts_from_the_start(totals):
     assert await strategy.reached()
 
 
+# -- self-trade is a distance too --------------------------------------------
+
+
+async def test_the_self_trade_figure_counts_from_the_start(totals, caplog):
+    """It sits beside progress to say how much of THIS run will not count
+    toward the fee tier. It used to be the lifetime total printed next to a
+    baselined one, which produced lines that cannot be true of any run:
+
+        volume progress: $0.00 / $1000000.00 qualifying
+        (of which $127113.97 traded between your own accounts)
+    """
+    totals.value = FakeTotals(0.0, volume=1500.0, self_trade=1200.0)
+    strategy = FakeStrategy(
+        ExecutionTarget(volume_usd=10_000.0),
+        _started_at(0.0, volume=1000.0, self_trade=1000.0),
+    )
+    with caplog.at_level(logging.INFO):
+        assert await strategy.reached() is None
+
+    line = next(
+        record.getMessage()
+        for record in caplog.records
+        if "volume progress" in record.getMessage()
+    )
+    # 1500 - 1000 = 500 done, of which 1200 - 1000 = 200 was with ourselves.
+    assert "$500.00 / $10000.00" in line
+    assert "$200.00 traded between your own accounts" in line
+
+
+async def test_the_part_can_never_be_larger_than_the_whole(totals):
+    """The property the old line broke. $127,113.97 of $0.00 was exactly
+    that, and it is what made the mismatch visible in the first place."""
+    totals.value = FakeTotals(0.0, volume=1500.0, self_trade=1200.0)
+    state = _started_at(0.0, volume=1000.0, self_trade=1000.0)
+    await FakeStrategy(ExecutionTarget(volume_usd=10_000.0), state).reached()
+
+    done = totals.value.qualifying_volume_usd - state.baseline_volume_usd
+    ours = totals.value.self_trade_volume_usd - state.baseline_self_trade_usd
+    assert 0.0 <= ours <= done
+
+
 # -- clearing it --------------------------------------------------------------
 
 
 def test_clearing_the_baseline_makes_the_next_run_measure_fresh():
-    state = _started_at(-3.0795, volume=500.0)
+    state = _started_at(-3.0795, volume=500.0, self_trade=100.0)
     assert state.has_baseline
     state.clear_baseline()
     assert not state.has_baseline
     assert state.baseline_fees_usd == 0.0
     assert state.baseline_volume_usd == 0.0
+    assert state.baseline_self_trade_usd == 0.0
 
 
 async def test_a_baseline_survives_a_save_and_load(tmp_path):

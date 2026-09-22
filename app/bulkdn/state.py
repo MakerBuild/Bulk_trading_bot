@@ -90,6 +90,10 @@ class LegState:
     maker: str = ""
     takers: list = field(default_factory=list)
     shares: list = field(default_factory=list)
+    # Which way the group opened, so the exit mirrors it after a restart.
+    # Absent from files written before the side was drawn, and True is what
+    # those runs did.
+    maker_is_buy: bool = True
     cycle_index: int = 0
     # Order IDs that were replaced but whose cancels were never confirmed.
     # Swept on the next chase pass so a failed cancel can't leave a duplicate
@@ -123,6 +127,12 @@ class StrategyState:
     # the goal over; cleared when a run ends, so the next start measures fresh.
     baseline_fees_usd: float = 0.0
     baseline_volume_usd: float = 0.0
+    # Self-trade volume as it stood at the baseline. Reported beside progress
+    # to say how much of THIS run will not count toward the fee tier, and that
+    # is a distance like the other two -- without it the line subtracted a
+    # baselined total from a lifetime one and read "$0.00 of which $127,113.97",
+    # which cannot be true of any run.
+    baseline_self_trade_usd: float = 0.0
     baseline_at: float = 0.0
 
     @property
@@ -132,6 +142,7 @@ class StrategyState:
     def clear_baseline(self) -> None:
         self.baseline_fees_usd = 0.0
         self.baseline_volume_usd = 0.0
+        self.baseline_self_trade_usd = 0.0
         self.baseline_at = 0.0
 
     def leg(self, key: str, symbol: str | None = None) -> LegState:
@@ -204,6 +215,7 @@ class StrategyState:
             # the right answer for a file that predates the idea.
             baseline_fees_usd=float(data.get("baseline_fees_usd", 0.0)),
             baseline_volume_usd=float(data.get("baseline_volume_usd", 0.0)),
+            baseline_self_trade_usd=float(data.get("baseline_self_trade_usd", 0.0)),
             baseline_at=float(data.get("baseline_at", 0.0)),
         )
 
