@@ -251,3 +251,62 @@ def test_without_a_side_the_draw_still_flips_a_coin():
         sides.add(group.maker_is_buy)
         book.release(group_id)
     assert sides == {True, False}
+
+
+# -- a finished group must stop counting ------------------------------------
+#
+# A released group leaves its leg in `state.legs` on purpose: the state file
+# is what a restart reads to find positions. But it is dropped from `_groups`,
+# and `_roles_for_key` then falls through to the CONFIGURED pair, whose side
+# is the constant True. Walking `state.legs` therefore counted every group
+# that had ever finished, as a buy.
+#
+# Live symptom, two draws in a row on a six-account pool:
+#
+#     === group 3 drawn: BTC-USD HVvToE..JS9z SELL -> ... at 1.65bps ===
+#     === group 4 drawn: BTC-USD CVjYFS..2Zxo SELL -> ... at 1.67bps ===
+#     ... CVjYFS..2Zxo: LimitOrder(SELL 0.003407 @ 86315.009999999995 ...)
+#     ... HVvToE..JS9z: LimitOrder(SELL 0.003407 @ 86315.009999999995 ...)
+#
+# Two makers, one side, one price, to the cent.
+
+
+def release(obj, key):
+    """What `_run_group` does in its finally: the group goes, the leg stays."""
+    del obj._groups[key]
+
+
+def test_a_released_groups_leg_does_not_vote_on_the_side():
+    obj = strategy()
+    register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    release(obj, "g1:" + BTC)
+
+    # Nothing is live, so the side is free and must be drawn, not inherited
+    # from a leg that finished.
+    assert {obj._least_crowded_side(BTC) for _ in range(40)} == {True, False}
+
+
+def test_two_finished_groups_do_not_push_the_next_one_onto_their_side():
+    """The live case exactly: two finished groups and one live SELL. The
+    next group must go BUY, and used to go SELL."""
+    obj = strategy()
+    for n, side in ((1, True), (2, False)):
+        key = f"g{n}:{BTC}"
+        register(obj, key, f"done-{n}", maker_is_buy=side, oid=f"old-{n}")
+        release(obj, key)
+    register(obj, "g3:" + BTC, "maker-c", maker_is_buy=False, oid="oid-3")
+
+    assert obj._least_crowded_side(BTC) is True
+
+
+async def test_a_released_groups_order_is_left_alone():
+    obj = strategy()
+    roles = register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    stale = "g2:" + BTC
+    register(obj, stale, "maker-b", maker_is_buy=True, oid="oid-2")
+    release(obj, stale)
+
+    await obj._clear_hedge_path(roles)
+
+    assert obj.sessions["maker-a"].cancelled == [(BTC, "oid-1")]
+    assert obj.sessions["maker-b"].cancelled == [], "that group is gone"

@@ -796,10 +796,19 @@ class Strategy:
 
         A tie is drawn rather than broken by a rule, so the first group of a
         run does not always open the same way.
+
+        Counted over the LIVE groups, not over `state.legs`. A finished group
+        leaves its leg behind on purpose -- the state file is what a restart
+        reads to find positions -- but it is dropped from `_groups` on release,
+        and `_roles_for_key` then falls through to the configured pair, whose
+        side is the constant True. So every group that had ever finished was
+        counted, and counted as a buy. Two live runs in a row drew SELL against
+        a SELL for exactly that reason, and the two makers then sat on one
+        price, which is the thing this exists to prevent.
         """
         resting = [0, 0]
-        for key, leg in self.state.legs.items():
-            if leg.symbol != symbol:
+        for key, group in self._groups.items():
+            if group.symbol != symbol:
                 continue
             roles = self._roles_for_key(key)
             if roles is not None:
@@ -839,8 +848,12 @@ class Strategy:
             # answered 429 to two accounts polling every five seconds.
             return
 
-        for key, leg in list(self.state.legs.items()):
-            if leg.symbol != roles.symbol or not leg.oid:
+        # Live groups, for the reason spelled out in `_least_crowded_side`:
+        # a released leg resolves to the configured pair rather than to the
+        # group that owned it, so its side is not its own.
+        for key, group in list(self._groups.items()):
+            leg = self.state.legs.get(key)
+            if group.symbol != roles.symbol or leg is None or not leg.oid:
                 continue
             other = self._roles_for_key(key)
             if other is None or other.maker_is_buy != roles.maker_is_buy:
@@ -1547,7 +1560,11 @@ class Strategy:
         leg.takers = list(group.takers)
         leg.shares = list(group.shares)
         leg.maker_is_buy = group.maker_is_buy
-        leg.offset_bps = self._offset_for_cycle(group.symbol)
+        # Only a fresh group draws. A resumed one already has an order resting
+        # at an offset, and re-drawing here moved it mid-order -- which is
+        # exactly what persisting the number was supposed to prevent.
+        if leg.offset_bps is None:
+            leg.offset_bps = self._offset_for_cycle(group.symbol)
         self._persist()
         log.info(
             "=== group %d drawn: %s at %.2fbps ===",

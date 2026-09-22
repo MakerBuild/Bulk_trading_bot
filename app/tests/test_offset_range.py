@@ -13,6 +13,8 @@ Rotating the accounts does not separate two orders at the same price.
 
 
 from bulkdn.config import Config, RiskConfig, _leg_from_dict
+from bulkdn.pairing import Group
+from bulkdn.state import StrategyState
 from bulkdn.strategy import Strategy
 
 BTC = "BTC-USD"
@@ -91,3 +93,58 @@ def test_a_market_that_is_not_configured_draws_nothing():
     """A leg keyed by a market this run does not trade must not raise in the
     middle of registering a group."""
     assert strategy(2.0)._offset_for_cycle("DOGE-USD") == 0.0
+
+
+# -- and a resumed cycle keeps the one it is already resting at -------------
+
+
+async def test_a_resumed_group_does_not_redraw_its_offset():
+    """Its order is already on the book at that offset. Re-drawing here moved
+    it mid-order, which is the thing persisting the number was for.
+
+    Seen live: a run restarted into two groups mid-OPEN and both were logged
+    as freshly `drawn`, at new offsets.
+    """
+    obj = strategy("1.5-2.5")
+    obj._groups = {}
+    obj._group_ids = {}
+    obj.pairing = None
+    obj.state = StrategyState()
+    obj._persist = lambda: None
+
+    async def ran(key, size, once=False):
+        return None
+
+    obj._run_leg = ran
+
+    key = obj.group_key(7, BTC)
+    obj.state.leg(key, BTC).offset_bps = 1.9
+    group = Group(BTC, maker="m", takers=("t",), shares=(1.0,),
+                  maker_is_buy=False)
+
+    await obj._run_group(7, group, 0.01)
+
+    assert obj.state.leg(key).offset_bps == 1.9
+
+
+async def test_a_fresh_group_still_draws_one():
+    obj = strategy("1.5-2.5")
+    obj._groups = {}
+    obj._group_ids = {}
+    obj.pairing = None
+    obj.state = StrategyState()
+    obj._persist = lambda: None
+
+    async def ran(key, size, once=False):
+        return None
+
+    obj._run_leg = ran
+
+    key = obj.group_key(8, BTC)
+    group = Group(BTC, maker="m", takers=("t",), shares=(1.0,),
+                  maker_is_buy=True)
+
+    await obj._run_group(8, group, 0.01)
+
+    drawn = obj.state.leg(key).offset_bps
+    assert drawn is not None and 1.5 <= drawn <= 2.5
