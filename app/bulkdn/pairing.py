@@ -135,7 +135,12 @@ class Pairing:
     def can_draw(self, takers: int = 1) -> bool:
         return len(self.active) < self.max_groups and len(self.free) >= takers + 1
 
-    def draw(self, symbol: str, takers: int | None = None) -> tuple[int, Group] | None:
+    def draw(
+        self,
+        symbol: str,
+        takers: int | None = None,
+        maker_is_buy: bool | None = None,
+    ) -> tuple[int, Group] | None:
         """One group, or None when the pool or the cap will not allow it.
 
         Returning None rather than raising: a full book of groups is the normal
@@ -157,7 +162,14 @@ class Pairing:
             maker=maker,
             takers=takers_drawn,
             shares=split_shares(len(takers_drawn), self.rng),
-            maker_is_buy=self.rng.random() < 0.5,
+            # The caller picks the side when it has a reason to -- it
+            # knows which side the other live groups are resting on and
+            # this does not. A coin flip is the answer when it does not
+            # care, which is what keeps the side unreadable.
+            maker_is_buy=(
+                self.rng.random() < 0.5 if maker_is_buy is None
+                else maker_is_buy
+            ),
         )
         self._next_id += 1
         self.active[self._next_id] = group

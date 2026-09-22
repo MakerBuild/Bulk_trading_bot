@@ -764,6 +764,9 @@ class Strategy:
             if roles is None:
                 continue
             try:
+                # Before the market order, not after: our own remainder is
+                # resting on exactly the side it is about to sweep.
+                await self._clear_hedge_path(roles)
                 await self.hedger.hedge(
                     roles, mark_price=self.feed.reference_price(roles.symbol)
                 )
@@ -773,6 +776,88 @@ class Strategy:
                 # The reconciler re-derives from position, so a single failure
                 # is recoverable; a persistent one trips the reject streak.
                 log.error("hedge for %s failed: %s", key, describe(exc))
+
+    def _least_crowded_side(self, symbol: str) -> bool:
+        """The side fewest live legs are resting on, for the next group.
+
+        Not unreadability -- that is what the coin flip underneath does. This
+        is about self-trades. A hedge is a market order against its maker's
+        own direction, so it sweeps the side that maker is resting on, and
+        every OTHER account of ours resting there is in its path too. Keeping
+        the groups on opposite sides means the only order in the way is the
+        filling leg's own, which `_clear_hedge_path` can pull without
+        disturbing anybody else's queue position.
+
+        It cannot be a guarantee, and is not written as one. A group's side
+        flips when it starts unwinding -- what it bought, it must sell -- and
+        two groups whose phases have drifted apart can end up on one side with
+        neither of them able to move. `_clear_hedge_path` is what makes the
+        result correct; this only keeps it cheap.
+
+        A tie is drawn rather than broken by a rule, so the first group of a
+        run does not always open the same way.
+        """
+        resting = [0, 0]
+        for key, leg in self.state.legs.items():
+            if leg.symbol != symbol:
+                continue
+            roles = self._roles_for_key(key)
+            if roles is not None:
+                resting[roles.maker_is_buy] += 1
+        if resting[True] == resting[False]:
+            return self._rng.random() < 0.5
+        return resting[True] < resting[False]
+
+    async def _clear_hedge_path(self, roles: LegRoles) -> None:
+        """Pull our own resting orders off the side this hedge will sweep.
+
+        A hedge covers its maker by trading the other way, so a maker that
+        bought is covered by a market SELL -- which sweeps the bid, where the
+        unfilled remainder of that same maker's order is resting, at the touch,
+        first in the queue. That is not an edge case: it is where the chaser
+        deliberately puts it.
+
+        The exchange will not let one account cross itself -- `CANCELLED_
+        SELFCROSSING` -- but two accounts under one master it matches like any
+        strangers, while the fee documentation excludes that volume from the
+        tier. Measured on a live run: 365 of 1465 trades.
+
+        So every resting order of ours in this market on that side is pulled
+        first, whichever group put it there. `_least_crowded_side` keeps the
+        other groups off this side, so the ordinary case cancels exactly one
+        order -- the filling leg's own -- and the chaser re-places it on the
+        next tick.
+
+        A cancel that fails does NOT stop the hedge. Unhedged exposure has no
+        bounded cost and a self-trade costs a fee; when only one of the two can
+        be avoided, it is never the hedge.
+        """
+        price = self.feed.reference_price(roles.symbol)
+        if self.hedger.actionable_hedge(roles, price) <= 0:
+            # Nothing will be sent, so nothing is in its way. Checked first
+            # because a cancel costs a request against an exchange that has
+            # answered 429 to two accounts polling every five seconds.
+            return
+
+        for key, leg in list(self.state.legs.items()):
+            if leg.symbol != roles.symbol or not leg.oid:
+                continue
+            other = self._roles_for_key(key)
+            if other is None or other.maker_is_buy != roles.maker_is_buy:
+                continue
+            session = self.sessions.get(other.maker)
+            if session is None:
+                continue
+            try:
+                await session.cancel(roles.symbol, leg.oid)
+            except Exception as exc:  # noqa: BLE001 - the hedge still goes
+                log.warning(
+                    "%s: could not pull its %s order out of the hedge's path "
+                    "(%s) -- hedging anyway, which may trade against it",
+                    session.name, roles.symbol, describe(exc),
+                )
+                continue
+            leg.oid = None
 
     async def _refreshed(self) -> bool:
         """Re-read positions because the book is known to be behind.
@@ -1521,7 +1606,9 @@ class Strategy:
                 drawn = None
                 if self.pairing is not None:
                     symbol = self._rng.choice(self.symbols)
-                    drawn = self.pairing.draw(symbol)
+                    drawn = self.pairing.draw(
+                        symbol, maker_is_buy=self._least_crowded_side(symbol)
+                    )
                 if drawn is None:
                     await asyncio.sleep(self.config.chase_interval_s)
                     continue
