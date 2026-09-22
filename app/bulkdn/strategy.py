@@ -797,22 +797,38 @@ class Strategy:
         A tie is drawn rather than broken by a rule, so the first group of a
         run does not always open the same way.
 
-        Counted over the LIVE groups, not over `state.legs`. A finished group
-        leaves its leg behind on purpose -- the state file is what a restart
-        reads to find positions -- but it is dropped from `_groups` on release,
-        and `_roles_for_key` then falls through to the configured pair, whose
-        side is the constant True. So every group that had ever finished was
-        counted, and counted as a buy. Two live runs in a row drew SELL against
-        a SELL for exactly that reason, and the two makers then sat on one
-        price, which is the thing this exists to prevent.
+        Counted over the PAIRING's active groups, which is the only record
+        that is current at the moment of a draw. Two earlier versions were not:
+
+        `state.legs` keeps a finished group's leg on purpose -- the state file
+        is what a restart reads to find positions -- but the group is dropped
+        from `_groups` on release, and `_roles_for_key` then falls through to
+        the configured pair, whose side is the constant True. Every group that
+        had ever finished was counted, and counted as a buy.
+
+        `_groups` is current, but not yet. `_run_group` fills it, and
+        `_run_group` is a task: the dispatcher draws, spawns it, and comes
+        straight back round to draw again without yielding, so the second draw
+        still saw an empty map. A live run opened with both groups on the bid:
+
+            === group 1 drawn: BTC-USD 79Dg5R..DCa4 BUY ... at 2.20bps ===
+            === group 2 drawn: BTC-USD 8rr5CY..YSLm BUY ... at 2.19bps ===
+
+        `Pairing.draw` registers in `active` before it returns, so by the time
+        the dispatcher asks about the next group, the last one is there.
+
+        The phase still comes from the leg, because that is what says whether a
+        group has turned around: a leg with no state yet has not, which is the
+        right answer for one that was drawn a moment ago.
         """
         resting = [0, 0]
-        for key, group in self._groups.items():
+        active = self.pairing.active if self.pairing is not None else {}
+        for group_id, group in active.items():
             if group.symbol != symbol:
                 continue
-            roles = self._roles_for_key(key)
-            if roles is not None:
-                resting[roles.maker_is_buy] += 1
+            leg = self.state.legs.get(self.group_key(group_id, group.symbol))
+            exiting = leg is not None and leg.phase == Phase.EXIT
+            resting[group.maker_is_buy != exiting] += 1
         if resting[True] == resting[False]:
             return self._rng.random() < 0.5
         return resting[True] < resting[False]
@@ -2111,6 +2127,11 @@ class Strategy:
         self._target_answer = (time.monotonic(), answer)
         if answer:
             return answer
+
+        # The status block redraws every second off this, and used to get it
+        # only when a cycle finished -- so a six-minute OPEN phase showed
+        # `$0 / $250,000  0.0%` while the log beside it counted past $19,000.
+        self._progress = (burned, volume)
 
         if target.burn_usd > 0:
             log.info("burn progress: $%.4f / $%.2f", burned, target.burn_usd)

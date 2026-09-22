@@ -72,16 +72,25 @@ def strategy(*, actionable=1.0):
     obj._book_suspect = False
     obj._liquidation_seen = asyncio.Event()
     obj._hedge_queue = asyncio.Queue()
+    # The side count reads the pairing, because that is the record which is
+    # current at the moment of a draw -- `_groups` is filled by a task that
+    # has not run yet.
+    obj.pairing = Pairing(
+        pool=[f"acct{n}" for n in range(12)], max_groups=6,
+        rng=random.Random(9),
+    )
     return obj
 
 
 def register(obj, key, maker, *, maker_is_buy, phase=Phase.OPEN, oid="oid-1",
              fails=False):
-    """Put a live group on the book, the way `_run_group` would."""
-    obj._groups[key] = Group(
+    """Put a live group on the book, the way a draw plus `_run_group` would."""
+    group = Group(
         BTC, maker=maker, takers=("t-" + maker,), shares=(1.0,),
         maker_is_buy=maker_is_buy,
     )
+    obj.pairing.reserve(int(key.split(":")[0][1:]), group)
+    obj._groups[key] = group
     leg = obj.state.leg(key, BTC)
     leg.phase = phase
     leg.oid = oid
@@ -273,6 +282,7 @@ def test_without_a_side_the_draw_still_flips_a_coin():
 
 def release(obj, key):
     """What `_run_group` does in its finally: the group goes, the leg stays."""
+    obj.pairing.release(int(key.split(":")[0][1:]))
     del obj._groups[key]
 
 
@@ -310,3 +320,39 @@ async def test_a_released_groups_order_is_left_alone():
 
     assert obj.sessions["maker-a"].cancelled == [(BTC, "oid-1")]
     assert obj.sessions["maker-b"].cancelled == [], "that group is gone"
+
+
+# -- drawn, not yet running -------------------------------------------------
+
+
+def test_two_groups_drawn_in_one_pass_do_not_take_the_same_side():
+    """The dispatcher draws, spawns `_run_group` as a task, and comes straight
+    back round without yielding -- so the second draw happens before the first
+    group has registered itself anywhere except in the pairing.
+
+    A live run opened exactly this way:
+
+        === group 1 drawn: BTC-USD 79Dg5R..DCa4 BUY ... at 2.20bps ===
+        === group 2 drawn: BTC-USD 8rr5CY..YSLm BUY ... at 2.19bps ===
+    """
+    obj = strategy()
+    obj._groups = {}  # nothing has run yet, which is the whole point
+
+    first = obj.pairing.draw(BTC, maker_is_buy=obj._least_crowded_side(BTC))
+    second = obj.pairing.draw(BTC, maker_is_buy=obj._least_crowded_side(BTC))
+
+    assert first[1].maker_is_buy != second[1].maker_is_buy
+
+
+def test_the_side_is_still_drawn_when_the_pairing_is_empty():
+    obj = strategy()
+    assert {obj._least_crowded_side(BTC) for _ in range(40)} == {True, False}
+
+
+def test_a_group_that_has_turned_around_counts_on_the_side_it_is_now_resting():
+    """Its leg says EXIT, so it is selling what it bought and the next group
+    should take the side it has left, not the one it opened on."""
+    obj = strategy()
+    register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True, phase=Phase.EXIT)
+    # Opened BUY, now closing, so it rests a SELL -- the bid is free.
+    assert obj._least_crowded_side(BTC) is True
