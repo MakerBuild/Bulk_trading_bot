@@ -151,7 +151,17 @@ legs:
     symbol: BTC-USD
     notional_usd: 100       # total per cycle, in dollars
     leverage: 10            # 1-50, capped by the market's own maximum
-    offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%)
+    offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%).
+                            # May be written as a range -- 1.5-2.5 -- and is
+                            # then drawn per cycle like the dollar settings.
+                            #
+                            # Worth doing as soon as more than one group runs
+                            # at a time. The resting price is worked out from
+                            # the book and this number and nothing else, so two
+                            # groups on one market sharing one offset land on
+                            # the same tick and queue behind each other. The
+                            # accounts rotate; the price does not follow unless
+                            # this does.
     max_distance_bps: 5.0   # re-price the order once it drifts this far
     chase_patience_s: 3     # unfilled this long? stop waiting and go get it.
                             # Lower = fills sooner, and gives up the 2bps edge

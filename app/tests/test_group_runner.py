@@ -12,6 +12,7 @@ import random
 
 import pytest
 
+from bulkdn.config import Config, LegConfig, RiskConfig
 from bulkdn.pairing import Group, Pairing
 from bulkdn.state import Phase, StateStore, StrategyState
 from bulkdn.strategy import Strategy
@@ -28,6 +29,13 @@ def strategy(tmp_path):
     obj.state = StrategyState()
     obj.store = StateStore(str(tmp_path / "state.json"))
     obj.symbols = [BTC]
+    # The runner draws this cycle's offset when it registers the group.
+    obj.config = Config(
+        markets=[LegConfig(symbol=BTC, size=1.0, offset_bps=2.0,
+                           max_distance_bps=5.0)],
+        risk=RiskConfig(),
+        private_key="x",
+    )
     obj.pairing = Pairing(
         pool=[f"acct{n}" for n in range(6)], max_groups=3, rng=random.Random(5)
     )

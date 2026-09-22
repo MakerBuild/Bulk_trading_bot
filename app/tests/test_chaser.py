@@ -73,7 +73,7 @@ class FakeFeed:
         return self._quote.reference_price
 
 
-def build(quote=None, max_order_size=1.0, max_distance_bps=5.0):
+def build(quote=None, max_order_size=1.0, max_distance_bps=5.0, offset_bps=0.0):
     quote = quote or Quote(BTC, best_bid=100_000.0, best_ask=100_010.0, mark_price=100_005.0, age_s=0.0)
     book = PositionBook(overlay_ttl_ms=5000)
     master = FakeSession("master", MASTER)
@@ -83,7 +83,7 @@ def build(quote=None, max_order_size=1.0, max_distance_bps=5.0):
         sessions={MASTER: master, SUB1: sub1},
         feed=feed,
         book=book,
-        params={BTC: ChaseParams(offset_bps=0.0, max_distance_bps=max_distance_bps, max_order_size=max_order_size)},
+        params={BTC: ChaseParams(offset_bps=offset_bps, max_distance_bps=max_distance_bps, max_order_size=max_order_size)},
     )
     return chaser, book, master, sub1
 
@@ -231,3 +231,48 @@ async def test_sweep_forgets_orders_that_are_already_gone():
 
     assert master.cancelled == []
     assert leg.stale_oids == []
+
+
+# -- whose offset the order rests at ----------------------------------------
+#
+# `ChaseParams` is built once per symbol, so every group trading that market
+# reads one offset. The resting price is a pure function of the book and that
+# number, so two groups computed the same tick and queued behind each other --
+# a live run showed both resting BUY at 85814.47. A group may now carry its
+# own, drawn per cycle, and it takes precedence.
+
+
+async def _resting_price(*, params_offset, roles_offset):
+    chaser, book, master, _sub1 = build(offset_bps=params_offset)
+    roles = LegRoles(
+        BTC, maker=MASTER, taker=SUB1, maker_is_buy=True, reduce_only=False,
+        offset_bps=roles_offset,
+    )
+    await chaser.step(roles, LegState(symbol=BTC, target_size=1.0))
+    return master.placed[-1]["price"]
+
+
+async def test_a_leg_without_one_still_rests_at_its_markets_offset():
+    """Every leg that is not drawn from a pool, and every run before this."""
+    bid = 100_000.0
+    assert await _resting_price(params_offset=2.0, roles_offset=None) == bid - 20.0
+
+
+async def test_the_cycles_own_offset_is_the_one_used():
+    bid = 100_000.0
+    assert await _resting_price(params_offset=2.0, roles_offset=4.0) == bid - 40.0
+
+
+async def test_two_cycles_on_one_market_rest_at_different_prices():
+    """The symptom, stated as the property that fixes it."""
+    first = await _resting_price(params_offset=2.0, roles_offset=1.6)
+    second = await _resting_price(params_offset=2.0, roles_offset=2.4)
+    assert first != second
+
+
+async def test_an_offset_of_zero_is_used_rather_than_read_as_absent():
+    """0.0 is falsy and means "rest on the touch", which is not the same as
+    "this leg was never given one" -- a truthiness test here would silently
+    hand the market's offset to a cycle that drew zero."""
+    on_the_touch = await _resting_price(params_offset=2.0, roles_offset=0.0)
+    assert on_the_touch != await _resting_price(params_offset=2.0, roles_offset=None)

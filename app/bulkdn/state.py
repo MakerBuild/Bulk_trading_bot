@@ -94,6 +94,11 @@ class LegState:
     # Absent from files written before the side was drawn, and True is what
     # those runs did.
     maker_is_buy: bool = True
+    # How far inside the touch this cycle rests, drawn when the leg's
+    # `offset_bps` is a range. Persisted so a resumed cycle keeps the
+    # offset it has been resting at rather than jumping to a new one
+    # mid-order. None means the leg follows its market's fixed number.
+    offset_bps: float | None = None
     cycle_index: int = 0
     # Order IDs that were replaced but whose cancels were never confirmed.
     # Swept on the next chase pass so a failed cancel can't leave a duplicate

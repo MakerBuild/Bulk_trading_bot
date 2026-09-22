@@ -1007,7 +1007,7 @@ def _append_market(config_path: str, symbol: str, template: LegConfig) -> None:
         f"leverage: {_render_number(template.leverage or 0)}"
         if template.leverage
         else None,
-        f"offset_bps: {_render_number(template.offset_bps)}",
+        f"offset_bps: {_render_span(template.offset_span, template.offset_bps)}",
         f"max_distance_bps: {_render_number(template.max_distance_bps)}",
         f"chase_patience_s: {_render_number(template.chase_patience_s)}",
         f"improve_ticks: {template.improve_ticks}",

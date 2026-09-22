@@ -82,6 +82,10 @@ class LegRoles:
     # draw, and the same $4,000 answered by $1,800, $1,400 and $800 is not.
     takers: tuple[str, ...] = ()
     shares: tuple[float, ...] = ()
+    # This cycle's offset, when it was drawn from a range. None leaves
+    # the chaser on the market's own number, which is every leg that is
+    # not drawn from a pool.
+    offset_bps: float | None = None
 
     @property
     def key(self) -> str:

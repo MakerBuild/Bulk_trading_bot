@@ -174,10 +174,17 @@ class Chaser:
             else 0.0
         )
         was_tightened = leg.tightened
-        offset = effective_offset_bps(
-            params.offset_bps, resting_for, params.chase_patience_s, was_tightened
+        # The cycle's own offset when one was drawn, the market's otherwise.
+        # `params` is built once per symbol, so every group on that market
+        # shares it -- and two groups resting off one offset compute one price
+        # from one book and sit at the same tick, in the same queue.
+        base_offset = (
+            params.offset_bps if roles.offset_bps is None else roles.offset_bps
         )
-        tightening_now = offset < params.offset_bps and not was_tightened
+        offset = effective_offset_bps(
+            base_offset, resting_for, params.chase_patience_s, was_tightened
+        )
+        tightening_now = offset < base_offset and not was_tightened
 
         target = chase_price(
             best_bid=quote.best_bid,
@@ -219,7 +226,7 @@ class Chaser:
                 session, roles, leg, target, desired, replace_oid=leg.oid,
                 reason=(
                     f"unfilled for {resting_for:.0f}s -- moving onto the touch "
-                    f"from {params.offset_bps:g}bps inside"
+                    f"from {base_offset:g}bps inside"
                 ),
             )
 

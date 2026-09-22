@@ -728,6 +728,7 @@ class Strategy:
                 id=key,
                 takers=group.takers,
                 shares=group.shares,
+                offset_bps=leg.offset_bps,
             )
 
         leg = self.state.legs.get(key)
@@ -1313,6 +1314,30 @@ class Strategy:
 
     # -- one leg's cycle ---------------------------------------------------
 
+    def _offset_for_cycle(self, symbol: str) -> float:
+        """How far inside the touch this cycle rests, drawn when it is a range.
+
+        Drawn per cycle rather than read per market, because the resting price
+        is a pure function of the book and this number: two groups on one
+        market, sharing one offset, compute the same tick and queue behind each
+        other. Rotating the accounts does not separate them -- only the price
+        does. A live run showed both groups resting BUY at 85814.47, tick for
+        tick.
+
+        Fixed for the cycle once drawn, for the same reason the hedge shares
+        are: an offset that moved every tick would walk the order around for
+        reasons the market never gave it.
+
+        A leg written as a plain number returns that number, which is what
+        every run before ranges did.
+        """
+        leg = next(
+            (leg for leg in self.config.active_legs if leg.symbol == symbol), None
+        )
+        if leg is None:
+            return 0.0
+        return leg.offset_span.pick() if leg.offset_span else leg.offset_bps
+
     def _size_for_cycle(self, symbol: str, configured_size: float) -> float:
         """This cycle's size for one leg, redrawn when it was written as a range.
 
@@ -1437,8 +1462,12 @@ class Strategy:
         leg.takers = list(group.takers)
         leg.shares = list(group.shares)
         leg.maker_is_buy = group.maker_is_buy
+        leg.offset_bps = self._offset_for_cycle(group.symbol)
         self._persist()
-        log.info("=== group %d drawn: %s ===", group_id, group)
+        log.info(
+            "=== group %d drawn: %s at %.2fbps ===",
+            group_id, group, leg.offset_bps,
+        )
         try:
             await self._run_leg(key, size, once=True)
         finally:

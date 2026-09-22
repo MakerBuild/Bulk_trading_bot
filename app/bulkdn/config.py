@@ -105,6 +105,12 @@ class LegConfig:
     # None means the setting was a plain number and never varies.
     notional_span: Span | None = None
     offset_bps: float = 0.0
+    # `offset_bps` written as a range, drawn per cycle. The price a
+    # resting order takes is a pure function of the book and this
+    # number, so two groups trading one market off one offset compute
+    # the same tick and queue behind each other -- which a pool of
+    # accounts is there to avoid. None means the number was fixed.
+    offset_span: Span | None = None
     max_distance_bps: float = 5.0
     # How long a resting order may go unfilled before it stops sitting
     # `offset_bps` inside the touch and moves onto it. Still passive -- the
@@ -605,12 +611,13 @@ class Config:
 
 
 def _span_from_raw(raw: dict[str, Any], key: str, name: str) -> Span | None:
-    """A leg size, which may be a range. None when the key is absent.
+    """A leg setting that may be written as a range. None when it is absent.
 
-    The margin plan at startup is built from the HIGH end, not from the first
-    draw: every later draw then fits inside a budget that was already checked,
-    so a cycle that happens to roll a big number cannot be the one that
-    discovers there was not enough margin for it.
+    For the two dollar settings, the margin plan at startup is built from the
+    HIGH end rather than from the first draw: every later draw then fits inside
+    a budget that was already checked, so a cycle that happens to roll a big
+    number cannot be the one that discovers there was not enough margin for it.
+    `offset_bps` carries no such constraint and resolves to its low end.
     """
     if key not in raw or raw[key] is None:
         return None
@@ -630,6 +637,12 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     # there was never margin for it.
     notional_span = _span_from_raw(raw, "notional_usd", name)
     cap_span = _span_from_raw(raw, "max_order_notional_usd", name)
+    # The scalar is the LOW end here, not the high: it is only read by a
+    # leg that was not drawn from a group, and the least passive end of
+    # the range is the safer fallback -- an order resting further inside
+    # the touch waits longer, and a phase that never fills is what
+    # `max_phase_minutes` ends the run over.
+    offset_span = _span_from_raw(raw, "offset_bps", name)
     notional_usd = notional_span.high if notional_span else 0.0
     cap_usd = cap_span.high if cap_span else 0.0
 
@@ -660,7 +673,8 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             notional_usd=notional_usd,
             notional_span=notional_span,
             max_order_span=cap_span,
-            offset_bps=float(raw.get("offset_bps", 0.0)),
+            offset_bps=offset_span.low if offset_span else 0.0,
+            offset_span=offset_span,
             max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
             chase_patience_s=float(raw.get("chase_patience_s", 3.0)),
             improve_ticks=int(raw.get("improve_ticks", 1)),
