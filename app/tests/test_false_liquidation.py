@@ -211,6 +211,9 @@ class Bot:
             Strategy._deferred_to_our_own_orders.__get__(self)
         )
         self._liquidation_confirmed = Strategy._liquidation_confirmed.__get__(self)
+        self._settled_by_a_fresh_read = (
+            Strategy._settled_by_a_fresh_read.__get__(self)
+        )
 
     # the pieces the guard leans on
     async def _sync_positions(self, max_age_s=0.0):
@@ -395,3 +398,39 @@ def test_the_bound_still_holds_inside_the_window(monkeypatch):
 
     bot.master.unconfirmed[ETH] = time.monotonic()
     assert run_guard(monkeypatch, bot) is True, "it deferred past the bound"
+
+
+# -- a stale read racing our own fill ---------------------------------------
+
+
+async def test_a_shrink_that_a_fresh_read_undoes_is_not_a_close(monkeypatch):
+    """The book has two sources that do not agree instantly. A periodic HTTP
+    read landing seconds after a hedge writes the OLDER number over the newer
+    one, and the position then looks smaller by exactly our own fill.
+
+    Live, on a run it ended:
+
+        hedge BTC-USD: net=-0.00230000 -> BUY 0.00230000 across
+            m1s1 0.00079300, m1s4 0.00150700
+        fill on m1s1: BUY 0.00079300 ... role=taker
+        m1s1 positions: BTC-USD=+0.01571200
+        POSITION CLOSED EXTERNALLY: m1s1 BTC-USD position reduced
+            externally: +0.01650500 -> +0.01571200
+
+    The difference is the hedge fill to the lot, the exchange had confirmed no
+    liquidation, and five accounts were closed at market regardless.
+    """
+    event = Liquidation(
+        account="master-KEY", account_name="master", symbol=ETH,
+        previous=0.3066, current=0.2066,
+    )
+    bot = bot_with([event])
+    patch_confirm(monkeypatch, bot)
+    # What a fresh read finds: the position never shrank.
+    bot.book.set_authoritative("master-KEY", ETH, 0.3066)
+
+    acted = await bot._guard_liquidation({ETH: None})
+
+    assert acted is False, "a stale reading must not close five accounts"
+    assert bot.halted is None
+    assert bot._sync_calls >= 1, "it has to actually ask before deciding"

@@ -547,6 +547,9 @@ class Strategy:
         if await self._deferred_to_our_own_orders(events):
             return False
 
+        if await self._settled_by_a_fresh_read(events):
+            return False
+
         confirmed = await self._liquidation_confirmed()
         label = "liquidation" if confirmed else "position closed externally"
         for event in events:
@@ -913,6 +916,69 @@ class Strategy:
             # to flatten, and must not wait on Telegram to do it.
             self.notifier.send_soon(self.notifier.halted(reason))
             self._stop.set()
+
+    async def _settled_by_a_fresh_read(self, events) -> bool:
+        """True when a fresh position read says the shrink was never there.
+
+        The book has two sources that do not agree instantly: the WebSocket,
+        which carries a fill the moment it lands, and the periodic HTTP read,
+        which can answer with state from before it. A read that arrives in the
+        seconds after a hedge writes the OLDER number over the newer one, and
+        the position then appears to have shrunk by exactly the size of our own
+        fill.
+
+        That happened on a live run and ended it:
+
+            hedge BTC-USD: net=-0.00230000 -> BUY 0.00230000 across
+                m1s1 0.00079300, m1s4 0.00150700
+            fill on m1s1: BUY 0.00079300 ... role=taker
+            m1s1 positions: BTC-USD=+0.01571200
+            POSITION CLOSED EXTERNALLY: m1s1 BTC-USD position reduced
+                externally: +0.01650500 -> +0.01571200
+
+        0.01650500 - 0.01571200 = 0.00079300, the hedge fill to the lot. The
+        exchange had already answered that no liquidation occurred, and five
+        accounts were closed at market anyway.
+
+        `_deferred_to_our_own_orders` does not catch this one: it defers on a
+        submission that went UNANSWERED, and this hedge was answered -- the
+        fill is in the log. What was stale is the read that came after it.
+
+        The response to this guard is irreversible, so it is worth one HTTP
+        round trip to be sure. A real close does not come back; a stale read
+        does. The check that reported the event already re-baselined the peak
+        to the low reading, so a recovered position simply reads as a new high
+        and nothing is reported twice.
+
+        A read that fails answers "no", for the same reason the liquidation
+        query does: not being able to ask must land on the same side as yes.
+        """
+        try:
+            await self._sync_positions(max_age_s=0.0)
+        except Exception as exc:  # noqa: BLE001 - unreadable means unconfirmed
+            log.warning(
+                "could not re-read positions to test whether %s really shrank "
+                "(%s) -- treating it as real",
+                ", ".join(sorted({e.account_name for e in events})),
+                describe(exc),
+            )
+            return False
+
+        for event in events:
+            spec = self.feed.specs.get(event.symbol)
+            if spec is None:
+                return False
+            current = self.book.authoritative(event.account, event.symbol)
+            if abs(event.previous) - abs(current) > spec.lot_size:
+                return False
+
+        log.warning(
+            "%s: the position is back at its old size on a fresh read, so the "
+            "shrink was a stale reading racing our own fill, not a close -- "
+            "carrying on",
+            ", ".join(sorted({e.account_name for e in events})),
+        )
+        return True
 
     async def _liquidation_confirmed(self) -> bool:
         """Did the exchange actually liquidate something? True if it cannot say.
