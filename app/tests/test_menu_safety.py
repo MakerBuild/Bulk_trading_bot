@@ -480,6 +480,9 @@ def test_status_covers_switched_off_markets(monkeypatch, capsys):
             self.store = Store()
             self.feed = type("F", (), {"load_specs": lambda self: None})()
 
+        def load_specs(self, strict=True):
+            self.feed.load_specs()
+
     monkeypatch.setattr(cli, "Runtime", Status)
     monkeypatch.setattr(cli, "sync_positions_http", lambda pool, book: None)
 

@@ -281,6 +281,16 @@ class Runtime:
             )
         return [keys[index]]
 
+    def load_specs(self, strict: bool = True) -> None:
+        """Load market specs, and drop from this runtime any the feed dropped.
+
+        The feed keeps its own copy of the market list, so a market it skipped
+        as unlisted has to leave `self.symbols` too -- every cancel, close and
+        status line below iterates that list and needs a spec for each.
+        """
+        self.feed.load_specs(strict=strict)
+        self.symbols = [symbol for symbol in self.symbols if symbol in self.feed.specs]
+
     async def start(self, verify: bool = True, trading: bool = True) -> None:
         """Connect, and -- for a run that will open positions -- prepare it.
 
@@ -308,7 +318,7 @@ class Runtime:
         if trading:
             self.check_access()
 
-        self.feed.load_specs()
+        self.load_specs(strict=trading)
         if verify and self._same_tree(self.master, self.sub1):
             verify_sub_account(self.master, self.sub1)
 
@@ -807,7 +817,8 @@ async def cmd_status(config: Config) -> int:
     # thing this left out.
     every_market = list(dict.fromkeys(market.symbol for market in config.markets))
     runtime = Runtime(config, dry_run=True, symbols=every_market)
-    runtime.feed.load_specs()
+    # Not strict: one delisted or misspelled market must not hide the rest.
+    runtime.load_specs(strict=False)
     switched_off = {m.symbol for m in config.markets if not m.enabled}
 
     # Every account, not the named pair. `status` is what an operator reads

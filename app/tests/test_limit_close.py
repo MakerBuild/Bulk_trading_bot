@@ -491,7 +491,8 @@ def test_the_closing_start_skips_the_gate_the_sizing_and_the_leverage(monkeypatc
         return None
 
     runtime._connect_all = connect_all
-    runtime.feed = type("F", (), {"load_specs": lambda self: None,
+    runtime.feed = type("F", (), {"load_specs": lambda self, strict=True: None,
+                                  "specs": {BTC: None},
                                   "subscribe": lambda self: subscribe()})()
 
     def refuse(*_a):
@@ -503,3 +504,38 @@ def test_the_closing_start_skips_the_gate_the_sizing_and_the_leverage(monkeypatc
 
     asyncio.run(runtime.start(verify=False, trading=False))
     assert connected, "it never connected"
+
+
+# -- one unlisted market does not block the panic button ---------------------
+
+
+def test_an_unlisted_market_is_skipped_when_closing_not_refused(caplog):
+    """Closing and status cover every market in the settings, so one
+    delisted or misspelled market that nobody trades stopped the close
+    before a single cancel went out."""
+    from bulkdn.feed import MarketFeed
+
+    listed = {"symbols": [{"symbol": BTC, "tickSize": 0.1, "lotSize": 0.000001,
+                           "minNotional": 1.0}]}
+    session = type("S", (), {"http": type("H", (), {
+        "get_exchange_info": lambda self: listed})()})()
+    feed = MarketFeed(session, [BTC, "ETHH-USD"])
+
+    with caplog.at_level("WARNING"):
+        feed.load_specs(strict=False)
+
+    assert feed.symbols == [BTC]
+    assert "ETHH-USD is not listed" in caplog.text
+
+
+def test_a_trading_run_still_refuses_an_unlisted_market():
+    from bulkdn.feed import MarketFeed
+
+    listed = {"symbols": [{"symbol": BTC, "tickSize": 0.1, "lotSize": 0.000001,
+                           "minNotional": 1.0}]}
+    session = type("S", (), {"http": type("H", (), {
+        "get_exchange_info": lambda self: listed})()})()
+    feed = MarketFeed(session, [BTC, "ETHH-USD"])
+
+    with pytest.raises(RuntimeError, match="ETHH-USD is not listed"):
+        feed.load_specs()

@@ -65,23 +65,38 @@ class MarketFeed:
         self.specs: dict[str, MarketSpec] = {}
         self._frozen_warned: set[str] = set()
 
-    def load_specs(self) -> dict[str, MarketSpec]:
+    def load_specs(self, strict: bool = True) -> dict[str, MarketSpec]:
         """Fetch tick size, lot size, and min notional over HTTP.
 
         These are needed before the first order can be rounded correctly, so
         this is a blocking startup step rather than something driven off the
         stream.
+
+        `strict=False` drops a market the exchange does not list, with a
+        warning, instead of refusing. That is for closing and for status:
+        they cover every market in the settings, switched off or not, so one
+        delisted or misspelled market nobody trades stopped the panic button
+        before it sent a single cancel. A run that trades keeps the refusal --
+        it cannot trade a market it has no spec for.
         """
         info = self.session.http.get_exchange_info()
         markets = info if isinstance(info, list) else info.get("symbols", [])
         by_symbol = {m["symbol"]: m for m in markets if "symbol" in m}
 
+        unlisted = [symbol for symbol in self.symbols if symbol not in by_symbol]
+        if unlisted and strict:
+            raise RuntimeError(
+                f"{unlisted[0]} is not listed on this exchange. Available: "
+                f"{sorted(by_symbol)[:20]}"
+            )
+        for symbol in unlisted:
+            log.warning(
+                "%s is not listed on this exchange -- skipped here; a position "
+                "in it cannot be read or closed by the bot", symbol,
+            )
+        self.symbols = [symbol for symbol in self.symbols if symbol in by_symbol]
+
         for symbol in self.symbols:
-            if symbol not in by_symbol:
-                raise RuntimeError(
-                    f"{symbol} is not listed on this exchange. Available: "
-                    f"{sorted(by_symbol)[:20]}"
-                )
             spec = MarketSpec.from_api(by_symbol[symbol])
             self.specs[symbol] = spec
             log.info(
