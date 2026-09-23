@@ -76,3 +76,27 @@ def test_no_proxy_configured_goes_direct(monkeypatch):
 
 def test_the_token_stays_out_of_a_repr():
     assert "abc" not in repr(TelegramConfig(bot_token="123:abc", user_ids=[1]))
+
+
+def test_the_token_stays_out_of_a_logged_failure(caplog):
+    """A proxy answering with an HTML page raises an aiohttp error naming the
+    request URL -- token included -- and it went into logs.txt as it was."""
+    notifier = Notifier(TelegramConfig(bot_token="987654:SECRET-token", user_ids=[1]))
+    url = "https://api.telegram.org/bot987654:SECRET-token/sendMessage"
+
+    class Response:
+        async def __aenter__(self):
+            raise RuntimeError(f"0, message='Attempt to decode JSON', url='{url}'")
+
+        async def __aexit__(self, *a):
+            return False
+
+    class Session:
+        def post(self, *a, **k):
+            return Response()
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(notifier._send_one(Session(), 1, "hi"))
+
+    assert "SECRET-token" not in caplog.text
+    assert "<bot-token>" in caplog.text

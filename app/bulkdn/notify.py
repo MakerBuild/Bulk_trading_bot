@@ -115,7 +115,18 @@ class Notifier:
                     for user_id in self.config.user_ids:
                         await self._send_one(session, user_id, chunk, proxy=proxy)
         except Exception as exc:  # noqa: BLE001 - reporting must never break trading
-            log.warning("telegram notification failed: %s", describe(exc))
+            log.warning("telegram notification failed: %s", self._redacted(describe(exc)))
+
+    def _redacted(self, text: str) -> str:
+        """`text` with the bot token masked.
+
+        The token sits in the request URL, and aiohttp puts that URL into its
+        errors -- a proxy or Cloudflare answering with an HTML page raises
+        ContentTypeError naming it in full. Logged as it was, the token went
+        into logs.txt, the file operators send when asking for help.
+        """
+        token = self.config.bot_token
+        return text.replace(token, "<bot-token>") if token else text
 
     async def _send_one(
         self,
@@ -139,9 +150,14 @@ class Notifier:
             ) as response:
                 payload = await response.json()
                 if not payload.get("ok"):
-                    log.warning("telegram rejected message to %s: %s", user_id, payload)
+                    log.warning(
+                        "telegram rejected message to %s: %s",
+                        user_id, self._redacted(str(payload)),
+                    )
         except Exception as exc:  # noqa: BLE001 - one bad recipient must not stop the rest
-            log.warning("telegram send to %s failed: %s", user_id, describe(exc))
+            log.warning(
+                "telegram send to %s failed: %s", user_id, self._redacted(describe(exc))
+            )
 
     # -- event helpers -----------------------------------------------------
     #
