@@ -229,6 +229,19 @@ class StrategyState:
         )
 
 
+def dry_run_path(path: str) -> str:
+    """Where a dry run keeps its state: beside the live file, never in it.
+
+    They shared one file, and a live run started after a dry run resumed the
+    dry run's three groups "mid-OPEN" -- groups that had never existed on the
+    exchange. That time they held nothing and simply traded a cycle. A dry
+    run stopped in HOLD or EXIT would have had the live run holding and
+    closing positions nobody opened, against a baseline nobody traded.
+    """
+    root, ext = os.path.splitext(path)
+    return f"{root}.dry{ext or '.json'}"
+
+
 class StateStore:
     """Loads and atomically saves `StrategyState` to a JSON file."""
 

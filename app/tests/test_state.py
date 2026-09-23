@@ -249,3 +249,15 @@ def test_a_state_file_written_before_ids_existed_still_loads():
     leg = revived.leg("BTC-USD")
     assert leg.id == "BTC-USD"
     assert leg.target_size == 0.5
+
+
+# -- a dry run keeps its own file -------------------------------------------
+
+
+def test_a_dry_run_never_writes_the_live_state_file():
+    """A live run resumed three groups a dry run had drawn, "mid-OPEN"."""
+    from bulkdn.state import dry_run_path
+
+    live = "./app/state/strategy_state.json"
+    assert dry_run_path(live) != live
+    assert dry_run_path(live).endswith(".dry.json")

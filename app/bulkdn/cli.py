@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import logging
 import logging.handlers
+import os
 import sys
 
 from bulk_api.common import SignatureDomain
@@ -47,7 +48,7 @@ from .retry import describe
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
 from .sizing import plan_sizes, resolve_notionals
-from .state import Phase, StateStore
+from .state import Phase, StateStore, dry_run_path
 from .ws_compat import apply_ws_compat, quieten_sdk_prints
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
 
@@ -597,6 +598,14 @@ def _print_stop_banner() -> None:
 
 async def cmd_run(config: Config, dry_run: bool) -> int:
     runtime = Runtime(config, dry_run)
+    if dry_run:
+        # Its own file, and an empty one every time. Nothing a dry run
+        # records exists on the exchange, so there is nothing in it for a
+        # later run -- live or dry -- to resume.
+        path = dry_run_path(config.state_file)
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(path)
+        runtime.store = StateStore(path)
     await runtime.start()
     strategy = runtime.build_strategy()
     await runtime.notifier.run_started(

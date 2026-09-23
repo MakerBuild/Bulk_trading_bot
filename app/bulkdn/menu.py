@@ -684,9 +684,11 @@ def _erase_targets(
     config: Config, config_path: str
 ) -> list[tuple[str, str, list[pathlib.Path], str]]:
     from .config import PRIVATE_KEY_FILE
+    from .state import dry_run_path
 
     return [
-        ("1", "Trading state", [pathlib.Path(config.state_file)],
+        ("1", "Trading state", [pathlib.Path(config.state_file),
+                                pathlib.Path(dry_run_path(config.state_file))],
          "what the bot has open, and any recorded halt"),
         ("2", "Private key", [pathlib.Path(PRIVATE_KEY_FILE)],
          "wipes the key; the file stays, ready for a new one"),
@@ -746,7 +748,7 @@ def _erase_data(config: Config, config_path: str) -> None:
             print(f"  {key}. {label:14}  nothing to delete")
             continue
         size = _human_size(sum(_size_of(p) for p in present))
-        where = _shown(present[0]) if len(present) == 1 else f"{len(present)} folders"
+        where = _shown(present[0]) if len(present) == 1 else f"{len(present)} items"
         print(f"  {key}. {label:14}  {where:34} {size:>10}")
         print(f"      {note}")
     print("  9. All of the above  -- back to a freshly installed copy")
