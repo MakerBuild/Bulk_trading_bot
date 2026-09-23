@@ -396,3 +396,48 @@ async def test_a_remainder_still_resting_is_pulled_as_before():
 
     assert obj.sessions["maker-a"].cancelled == []
     assert obj.sessions["maker-b"].cancelled == [(BTC, "oid-2")]
+
+
+# -- no hedge while positions are being taken down ---------------------------
+
+
+async def test_the_worker_sends_nothing_while_closing_out():
+    obj = strategy()
+    register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    obj._closing_out = True
+    obj._hedge_queue.put_nowait("g1:" + BTC)
+
+    worker = asyncio.create_task(obj._hedge_worker())
+    await asyncio.sleep(0.05)
+    obj._stop.set()
+    await asyncio.wait_for(worker, 2)
+
+    assert obj.hedger.hedged == [], "a close was answered with a new position"
+
+
+async def test_the_worker_sends_nothing_once_halted():
+    """The emergency stop flattens every account while the worker still runs."""
+    obj = strategy()
+    register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    obj._halt_reason = "hedge limit exceeded"
+    obj._hedge_queue.put_nowait("g1:" + BTC)
+
+    worker = asyncio.create_task(obj._hedge_worker())
+    await asyncio.sleep(0.05)
+    obj._stop.set()
+    await asyncio.wait_for(worker, 2)
+
+    assert obj.hedger.hedged == []
+
+
+async def test_the_worker_still_hedges_normally():
+    obj = strategy()
+    register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    obj._hedge_queue.put_nowait("g1:" + BTC)
+
+    worker = asyncio.create_task(obj._hedge_worker())
+    await asyncio.sleep(0.05)
+    obj._stop.set()
+    await asyncio.wait_for(worker, 2)
+
+    assert obj.hedger.hedged == ["g1:" + BTC]

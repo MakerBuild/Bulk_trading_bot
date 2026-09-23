@@ -231,6 +231,9 @@ class Strategy:
         # Groups `_recover` brought back, for the dispatcher to start. None
         # until recovery has run.
         self._restored: list[tuple[int, Group, str]] | None = None
+        # Set while the liquidation guard closes positions out. See
+        # `_hedging_suspended`.
+        self._closing_out = False
         # Seeded from the system clock, and held rather than using the
         # module-level generator: a run that has to be reproduced can be
         # given a seed here without reaching into every other user of
@@ -249,6 +252,19 @@ class Strategy:
         if sessions:
             return list(sessions.values())
         return [s for s in (getattr(self, "master", None), getattr(self, "sub1", None)) if s]
+
+    @property
+    def _hedging_suspended(self) -> bool:
+        """Whether the run is taking positions down rather than hedging them.
+
+        True from the moment the liquidation guard starts closing, and for the
+        whole of a halt -- whose emergency stop flattens every account while the
+        worker is still running. A hedge in either window answers each close
+        with a new position the other way.
+        """
+        return getattr(self, "_closing_out", False) or (
+            getattr(self, "_halt_reason", None) is not None
+        )
 
     def _persist(self) -> None:
         """Save the state file, and survive not being able to.
@@ -565,6 +581,17 @@ class Strategy:
         # accounts. Which side was hit does not change the answer -- the pair
         # is broken either way, and a lone leg is outright exposure.
         affected = {event.symbol for event in events}
+        # Hedging stops before the first close goes out, and our own resting
+        # orders come off the book. The hedge worker used to run on beside
+        # this: on a live run it "hedged" the closes as they filled, and
+        # the accounts the guard had just closed ended holding fresh shorts
+        # (m1s1 -0.0103, m1s4 -0.0211). A resting order filling mid-close
+        # would have been the same thing from the other side.
+        self._closing_out = True
+        try:
+            await cancel_all_orders(self.all_sessions, sorted(affected))
+        except Exception as exc:  # noqa: BLE001 - the closes still go
+            log.critical("could not cancel resting orders before closing: %s", describe(exc))
         for symbol in affected:
             for session in self.all_sessions:
                 size = self.book.authoritative(session.pubkey, symbol)
@@ -782,6 +809,11 @@ class Strategy:
             try:
                 key = await asyncio.wait_for(self._hedge_queue.get(), timeout=0.5)
             except asyncio.TimeoutError:
+                continue
+
+            if self._hedging_suspended:
+                # Closing out, or halted: the positions are being taken down,
+                # and a hedge now would open the opposite of each close.
                 continue
 
             if self._book_suspect and not await self._refreshed():
@@ -1289,6 +1321,8 @@ class Strategy:
                 # hedge rule's answer is to open a fresh one on the account that
                 # still holds something -- exactly the wrong response.
                 if await self._guard_liquidation(self._phases_by_account()):
+                    return
+                if self._hedging_suspended:
                     return
 
                 try:

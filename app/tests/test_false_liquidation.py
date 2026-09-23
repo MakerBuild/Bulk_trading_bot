@@ -434,3 +434,32 @@ async def test_a_shrink_that_a_fresh_read_undoes_is_not_a_close(monkeypatch):
     assert acted is False, "a stale reading must not close five accounts"
     assert bot.halted is None
     assert bot._sync_calls >= 1, "it has to actually ask before deciding"
+
+
+# -- nothing hedges while the guard closes out -------------------------------
+#
+# 2026-09-22 23:23: the guard closed the pair and the hedge worker, still
+# running beside it, "hedged" the closes as they filled -- m1s1 and m1s4 ended
+# holding fresh shorts they had never had.
+
+
+def test_hedging_is_suspended_before_the_first_close(monkeypatch):
+    bot = bot_with([liquidation_event()], in_doubt=False)
+    order = []
+
+    async def cancel_all(sessions, symbols):
+        order.append(("cancel", tuple(symbols)))
+
+    real_market = bot.master.market
+
+    async def market(*a, **k):
+        order.append(("close", bot._closing_out))
+        return await real_market(*a, **k)
+
+    bot.master.market = market
+    monkeypatch.setattr("bulkdn.strategy.cancel_all_orders", cancel_all)
+
+    run_guard(monkeypatch, bot)
+
+    assert order[0] == ("cancel", (ETH,)), "resting orders were left to fill mid-close"
+    assert ("close", True) in order, "a close went out with hedging still live"
