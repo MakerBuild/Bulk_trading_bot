@@ -228,6 +228,9 @@ class Strategy:
         self._groups: dict[str, Group] = {}
         self._group_ids: dict[str, int] = {}
         self.pairing: Pairing | None = None
+        # Groups `_recover` brought back, for the dispatcher to start. None
+        # until recovery has run.
+        self._restored: list[tuple[int, Group, str]] | None = None
         # Seeded from the system clock, and held rather than using the
         # module-level generator: a run that has to be reproduced can be
         # given a seed here without reaching into every other user of
@@ -355,7 +358,10 @@ class Strategy:
         and reported nothing to correct for three minutes while the pair sat
         directional.
         """
-        if self._groups:
+        if self._groups or self.pairing is not None:
+            # A pool run with no group live has nothing to reconcile -- not
+            # the configured pair, which in a pool is two accounts that may
+            # each belong to a group that has not been restored yet.
             return [
                 roles
                 for roles in (self._roles_for_key(key) for key in self._groups)
@@ -735,11 +741,32 @@ class Strategy:
                 max_order_size=leg.max_order_size,
             )
 
+        # A pool run has no configured pair to fall back to. The "pair" here
+        # is pool[0] and pool[1] -- in multi mode m1 and m1s1, two accounts
+        # that usually sit in DIFFERENT groups -- so resolving an unowned key
+        # to them hedged one against the other. After a restart mid-cycle
+        # that bought or sold on an account no group owned, and nothing ever
+        # closed it.
+        if self.pairing is not None:
+            return None
+
         leg = self.state.legs.get(key)
         symbol = leg.symbol if leg is not None else key
         if symbol not in self.symbols:
             return None
         return self._roles_by_symbol(self.state.leg(key, symbol).phase).get(symbol)
+
+    def _keys_to_hedge(self, key: str) -> list[str]:
+        """The legs a queued key stands for.
+
+        Usually itself. A bare market name reaches the queue when a fill could
+        not be tied to a group -- an account update that named nobody, or a
+        fill on an account between groups -- and in a pool it means "check
+        every group on that market", not "hedge the configured pair".
+        """
+        if self.pairing is None or key in self._groups or key not in self.symbols:
+            return [key]
+        return [k for k, group in self._groups.items() if group.symbol == key]
 
     async def _hedge_worker(self) -> None:
         """Drains fill signals and restores neutrality, one leg at a time."""
@@ -764,22 +791,24 @@ class Strategy:
                 # of being wrong is paid immediately and in full.
                 continue
 
-            roles = self._roles_for_key(key)
-            if roles is None:
-                continue
-            try:
-                # Before the market order, not after: our own remainder is
-                # resting on exactly the side it is about to sweep.
-                await self._clear_hedge_path(roles)
-                await self.hedger.hedge(
-                    roles, mark_price=self.feed.reference_price(roles.symbol)
-                )
-            except HedgeLimitExceeded as exc:
-                self._trigger_halt(f"hedge limit exceeded -- {exc}")
-            except Exception as exc:
-                # The reconciler re-derives from position, so a single failure
-                # is recoverable; a persistent one trips the reject streak.
-                log.error("hedge for %s failed: %s", key, describe(exc))
+            for leg_key in self._keys_to_hedge(key):
+                roles = self._roles_for_key(leg_key)
+                if roles is None:
+                    continue
+                try:
+                    # Before the market order, not after: our own remainder is
+                    # resting on exactly the side it is about to sweep.
+                    await self._clear_hedge_path(roles)
+                    await self.hedger.hedge(
+                        roles, mark_price=self.feed.reference_price(roles.symbol)
+                    )
+                except HedgeLimitExceeded as exc:
+                    self._trigger_halt(f"hedge limit exceeded -- {exc}")
+                except Exception as exc:
+                    # The reconciler re-derives from position, so a single
+                    # failure is recoverable; a persistent one trips the
+                    # reject streak.
+                    log.error("hedge for %s failed: %s", leg_key, describe(exc))
 
     def _least_crowded_side(self, symbol: str) -> bool:
         """The side fewest live legs are resting on, for the next group.
@@ -1711,7 +1740,13 @@ class Strategy:
         # before any new one is drawn: their accounts are already committed,
         # and a fresh draw made while they are unaccounted for could hand the
         # same accounts to a second group.
-        for group_id, group, _key in self.restore_groups():
+        # Restored by `_recover`, which had to do it before its reconcile;
+        # restoring twice would reserve the same accounts twice.
+        restored = getattr(self, "_restored", None)
+        self._restored = []
+        if restored is None:
+            restored = self.restore_groups()
+        for group_id, group, _key in restored:
             size = self.state.leg(self.group_key(group_id, group.symbol)).target_size
             running.add(asyncio.create_task(self._run_group(group_id, group, size)))
         try:
@@ -2258,9 +2293,21 @@ class Strategy:
                 "the state to IDLE."
             )
 
+        if self.pairing is not None:
+            # A pool run: the groups are the plan. Restored HERE, before the
+            # reconcile below, because that reconcile hedges whatever
+            # `_live_roles` names -- and with the groups not yet back it named
+            # the configured pair, m1 and m1s1, and traded one against the
+            # other. The dispatcher starts these rather than restoring again.
+            self._restored = self.restore_groups()
+            self._refuse_unowned_positions()
+            symbols_to_recover: list[str] = []
+        else:
+            symbols_to_recover = list(self.symbols)
+
         # Decided per leg, because legs recover independently: one may have
         # been mid-entry while the other was already unwinding.
-        for symbol in self.symbols:
+        for symbol in symbols_to_recover:
             leg = self.state.leg(symbol)
             spec = self.feed.specs[symbol]
             leg_has_positions = any(
@@ -2309,6 +2356,39 @@ class Strategy:
             log.warning("recovery corrected %s", correction)
 
         self._persist()
+
+    def _refuse_unowned_positions(self) -> None:
+        """Stop before trading if a position belongs to no restored group.
+
+        Every position a pool run opens is recorded against the group that
+        opened it, and that record is how the next run knows who closes it. A
+        position outside every record -- the state file lost or erased, or a
+        trade made by hand -- has nobody to close it: no group will exit it,
+        and an account holding it can be drawn into a new group whose hedge
+        then treats it as that group's own imbalance.
+
+        Dust is let through. A residual under the market's minimum order cannot
+        be closed by anyone, and every run leaves some.
+        """
+        owned = {pubkey for group in self._groups.values() for pubkey in group.accounts}
+        stray = []
+        for symbol in self.symbols:
+            spec = self.feed.specs[symbol]
+            price = self.feed.reference_price(symbol) or 0.0
+            for session in self.all_sessions:
+                if session.pubkey in owned:
+                    continue
+                size = abs(self.book.authoritative(session.pubkey, symbol))
+                if size < spec.lot_size or (price and size * price < spec.min_notional):
+                    continue
+                stray.append(f"{session.name} {symbol} {size:g}")
+        if stray:
+            raise RuntimeError(
+                "positions open on accounts no recorded group owns: "
+                + ", ".join(stray)
+                + ". Nothing in this run would ever close them. Close them "
+                "first -- `6. Close All Positions` -- then start again."
+            )
 
     async def _emergency_stop(self, reason: str) -> None:
         log.critical("emergency stop: %s", reason)

@@ -11,7 +11,9 @@ import random
 
 import pytest
 
+from bulkdn.marketdata import MarketSpec
 from bulkdn.pairing import Group, Pairing
+from bulkdn.positions import PositionBook
 from bulkdn.state import Phase, StateStore, StrategyState
 from bulkdn.strategy import Strategy
 
@@ -178,3 +180,104 @@ def test_such_a_group_does_not_reserve_accounts(tmp_path):
     remember(obj)
     obj.restore_groups()
     assert "opener" in obj.pairing.free
+
+
+# -- a pool never falls back to the configured pair --------------------------
+#
+# The "configured pair" of a pool is pool[0] and pool[1] -- in multi mode m1
+# and m1s1, which usually sit in different groups. Recovery reconciled it
+# before the groups were back, and on a restart mid-cycle that bought or sold
+# on an account no group owned: unhedged, and nothing would ever close it.
+
+
+SPEC = MarketSpec(symbol=BTC, tick_size=0.1, lot_size=0.000001, min_notional=1.0)
+
+
+class Session:
+    def __init__(self, pubkey):
+        self.pubkey = pubkey
+        self.name = pubkey
+
+
+class Feed:
+    specs = {BTC: SPEC}
+
+    def reference_price(self, symbol):
+        return 86_000.0
+
+
+def pool_strategy(tmp_path, held=None):
+    obj = strategy(tmp_path)
+    obj.sessions = {pk: Session(pk) for pk in ("opener", "t1", "t2", "spare")}
+    obj.symbols = [BTC]
+    obj.feed = Feed()
+    obj.book = PositionBook(overlay_ttl_ms=5000)
+    for pubkey, size in (held or {}).items():
+        obj.book.set_authoritative(pubkey, BTC, size)
+    return obj
+
+
+def test_a_key_no_group_owns_resolves_to_nothing(tmp_path):
+    obj = pool_strategy(tmp_path)
+    assert obj._roles_for_key(BTC) is None
+
+
+def test_no_group_live_means_nothing_to_reconcile(tmp_path):
+    assert pool_strategy(tmp_path)._live_roles() == []
+
+
+def test_a_bare_market_in_the_queue_means_every_group_on_it(tmp_path):
+    obj = pool_strategy(tmp_path)
+    key = remember(obj)
+    obj.restore_groups()
+
+    assert obj._keys_to_hedge(BTC) == [key]
+    assert obj._keys_to_hedge(key) == [key]
+
+
+async def test_recovery_reconciles_the_restored_groups_not_the_pair(tmp_path, monkeypatch):
+    import bulkdn.strategy as strategy_mod
+
+    obj = pool_strategy(tmp_path, held={"opener": 0.02, "t1": -0.012, "t2": -0.008})
+    key = remember(obj)
+    reconciled = []
+
+    async def reconcile_net(hedger, roles, feed):
+        reconciled.append([r.key for r in roles])
+        return []
+
+    async def cancel_all(sessions, symbols):
+        return None
+
+    monkeypatch.setattr(strategy_mod, "sync_positions_http", lambda s, b: None)
+    monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
+    monkeypatch.setattr(strategy_mod, "reconcile_net", reconcile_net)
+    obj.hedger = object()
+
+    await obj._recover()
+
+    assert reconciled == [[key]], "the configured pair was reconciled"
+    assert [k for _i, _g, k in obj._restored] == [key]
+
+
+def test_a_position_no_group_owns_stops_the_run(tmp_path):
+    """Nothing in the run would ever close it."""
+    obj = pool_strategy(tmp_path, held={"spare": 0.01})
+    remember(obj)
+    obj.restore_groups()
+
+    with pytest.raises(RuntimeError, match="spare"):
+        obj._refuse_unowned_positions()
+
+
+def test_dust_no_group_owns_is_let_through(tmp_path):
+    """Under the minimum order nobody can close it, and every run leaves some."""
+    obj = pool_strategy(tmp_path, held={"spare": 0.000002})
+    obj._refuse_unowned_positions()
+
+
+def test_positions_inside_a_restored_group_are_its_own(tmp_path):
+    obj = pool_strategy(tmp_path, held={"opener": 0.02, "t1": -0.02})
+    remember(obj)
+    obj.restore_groups()
+    obj._refuse_unowned_positions()
