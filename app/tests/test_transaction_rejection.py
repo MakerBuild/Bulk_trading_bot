@@ -353,3 +353,30 @@ async def test_a_refused_transaction_placed_nothing():
         await s.place_limit(BTC, True, 100.0, 0.001, cancel_oid="old")
     assert caught.value.placed is False
     assert caught.value.order_id
+
+
+async def test_a_submission_that_never_left_counts_toward_the_streak():
+    """A fault that stops every order before it is sent is what the reject
+    streak is for; it used to count nothing and put the symbol in doubt."""
+    from bulkdn.accounts import AccountSession, NotSent
+
+    class Client:
+        async def submit(self, actions, **kwargs):
+            raise NotSent("not connected to WebSocket")
+
+    session = object.__new__(AccountSession)
+    session.name = "m1s1"
+    session.pubkey = "m1s1-key"
+    session.client = Client()
+    session.reject_streak = 0
+    session.last_reject = ""
+    session.unconfirmed = {}
+
+    class Action:
+        symbol = "BTC-USD"
+
+    with pytest.raises(NotSent):
+        await session.submit([Action()])
+
+    assert session.reject_streak == 1
+    assert "BTC-USD" not in session.unconfirmed, "an order that never left is not in doubt"

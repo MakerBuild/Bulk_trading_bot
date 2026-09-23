@@ -774,3 +774,28 @@ async def test_a_hedge_that_waited_on_the_lock_rechecks_before_sending():
 
     assert sub1.orders == []
     assert result.skipped_reason == "hedging suspended"
+
+
+# -- a slice that never left this process is released, not doubted -----------
+
+
+async def test_a_slice_that_was_never_sent_is_released_not_held():
+    """No socket, no signer, an account the socket does not carry: the order
+    certainly did not trade. Held in doubt, a persistent fault here re-hedged,
+    doubted and re-read forever and never moved the reject streak."""
+    from bulkdn.accounts import NotSent
+
+    book, hedger, _master, sub1 = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
+
+    async def not_connected(*args, **kwargs):
+        raise NotSent("not connected to WebSocket")
+
+    sub1.market = not_connected
+    with pytest.raises(NotSent):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    assert hedger.in_flight.total(BTC) == 0.0
+    assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.10)

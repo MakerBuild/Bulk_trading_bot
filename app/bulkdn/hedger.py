@@ -32,7 +32,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from .accounts import AccountSession, OrderRejected, short_pubkey
+from .accounts import AccountSession, NotSent, OrderRejected, short_pubkey
 from .marketdata import MarketSpec, min_order_size, round_notional, round_size, touch_text
 from .impact import ImpactBook
 from .positions import PositionBook
@@ -605,7 +605,7 @@ class Hedger:
                 )
                 for (_pubkey, piece), result in zip(slices, results, strict=True):
                     signed = piece if is_buy else -piece
-                    if isinstance(result, OrderRejected):
+                    if isinstance(result, (OrderRejected, NotSent)):
                         # The exchange answered no, so this slice never traded
                         # and its exposure is still real. Releasing only its
                         # reservation lets the next trigger retry exactly the

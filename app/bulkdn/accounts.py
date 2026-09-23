@@ -91,6 +91,17 @@ def is_rate_limited(exc: BaseException) -> bool:
     return any(marker in text for marker in _RATE_LIMIT_MARKERS)
 
 
+class NotSent(RuntimeError):
+    """Refused on this side before anything reached the exchange.
+
+    No socket, no signer, an account the socket does not carry. Unlike a
+    timeout, the order certainly did not execute, so a hedge slice that
+    fails this way is released rather than held in doubt -- held, a
+    persistent fault here re-hedged, doubted and re-read forever without
+    ever moving the reject streak.
+    """
+
+
 class SubmissionInDoubt(RuntimeError):
     """A request was failed on the socket without an answer addressed to it.
 
@@ -402,15 +413,15 @@ class RoutedWsClient(BulkWebSocketClient):
         """
         signer = self._signing_key
         if not signer:
-            raise RuntimeError("signer not configured")
+            raise NotSent("signer not configured")
         account = account or self.account_pubkey
         if not account:
-            raise RuntimeError("account_pubkey not configured")
+            raise NotSent("account_pubkey not configured")
         if self.accounts and account not in self.accounts:
             # A socket signs only for the accounts its key was built for.
             # Sending for another would be rejected by the exchange, but the
             # useful moment to notice is here, where the account is named.
-            raise RuntimeError(
+            raise NotSent(
                 f"this connection does not carry {short_pubkey(account)}"
             )
         if nonce is None:
@@ -450,7 +461,7 @@ class RoutedWsClient(BulkWebSocketClient):
             ]
 
         if not self.is_connected:
-            raise RuntimeError("not connected to WebSocket")
+            raise NotSent("not connected to WebSocket")
 
         tx = signer.sign_transaction(tx, self.signature_domain)
 
@@ -622,6 +633,14 @@ class AccountSession:
             # session is the only thing that knows which of them this is.
             kwargs.setdefault("account", self.pubkey)
             responses = await self.client.submit(actions, **kwargs)
+        except NotSent as exc:
+            # Nothing left this process, so nothing is in doubt -- and a fault
+            # that stops every order is exactly what the streak is for.
+            self._settle(actions)
+            if count_rejects:
+                self.reject_streak += 1
+                self.last_reject = str(exc)
+            raise
         except OrderRejected as exc:
             # The whole transaction was refused -- bad signature, rate limit,
             # a malformed envelope. That is an answer, and a definite one:
