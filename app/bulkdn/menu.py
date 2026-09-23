@@ -12,8 +12,12 @@ a menu entry that silently does nothing is worse than one that admits it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import logging
+import math
 import pathlib
+import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,15 +26,24 @@ import requests
 
 from .accounts import short_pubkey, unwrap_full_account
 from .cli import (
+    ACCEPTED,
+    EXIT_UNKNOWN,
     LOG_FILE,
+    UNKNOWN,
+    UNKNOWN_ADVICE,
+    UNSENT,
     cmd_create_subaccount,
     cmd_encrypt_key,
     cmd_flatten,
     cmd_run,
     cmd_status,
+    submit_signed,
 )
 from .config import Config, ConfigError, LegConfig
+from .retry import describe
 from . import proxy
+
+log = logging.getLogger(__name__)
 
 BOX_WIDTH = 46
 
@@ -60,23 +73,56 @@ def _box(title: str, lines: list[str]) -> str:
     return "\n".join(out)
 
 
+class Cancelled(Exception):
+    """Ctrl+C or end-of-input at a prompt: abandon the current action.
+
+    An exception rather than a sentinel answer. `_ask` used to turn Ctrl+C
+    into "0", which is "back" on a menu -- and a perfectly good VALUE on every
+    prompt that asks for one. Ctrl+C at "new value:" wrote a burn target of 0,
+    which disables the limit, and Ctrl+C at "name:" submitted a real
+    createSubAccount called "0". Raising means no caller can mistake a cancel
+    for an answer: whatever it was about to write or send is simply never
+    reached. `run_menu` catches it and returns to the main menu.
+    """
+
+
 def _ask(prompt: str) -> str:
     try:
         return input(prompt).strip()
-    except (EOFError, KeyboardInterrupt):
+    except (EOFError, KeyboardInterrupt) as exc:
         print()
-        return "0"
+        raise Cancelled() from exc
 
 
 def _confirm(what: str) -> bool:
     """Real funds are at stake, so require the word, not a keystroke."""
     print(f"\n  !!  {what}")
     print("      This is mainnet. Type 'yes' to proceed, anything else aborts.")
-    return _ask("      > ") == "yes"
+    try:
+        return _ask("      > ") == "yes"
+    except Cancelled:
+        return False
 
 
 def _pause() -> None:
-    _ask("\n  [enter] to return to the menu ")
+    # Ctrl+C here means "get me out", which is where this goes anyway.
+    with contextlib.suppress(Cancelled):
+        _ask("\n  [enter] to return to the menu ")
+
+
+def _fresh(config: Config) -> Config:
+    """A private copy of the settings for one run.
+
+    A run writes into the config it is given: the sizing plan replaces each
+    leg's size with what the thinnest account can carry, and a leg written as
+    a range redraws its size every cycle. That is by design inside a run --
+    but the menu held ONE config for its whole life, so a dry run's sizes
+    became the next live run's sizes, capped by whatever margin the rehearsal
+    happened to see. Each run now gets its own copy, and nothing it does
+    outlives it. The menu's own edits -- targets, markets, mode -- still land
+    on the original, which is what every later copy is taken from.
+    """
+    return copy.deepcopy(config)
 
 
 # -- helpers ----------------------------------------------------------------
@@ -159,8 +205,13 @@ def _trees(config: Config) -> list[Tree]:
     saw no sign of it anywhere -- not in the balance table, not in the history,
     not in the progress figures it was being judged against.
     """
-    keys = config.private_keys or ([config.private_key] if config.private_key else [])
-    return [_tree(config, key, index) for index, key in enumerate(keys, start=1)]
+    # `private_keys` only: Config.__post_init__ already folds a lone
+    # `private_key` into it, so a fallback here would be a second rule for
+    # "which keys exist" free to disagree with the first.
+    return [
+        _tree(config, key, index)
+        for index, key in enumerate(config.private_keys, start=1)
+    ]
 
 
 def _accounts(config: Config) -> list[tuple[str, str]]:
@@ -170,18 +221,33 @@ def _accounts(config: Config) -> list[tuple[str, str]]:
     return [pair for tree in trees for pair in tree.labelled(alone)]
 
 
-def _transferable(config: Config, pubkey: str) -> float:
-    body = requests.post(
-        f"{config.http_url}/account",
-        json={"type": "fullAccount", "user": pubkey},
-        timeout=25,
-    )
-    if body.status_code != 200:
-        return 0.0
-    margin = unwrap_full_account(body.json()).get("margin") or {}
-    # transferableBalance, not totalMargin: margin backing an open position
-    # cannot be moved, and asking to move it just gets the transfer rejected.
-    return float(margin.get("transferableBalance") or 0.0)
+def _transferable(config: Config, pubkey: str) -> float | None:
+    """What this account could move right now, or None when it is not known.
+
+    None, never 0.0, for a read that failed. A 429 or a 502 used to come back
+    as 0.0, which is indistinguishable from an empty account -- and Balance
+    then planned transfers INTO it, levelling the tree against a figure that
+    was never read. The callers leave an unknown account out of the plan.
+    """
+    try:
+        body = requests.post(
+            f"{config.http_url}/account",
+            json={"type": "fullAccount", "user": pubkey},
+            timeout=25,
+        )
+        if body.status_code != 200:
+            log.warning(
+                "balance read for %s failed: HTTP %s",
+                short_pubkey(pubkey), body.status_code,
+            )
+            return None
+        margin = unwrap_full_account(body.json()).get("margin") or {}
+        # transferableBalance, not totalMargin: margin backing an open position
+        # cannot be moved, and asking to move it just gets the transfer rejected.
+        return float(margin.get("transferableBalance") or 0.0)
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+        log.warning("balance read for %s failed: %s", short_pubkey(pubkey), describe(exc))
+        return None
 
 
 def _http(config: Config):
@@ -199,10 +265,34 @@ def _http(config: Config):
 # -- menu items -------------------------------------------------------------
 
 
+def _stop_conditions(config: Config) -> str:
+    """When this run will end, in the words the confirmation shows.
+
+    The confirmation used to say "unlimited cycle(s)" whenever `cycles` was 0
+    -- which the shipped settings are -- even with a $3 burn target that would
+    end the run within the hour. Every limit that applies is named, because
+    "how long will this spend my money for" is the question being confirmed.
+    """
+    target = config.target
+    limits = []
+    if target.cycles:
+        limits.append(f"{target.cycles} cycle(s)")
+    if target.burn_usd:
+        limits.append(f"${target.burn_usd:,.2f} of fees burned")
+    if target.volume_usd:
+        limits.append(f"${target.volume_usd:,.2f} of qualifying volume")
+    if not limits:
+        return "no stop condition set -- runs until you press S"
+    if len(limits) == 1:
+        return f"stops after {limits[0]}"
+    return f"stops at {', '.join(limits[:-1])} or {limits[-1]}, whichever comes first"
+
+
 def _start(config: Config) -> None:
     # Named here because the mode can also come from the command line, so the
     # settings file is not proof of what this run will trade.
     print(f"\n  {config.mode}: {', '.join(leg.symbol for leg in config.active_legs)}")
+    print(f"  {_stop_conditions(config)}")
     print("\n  1. dry run  -- connects and logs, submits nothing")
     print("  2. live     -- REAL FUNDS")
     print("  0. back")
@@ -210,20 +300,20 @@ def _start(config: Config) -> None:
     print("  need a second window, and you do not need to close this one.")
     choice = _ask("\n  > ")
     if choice == "1":
-        asyncio.run(cmd_run(config, dry_run=True))
+        asyncio.run(cmd_run(_fresh(config), dry_run=True))
     elif choice == "2":
-        if _confirm(f"Start a live cycle on "
+        if _confirm(f"Start LIVE trading, {config.mode} mode, on "
                     f"{', '.join(leg.symbol for leg in config.active_legs)}: "
-                    f"{config.cycles or 'unlimited'} cycle(s), "
-                    f"{config.hold_minutes} min hold."):
-            asyncio.run(cmd_run(config, dry_run=False))
+                    f"{_stop_conditions(config)}; "
+                    f"{config.hold_minutes} min hold per cycle."):
+            asyncio.run(cmd_run(_fresh(config), dry_run=False))
         else:
             print("  aborted")
     _pause()
 
 
 def _active_strategy(config: Config) -> None:
-    asyncio.run(cmd_status(config))
+    asyncio.run(cmd_status(_fresh(config)))
     _pause()
 
 
@@ -357,6 +447,10 @@ def _pick_tree(config: Config, what: str) -> Tree | None:
     return None
 
 
+# What the exchange accepts as a sub-account name, per the prompt's own text.
+SUBACCOUNT_NAME = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
 def _create_subaccount(config: Config) -> None:
     tree = _pick_tree(config, "the new sub-account belongs to one of them")
     if tree is None:
@@ -367,8 +461,33 @@ def _create_subaccount(config: Config) -> None:
         print("  aborted")
         _pause()
         return
-    asyncio.run(cmd_create_subaccount(config, name, None, private_key=tree.private_key))
-    print("\n  ready to use -- the bot finds it from your master on startup")
+    if not SUBACCOUNT_NAME.fullmatch(name):
+        # Checked here rather than left to the exchange: a refusal there costs
+        # a signed transaction and says less.
+        print("  a name is 1-32 characters of A-Z a-z 0-9 - _ -- nothing was sent")
+        _pause()
+        return
+    # A sub-account cannot be deleted or moved to another master, so this is
+    # confirmed like anything else that changes the account.
+    if not _confirm(
+        f"Create sub-account {name!r} under master {short_pubkey(tree.master)}. "
+        "It cannot be deleted afterwards."
+    ):
+        print("  aborted")
+        _pause()
+        return
+
+    code = asyncio.run(
+        cmd_create_subaccount(config, name, None, private_key=tree.private_key)
+    )
+    # What the exchange said, not what was hoped. This printed "ready to use"
+    # whatever came back, including after a rejection.
+    if code == 0:
+        print("\n  ready to use -- the bot finds it from your master on startup")
+    elif code == EXIT_UNKNOWN:
+        print("\n  NOT CONFIRMED -- see above, and check before creating it again")
+    else:
+        print("\n  not created -- see the exchange's answer above")
     _pause()
 
 
@@ -406,9 +525,6 @@ def _balance_subaccounts(config: Config) -> None:
     offer here, and pretending otherwise would only produce transfers the
     exchange rejects.
     """
-    from .subaccounts import submit_transfer
-    from bulk_api.common import SignatureDomain
-
     trees = _trees(config)
     alone = len(trees) == 1
     plan: list[tuple[Tree, str, str, float]] = []
@@ -420,7 +536,19 @@ def _balance_subaccounts(config: Config) -> None:
                   "owns no sub-accounts yet")
             continue
 
-        balances = [(label, pk, _transferable(config, pk)) for label, pk in accounts]
+        read = [(label, pk, _transferable(config, pk)) for label, pk in accounts]
+        # An account whose balance could not be read is left out, not counted
+        # as empty: planning around a guessed 0 would move margin INTO it on
+        # the strength of a failed request.
+        unread = [(label, pk) for label, pk, bal in read if bal is None]
+        balances = [(label, pk, bal) for label, pk, bal in read if bal is not None]
+        for label, pk in unread:
+            print(f"\n  !! could not read {label} {short_pubkey(pk)} -- left out "
+                  "of the plan. Try again in a minute.")
+        if len(balances) < 2:
+            print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)}: fewer than "
+                  "two balances could be read, so nothing is planned for it")
+            continue
         total = sum(bal for _, _, bal in balances)
         target = total / len(balances)
 
@@ -454,21 +582,77 @@ def _balance_subaccounts(config: Config) -> None:
         _pause()
         return
 
-    for tree, src, dst, amount in plan:
-        result = submit_transfer(
-            http_url=config.http_url,
-            # The owning key, not the first one in the file. A transfer signed
-            # by a key that owns neither end is a transfer the exchange
-            # refuses, and it would refuse it one account at a time.
-            private_key=tree.private_key,
-            domain=SignatureDomain[config.signature_domain_name],
-            from_pubkey=src,
-            to_pubkey=dst,
-            margin_amount=amount,
-        )
-        state = "ok" if result.ok else f"FAILED {result.response_json}"
-        print(f"    {short_pubkey(src)} -> {short_pubkey(dst)} {amount:,.2f}: {state}")
+    _submit_plan(config, plan)
     _pause()
+
+
+def _submit_plan(config: Config, plan: list[tuple[Tree, str, str, float]]) -> None:
+    """Send a list of transfers, one at a time, and say what became of each.
+
+    A failure used to end the loop with a traceback halfway down the list --
+    the exchange timing out on the third of six transfers left the operator
+    with two done, four not, and no summary saying which. Now each is caught
+    on its own:
+
+      * refused outright   the next one is still sent: each move is sized
+                           from its own two balances, so one refusal does not
+                           make any other one wrong.
+      * outcome UNKNOWN,   the network failed under it. The rest are NOT sent:
+        or unreachable     whatever broke that one is likely to break the
+                           next, and a pile of unknowns is harder to check by
+                           hand than one.
+    """
+    from .subaccounts import submit_transfer
+    from bulk_api.common import SignatureDomain
+
+    done: list[str] = []
+    refused: list[str] = []
+    unknown: list[str] = []
+    for index, (tree, src, dst, amount) in enumerate(plan):
+        line = f"{short_pubkey(src)} -> {short_pubkey(dst)} {amount:,.2f}"
+        try:
+            _result, outcome, detail = submit_signed(
+                submit_transfer,
+                http_url=config.http_url,
+                # The owning key, not the first one in the file. A transfer
+                # signed by a key that owns neither end is a transfer the
+                # exchange refuses, and it would refuse it one account at a time.
+                private_key=tree.private_key,
+                domain=SignatureDomain[config.signature_domain_name],
+                from_pubkey=src,
+                to_pubkey=dst,
+                margin_amount=amount,
+            )
+        except Exception as exc:  # noqa: BLE001 - one transfer must not lose the summary
+            # Raised before anything reached the wire -- signing, serialising.
+            outcome, detail = "error", describe(exc)
+        if outcome == ACCEPTED:
+            done.append(line)
+            print(f"    {line}: ok")
+        elif outcome in (UNKNOWN, UNSENT):
+            if outcome == UNKNOWN:
+                unknown.append(line)
+                print(f"    {line}: UNKNOWN ({detail})")
+            else:
+                refused.append(line)
+                print(f"    {line}: exchange unreachable, not sent ({detail})")
+            skipped = [
+                f"{short_pubkey(s)} -> {short_pubkey(d)} {a:,.2f}"
+                for _t, s, d, a in plan[index + 1:]
+            ]
+            break
+        else:
+            refused.append(line)
+            print(f"    {line}: refused ({detail})")
+    else:
+        skipped = []
+
+    print(f"\n  {len(done)} done, {len(refused)} refused, {len(unknown)} unknown, "
+          f"{len(skipped)} not sent")
+    for line in skipped:
+        print(f"    not sent: {line}")
+    if unknown:
+        print(f"\n  {UNKNOWN_ADVICE}")
 
 
 def _collect_to_master(config: Config) -> None:
@@ -478,9 +662,6 @@ def _collect_to_master(config: Config) -> None:
     one tree: the key that signs owns both ends, and a sub under another key
     has no master here to be swept into.
     """
-    from .subaccounts import submit_transfer
-    from bulk_api.common import SignatureDomain
-
     trees = _trees(config)
     alone = len(trees) == 1
     plan: list[tuple[Tree, str, float]] = []
@@ -495,6 +676,12 @@ def _collect_to_master(config: Config) -> None:
         print(f"  {'sub-account':<22} {'transferable':>14}")
         for label, pk in tree.labelled(alone)[1:]:
             bal = _transferable(config, pk)
+            if bal is None:
+                # Unknown is not zero, and it is not "everything" either:
+                # nothing is planned for an account that could not be read.
+                print(f"  {label + ' ' + short_pubkey(pk):<22} {'unreadable':>14}"
+                      "  -- left out")
+                continue
             print(f"  {label + ' ' + short_pubkey(pk):<22} {bal:>14.2f}")
             # Floored, not rounded: rounding 10.005 up asks for a cent the
             # account does not have, and the whole transfer is refused for it.
@@ -519,17 +706,7 @@ def _collect_to_master(config: Config) -> None:
         _pause()
         return
 
-    for tree, src, amount in plan:
-        result = submit_transfer(
-            http_url=config.http_url,
-            private_key=tree.private_key,
-            domain=SignatureDomain[config.signature_domain_name],
-            from_pubkey=src,
-            to_pubkey=tree.master,
-            margin_amount=amount,
-        )
-        state = "ok" if result.ok else f"FAILED {result.response_json}"
-        print(f"    {short_pubkey(src)} -> {short_pubkey(tree.master)} {amount:,.2f}: {state}")
+    _submit_plan(config, [(tree, src, tree.master, amount) for tree, src, amount in plan])
     _pause()
 
 
@@ -814,14 +991,25 @@ def _key_state(path: str) -> str:
     Costs one Argon2 derivation, so it is read once per visit rather than on
     every redraw of the menu.
     """
+    from nacl.exceptions import CryptoError
+
     from . import keystore
 
     if not keystore.is_encrypted(path):
         return "PLAINTEXT"
     try:
         keystore.load(path, keystore.DEFAULT_PASSWORD)
-    except Exception:  # noqa: BLE001 - anything but success means a real password
-        return "encrypted"
+    except keystore.KeystoreError as exc:
+        # Only a failed decryption means "a password other than the default".
+        # A file that is truncated, from a newer build, or unreadable also
+        # fails to open -- and calling that "encrypted" told the operator
+        # their key was safely protected when the bot could not read it at
+        # all, which they would discover at the next start.
+        if isinstance(exc.__cause__, CryptoError):
+            return "encrypted"
+        return "UNREADABLE"
+    except Exception:  # noqa: BLE001 - any other failure is not "protected"
+        return "UNREADABLE"
     return "default password"
 
 
@@ -938,10 +1126,18 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
         return
     try:
         value = float(raw)
-        if value < 0:
+        # `inf` and `nan` parse as floats. inf crashed `_render_number` on
+        # the way to the file; nan passed `< 0` and would have been written
+        # as a target that no progress ever reaches or exceeds.
+        if not math.isfinite(value) or value < 0:
+            raise ValueError
+        if key == "cycles" and not value.is_integer():
+            # Written as typed and read back as a whole number, so 2.5 would
+            # save "2.5" and then refuse to load.
             raise ValueError
     except ValueError:
-        print("  must be a non-negative number")
+        print("  must be a non-negative number"
+              + (" (a whole number of cycles)" if key == "cycles" else ""))
         return
 
     _write_target(config_path, key, value, config.target)
@@ -988,6 +1184,22 @@ def _write_mode(config_path: str, mode: str) -> None:
     _write_scalar(config_path, "mode", mode)
 
 
+_SYMBOL_LINE = re.compile(r"""^\s*(?:-\s+)?symbol\s*:\s*(['"]?)([^'"#\s]+)\1\s*(?:#.*)?$""")
+
+
+def _symbol_on(line: str) -> str | None:
+    """The market a `symbol:` line names, however it is spelled.
+
+    Matched by exact text before, so `symbol: "ETH-USD"`, `symbol: ETH-USD  #
+    the dear one` or `symbol:  ETH-USD` were all invisible -- and turning that
+    market on or off from the menu failed with "not in the settings file" for a
+    market the file plainly listed. Quotes, spacing and a trailing comment are
+    what YAML itself ignores, so they are ignored here too.
+    """
+    match = _SYMBOL_LINE.match(line)
+    return match.group(2) if match else None
+
+
 def _block_at(lines: list[str], symbol: str) -> tuple[int, int] | None:
     """The line range of the market block naming `symbol`, or None.
 
@@ -998,8 +1210,7 @@ def _block_at(lines: list[str], symbol: str) -> tuple[int, int] | None:
     and the block runs until a line at or above its own indentation.
     """
     for index, line in enumerate(lines):
-        stripped = line.strip().lstrip("- ").strip()
-        if stripped != f"symbol: {symbol}":
+        if _symbol_on(line) != symbol:
             continue
         indent = len(line) - len(line.lstrip())
         if line.lstrip().startswith("- "):
@@ -1050,7 +1261,15 @@ def _write_market_enabled(config_path: str, symbol: str, enabled: bool) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
-def _append_market(config_path: str, symbol: str, template: LegConfig) -> None:
+def _append_market(
+    config_path: str,
+    symbol: str,
+    template: LegConfig,
+    *,
+    notional: str | None = None,
+    cap: str | None = None,
+    leverage: float | None = None,
+) -> None:
     """Add a market to the file, copying its numbers from an existing one.
 
     Copied rather than asked for one field at a time: the numbers that matter
@@ -1058,6 +1277,11 @@ def _append_market(config_path: str, symbol: str, template: LegConfig) -> None:
     at seven settings is a market that trades wrong. The copy is a starting
     point the operator can edit, and the screen says which market it came
     from.
+
+    `notional`, `cap` and `leverage` are what `_add_market` worked out for the
+    NEW market -- the template's dollar size (or a stand-in when it has none),
+    and its leverage clamped to the new market's ceiling. Left as None they
+    fall back to the template's own, for callers that have nothing to adjust.
     """
     with open(config_path, encoding="utf-8") as handle:
         lines = handle.read().splitlines()
@@ -1069,17 +1293,24 @@ def _append_market(config_path: str, symbol: str, template: LegConfig) -> None:
     if listed is None and mapped is None:
         raise ConfigError(f"{config_path} has neither a markets: nor a legs: block")
 
+    if notional is None:
+        notional = _render_span(template.notional_span, template.notional_usd)
+    if cap is None and template.max_order_notional_usd > 0:
+        cap = _render_span(template.max_order_span, template.max_order_notional_usd)
+    if leverage is None:
+        leverage = template.leverage
+
     fields = [
-        f"notional_usd: {_render_span(template.notional_span, template.notional_usd)}",
-        f"leverage: {_render_number(template.leverage or 0)}"
-        if template.leverage
-        else None,
+        f"notional_usd: {notional}",
+        f"leverage: {_render_number(leverage)}" if leverage else None,
         f"offset_bps: {_render_span(template.offset_span, template.offset_bps)}",
         f"max_distance_bps: {_render_number(template.max_distance_bps)}",
         f"chase_patience_s: {_render_number(template.chase_patience_s)}",
         f"improve_ticks: {template.improve_ticks}",
-        "max_order_notional_usd: "
-        f"{_render_span(template.max_order_span, template.max_order_notional_usd)}",
+        # Omitted rather than written as 0 when there is no dollar cap to copy:
+        # absent means "the whole leg", which is what a coin cap copied into a
+        # different coin could not honestly mean anyway.
+        f"max_order_notional_usd: {cap}" if cap else None,
         "enabled: true",
     ]
     fields = [field for field in fields if field]
@@ -1145,30 +1376,52 @@ def _market_line(leg: LegConfig) -> str:
     return f"[{state}] {leg.symbol:<10} {size} per cycle"
 
 
-def _listed_symbols(config: Config) -> list[str]:
-    """Every market the exchange lists, for the add screen."""
+def _exchange_markets(config: Config) -> dict[str, dict]:
+    """Every market the exchange lists, keyed by symbol, from one request.
+
+    One read serves the whole add screen -- the list to choose from, the new
+    market's minimum order and its leverage ceiling -- where it used to be
+    fetched twice, and the second copy could disagree with the first.
+    """
     info = _http(config).get_exchange_info()
     markets = info if isinstance(info, list) else info.get("symbols", [])
-    return sorted(m["symbol"] for m in markets if isinstance(m, dict) and "symbol" in m)
+    return {
+        m["symbol"]: m for m in markets if isinstance(m, dict) and "symbol" in m
+    }
 
 
-def _min_notional(config: Config, symbol: str) -> float:
-    info = _http(config).get_exchange_info()
-    markets = info if isinstance(info, list) else info.get("symbols", [])
-    for entry in markets:
-        if isinstance(entry, dict) and entry.get("symbol") == symbol:
-            return float(entry.get("minNotional") or 0.0)
-    return 0.0
+# What a market added from the menu starts at when no existing market is sized
+# in dollars to copy from. The shipped settings' own figure.
+NEW_MARKET_NOTIONAL_USD = 100.0
+
+
+def _template_market(config: Config) -> LegConfig | None:
+    """The market a new one copies its size from: one written in dollars.
+
+    Only a dollar size means the same thing in another market. `size: 0.001`
+    is a quantity of BTC; copied into ETH-USD it would be a thousandth of an
+    ether. And copying it as `notional_usd` -- which is what happened -- wrote
+    `notional_usd: 0`, a market with no size, which the next load refused and
+    took the whole bot down with it. Prefers one switched on, since that is the
+    one somebody tuned recently.
+    """
+    in_dollars = [
+        leg for leg in config.markets
+        if leg.notional_usd > 0 or leg.notional_span is not None
+    ]
+    enabled = [leg for leg in in_dollars if leg.enabled]
+    return (enabled or in_dollars or [None])[0]
 
 
 def _add_market(config: Config, config_path: str) -> None:
     """Add one of the exchange's markets, copied from a market already set up."""
     have = {leg.symbol for leg in config.markets}
     try:
-        available = [s for s in _listed_symbols(config) if s not in have]
+        listed = _exchange_markets(config)
     except Exception as exc:  # noqa: BLE001 - the menu must survive the exchange
         print(f"\n  could not read the market list: {exc}")
         return
+    available = sorted(s for s in listed if s not in have)
     if not available:
         print("\n  every market the exchange lists is already in the file")
         return
@@ -1181,29 +1434,70 @@ def _add_market(config: Config, config_path: str) -> None:
         print("  aborted")
         return
     symbol = available[int(answer) - 1]
+    spec = listed[symbol]
 
-    template = config.markets[0]
-    floor = _min_notional(config, symbol)
-    smallest = (
-        template.notional_span.low
-        if template.notional_span is not None
-        else template.notional_usd
-    )
-    if floor and smallest and smallest < floor:
-        # Said before it is written, not discovered as a rejected order an
-        # hour into a run.
+    def read(key: str) -> float:
+        try:
+            return float(spec.get(key) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    floor = read("minNotional")
+    ceiling = read("maxLeverage")
+
+    template = _template_market(config)
+    switch_off = False
+    if template is None:
+        # Every market is sized in coins. The chase settings still copy fine;
+        # the size cannot, so it starts at a stand-in and switched off.
+        template = config.markets[0]
+        start = max(floor, NEW_MARKET_NOTIONAL_USD)
+        notional, cap = _render_number(start), None
+        switch_off = True
         print(
-            f"\n  !! {symbol} will not accept an order under ${floor:g}, and the "
-            f"size copied from {template.symbol} starts at ${smallest:g}."
+            f"\n  !! {template.symbol} is sized in coins, which mean something else "
+            f"in {symbol}."
         )
-        print("     It will be added switched off. Raise notional_usd for it,")
-        print("     then turn it on here.")
+        print(f"     It will be added switched off at notional_usd: {notional}.")
+        print("     Set the size you want for it, then turn it on here.")
+    else:
+        notional, cap = None, None
+        smallest = (
+            template.notional_span.low
+            if template.notional_span is not None
+            else template.notional_usd
+        )
+        if floor and smallest and smallest < floor:
+            # Said before it is written, not discovered as a rejected order an
+            # hour into a run.
+            switch_off = True
+            print(
+                f"\n  !! {symbol} will not accept an order under ${floor:g}, and the "
+                f"size copied from {template.symbol} starts at ${smallest:g}."
+            )
+            print("     It will be added switched off. Raise notional_usd for it,")
+            print("     then turn it on here.")
 
-    _append_market(config_path, symbol, template)
-    if floor and smallest and smallest < floor:
+    leverage = template.leverage
+    if leverage and ceiling and leverage > ceiling:
+        # The run checks this at startup and refuses to start -- over a number
+        # the menu itself wrote. Clamped here instead, and said.
+        print(
+            f"\n  {template.symbol}'s leverage {_render_number(leverage)} is above "
+            f"{symbol}'s maximum of {_render_number(ceiling)} -- using "
+            f"{_render_number(ceiling)}."
+        )
+        leverage = ceiling
+
+    _append_market(
+        config_path, symbol, template,
+        notional=notional, cap=cap, leverage=leverage,
+    )
+    if switch_off:
         _write_market_enabled(config_path, symbol, False)
     print(f"\n  {symbol} added to {config_path}, copied from {template.symbol}")
-    print("  Restart from the menu for it to take effect.")
+    # There is no restart item in the menu; the file is read once, at start.
+    print("  It is read when the bot starts: exit (0) and run it again to trade it.")
 
 
 def _markets_screen(config: Config, config_path: str) -> None:
@@ -1467,10 +1761,10 @@ def _close_all(config: Config) -> None:
 
     choice = _ask("\n  > ")
     if choice == "1":
-        asyncio.run(cmd_flatten(config, dry_run=True))
+        asyncio.run(cmd_flatten(_fresh(config), dry_run=True))
     elif choice == "2":
         if _confirm("Close all positions at market."):
-            asyncio.run(cmd_flatten(config, dry_run=False))
+            asyncio.run(cmd_flatten(_fresh(config), dry_run=False))
         else:
             print("  aborted")
     elif choice == "3":
@@ -1482,7 +1776,8 @@ def _close_all(config: Config) -> None:
             print("  so it can take a while -- Ctrl+C cancels the orders and stops.")
             asyncio.run(
                 cmd_flatten(
-                    config, dry_run=False, limit=True, timeout_s=LIMIT_CLOSE_TIMEOUT_S
+                    _fresh(config), dry_run=False, limit=True,
+                    timeout_s=LIMIT_CLOSE_TIMEOUT_S,
                 )
             )
         else:
@@ -1493,31 +1788,52 @@ def _close_all(config: Config) -> None:
 # -- entry point ------------------------------------------------------------
 
 
+# The main menu, in order. Numbered from this list rather than by hand, and the
+# one place anything else learns an item's number from -- the stop banner a
+# live run prints names "Close All Positions" by its number, and that number
+# was a literal in cli.py waiting for the day this list changed.
+CLOSE_ALL_LABEL = "Close All Positions"
+MAIN_ITEMS = (
+    "Start",
+    "Active Strategy",
+    "History",
+    "Accounts Management",
+    "Configuration",
+    CLOSE_ALL_LABEL,
+    "Logs",
+)
+
+
+def main_item(label: str) -> str:
+    """`label` as the main menu shows it, number included: `6. Close ...`."""
+    return f"{MAIN_ITEMS.index(label) + 1}. {label}"
+
+
 def run_menu(config: Config, config_path: str) -> int:
-    items = [
-        "1. Start",
-        "2. Active Strategy",
-        "3. History",
-        "4. Accounts Management",
-        "5. Configuration",
-        "6. Close All Positions",
-        "7. Logs",
-        "0. Exit",
-    ]
-    actions: dict[str, Callable[[], None]] = {
-        "1": lambda: _start(config),
-        "2": lambda: _active_strategy(config),
-        "3": lambda: _history(config),
-        "4": lambda: _accounts_menu(config, config_path),
-        "5": lambda: _configuration(config, config_path),
-        "6": lambda: _close_all(config),
-        "7": _logs,
+    items = [main_item(label) for label in MAIN_ITEMS] + ["0. Exit"]
+    handlers: dict[str, Callable[[], None]] = {
+        "Start": lambda: _start(config),
+        "Active Strategy": lambda: _active_strategy(config),
+        "History": lambda: _history(config),
+        "Accounts Management": lambda: _accounts_menu(config, config_path),
+        "Configuration": lambda: _configuration(config, config_path),
+        CLOSE_ALL_LABEL: lambda: _close_all(config),
+        "Logs": _logs,
+    }
+    actions = {
+        str(number): handlers[label]
+        for number, label in enumerate(MAIN_ITEMS, start=1)
     }
 
     while True:
         print("\n" + _box("DELTA-NEUTRAL BOT", items))
         print(f"  mainnet  {config.http_url}")
-        choice = _ask("\n  > ")
+        try:
+            choice = _ask("\n  > ")
+        except Cancelled:
+            # Ctrl+C or a closed input at the top level means leave. Looping
+            # instead would spin forever on an input that is gone.
+            return 0
         if choice == "0":
             return 0
         action = actions.get(choice)
@@ -1526,6 +1842,9 @@ def run_menu(config: Config, config_path: str) -> int:
             continue
         try:
             action()
+        except Cancelled:
+            # Whatever the prompt was about to write or send, it did not.
+            print("  cancelled -- nothing was changed")
         except NoAccountTree as exc:
             print(f"\n  {exc}")
             _pause()

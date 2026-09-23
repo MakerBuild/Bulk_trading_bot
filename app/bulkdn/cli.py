@@ -267,9 +267,10 @@ class Runtime:
         subscribes on their behalf, nothing polls for them, and no later code
         has to remember that some accounts are present but off limits.
         """
-        keys = config.private_keys or (
-            [config.private_key] if config.private_key else []
-        )
+        # `private_keys` only. Config.__post_init__ already folds a lone
+        # `private_key` into it, and a second fallback here was a second rule
+        # for "which keys exist" that could drift from the first.
+        keys = config.private_keys
         if config.mode != "single":
             return keys
         index = max(1, config.single_master) - 1
@@ -593,13 +594,24 @@ class Runtime:
 # -- commands --------------------------------------------------------------
 
 
-STOP_BANNER = [
-    "S  --  stop and cancel",
-    "",
-    "Stops both legs at the next tick and pulls every resting",
-    "order, then returns to the menu. Open positions are left",
-    "as they are -- close them with `6. Close All Positions`.",
-]
+def _stop_banner() -> list[str]:
+    """What the stop key does, naming the menu item that closes positions.
+
+    The item is looked up rather than typed. The banner said `6. Close All
+    Positions` as a literal, and a menu that gains or reorders an item then
+    sends the operator -- at exactly the moment they want out -- to the wrong
+    number. Imported here rather than at the top because `menu` imports this
+    module; see `main`.
+    """
+    from .menu import CLOSE_ALL_LABEL, main_item
+
+    return [
+        "S  --  stop and cancel",
+        "",
+        "Stops every leg at the next tick and pulls every resting",
+        "order, then returns to the menu. Open positions are left",
+        f"as they are -- close them with `{main_item(CLOSE_ALL_LABEL)}`.",
+    ]
 
 
 def _print_stop_banner() -> None:
@@ -608,11 +620,12 @@ def _print_stop_banner() -> None:
     Measured rather than typed: hand-aligned box borders drift the moment a
     line is edited, and a crooked box is the first thing read as "unfinished".
     """
-    width = max(len(line) for line in STOP_BANNER) + 4
+    lines = _stop_banner()
+    width = max(len(line) for line in lines) + 4
     rule = "  +" + "-" * width + "+"
     print()
     print(rule)
-    for line in STOP_BANNER:
+    for line in lines:
         print("  |  " + line.ljust(width - 2) + "|")
     print(rule)
     print()
@@ -672,6 +685,10 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
         with contextlib.suppress(asyncio.CancelledError):
             await stopper
         await runtime.stop()
+        # Cycle reports and halt alerts go out in the background. asyncio.run
+        # cancels anything still pending the moment this returns, so the last
+        # of them -- often the one that matters -- gets a few seconds to land.
+        await runtime.notifier.drain()
 
 
 async def cmd_flatten(
@@ -703,12 +720,17 @@ async def cmd_flatten(
         # waiting to happen on an account nobody is watching any more.
         await cancel_all_orders(runtime.pool, runtime.symbols)
         if limit:
+            # From the first market switched on. `markets[0]` is whatever
+            # happens to be first in the file, and it may be one switched off
+            # months ago with a setting nobody has looked at since. One value
+            # for every market because flatten_limit takes one.
+            tuned = [m for m in config.markets if m.enabled] or list(config.markets)
             closed = await flatten_limit(
                 runtime.sessions,
                 runtime.book,
                 runtime.feed,
                 runtime.symbols,
-                improve_ticks=config.master_account.improve_ticks,
+                improve_ticks=tuned[0].improve_ticks,
                 timeout_s=timeout_s,
             )
         else:
@@ -779,8 +801,14 @@ async def cmd_flatten(
 
 async def cmd_status(config: Config) -> int:
     """Read-only: print positions, open orders, and persisted state."""
-    runtime = Runtime(config, dry_run=True)
+    # Every market in the settings, switched on or not -- the same set
+    # `flatten` closes. A market turned off with a position still open is
+    # exactly what someone reading `status` needs to see, and it was the one
+    # thing this left out.
+    every_market = list(dict.fromkeys(market.symbol for market in config.markets))
+    runtime = Runtime(config, dry_run=True, symbols=every_market)
     runtime.feed.load_specs()
+    switched_off = {m.symbol for m in config.markets if not m.enabled}
 
     # Every account, not the named pair. `status` is what an operator reads
     # to decide whether anything is open, and answering for two accounts out
@@ -815,7 +843,11 @@ async def cmd_status(config: Config) -> int:
         held = " ".join(
             f"{name}={size:+.8f}" for name, size in sizes.items() if size
         )
-        print(f"  {symbol:<10} net={sum(sizes.values()):+.8f}  {held or 'all flat'}")
+        off = "  (switched off)" if symbol in switched_off else ""
+        print(
+            f"  {symbol:<10} net={sum(sizes.values()):+.8f}  "
+            f"{held or 'all flat'}{off}"
+        )
 
     print("\nopen orders:")
     for session in runtime.pool:
@@ -855,7 +887,9 @@ async def cmd_check(config: Config) -> int:
             "\nIf the account does not exist yet, the master itself has to be "
             "created first by an on-chain deposit -- this bot cannot do that. "
             "Once the master is funded, run `bulkdn create-subaccount --name "
-            "<name>`, then put the returned pubkey in the config."
+            "<name>` (or Accounts Management -> Create New Subaccount). There "
+            "is nothing to copy into the settings: the bot finds sub-accounts "
+            "from the master at startup."
         )
         return 1
     return 0
@@ -870,7 +904,7 @@ def _tree_holding(config: Config, pubkey: str) -> tuple[str, list[str]] | None:
     """
     from .accounts import discover_accounts
 
-    for key in config.private_keys or ([config.private_key] if config.private_key else []):
+    for key in config.private_keys:
         try:
             master, children = discover_accounts(
                 private_key=key, http_url=config.http_url
@@ -881,6 +915,72 @@ def _tree_holding(config: Config, pubkey: str) -> tuple[str, list[str]] | None:
         if pubkey in accounts:
             return key, accounts
     return None
+
+
+# -- what a signed account action actually did -------------------------------
+#
+# A transfer or a createSubAccount is POSTed with retries that replay the SAME
+# signed body. That keeps a retry from becoming a second transfer -- and it is
+# also why a failure after a replay proves nothing. The first attempt may have
+# been applied and only its answer lost; the replay then comes back refused
+# (nonce already used) or times out as well. "Rejected -- balances unchanged"
+# was printed for all of it, and an operator who believed it and ran the
+# transfer again moved the money twice.
+#
+# So there are four outcomes, not two. The transport layer marks a result (or
+# the RetryExhausted it raises) `uncertain` when some attempt may have reached
+# the exchange without an answer; this turns that into what the operator is
+# told.
+
+ACCEPTED = "accepted"
+REJECTED = "rejected"
+UNKNOWN = "unknown"
+# Every attempt failed before anything reached the exchange -- refused
+# connection, DNS, connect timeout. Nothing can have been applied.
+UNSENT = "unsent"
+
+# Exit code for "sent, but whether it took effect cannot be known from here".
+# Distinct from 1 so a script -- and the menu -- can tell "refused, safe to fix
+# and resend" from "check before you touch it".
+EXIT_UNKNOWN = 2
+
+
+def submit_signed(submit, **kwargs):
+    """Run one signed account action and classify what happened.
+
+    Returns `(result, outcome, detail)`. `result` is None when no answer came
+    back at all. `outcome` is ACCEPTED; REJECTED -- the exchange answered and
+    said no, with nothing lost on the way, so nothing changed; UNSENT -- it was
+    never reached; or UNKNOWN.
+
+    `uncertain` is read with getattr so a result from a transport that does not
+    report it is judged on its status alone; a final 5xx is a gateway that may
+    have forwarded the request, which is UNKNOWN either way.
+    """
+    from .retry import RetryExhausted
+
+    try:
+        result = submit(**kwargs)
+    except RetryExhausted as exc:
+        # No answer at all. Unknown unless the transport is sure no attempt
+        # left the machine; absent the flag, assume one might have.
+        if getattr(exc, "uncertain", True):
+            return None, UNKNOWN, describe(exc.last)
+        return None, UNSENT, describe(exc.last)
+    if result.ok:
+        return result, ACCEPTED, ""
+    detail = f"HTTP {result.response_status} {result.response_json}"
+    if getattr(result, "uncertain", False) or result.response_status >= 500:
+        return result, UNKNOWN, detail
+    return result, REJECTED, detail
+
+
+UNKNOWN_ADVICE = (
+    "The outcome is UNKNOWN: the request hit a network fault, and an attempt "
+    "may already have been applied without its answer arriving. Check the "
+    "balances (`bulkdn status`, or the Balance screen) BEFORE trying again, "
+    "or the same money may move twice."
+)
 
 
 async def cmd_transfer(
@@ -928,7 +1028,8 @@ async def cmd_transfer(
         f"  via  {config.http_url}\n"
     )
 
-    result = submit_transfer(
+    result, outcome, detail = submit_signed(
+        submit_transfer,
         http_url=config.http_url,
         private_key=key,
         domain=SignatureDomain[config.signature_domain_name],
@@ -937,9 +1038,17 @@ async def cmd_transfer(
         margin_amount=amount,
     )
 
-    print(f"HTTP {result.response_status}")
-    print(result.response_json)
-    if not result.ok:
+    if result is not None:
+        print(f"HTTP {result.response_status}")
+        print(result.response_json)
+    if outcome == UNKNOWN:
+        print(f"\nno confirmation ({detail}).\n{UNKNOWN_ADVICE}")
+        return EXIT_UNKNOWN
+    if outcome == UNSENT:
+        print(f"\nthe exchange could not be reached ({detail}) -- nothing was "
+              "sent, balances unchanged")
+        return 1
+    if outcome == REJECTED:
         print("\ntransfer rejected -- balances unchanged")
         return 1
     print("\ntransfer accepted; confirm with `bulkdn status`")
@@ -1029,7 +1138,8 @@ async def cmd_create_subaccount(
         f"mainnet, domain byte {SignatureDomain[config.signature_domain_name].value}\n"
     )
 
-    result = build_and_submit(
+    result, outcome, detail = submit_signed(
+        build_and_submit,
         http_url=config.http_url,
         private_key=private_key or config.private_key,
         domain=SignatureDomain[config.signature_domain_name],
@@ -1037,25 +1147,45 @@ async def cmd_create_subaccount(
         margin_amount=margin_amount,
     )
 
-    print(f"HTTP {result.response_status}")
-    print(result.response_json)
+    if result is not None:
+        print(f"HTTP {result.response_status}")
+        print(result.response_json)
 
-    if result.ok:
+    if outcome == ACCEPTED:
         pubkey = result.sub_pubkey
         if pubkey:
             # Nothing to copy anywhere: Runtime reads the master's own record
             # to find this at startup.
             print(f"\ncreated: {pubkey}")
         else:
+            # Still nothing to copy -- the bot discovers sub-accounts from the
+            # master. This used to send the operator to set `sub1_pubkey`,
+            # a setting no code has read for several versions.
             print(
-                "\naccepted, but the response carried no pubkey -- check `bulkdn status` "
-                "or the BULK UI, then add it as sub1_pubkey in your config."
+                "\naccepted, but the response carried no pubkey -- check "
+                "`bulkdn status` or the BULK UI to see it. Nothing needs adding "
+                "to the settings: the bot finds it from the master on startup."
             )
         return 0
 
+    if outcome == UNKNOWN:
+        print(
+            f"\nno confirmation ({detail}).\n"
+            "The outcome is UNKNOWN: the request hit a network fault, and an "
+            "attempt may already have created it without the answer arriving. "
+            "Check `bulkdn status` or the BULK UI BEFORE trying again, or you "
+            "may end up with two."
+        )
+        return EXIT_UNKNOWN
+
+    if outcome == UNSENT:
+        print(f"\nthe exchange could not be reached ({detail}) -- nothing was sent")
+        return 1
+
     print(
-        "\nrejected. If the message is `bad signature`, the signed bytes disagree "
-        "with what the server expects. Nothing was changed on the account."
+        "\nrejected. If the message is `bad signature`, the "
+        "signed bytes disagree with what the server expects. Nothing was "
+        "changed on the account."
     )
     return 1
 
@@ -1063,7 +1193,10 @@ async def cmd_create_subaccount(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bulkdn",
-        description="Delta-neutral BTC/SOL bot across a BULK master account and sub-account",
+        description=(
+            "Delta-neutral volume bot for BULK: trades every market enabled in "
+            "the settings across a pool of master and sub-accounts"
+        ),
     )
     parser.add_argument("--config", default="settings.yaml", help="path to the settings file")
     parser.add_argument("--log-level", help="override the log level in the config file")
@@ -1120,7 +1253,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     create_sub = sub.add_parser(
         "create-subaccount",
-        help="create a sub-account (best-effort -- SDK has no signer for this action)",
+        help="create a sub-account under the master (signed by the bot itself)",
     )
     create_sub.add_argument("--name", required=True, help="sub-account name, 1-32 chars")
     create_sub.add_argument(
@@ -1209,6 +1342,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 3
+    except ConfigError as exc:
+        # Raised after loading too: Runtime is where the settings meet the
+        # exchange -- fewer than two accounts to pair, a single_master past the
+        # last key, a leverage above the market's ceiling. The same plain
+        # sentence as a bad file, not a traceback through asyncio.run.
+        print(f"\nconfiguration error: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         log.warning("interrupted")
         return 130

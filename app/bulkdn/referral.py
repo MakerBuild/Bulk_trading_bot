@@ -257,13 +257,25 @@ class ReferralStatus:
         return ", ".join(parts) or "no referral or invite"
 
 
-def _owner_label(status: ReferralStatus) -> str:
+def _owner_label(status: ReferralStatus, *, route: str) -> str:
     """How to name the build owner in a line other people will read.
 
-    Their referral code when the indexer reports one -- it is a name they
+    Their referral code when it is known to be THEIRS -- it is a name they
     chose to publish. Never their wallet: that is an address they did not.
+
+    `referred_by_code` is the owner's code only on the referral route, where
+    the referrer wallet it belongs to is the one that matched. On the invite
+    route it was used regardless, and it belongs to whoever REFERRED the
+    account, which need not be the owner at all: an account invited by the
+    owner and referred by someone else was reported as "invited by
+    <someone else's code>", naming a stranger as the owner of this build to
+    everyone it was handed to. The invite route has no public name to offer
+    -- `invited_by_code_id` is an internal id, not the code the owner holds --
+    so it says who, generically, rather than guessing.
     """
-    return status.referred_by_code or "the owner of this build"
+    if route == "referral" and status.referred_by_code:
+        return status.referred_by_code
+    return "the owner of this build"
 
 
 def _as_str(value) -> str | None:
@@ -357,9 +369,13 @@ def check_access(
     # alone, which is all the operator needs: it says they are admitted and by
     # which door.
     if status.referred_by_wallet and wallet_digest(status.referred_by_wallet) in allowed.wallets:
-        return AccessDecision(True, f"referred by {_owner_label(status)}", status)
+        return AccessDecision(
+            True, f"referred by {_owner_label(status, route='referral')}", status
+        )
     if status.invited_by_wallet and wallet_digest(status.invited_by_wallet) in allowed.wallets:
-        return AccessDecision(True, f"invited by {_owner_label(status)}", status)
+        return AccessDecision(
+            True, f"invited by {_owner_label(status, route='invite')}", status
+        )
 
     if status.referred_by_code and code_digest(status.referred_by_code) in allowed.codes:
         return AccessDecision(

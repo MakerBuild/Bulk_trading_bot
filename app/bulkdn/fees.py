@@ -21,10 +21,15 @@ progress.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import requests
+
+from .marketdata import epoch_seconds
+
+log = logging.getLogger(__name__)
 
 # Feature tiers come back under differing key spellings across scopes; accept
 # both rather than guessing which one a given deployment uses.
@@ -164,6 +169,9 @@ class Realised:
     fees_usd: float = 0.0
     volume_usd: float = 0.0
     self_trade_volume_usd: float = 0.0
+    # True when some account's history was longer than the walk would read,
+    # so these totals are a lower bound. See `realised_for_account`.
+    truncated: bool = False
 
     @property
     def qualifying_volume_usd(self) -> float:
@@ -201,7 +209,9 @@ class Realised:
         return self.volume_usd - self.self_trade_volume_usd
 
     @classmethod
-    def from_fills(cls, rows, tree: set[str], seen: set | None = None) -> Realised:
+    def from_fills(
+        cls, rows, tree: set[str], seen: set | None = None, user: str | None = None
+    ) -> Realised:
         """Total one page of fills.
 
         `seen` carries trade ids across the whole walk so each trade is counted
@@ -218,16 +228,18 @@ class Realised:
 
         Rows are plain dicts straight from the API. See `fills_page` for why
         they are not the SDK's parsed model.
+
+        `user` is whose history the rows came from. It decides which side's
+        fee is theirs when a row carries `makerFee`/`takerFee` rather than a
+        single `fee` -- see `_fee_of`.
         """
         total = cls()
         for fill in rows:
             notional = float(fill.get("amount") or 0.0) * float(fill.get("price") or 0.0)
             total.fills += 1
-            total.fees_usd += float(fill.get("fee") or 0.0)
+            total.fees_usd += _fee_of(fill, user)
 
-            # `slot` and `sequence` identify the trade itself. Verified unique
-            # across a live history: 1830 rows, 1465 ids, no collisions.
-            trade = (fill.get("slot"), fill.get("sequence"))
+            trade = _trade_key(fill)
             if seen is not None:
                 if trade in seen:
                     continue
@@ -244,7 +256,69 @@ class Realised:
             fees_usd=self.fees_usd + other.fees_usd,
             volume_usd=self.volume_usd + other.volume_usd,
             self_trade_volume_usd=self.self_trade_volume_usd + other.self_trade_volume_usd,
+            truncated=self.truncated or other.truncated,
         )
+
+
+# Fields that describe one account's VIEW of a trade rather than the trade:
+# which side it was on and what it was charged. Two histories showing the same
+# trade differ in these, so they are left out of the fallback identity below.
+_VIEW_FIELDS = frozenset({"fee", "makerFee", "takerFee", "isBuy", "side", "user", "account"})
+
+
+def _trade_key(fill: dict):
+    """What identifies the trade a row belongs to, for counting it once.
+
+    `slot` and `sequence` together, when both are there -- verified unique
+    across a live history: 1830 rows, 1465 ids, no collisions. That is the
+    only shape seen so far.
+
+    It used to be those two and nothing else, so a row missing either one got
+    the key `(None, None)` -- and so did every other such row. The first was
+    counted and every later one was taken for a repeat of it: a history in
+    another shape would have totalled one trade's volume, and a volume target
+    would never have been reached. A `tradeId` is used instead where there is
+    one; failing that, the row's own contents minus the per-account fields, so
+    that two rows are only ever merged when they genuinely say the same thing.
+    """
+    slot, sequence = fill.get("slot"), fill.get("sequence")
+    if slot is not None and sequence is not None:
+        return ("slot", slot, sequence)
+    trade_id = fill.get("tradeId", fill.get("tid"))
+    if trade_id is not None:
+        return ("id", str(trade_id))
+    return ("row",) + tuple(
+        sorted((k, repr(v)) for k, v in fill.items() if k not in _VIEW_FIELDS)
+    )
+
+
+def _fee_of(fill: dict, user: str | None) -> float:
+    """The fee THIS account paid on a fill row, signed as the API signs it.
+
+    The history rows seen so far carry a single `fee`. The fill stream, and
+    `burned_usd`'s own docstring, show the other spelling: `takerFee` and
+    `makerFee`. A row in that shape used to read as free -- `fee` absent, so
+    zero -- and a burn target measured on it would never have been reached.
+
+    With both side fields present, the one for the side `user` was on is
+    theirs; both, if they were somehow on both. Without a `user` to go by, or
+    with a row naming neither side as them, whatever side fields are present
+    are summed -- which is exact for a row that carries only its own side.
+    """
+    if fill.get("fee") is not None:
+        return float(fill.get("fee") or 0.0)
+    maker_fee = fill.get("makerFee")
+    taker_fee = fill.get("takerFee")
+    if maker_fee is None and taker_fee is None:
+        return 0.0
+    if user is not None and (fill.get("maker") == user or fill.get("taker") == user):
+        total = 0.0
+        if fill.get("maker") == user:
+            total += float(maker_fee or 0.0)
+        if fill.get("taker") == user:
+            total += float(taker_fee or 0.0)
+        return total
+    return float(maker_fee or 0.0) + float(taker_fee or 0.0)
 
 
 def fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[dict], str | None]:
@@ -281,9 +355,34 @@ def fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[di
     return rows, next_cursor
 
 
+# Accounts already warned about in this process. The walk runs every thirty
+# seconds while a target is set; once per account is enough to be seen.
+_TRUNCATION_WARNED: set[str] = set()
+
+# Where a history row may carry its time, in milliseconds.
+_TIME_KEYS = ("timestamp", "time", "ts")
+
+
+def _row_time_ms(row: dict) -> float | None:
+    """The row's time in epoch milliseconds, whatever unit it was stamped in.
+
+    Fills are stamped in nanoseconds. Read as-is and compared with a cutoff in
+    milliseconds, every row was "newer" than any run's start, the walk never
+    stopped early, and the target counted the account's whole history.
+    """
+    for key in _TIME_KEYS:
+        value = row.get(key)
+        if value is not None:
+            try:
+                return epoch_seconds(float(value)) * 1000.0
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def realised_for_account(
     http, user: str, tree: set[str], limit: int = 1000, max_pages: int = 20,
-    seen: set | None = None,
+    seen: set | None = None, since_ms: float | None = None,
 ) -> Realised:
     """Walk an account's fill history and total spend and volume.
 
@@ -292,14 +391,55 @@ def realised_for_account(
 
     `max_pages` bounds the walk. History is paginated by cursor, and an account
     with a long life would otherwise make this unbounded.
+
+    **Hitting that bound makes the totals wrong, not merely incomplete.** The
+    burn and volume targets are measured as (total now - total at the run's
+    start), and both totals come from this walk. Past `max_pages * limit`
+    fills -- twenty thousand by default, a day's work for a busy pool -- each
+    read sees only the newest twenty thousand, so the difference is the new
+    fills minus the old ones that dropped off the far end: roughly zero, and
+    the target is never reached. It used to stop there in silence. It now
+    warns, once per account per process, and marks the result `truncated`.
+
+    `since_ms` is the fix for that, for a caller that measures from a point in
+    time rather than by difference: rows older than it are not counted, and
+    when the pages come newest-first the walk stops at the first page that
+    reaches back past it, so its length follows the run and not the account's
+    lifetime. Pages that come oldest-first cannot be cut short that way and
+    are read to the end, still skipping the old rows. A row without a time is
+    counted -- there is no way to place it. The execution target passes the
+    run's start here (`Strategy._read_totals`).
     """
     total = Realised()
     cursor = None
     for _ in range(max_pages):
         rows, cursor = fills_page(http, user, limit, cursor)
-        total = total + Realised.from_fills(rows, tree, seen)
-        if not cursor or not rows:
+        counted = rows
+        reached_back = False
+        if since_ms is not None:
+            times = [_row_time_ms(row) for row in rows]
+            known = [t for t in times if t is not None]
+            newest_first = len(known) >= 2 and known[0] >= known[-1]
+            reached_back = newest_first and known[-1] < since_ms
+            counted = [row for row, t in zip(rows, times, strict=True) if t is None or t >= since_ms]
+        total = total + Realised.from_fills(counted, tree, seen, user=user)
+        # On the page as served, not as filtered: an oldest-first history has
+        # whole pages from before `since_ms`, and there is more after them.
+        if not cursor or not rows or reached_back:
             break
+    else:
+        # Ran out of pages with a cursor still in hand: there was more.
+        if cursor:
+            total.truncated = True
+            if user not in _TRUNCATION_WARNED:
+                _TRUNCATION_WARNED.add(user)
+                log.warning(
+                    "fill history for %s is longer than the %d pages x %d read "
+                    "here -- spend and volume totals are a lower bound, and an "
+                    "execution target measured from them may never read as "
+                    "reached",
+                    user, max_pages, limit,
+                )
     return total
 
 

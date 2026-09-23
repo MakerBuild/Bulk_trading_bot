@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 
 import requests
 
-from .marketdata import MarketSpec
+from .marketdata import MarketSpec, epoch_seconds
 from .positions import PositionBook
 from .state import Phase
 
@@ -65,7 +65,9 @@ class Liquidation:
 
     @property
     def fully_closed(self) -> bool:
-        return abs(self.current) == 0.0
+        # Not `== 0.0`: a size that came through float arithmetic is rarely
+        # exactly zero when it means zero.
+        return abs(self.current) < 1e-12
 
     def describe(self) -> str:
         what = "closed" if self.fully_closed else "reduced"
@@ -174,9 +176,10 @@ class LiquidationGuard:
             for symbol, spec in self.specs.items():
                 current = book.authoritative(account, symbol)
                 if not accumulating(account, symbol):
-                    # This leg is unwinding, so shrinking is the plan. Keep the
-                    # peak current or its next entry would start from a high
-                    # that belongs to the position it just closed.
+                    # This leg is unwinding, so shrinking is the plan. The peak
+                    # is only raised here, never lowered; the next entry starts
+                    # from a clean peak because a finished leg's accounts are
+                    # reset by `reset_symbol`.
                     self.observe(account, symbol, current)
                     continue
                 key = (account, symbol)
@@ -229,9 +232,13 @@ def recent_liquidations(
     if not isinstance(events, list):
         raise ValueError(f"riskEvents returned {type(body).__name__}, not a list")
 
-    cutoff_ns = (time.time() - within_s) * 1e9
+    # Judged in seconds, whatever unit the event carries. The cutoff was in
+    # nanoseconds while the rest of the feed stamps in milliseconds, and a
+    # millisecond stamp read as nanoseconds is always "long ago".
+    cutoff = time.time() - within_s
     return [
         event
         for event in events
-        if isinstance(event, dict) and float(event.get("timestamp") or 0) >= cutoff_ns
+        if isinstance(event, dict)
+        and epoch_seconds(float(event.get("timestamp") or 0)) >= cutoff
     ]

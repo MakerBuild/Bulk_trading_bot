@@ -8,7 +8,7 @@ terminates -- a menu that cannot be left is worse than one that is ugly.
 import builtins
 
 from bulkdn import menu
-from bulkdn.config import HoldTime
+from bulkdn.config import ExecutionTarget, HoldTime
 
 
 class StubLeg:
@@ -21,6 +21,8 @@ class StubConfig:
 
     http_url = "https://mainnet-api1.bulk.trade/api/v1"
     cycles = 1
+    # The start screen states the real stop conditions, all of which live here.
+    target = ExecutionTarget(cycles=1)
     hold_minutes = HoldTime(5.0, 5.0)
     # The start screen names the markets before asking, because the mode can
     # come from the command line and the settings file is then not proof of
