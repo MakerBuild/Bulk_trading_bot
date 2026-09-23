@@ -1226,7 +1226,22 @@ class Strategy:
             # next decision must be made on exchange truth rather than on a
             # book that stopped being updated. Read over HTTP, which did not
             # drop, rather than waiting for the stream to refill the book.
-            sync_positions_http(self.all_sessions, self.book)
+            #
+            # Guarded, and off the event loop. This ran bare and synchronous
+            # inside the supervisor: one failed read -- a 429 or a 504, likely
+            # exactly when sockets are dropping -- raised out of `_supervise`
+            # and ended it, taking the exposure limits, the liquidation guard
+            # and the reconciler with it while the groups traded on. And on
+            # the loop it stalled every socket for a request per account.
+            try:
+                await self._sync_positions(max_age_s=0.0)
+            except Exception as exc:  # noqa: BLE001 - the book stays suspect
+                log.error(
+                    "could not re-read positions after reconnecting: %s -- "
+                    "holding hedges until a read succeeds",
+                    describe(exc),
+                )
+                self._book_suspect = True
         return restored
 
     # -- phase driver ------------------------------------------------------

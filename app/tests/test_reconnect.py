@@ -80,8 +80,16 @@ class FakeStrategy:
         self.sub1 = sub1
         self.book = object()
         self.resyncs = 0
+        self.resync_fails = False
+        self._book_suspect = False
         self._reconnect_times = []
         self.risk = FakeRisk()
+
+    async def _sync_positions(self, max_age_s=0.0):
+        """Stands in for the threaded, shared position read."""
+        if self.resync_fails:
+            raise RuntimeError("HTTP 429")
+        self.resyncs += 1
 
     @property
     def all_sessions(self):
@@ -620,3 +628,14 @@ async def test_the_wait_grows_rather_than_repeating():
 
     assert waits == sorted(waits), "the wait did not grow"
     assert sum(waits) > 30, f"six attempts spanned only {sum(waits):.0f}s"
+
+
+async def test_a_failed_re_read_does_not_end_the_supervisor():
+    """It ran bare inside `_supervise`: one 429 ended the supervisor, and the
+    exposure limits, the liquidation guard and the reconciler went with it
+    while the groups traded on."""
+    strategy, _master, _sub1 = build()
+    strategy.resync_fails = True
+
+    assert await strategy.healed(DROPPED) is True
+    assert strategy._book_suspect, "a book that could not be re-read is suspect"
