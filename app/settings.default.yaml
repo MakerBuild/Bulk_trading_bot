@@ -96,6 +96,9 @@
 #  DIFFERENT masters is not a self-trade to anybody, because nothing on the
 #  exchange links one master to another. That is the whole of the
 #  difference, and with one key in the file the two modes are identical.
+#
+#  You are responsible for complying with the exchange's terms, including
+#  its rules on self-trading and wash trading, whichever mode you choose.
 mode: multi
 single_master: 1
 
@@ -182,7 +185,7 @@ legs:
                             # has to sit ABOVE this, with room to spare. Raise
                             # one without the other and the first clean fill
                             # trips the kill switch: every order cancelled,
-                            # both accounts closed at market, bot stopped.
+                            # every account closed at market, bot stopped.
                             # Twice this value is a sane floor.
 
   sub_account:
@@ -216,7 +219,12 @@ hold_minutes: 0.5-1.5
 # ---------------------------------------------------------------------------
 #  WHEN TO STOP
 #
-#  Whichever limit is hit first ends the run. 0 disables that limit.
+#  Whichever limit is hit first ends the run. 0 disables that limit. Groups
+#  already open finish their cycle; no new ones are drawn.
+#
+#  `cycles` counts groups started in this run, a resumed group included --
+#  each group lives for exactly one open/hold/exit cycle.
+#
 #  Spend and volume are read from the exchange's own fill records, so they
 #  match what you were actually charged rather than a local guess.
 #
@@ -230,7 +238,7 @@ hold_minutes: 0.5-1.5
 #  to start the goal over deliberately.
 # ---------------------------------------------------------------------------
 execution_target:
-  cycles: 0                 # number of open/hold/exit cycles; 0 = unlimited
+  cycles: 0                 # number of groups to start; 0 = unlimited
   burn_usd: 3               # stop once $3 of fees has been spent this run
   volume_usd: 0             # stop once this much qualifying volume is done
 
@@ -238,7 +246,7 @@ execution_target:
 # ---------------------------------------------------------------------------
 #  SAFETY LIMITS
 #
-#  Breaching any of these cancels every order, closes both accounts, and
+#  Breaching any of these cancels every order, closes every account, and
 #  stops the bot. They are hard stops, not warnings.
 #
 #  Note on minimum order size: every market sets a floor -- $1 on BTC-USD, $50
@@ -247,7 +255,10 @@ execution_target:
 #  can remove. Keep max_net_exposure_usd comfortably above the larger floor.
 # ---------------------------------------------------------------------------
 risk:
-  max_net_exposure_usd: 500.0   # one-sided exposure the pair may carry.
+  max_net_exposure_usd: 500.0   # one-sided exposure allowed, checked per
+                                # market over every account AND per group.
+                                # A market with no price is valued at its
+                                # last known price, not at zero.
                                 # Must stay above legs.*.max_order_notional_usd
                                 # -- see the note there. 500 against the 100
                                 # above leaves 5x, which is why the shipped
@@ -267,7 +278,7 @@ risk:
 # when a resting order is never going to fill. It matters most on the way out,
 # where the sweep that closes anything left over runs only once the phase ends
 # -- so without this, an exit that cannot fill leaves positions open with the
-# bot still looking busy. Hitting it cancels, closes both accounts and stops.
+# bot still looking busy. Hitting it cancels, closes every account and stops.
 # 0 disables it.
 max_phase_minutes: 30
 
@@ -326,34 +337,56 @@ position_sync_interval_s: 60.0
 hedge_tolerance_lots: 1.0   # imbalance tolerated before hedging, in lots
 overlay_ttl_ms: 2000        # how long an unconfirmed fill is trusted
 
-# When the configured sizes need more margin than the accounts hold, every leg
-# is scaled down together until the cycle fits inside this share of the SMALLER
-# account's available margin. Sizes that already fit are used exactly as
-# written -- this is a fallback, not a permanent cap.
+# Sizes are weighed against the THINNEST account in the pool, since any account
+# can be drawn to open. A cycle whose margin fits within 80% of that account's
+# available margin is used exactly as written; the other 20% is what stands
+# between a one-sided account and liquidation while its hedge is in flight, and
+# what pays the fees. A cycle that needs more is scaled down -- every leg
+# together -- until it fits inside THIS share of that margin. So this is a
+# fallback, not a permanent cap.
 max_margin_fraction: 0.25
 
 
 # ---------------------------------------------------------------------------
-#  Sub-account
+#  Telegram
 #
-#  Normally discovered from your master account at startup -- a sub-account
-#  has no private key of its own, so its address is a fact about the master
-#  rather than something to configure. Set this only to pin one specific
-#  sub-account when the master has several.
+#  Optional. The bot runs unattended, and a halt that only reaches the console
+#  reaches nobody -- with this set, starts, finished cycles, halts and the end
+#  of a run are sent to Telegram as well. Nothing is sent until BOTH are set.
+#
+#    bot_token   from @BotFather when you create the bot
+#    user_ids    who receives the messages: numeric Telegram user ids (ask
+#                @userinfobot for yours). Each person must press Start in a
+#                chat with the bot once, or Telegram refuses to deliver.
+#
+#  A failed message never affects trading. If proxy.local holds an http(s)
+#  proxy, messages go through it too; a SOCKS proxy is not applied to them.
+#
+#  Sub-accounts are not configured anywhere: the bot finds every one of them
+#  from its master at startup. (Older files had a `sub1_pubkey` line here; it
+#  is no longer read and can be deleted.)
 # ---------------------------------------------------------------------------
-sub1_pubkey: ""
+# telegram:
+#   bot_token: "123456789:AAE-your-token-here"
+#   user_ids: [123456789]
 
 
 # ---------------------------------------------------------------------------
 #  Connection
 #
-#  The mainnet WebSocket currently serves an expired certificate while the
-#  HTTP host verifies cleanly. `ws_ssl_auto_bypass` keeps verification on but
-#  retries once without it, which is what keeps the account stream open -- and
-#  a bot that cannot see its fills cannot hedge. Set false to fail hard.
+#  TLS is verified on every connection, against the certificate bundle the bot
+#  ships with. An earlier version of this note said the WebSocket served an
+#  expired certificate; it never did. What had expired was a root certificate
+#  in the WINDOWS store, which the bot no longer relies on.
+#
+#  So both switches below are off, and should stay off. `ws_ssl_auto_bypass`
+#  retries once WITHOUT verification if the certificate is rejected -- for a
+#  network that genuinely cannot connect any other way. Turning it on means the
+#  fills and positions every hedge is computed from may come from an endpoint
+#  nothing has authenticated.
 # ---------------------------------------------------------------------------
-ws_ssl_auto_bypass: true
-ws_insecure_ssl: false      # skip verification outright; prefer the retry
+ws_ssl_auto_bypass: false
+ws_insecure_ssl: false      # skip verification outright; never use this
 
 # Endpoint overrides, for when the published hosts change.
 # http_url: "https://mainnet-api1.bulk.trade/api/v1"

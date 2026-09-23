@@ -42,6 +42,55 @@ if errorlevel 1 (
     exit /b 1
 )
 
+rem The pinned dependencies in app\docs\requirements.txt need a 64-bit Python
+rem 3.12 or newer: numpy 2.5 is the floor, and numba and llvmlite publish no
+rem 32-bit Windows wheels. The SDK wheel itself asks only for 3.10, and the
+rem bulk-keychain it declares -- the package with no wheels for new Pythons --
+rem is never installed, because the SDK goes in with --no-deps. So these are
+rem the real limits, and 3.12 through 3.14 is what has been run.
+rem
+rem Checked here because the failure otherwise comes from inside pip, as a
+rem wall of build errors for numpy or llvmlite, and the message after it said
+rem to check the internet. Checked against the interpreter that will run the
+rem bot: the existing virtualenv if there is one, since a re-run keeps it.
+set "PY_CHECK=python"
+if exist "app\.venv\Scripts\python.exe" set "PY_CHECK=app\.venv\Scripts\python.exe"
+set "PY_FOUND="
+rem Unquoted inside the for /f on purpose: both values above are space-free,
+rem relative to this folder, and a leading quote there makes cmd strip the
+rem wrong pair of quotes from the command.
+for /f "delims=" %%V in ('!PY_CHECK! -c "import platform; print(platform.python_version(), platform.architecture()[0])" 2^>nul') do set "PY_FOUND=%%V"
+if not defined PY_FOUND set "PY_FOUND=nothing -- it did not run"
+"!PY_CHECK!" -c "import sys, struct; sys.exit(0 if sys.version_info >= (3, 12) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   This needs 64-bit Python 3.12 or newer. Found: !PY_FOUND!
+    echo.
+    if exist "app\.venv\Scripts\python.exe" (
+        echo   That is the Python app\.venv was built with. Install a newer one
+        echo   from https://www.python.org/downloads/ and tick the box
+        echo   "Add python.exe to PATH", then delete the app\.venv folder and
+        echo   run install.bat again. Your settings and key are not in it.
+    ) else (
+        echo   Get it from https://www.python.org/downloads/ and TICK THE BOX
+        echo   "Add python.exe to PATH" at the bottom of the installer. If it
+        echo   says it did not run, the python on PATH is usually the Microsoft
+        echo   Store placeholder, which the real install replaces.
+    )
+    echo.
+    echo   Full walkthrough: the step-by-step guide in this folder
+    echo.
+    pause
+    exit /b 1
+)
+"!PY_CHECK!" -c "import sys; sys.exit(1 if sys.version_info[:2] > (3, 14) else 0)" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   Note: Python !PY_FOUND! is newer than anything this has been tested
+    echo   on. If installing the dependencies fails below, numba or llvmlite
+    echo   probably has no build for it yet -- Python 3.14 is known to work.
+)
+
 if not exist "app\.venv\Scripts\python.exe" (
     echo.
     echo   Creating the virtualenv...
@@ -71,12 +120,28 @@ rem        scheme, passed as --proxy rather than through the environment.
 rem
 rem Both verified end to end against a network where github.com is blocked.
 rem The line is never echoed: it usually carries a password.
+rem
+rem It is read with delayed expansion OFF. With it on, `set "X=%%L"` treats
+rem every ! in the line as a variable reference and deletes it, so a password
+rem like pa!ss reached the proxy as pass and every request was refused. Each
+rem line is copied raw, tested in a short-lived scope where !LINE! is safe --
+rem expanding a variable never re-expands its value -- and the verdict leaves
+rem that scope through the for variable; the raw line is assigned only after
+rem the endlocal, back where ! means nothing. The scope around the loop is
+rem then left open under a fresh enabledelayedexpansion rather than closed,
+rem because closing it would throw BOT_PROXY away with it. From here on the
+rem value is only ever read as !BOT_PROXY!, which inserts it verbatim.
 set "BOT_PROXY="
 if exist "proxy.local" (
+    setlocal DisableDelayedExpansion
     for /f "usebackq tokens=* delims=" %%L in ("proxy.local") do (
         set "LINE=%%L"
-        if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "BOT_PROXY=%%L"
+        setlocal EnableDelayedExpansion
+        set "KEEP="
+        if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "KEEP=1"
+        for %%K in ("!KEEP!") do endlocal & if "%%~K"=="1" set "BOT_PROXY=%%L"
     )
+    setlocal EnableDelayedExpansion
 )
 set "PIPARG="
 if defined BOT_PROXY (
@@ -89,6 +154,15 @@ if defined BOT_PROXY (
 
 echo   Updating pip...
 "%VENV_PY%" -m pip install !PIPARG! --quiet --upgrade pip
+rem Not fatal. The pip a 3.12+ virtualenv starts with installs every wheel
+rem below; the upgrade only saves a nag. A failure here is nearly always the
+rem network, and the next step will say so again if it is -- stopping here
+rem would be stopping for the lesser of the two.
+if errorlevel 1 (
+    echo   Could not update pip. Carrying on with the one the virtualenv came
+    echo   with, which is normally fine. If the steps below fail as well, the
+    echo   error above is the likely reason.
+)
 
 rem --no-deps is required: bulk-client declares bulk-keychain, which it never
 rem imports and which has no wheel for current Pythons, so pip would try to
@@ -160,14 +234,10 @@ echo   Installing dependencies...
 echo   ^(pip will report bulk-keychain and solders as missing. That is expected:
 echo    the SDK declares them and never imports them. The signing check at the
 echo    end is what tells you the install works.^)
-rem certifi is named even though requests would pull it in anyway: the bot now
-rem uses it directly, to verify the WebSocket against the same trust anchors as
-rem its HTTP calls. A dependency that is only there by accident is one a future
-rem version of requests can drop.
-rem python-socks and PySocks are what let a SOCKS proxy work -- the first for the
-rem account stream, the second for HTTP. Neither library says anything useful at
-rem the point of failure without them, so they are installed for everyone rather
-rem than left for whoever turns out to need a proxy.
+rem The list, pinned, lives in app\docs\requirements.txt and nowhere else. It
+rem used to be written out here as well, unpinned, and the two drifted apart.
+rem That file says why each entry is there -- certifi, python-socks and PySocks
+rem included -- and why the SDK, installed above, is not.
 set "DEPS_OK="
 for /L %%i in (1,1,3) do (
     if not defined DEPS_OK (
@@ -175,7 +245,7 @@ for /L %%i in (1,1,3) do (
             echo   That did not come through. Trying again ^(%%i of 3^)...
             ping -n 3 127.0.0.1 >nul
         )
-        "%VENV_PY%" -m pip install !PIPARG! --quiet pandas numpy numba websockets pynacl base58 sortedcontainers aiohttp requests PyYAML certifi python-socks PySocks
+        "%VENV_PY%" -m pip install !PIPARG! --quiet -r "app\docs\requirements.txt"
         if not errorlevel 1 set "DEPS_OK=1"
     )
 )
@@ -211,7 +281,8 @@ if not exist "private_key.local" (
     >> private_key.local echo # from the menu: Accounts Management -^> Encrypt Private Key.
     >> private_key.local echo #
     >> private_key.local echo # A sub-account has no key of its own -- it is created by, and signed
-    >> private_key.local echo # for by, the master -- so this one key is all the bot needs.
+    >> private_key.local echo # for by, its master. To trade several masters, put each key on a
+    >> private_key.local echo # line of its own; add them all before encrypting.
     >> private_key.local echo.
     echo   Created private_key.local for your key.
 )
@@ -259,3 +330,6 @@ echo     2. Edit settings.yaml -- the only settings file you touch
 echo     3. Run run.bat
 echo.
 pause
+rem Explicit, because update.bat calls this and reads the exit code to decide
+rem whether to say "Up to date".
+exit /b 0

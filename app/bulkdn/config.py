@@ -8,7 +8,9 @@ signing authority.
 
 from __future__ import annotations
 
+import difflib
 import logging
+import math
 import os
 import random
 from dataclasses import dataclass, field
@@ -48,7 +50,8 @@ PRIVATE_KEY_TEMPLATE = """# Paste your BULK master account's base58 private key 
 # from the menu: Accounts Management -> Encrypt Private Key.
 #
 # A sub-account has no key of its own -- it is created by, and signed
-# for by, the master -- so this one key is all the bot needs.
+# for by, its master. To trade several masters, put each key on a
+# line of its own; add them all before encrypting.
 
 """
 
@@ -59,9 +62,12 @@ PRIVATE_KEY_TEMPLATE = """# Paste your BULK master account's base58 private key 
 # being posted to is rejected as `bad signature`, so pinning both together in
 # one place removes the whole class of mistake.
 #
-# Note the WebSocket host currently serves an EXPIRED certificate while the
-# HTTP host verifies cleanly, so `ws_ssl_auto_bypass` (on by default) is what
-# keeps the account stream connectable.
+# TLS on both hosts verifies against certifi's bundle (see ws_compat). An
+# earlier note here said the WebSocket host served an expired certificate; it
+# never did. What had expired was a root in the WINDOWS certificate store, which
+# `requests` never consulted because it ships certifi -- so HTTP worked while the
+# socket, trusting the system store, failed. With the socket on certifi too,
+# `ws_ssl_auto_bypass` is no longer needed and is off by default.
 MAINNET_HTTP_URL = "https://mainnet-api1.bulk.trade/api/v1"
 MAINNET_WS_URL = "wss://mainnet-ws1.bulk.trade"
 
@@ -210,6 +216,14 @@ class RiskConfig:
             raise ConfigError("risk.max_reject_streak must be >= 1")
         if self.max_hedge_impact_bps < 0:
             raise ConfigError("risk.max_hedge_impact_bps must be >= 0")
+        # Zero is refused as well as a negative: both make every quote and
+        # every socket read as stale from the first tick, so the bot would
+        # halt -- or refuse to re-price -- on data that is milliseconds old.
+        # Neither has an "off" meaning to preserve.
+        if self.ws_stale_timeout_s <= 0:
+            raise ConfigError("risk.ws_stale_timeout_s must be > 0 seconds")
+        if self.price_stale_timeout_s <= 0:
+            raise ConfigError("risk.price_stale_timeout_s must be > 0 seconds")
 
 
 @dataclass
@@ -466,11 +480,18 @@ class Config:
     # a client-side gate does and does not actually prevent.
     access: AccessConfig = field(default_factory=AccessConfig)
 
-    # The live WebSocket endpoints have been observed serving certificates that
-    # fail verification. Retrying once without checks keeps the account stream
-    # available; set `ws_ssl_auto_bypass: false` to fail hard instead.
+    # Escape hatches for TLS, both OFF by default.
+    #
+    # The WebSocket was once thought to serve an expired certificate, and the
+    # bypass was switched on by default to keep the account stream up. The
+    # certificate was fine: an expired root in the Windows store was rejecting
+    # it, and verifying against certifi (ws_compat) fixed the actual cause. A
+    # default that quietly drops verification would now only ever fire on a
+    # certificate that really is wrong -- which is the one case where the fills
+    # and positions every hedge is computed from must not be trusted. Kept, off,
+    # for an operator whose network genuinely cannot connect any other way.
     ws_insecure_ssl: bool = False
-    ws_ssl_auto_bypass: bool = True
+    ws_ssl_auto_bypass: bool = False
 
     # Optional endpoint overrides, for when the derived host is wrong.
     http_url_override: str = ""
@@ -482,12 +503,18 @@ class Config:
     # one of them joins the pool the strategy draws pairs from; `private_key`
     # remains the first of them, because the single-account commands -- status,
     # transfer, create-subaccount -- act on one account and that one is it.
-    private_keys: list[str] = field(default_factory=list)
+    #
+    # Both are `repr=False`. A dataclass repr prints every field, and a Config
+    # ends up in a repr more easily than it looks: a failing test's assertion
+    # message, a debugger, a `log.debug("%r", config)` someone adds while
+    # chasing something else. Any of those would put the signing keys into
+    # logs.txt -- the file operators are told to send when asking for help.
+    private_keys: list[str] = field(default_factory=list, repr=False)
     # The one a single-account command acts on. Kept as a field of its own
     # rather than derived, because most of the bot and most of its tests name
     # exactly one key and should not have to know a pool exists. The two are
     # reconciled below so they cannot disagree.
-    private_key: str = ""
+    private_key: str = field(default="", repr=False)
 
     @property
     def http_url(self) -> str:
@@ -608,6 +635,190 @@ class Config:
         if self.hedge_tolerance_lots < 1.0:
             raise ConfigError("hedge_tolerance_lots must be >= 1.0")
         self.risk.validate()
+        if self.overlay_ttl_ms < 0:
+            raise ConfigError("overlay_ttl_ms must be >= 0")
+        self._warn_exposure_below_order_cap()
+
+    def _warn_exposure_below_order_cap(self) -> None:
+        """Say so when one clean fill would trip the exposure kill switch.
+
+        A resting order that fills all at once leaves the pair one-sided by
+        its size until the hedge lands, so `risk.max_net_exposure_usd` has to
+        sit above the per-order cap with room to spare. Below it, the first
+        full fill halts the run: every order cancelled, every account closed
+        at market. A warning rather than an error, because a coin-sized cap
+        cannot be priced here and a deliberately tight limit is the operator's
+        call -- but it must not be a surprise found in a halt message.
+        """
+        limit = self.risk.max_net_exposure_usd
+        for index, market in enumerate(self.markets):
+            if not market.enabled:
+                continue
+            cap = market.max_order_notional_usd
+            if market.max_order_span is not None:
+                cap = max(cap, market.max_order_span.high)
+            if cap > 0 and limit <= cap:
+                log.warning(
+                    "risk.max_net_exposure_usd ($%s) is not above %s's per-order "
+                    "cap ($%s): one resting order filling in full would trip "
+                    "the exposure halt before the hedge lands. Twice the cap is "
+                    "a sane floor.",
+                    f"{limit:g}", self._market_name(index), f"{cap:g}",
+                )
+
+
+# -- reading values ----------------------------------------------------------
+#
+# Every scalar in the file goes through one of these rather than a bare
+# `float()` / `int()` / `bool()`. The bare calls fail in two different bad ways:
+#
+#   * `float("5bps")` raises a ValueError whose traceback names no setting, so
+#     the operator sees a stack dump and has to guess which of forty lines did
+#     it -- and the menu, which catches ConfigError, catches nothing.
+#   * `bool("false")` is True. A quoted `enabled: "false"` -- which is what some
+#     editors and every copy-paste from a chat produce -- switched a market ON.
+#
+# Each helper names the setting in its error, which is the whole point.
+
+_TRUE_WORDS = frozenset({"true", "yes", "on", "1"})
+_FALSE_WORDS = frozenset({"false", "no", "off", "0"})
+
+
+def _as_bool(value: Any, name: str) -> bool:
+    """A yes/no setting, strictly.
+
+    YAML already turns unquoted `true`/`no`/`off` into booleans; this is for
+    the quoted spellings, which arrive as strings and which `bool()` reads as
+    True whatever they say. Anything that is not clearly one or the other is
+    refused rather than guessed: a switch that decides whether a market trades
+    or whether TLS is checked should not be resolved by a coin toss.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _TRUE_WORDS:
+            return True
+        if word in _FALSE_WORDS:
+            return False
+    raise ConfigError(f"{name} must be true or false, got {value!r}")
+
+
+def _as_float(value: Any, name: str) -> float:
+    """A number, or a ConfigError naming the setting.
+
+    `true` is refused even though Python calls it 1: a boolean where a number
+    belongs is a mistake in the file, not a value. So are `.inf` and `.nan`,
+    which YAML happily reads and which then pass every `> 0` check in validate
+    -- or, for nan, fail every comparison silently.
+    """
+    if isinstance(value, bool):
+        raise ConfigError(f"{name} must be a number, got {value!r}")
+    try:
+        number = float(value.strip()) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a number, got {value!r}") from exc
+    if not math.isfinite(number):
+        raise ConfigError(f"{name} must be a finite number, got {value!r}")
+    return number
+
+
+def _as_int(value: Any, name: str) -> int:
+    """A whole number. `2.5` for a count is refused, not truncated to 2.
+
+    Truncating would quietly run a different setting from the one written --
+    `max_groups: 2.5` is either a typo or a misunderstanding, and in both
+    cases the operator should hear about it. `3.0` is accepted, since it is 3.
+    """
+    number = _as_float(value, name)
+    if not number.is_integer():
+        raise ConfigError(f"{name} must be a whole number, got {value!r}")
+    return int(number)
+
+
+def _as_str(value: Any, name: str) -> str:
+    """A text setting. A number or a list here is a misplaced line, not text."""
+    if not isinstance(value, str):
+        raise ConfigError(f"{name} must be text, got {value!r}")
+    return value
+
+
+def _mapping(value: Any, name: str) -> dict[str, Any]:
+    """A block that must be a mapping. Absent or empty reads as `{}`."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a mapping")
+    return value
+
+
+# -- spotting typos ----------------------------------------------------------
+#
+# Unknown keys were ignored in silence, so `notional_ust: 5000` loaded, traded
+# the default, and the operator concluded the bot ignores its own settings.
+# They are warned about rather than refused: a newer settings file opened by an
+# older build must still start, and a key that did nothing yesterday is not a
+# reason to refuse to close a position today.
+
+_LEG_KEYS = frozenset({
+    "symbol", "size", "notional_usd", "offset_bps", "max_distance_bps",
+    "chase_patience_s", "improve_ticks", "max_order_size",
+    "max_order_notional_usd", "leverage", "enabled",
+})
+_TOP_KEYS = frozenset({
+    "markets", "legs", "pool", "mode", "single_master", "hold_minutes",
+    "max_phase_minutes", "chase_interval_s", "reconcile_interval_s",
+    "position_sync_interval_s", "cycles", "execution_target",
+    "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
+    "state_file", "log_level", "http_url", "ws_url", "ws_insecure_ssl",
+    "ws_ssl_auto_bypass", "telegram", "access",
+})
+_POOL_KEYS = frozenset({"max_groups", "max_takers", "single_master"})
+_RISK_KEYS = frozenset({
+    "max_net_exposure_usd", "max_position_usd", "max_reject_streak",
+    "ws_stale_timeout_s", "price_stale_timeout_s", "max_hedge_impact_bps",
+})
+_TARGET_KEYS = frozenset({"cycles", "burn_usd", "volume_usd"})
+_TELEGRAM_KEYS = frozenset({"bot_token", "user_ids", "user_id"})
+_ACCESS_KEYS = frozenset({
+    "require_referral", "codes", "code", "wallets", "wallet", "allow_on_error",
+})
+
+# Settings that used to mean something. Named with what happened to them, so
+# the warning says "delete this" rather than "did you mean ...", which for a
+# retired key would point at an unrelated setting that happens to look alike.
+_RETIRED = {
+    "sub1_pubkey": (
+        "no longer read and can be deleted. Sub-accounts are found from each "
+        "master at startup, so there is nothing to pin."
+    ),
+    "tight_distance_bps": (
+        "no longer used and can be deleted. A tightened order now follows the "
+        "touch tick by tick, which is what that setting was trying to "
+        "approximate in the wrong unit."
+    ),
+}
+
+
+def _warn_unknown(raw: dict[str, Any], known: frozenset[str], where: str) -> None:
+    """Log each key `known` does not list, with the nearest one that exists."""
+    for key in raw:
+        path = f"{where}.{key}" if where else str(key)
+        if not isinstance(key, str):
+            log.warning("%s is not a setting this bot reads, so it has no effect", path)
+            continue
+        if key in known:
+            continue
+        if key in _RETIRED:
+            log.warning("%s is %s", path, _RETIRED[key])
+            continue
+        near = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.6)
+        hint = f" -- did you mean `{near[0]}`?" if near else ""
+        log.warning(
+            "%s is not a setting this bot reads, so it has no effect%s", path, hint
+        )
 
 
 def _span_from_raw(raw: dict[str, Any], key: str, name: str) -> Span | None:
@@ -627,8 +838,17 @@ def _span_from_raw(raw: dict[str, Any], key: str, name: str) -> Span | None:
 def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if not isinstance(raw, dict):
         raise ConfigError(f"legs.{name} must be a mapping")
-    size = float(raw.get("size") or 0.0)
-    cap_size = float(raw.get("max_order_size") or 0.0)
+    # Retired and misspelled settings alike. Unknown keys used to be ignored
+    # in silence, which let someone tune a number that was never read and
+    # conclude the bot ignores its own config.
+    _warn_unknown(raw, _LEG_KEYS, name)
+
+    def number(key: str, default: float) -> float:
+        value = raw.get(key)
+        return default if value is None else _as_float(value, f"{name}.{key}")
+
+    size = number("size", 0.0)
+    cap_size = number("max_order_size", 0.0)
 
     # Both dollar settings may be written as a range. The value carried
     # forward is the HIGH end, because the margin plan at startup is built
@@ -655,16 +875,8 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
         # rather than being pinned to the high end for the rest of the run.
         cap_span = notional_span
 
-    # Retired settings. Unknown keys are otherwise ignored in silence, which
-    # would let someone tune a number that stopped being read and conclude the
-    # bot ignores its own config.
-    if "tight_distance_bps" in raw:
-        log.warning(
-            "legs.%s.tight_distance_bps is no longer used and can be deleted. "
-            "A tightened order now follows the touch tick by tick, which is "
-            "what that setting was trying to approximate in the wrong unit.",
-            name,
-        )
+    if "symbol" in raw and not isinstance(raw["symbol"], str):
+        raise ConfigError(f"{name}.symbol must be a market name like BTC-USD")
 
     try:
         return LegConfig(
@@ -675,15 +887,21 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             max_order_span=cap_span,
             offset_bps=offset_span.low if offset_span else 0.0,
             offset_span=offset_span,
-            max_distance_bps=float(raw.get("max_distance_bps", 5.0)),
-            chase_patience_s=float(raw.get("chase_patience_s", 3.0)),
-            improve_ticks=int(raw.get("improve_ticks", 1)),
+            max_distance_bps=number("max_distance_bps", 5.0),
+            chase_patience_s=number("chase_patience_s", 3.0),
+            improve_ticks=(
+                _as_int(raw["improve_ticks"], f"{name}.improve_ticks")
+                if raw.get("improve_ticks") is not None
+                else 1
+            ),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(
-                float(raw["leverage"]) if raw.get("leverage") is not None else None
+                _as_float(raw["leverage"], f"{name}.leverage")
+                if raw.get("leverage") is not None
+                else None
             ),
-            enabled=bool(raw.get("enabled", True)),
+            enabled=_as_bool(raw.get("enabled", True), f"{name}.enabled"),
         )
     except KeyError as exc:
         raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
@@ -773,6 +991,7 @@ def _telegram_from_dict(raw: Any) -> TelegramConfig:
     """Read Telegram settings, tolerating a single id given unwrapped."""
     if not isinstance(raw, dict):
         raise ConfigError("telegram must be a mapping")
+    _warn_unknown(raw, _TELEGRAM_KEYS, "telegram")
 
     user_ids = raw.get("user_ids", raw.get("user_id", []))
     if isinstance(user_ids, (int, str)):
@@ -795,6 +1014,7 @@ def _access_from_dict(raw: Any) -> AccessConfig:
     """Read referral-gating settings, tolerating a single code given unwrapped."""
     if not isinstance(raw, dict):
         raise ConfigError("access must be a mapping")
+    _warn_unknown(raw, _ACCESS_KEYS, "access")
 
     def as_list(value) -> list[str]:
         if value is None:
@@ -806,16 +1026,75 @@ def _access_from_dict(raw: Any) -> AccessConfig:
         raise ConfigError("access.codes and access.wallets must be strings or lists")
 
     access = AccessConfig(
-        require_referral=bool(raw.get("require_referral", False)),
+        require_referral=_as_bool(
+            raw.get("require_referral", False), "access.require_referral"
+        ),
         codes=as_list(raw.get("codes", raw.get("code"))),
         wallets=as_list(raw.get("wallets", raw.get("wallet"))),
-        allow_on_error=bool(raw.get("allow_on_error", False)),
+        allow_on_error=_as_bool(
+            raw.get("allow_on_error", False), "access.allow_on_error"
+        ),
     )
     try:
         access.validate()
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     return access
+
+
+def _read_yaml(path: str) -> dict[str, Any]:
+    """The settings file as a mapping, or a ConfigError that says what to do.
+
+    Every way this can fail is something an operator does to the file in an
+    editor, so every one of them gets a sentence rather than a traceback:
+
+    * Notepad on a Russian-locale Windows can save as cp1251. The first
+      Cyrillic comment then makes the file undecodable as UTF-8, and the raw
+      UnicodeDecodeError names a byte offset and nothing else.
+    * A tab, or an unclosed quote, is a YAML error with a line number -- worth
+      passing on, since it points straight at the line.
+    * A file that is a list or a bare word at the top parses fine and then
+      failed with AttributeError on the first `.get`.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = yaml.safe_load(handle)
+    except FileNotFoundError as exc:
+        raise ConfigError(f"config file not found: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not saved as UTF-8 (byte {exc.start} is not valid "
+            "UTF-8). An editor most likely saved it in the Windows code page. "
+            "Open it in Notepad, choose File -> Save As, set Encoding to UTF-8, "
+            "and save it again."
+        ) from exc
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"{path} must be a set of `name: value` settings at the top level, "
+            f"but it reads as a {type(raw).__name__}"
+        )
+    return raw
+
+
+def _log_level(value: Any) -> str:
+    """The log level name. Text only; an unknown name is logged at INFO.
+
+    `log_level: 10` or a list used to reach `configure_logging` and fail there
+    with AttributeError on `.upper()`, before logging existed to report it.
+    """
+    level = _as_str(value, "log_level")
+    if not isinstance(logging.getLevelName(level.upper()), int):
+        log.warning(
+            "log_level %r is not a level this understands -- logging at INFO. "
+            "Use INFO, or DEBUG when diagnosing something.",
+            level,
+        )
+    return level
 
 
 def load_config(
@@ -831,15 +1110,21 @@ def load_config(
     a settings file that does -- rather than running with a config nothing ever
     checked.
     """
-    try:
-        with open(path, encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle) or {}
-    except FileNotFoundError as exc:
-        raise ConfigError(f"config file not found: {path}") from exc
+    raw = _read_yaml(path)
+    _warn_unknown(raw, _TOP_KEYS, "")
 
-    pool_raw = raw.get("pool") or {}
-    if not isinstance(pool_raw, dict):
-        raise ConfigError("pool must be a mapping")
+    def number(block: dict[str, Any], key: str, default: float, where: str = "") -> float:
+        value = block.get(key)
+        name = f"{where}.{key}" if where else key
+        return default if value is None else _as_float(value, name)
+
+    def whole(block: dict[str, Any], key: str, default: int, where: str = "") -> int:
+        value = block.get(key)
+        name = f"{where}.{key}" if where else key
+        return default if value is None else _as_int(value, name)
+
+    pool_raw = _mapping(raw.get("pool"), "pool")
+    _warn_unknown(pool_raw, _POOL_KEYS, "pool")
 
     # A file written by the menu carries `markets:` and no `legs:` at all,
     # so an absent one is only an error when nothing else names a market.
@@ -848,56 +1133,68 @@ def load_config(
         raise ConfigError("legs must be a mapping")
     markets, market_names = _markets_from_raw(raw, legs)
 
-    risk_raw = raw.get("risk") or {}
-    if not isinstance(risk_raw, dict):
-        raise ConfigError("risk must be a mapping")
+    risk_raw = _mapping(raw.get("risk"), "risk")
+    _warn_unknown(risk_raw, _RISK_KEYS, "risk")
 
-    target_raw = raw.get("execution_target") or {}
-    if not isinstance(target_raw, dict):
-        raise ConfigError("execution_target must be a mapping")
+    target_raw = _mapping(raw.get("execution_target"), "execution_target")
+    _warn_unknown(target_raw, _TARGET_KEYS, "execution_target")
     # `cycles` was a top-level key before execution targets existed; the
     # top-level spelling still works and the nested one wins.
+    #
+    # Absent means unlimited, as the shipped file says. It meant 1 in the code,
+    # which a pool run never honoured -- so settings written before cycles were
+    # counted per group would suddenly have run one group and stopped.
+    if target_raw.get("cycles") is not None:
+        cycles = whole(target_raw, "cycles", 0, "execution_target")
+    else:
+        cycles = whole(raw, "cycles", 0)
     target = ExecutionTarget(
-        cycles=int(target_raw.get("cycles", raw.get("cycles", 1))),
-        burn_usd=float(target_raw.get("burn_usd", 0.0)),
-        volume_usd=float(target_raw.get("volume_usd", 0.0)),
+        cycles=cycles,
+        burn_usd=number(target_raw, "burn_usd", 0.0, "execution_target"),
+        volume_usd=number(target_raw, "volume_usd", 0.0, "execution_target"),
     )
+
+    if raw.get("single_master") is not None:
+        single_master = whole(raw, "single_master", 1)
+    else:
+        single_master = whole(pool_raw, "single_master", 1, "pool")
 
     config = Config(
         markets=markets,
         market_names=market_names,
         mode=_mode_from_raw(mode if mode is not None else raw.get("mode", "multi")),
-        single_master=int(
-            raw.get("single_master", pool_raw.get("single_master", 1))
-        ),
-        max_groups=int(pool_raw.get("max_groups", 5)),
-        max_takers=int(pool_raw.get("max_takers", 1)),
+        single_master=single_master,
+        max_groups=whole(pool_raw, "max_groups", 5, "pool"),
+        max_takers=whole(pool_raw, "max_takers", 1, "pool"),
         hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
-        max_phase_minutes=float(raw.get("max_phase_minutes", 30.0)),
-        chase_interval_s=float(raw.get("chase_interval_s", 1.0)),
-        reconcile_interval_s=float(raw.get("reconcile_interval_s", 5.0)),
-        position_sync_interval_s=float(
-            raw.get("position_sync_interval_s", 60.0)
-        ),
+        max_phase_minutes=number(raw, "max_phase_minutes", 30.0),
+        chase_interval_s=number(raw, "chase_interval_s", 1.0),
+        reconcile_interval_s=number(raw, "reconcile_interval_s", 5.0),
+        position_sync_interval_s=number(raw, "position_sync_interval_s", 60.0),
         cycles=target.cycles,
         target=target,
-        hedge_tolerance_lots=float(raw.get("hedge_tolerance_lots", 1.0)),
-        overlay_ttl_ms=int(raw.get("overlay_ttl_ms", 2000)),
-        max_margin_fraction=float(raw.get("max_margin_fraction", 0.25)),
+        hedge_tolerance_lots=number(raw, "hedge_tolerance_lots", 1.0),
+        overlay_ttl_ms=whole(raw, "overlay_ttl_ms", 2000),
+        max_margin_fraction=number(raw, "max_margin_fraction", 0.25),
         risk=RiskConfig(
-            max_net_exposure_usd=float(risk_raw.get("max_net_exposure_usd", 500.0)),
-            max_position_usd=float(risk_raw.get("max_position_usd", 5000.0)),
-            max_reject_streak=int(risk_raw.get("max_reject_streak", 5)),
-            max_hedge_impact_bps=float(risk_raw.get("max_hedge_impact_bps", 0.0)),
-            ws_stale_timeout_s=float(risk_raw.get("ws_stale_timeout_s", 30.0)),
-            price_stale_timeout_s=float(risk_raw.get("price_stale_timeout_s", 15.0)),
+            max_net_exposure_usd=number(risk_raw, "max_net_exposure_usd", 500.0, "risk"),
+            max_position_usd=number(risk_raw, "max_position_usd", 5000.0, "risk"),
+            max_reject_streak=whole(risk_raw, "max_reject_streak", 5, "risk"),
+            max_hedge_impact_bps=number(risk_raw, "max_hedge_impact_bps", 0.0, "risk"),
+            ws_stale_timeout_s=number(risk_raw, "ws_stale_timeout_s", 30.0, "risk"),
+            price_stale_timeout_s=number(risk_raw, "price_stale_timeout_s", 15.0, "risk"),
         ),
-        state_file=raw.get("state_file", "./app/state/strategy_state.json"),
-        log_level=raw.get("log_level", "INFO"),
-        http_url_override=raw.get("http_url", ""),
-        ws_url_override=raw.get("ws_url", ""),
-        ws_insecure_ssl=bool(raw.get("ws_insecure_ssl", False)),
-        ws_ssl_auto_bypass=bool(raw.get("ws_ssl_auto_bypass", True)),
+        state_file=_as_str(
+            raw.get("state_file", "./app/state/strategy_state.json"), "state_file"
+        ),
+        log_level=_log_level(raw.get("log_level", "INFO")),
+        http_url_override=_as_str(raw.get("http_url") or "", "http_url"),
+        ws_url_override=_as_str(raw.get("ws_url") or "", "ws_url"),
+        ws_insecure_ssl=_as_bool(raw.get("ws_insecure_ssl", False), "ws_insecure_ssl"),
+        # Off by default -- see the field on Config for why.
+        ws_ssl_auto_bypass=_as_bool(
+            raw.get("ws_ssl_auto_bypass", False), "ws_ssl_auto_bypass"
+        ),
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
         access=_access_from_dict(raw.get("access") or {}),
         private_keys=_load_private_keys(require_credentials),

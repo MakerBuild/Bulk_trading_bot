@@ -213,7 +213,10 @@ def test_install_bat_writes_the_same_template():
     so they are checked against each other rather than trusted to stay equal."""
     from bulkdn.config import PRIVATE_KEY_TEMPLATE
 
-    batch = pathlib.Path("install.bat").read_text(encoding="utf-8")
+    # Found from this file, not the working directory: pytest can be started
+    # from the root or from app/, and only one of those has install.bat in it.
+    root = pathlib.Path(__file__).resolve().parents[2]
+    batch = (root / "install.bat").read_text(encoding="utf-8")
     echoed = []
     for line in batch.splitlines():
         stripped = line.strip()
