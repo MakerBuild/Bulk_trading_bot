@@ -169,10 +169,15 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
 class Runtime:
     """Wires the components together and owns their lifecycle."""
 
-    def __init__(self, config: Config, dry_run: bool):
+    def __init__(
+        self, config: Config, dry_run: bool, symbols: list[str] | None = None
+    ):
         self.config = config
         self.dry_run = dry_run
-        self.symbols = [leg.symbol for leg in config.active_legs]
+        # The markets this runtime subscribes to and acts on. A trading run
+        # takes the enabled ones; `flatten` passes every configured market,
+        # because a market switched off can still hold a position.
+        self.symbols = symbols or [leg.symbol for leg in config.active_legs]
 
         # Must be installed before any client is constructed: it repairs fill
         # parsing and TLS handling inside the SDK itself.
@@ -275,7 +280,17 @@ class Runtime:
             )
         return [keys[index]]
 
-    async def start(self, verify: bool = True) -> None:
+    async def start(self, verify: bool = True, trading: bool = True) -> None:
+        """Connect, and -- for a run that will open positions -- prepare it.
+
+        `trading=False` is the closing path. It connects, loads the market
+        specs and subscribes, and nothing else: no referral gate, no sizing
+        plan, no leverage change. `flatten` went through all three, so the
+        panic button could fail before sending a single cancel -- on an
+        indexer outage, on an account with no free margin (which is exactly
+        when you want out), or on a leverage change the exchange refused.
+        Closing opens nothing, and none of them has anything to say about it.
+        """
         log.info(
             # The markets are named here because the mode can come from the
             # command line, so the settings file is no longer proof of what a
@@ -289,11 +304,18 @@ class Runtime:
         )
         # Before anything is placed. A gate that tripped later would abandon
         # open positions and leave the pair directional.
-        self.check_access()
+        if trading:
+            self.check_access()
 
         self.feed.load_specs()
         if verify and self._same_tree(self.master, self.sub1):
             verify_sub_account(self.master, self.sub1)
+
+        if not trading:
+            await self._connect_all()
+            await self.feed.subscribe()
+            await asyncio.sleep(2.0)
+            return
 
         # Curves are executor-published and change slowly, so they are read
         # once here rather than per hedge.
@@ -667,8 +689,12 @@ async def cmd_flatten(
     command is the panic button, and something scripted on top of it would
     otherwise read a timeout as success and stop watching.
     """
-    runtime = Runtime(config, dry_run)
-    await runtime.start(verify=False)
+    # Every market in the settings, switched on or not. It took the enabled
+    # ones only and then reset the state, so a market turned off with a
+    # position still open was left on the exchange and forgotten.
+    every_market = list(dict.fromkeys(market.symbol for market in config.markets))
+    runtime = Runtime(config, dry_run, symbols=every_market)
+    await runtime.start(verify=False, trading=False)
     closed = True
     try:
         # Every account, not the first two. This is the panic button, and in
@@ -689,6 +715,24 @@ async def cmd_flatten(
             await flatten(
                 runtime.sessions, runtime.book, runtime.feed, runtime.symbols
             )
+
+        # A market that is not in the settings at all -- traded by hand, or
+        # removed from the file -- cannot be closed from here: there is no
+        # spec for it to size an order with. Said loudly, and the state is
+        # kept, rather than reporting flat over a position that is not.
+        elsewhere = {
+            f"{runtime.sessions[account].name} {symbol} {size:+g}"
+            for account, held in runtime.book.snapshot().items()
+            for symbol, size in held.items()
+            if symbol not in runtime.symbols and size and account in runtime.sessions
+        }
+        if elsewhere:
+            print("")
+            print("  STILL OPEN in markets that are not in settings.yaml:")
+            for line in sorted(elsewhere):
+                print(f"    {line}")
+            print("  Close these on the exchange by hand. The state is kept.")
+            return 1
 
         state = runtime.store.load()
         # Legs, not the summary: a leg can hold an order id with the pair

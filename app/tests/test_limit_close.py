@@ -292,36 +292,46 @@ class FakeRuntime:
 
     instances = []
     store_override = None
+    # Positions the book reports after the close, for the "still open
+    # elsewhere" check: {account: {symbol: size}}.
+    leftover = {}
 
-    def __init__(self, config, dry_run):
+    def __init__(self, config, dry_run, symbols=None):
         from bulkdn.state import StrategyState
 
         self.config = config
         self.dry_run = dry_run
         self.master = object()
         self.sub1 = object()
-        self.symbols = [BTC]
+        self.symbols = symbols or [BTC]
         self.sessions = {}
+        self.started_trading = None
         # What the flatten cancels orders on: every account the run holds,
         # which in pool mode is more than the named pair.
         self.pool = [self.master, self.sub1]
         self.book = PositionBook()
+        for account, held in FakeRuntime.leftover.items():
+            self.sessions[account] = type("S", (), {"name": account})()
+            for symbol, size in held.items():
+                self.book.set_authoritative(account, symbol, size)
         self.feed = FakeFeed()
         self.store = FakeRuntime.store_override or FakeStore(StrategyState())
         self.stopped = False
         FakeRuntime.instances.append(self)
 
-    async def start(self, verify=True):
-        return None
+    async def start(self, verify=True, trading=True):
+        self.started_trading = trading
 
     async def stop(self):
         self.stopped = True
 
 
-def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, **kwargs):
+def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None,
+                    leftover=None, **kwargs):
     from bulkdn import cli
 
     FakeRuntime.instances = []
+    FakeRuntime.leftover = leftover or {}
     # A real store when the test is about what lands in the file; the fake
     # one otherwise, so nothing touches the disk that does not need to.
     FakeRuntime.store_override = store
@@ -343,8 +353,17 @@ def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, **kwargs):
     class Account:
         improve_ticks = 1
 
+    class Market:
+        def __init__(self, symbol, enabled=True):
+            self.symbol = symbol
+            self.enabled = enabled
+
+    configured = markets or [Market(BTC)]
+
     class Cfg:
         master_account = Account()
+    # Every market in the file, the switched-off ones included.
+    Cfg.markets = configured
 
     return asyncio.run(cli.cmd_flatten(Cfg(), dry_run=dry_run, **kwargs))
 
@@ -402,3 +421,81 @@ def test_a_live_flatten_clears_it(monkeypatch, tmp_path):
     after = store.load()
     assert after.phase == Phase.IDLE
     assert after.halted_reason is None
+
+
+# -- the panic button cannot be stopped by what only trading needs -----------
+
+
+def test_a_close_starts_without_the_trading_checks(monkeypatch):
+    """The referral gate, the sizing plan and the leverage change all ran
+    first, so the close could fail before a single cancel -- on an indexer
+    outage, or with no free margin, which is exactly when you want out."""
+    run_cmd_flatten(monkeypatch, closed=True)
+    assert FakeRuntime.instances[0].started_trading is False
+
+
+def test_a_switched_off_market_is_closed_too(monkeypatch):
+    """Only the enabled markets were closed, and the state reset after, so a
+    market turned off with a position open was left open and forgotten."""
+    class Market:
+        def __init__(self, symbol, enabled):
+            self.symbol = symbol
+            self.enabled = enabled
+
+    run_cmd_flatten(
+        monkeypatch, closed=True,
+        markets=[Market(BTC, True), Market("ETH-USD", False)],
+    )
+    assert FakeRuntime.instances[0].symbols == [BTC, "ETH-USD"]
+
+
+def test_a_position_in_a_market_not_in_the_settings_is_reported(monkeypatch, capsys, tmp_path):
+    from bulkdn.state import Phase, StateStore, StrategyState
+
+    store = StateStore(str(tmp_path / "state.json"))
+    state = StrategyState()
+    state.leg("g1:" + BTC, BTC).phase = Phase.EXIT
+    store.save(state)
+
+    code = run_cmd_flatten(
+        monkeypatch, closed=True, store=store, leftover={"m2s3": {"SOL-USD": -1.5}},
+    )
+
+    assert code == 1, "reported flat over an open position"
+    assert "m2s3 SOL-USD" in capsys.readouterr().out
+    assert store.load().legs, "the state was reset over a position still open"
+
+
+def test_the_closing_start_skips_the_gate_the_sizing_and_the_leverage(monkeypatch):
+    from bulkdn import cli
+
+    async def instant(_s):
+        return None
+
+    monkeypatch.setattr(cli.asyncio, "sleep", instant)
+    runtime = object.__new__(cli.Runtime)
+    runtime.dry_run = False
+    runtime.master = runtime.sub1 = type("S", (), {"pubkey": "m1", "client": object()})()
+    runtime.symbols = [BTC]
+    runtime.config = type("C", (), {"mode": "multi"})()
+    connected = []
+
+    async def connect_all():
+        connected.append(True)
+
+    async def subscribe():
+        return None
+
+    runtime._connect_all = connect_all
+    runtime.feed = type("F", (), {"load_specs": lambda self: None,
+                                  "subscribe": lambda self: subscribe()})()
+
+    def refuse(*_a):
+        raise AssertionError("closing ran a trading-only step")
+
+    runtime.check_access = refuse
+    runtime.apply_sizing = refuse
+    runtime.apply_leverage = refuse
+
+    asyncio.run(runtime.start(verify=False, trading=False))
+    assert connected, "it never connected"
