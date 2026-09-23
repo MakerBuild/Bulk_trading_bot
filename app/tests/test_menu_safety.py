@@ -486,3 +486,48 @@ def test_status_covers_switched_off_markets(monkeypatch, capsys):
     assert asyncio.run(cli.cmd_status(config)) == 0
     assert made == [["BTC-USD", "ETH-USD"]]
     assert "(switched off)" in capsys.readouterr().out
+
+
+# -- Target Progress reads this run from the run's start -----------------------
+
+
+def test_this_run_is_read_from_the_runs_start(monkeypatch, tmp_path, capsys):
+    """The run now records a start time and zero baselines; subtracting those
+    from a lifetime walk printed the lifetime totals as 'this run'."""
+    import types
+
+    import bulkdn.fees as fees_mod
+    from bulkdn import menu
+    from bulkdn.fees import Realised
+    from bulkdn.state import StateStore, StrategyState
+
+    state_file = tmp_path / "state.json"
+    state = StrategyState()
+    state.baseline_at = 1_790_000_000.0
+    StateStore(str(state_file)).save(state)
+
+    calls = []
+
+    def realised(http, trees, since_ms=None, **kw):
+        calls.append(since_ms)
+        if since_ms is None:
+            return Realised(fills=900, fees_usd=-500.0, volume_usd=2_800_000.0)
+        return Realised(fills=90, fees_usd=-20.0, volume_usd=110_000.0)
+
+    monkeypatch.setattr(fees_mod, "realised_for_trees", realised)
+    monkeypatch.setattr(fees_mod, "account_fee_tier", lambda *a, **k: None)
+    monkeypatch.setattr(fees_mod, "fee_state", lambda *a, **k: {})
+    monkeypatch.setattr(menu, "_trees", lambda c: [types.SimpleNamespace(accounts=["m1"], master="m1")])
+    monkeypatch.setattr(menu, "_http", lambda c: object())
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+    config = types.SimpleNamespace(
+        state_file=str(state_file), http_url="http://x",
+        target=types.SimpleNamespace(burn_usd=0.0, volume_usd=100_000.0),
+    )
+
+    menu._target_progress(config)
+    out = capsys.readouterr().out.split("THIS RUN")[1]
+
+    assert calls == [None, 1_790_000_000_000.0]
+    assert "$110,000.00" in out, "this run showed something else"
+    assert "2,800,000" not in out, "the lifetime total was printed as this run"

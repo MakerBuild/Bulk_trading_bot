@@ -1664,8 +1664,16 @@ def _target_progress(config: Config) -> None:
     if not state.has_baseline:
         print("\n    not started -- the target is measured from the next start")
     else:
-        burned = burned_usd(totals.fees_usd - state.baseline_fees_usd)
-        volume = totals.qualifying_volume_usd - state.baseline_volume_usd
+        # Read from the run's start, the way the stop check reads it. The
+        # run now records a start time and zero baselines, so subtracting
+        # those from a lifetime walk printed the lifetime totals here as
+        # "this run".
+        run = realised_for_trees(
+            http, [tree.accounts for tree in trees],
+            since_ms=state.baseline_at * 1000,
+        )
+        burned = burned_usd(run.fees_usd)
+        volume = run.qualifying_volume_usd
         print()
         print(f"    burned        ${burned:,.4f}", end="")
         if config.target.burn_usd > 0:
