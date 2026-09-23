@@ -219,11 +219,12 @@ async def test_an_unanswered_hedge_stays_reserved_until_a_read_settles_it():
         await hedger.hedge(OPEN_BTC, mark_price=PRICE)
 
     # Still reserved, well past the ordinary two-second reservation: the
-    # clock is moved five seconds on, which an ordinary entry would not live.
+    # clock is moved three seconds on -- past the two an ordinary entry
+    # lives, and short of the five the fill overlay in this book does.
     import bulkdn.hedger as hedger_mod
 
     real_monotonic = hedger_mod.time.monotonic
-    hedger_mod.time.monotonic = lambda: real_monotonic() + 5.0
+    hedger_mod.time.monotonic = lambda: real_monotonic() + 3.0
     try:
         assert hedger.in_flight.total(BTC) == pytest.approx(-0.10)
         assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.0)
