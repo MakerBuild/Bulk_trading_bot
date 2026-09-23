@@ -192,7 +192,12 @@ async def flatten(
         outstanding = []
         for session in sessions.values():
             for symbol in symbols:
-                size = book.authoritative(session.pubkey, symbol)
+                # Effective, not authoritative: a close that filled while the
+                # read above was in flight is an overlay the read could not
+                # see. Sized off the read alone, the same close went out
+                # again -- refused as reduce-only, and counted toward the
+                # reject streak, in the middle of an emergency stop.
+                size = book.effective(session.pubkey, symbol)
                 spec = feed.specs.get(symbol)
                 if spec is None:
                     continue
@@ -233,11 +238,11 @@ async def flatten(
 
     await sync_positions(list(sessions.values()), book)
     leftovers = [
-        f"{session.name} {symbol}={book.authoritative(session.pubkey, symbol):+.8f}"
+        f"{session.name} {symbol}={book.effective(session.pubkey, symbol):+.8f}"
         for session in sessions.values()
         for symbol in symbols
         if symbol in feed.specs
-        and abs(book.authoritative(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
+        and abs(book.effective(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
     ]
     if leftovers:
         log.error(
@@ -304,7 +309,7 @@ async def flatten_limit(
                     spec = feed.specs.get(symbol)
                     if spec is None:
                         continue
-                    size = book.authoritative(session.pubkey, symbol)
+                    size = book.effective(session.pubkey, symbol)
                     rounded = round_size(abs(size), spec)
                     if rounded >= spec.lot_size:
                         outstanding.append((session, symbol, size, rounded, spec))
@@ -381,11 +386,11 @@ async def flatten_limit(
         await pull_all()
 
     leftovers = [
-        f"{session.name} {symbol}={book.authoritative(session.pubkey, symbol):+.8f}"
+        f"{session.name} {symbol}={book.effective(session.pubkey, symbol):+.8f}"
         for session in sessions.values()
         for symbol in symbols
         if symbol in feed.specs
-        and abs(book.authoritative(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
+        and abs(book.effective(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
     ]
     log.warning(
         "limit close: gave up after %.0f minutes with %s still open. Orders are "

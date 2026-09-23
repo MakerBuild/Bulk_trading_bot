@@ -68,11 +68,20 @@ class SeenTrades:
         return len(self._seen)
 
 
+# How long a fill left unconfirmed by a read is held while a confirming read
+# is fetched. Bounded, so a read that never succeeds does not pin a fill in
+# the book for good.
+CONFIRM_HOLD_S = 30.0
+
+
 @dataclass
 class _Overlay:
     delta: float
     expires_at: float
     label: str
+    # When it arrived. An HTTP read keeps the overlays that arrived after it
+    # was sent -- it cannot have seen them -- and drops the ones before.
+    added_at: float = 0.0
 
 
 @dataclass
@@ -82,10 +91,16 @@ class PositionBook:
     overlay_ttl_ms: int = 2000
     _authoritative: dict[Key, float] = field(default_factory=dict)
     _overlays: dict[Key, list[_Overlay]] = field(default_factory=dict)
-    # When each key last heard from the stream -- a position update or a
-    # fill. An HTTP read is only allowed to overwrite a key the stream has
-    # not spoken about since the read was sent. See `apply_read`.
-    _touched_at: dict[Key, float] = field(default_factory=dict)
+    # When each key's position was last written -- by a stream position
+    # update or a read. An HTTP read does not overwrite a position written
+    # after it was sent. Fills do not count here: they are overlays, and a
+    # read that skipped a key because a fill had arrived kept the position
+    # from BEFORE that fill -- once the overlay expired, the book fell back
+    # to it. See `apply_read`.
+    _position_at: dict[Key, float] = field(default_factory=dict)
+    # Keys whose last read could not be applied because a fill had arrived
+    # after it was sent. See `apply_read`.
+    _awaiting_read: set[Key] = field(default_factory=set)
 
     # -- writes ------------------------------------------------------------
 
@@ -99,7 +114,8 @@ class PositionBook:
         key = (account, symbol)
         self._authoritative[key] = float(size)
         self._overlays.pop(key, None)
-        self._touched_at[key] = time.monotonic()
+        self._position_at[key] = time.monotonic()
+        self._awaiting_read.discard(key)
 
     def apply_snapshot(self, account: str, positions: Iterable) -> None:
         """Replace all of an account's positions from a full snapshot.
@@ -128,20 +144,56 @@ class PositionBook:
         fill's overlay: the book then reads the fill as never having happened,
         and the reconciler, which runs right after the read, hedges it again.
 
-        So a key the stream has touched since `requested_at` is left alone.
-        Everything else is replaced, including zeroing what the exchange no
-        longer lists. Returns the symbols that were skipped, for the log.
+        Three cases per key:
+
+        * The stream reported the position after `requested_at`. That report
+          is newer than this answer, which is left unused.
+        * A fill arrived after `requested_at`. The answer may or may not
+          include it -- it was sent before the fill and served some time
+          after -- so it is not written: writing it and keeping the fill's
+          overlay counts the fill twice when the answer had it, and dropping
+          the overlay loses the fill when it had not. The overlay is kept
+          alive instead, and the key is marked for a confirming read, one
+          sent after the fill, which can only include it.
+
+          Merely skipping was not enough. The overlay then expired on its
+          ordinary clock and the book fell back to the position from BEFORE
+          the fill -- a closing order sized from it went out a second time.
+        * Otherwise the answer is written, zeroing what the exchange no longer
+          lists, and the overlays it accounts for are dropped.
+
+        Returns the symbols that were skipped, for the log.
         """
         fresh = {(account, p.symbol): float(p.size) for p in positions}
         for key in [key for key in self._authoritative if key[0] == account]:
             fresh.setdefault(key, 0.0)
         skipped = []
-        for (acct, symbol), size in fresh.items():
-            if self._touched_at.get((acct, symbol), 0.0) > requested_at:
-                skipped.append(symbol)
+        now = time.monotonic()
+        for key, size in fresh.items():
+            if self._position_at.get(key, 0.0) > requested_at:
+                skipped.append(key[1])
+                self._awaiting_read.discard(key)
                 continue
-            self.set_authoritative(acct, symbol, size)
+            later = [o for o in self._overlays.get(key, ()) if o.added_at > requested_at]
+            if later:
+                skipped.append(key[1])
+                # Held well past the ordinary TTL: the confirming read is
+                # requested at once, but a slow or failing one must not let
+                # the fill lapse back to the older position in the meantime.
+                hold_until = now + max(self.overlay_ttl_ms / 1000.0, CONFIRM_HOLD_S)
+                for overlay in later:
+                    overlay.expires_at = max(overlay.expires_at, hold_until)
+                self._awaiting_read.add(key)
+                continue
+            self._authoritative[key] = size
+            self._position_at[key] = now
+            self._overlays.pop(key, None)
+            self._awaiting_read.discard(key)
         return skipped
+
+    def awaiting_read(self) -> bool:
+        """Whether a fill is waiting on a read sent after it to be confirmed."""
+        return bool(self._awaiting_read)
 
     def add_overlay(self, account: str, symbol: str, delta: float, label: str = "") -> None:
         """Optimistically shift a position before the exchange confirms it."""
@@ -151,9 +203,8 @@ class PositionBook:
         now = time.monotonic()
         expires_at = now + (self.overlay_ttl_ms / 1000.0)
         self._overlays.setdefault(key, []).append(
-            _Overlay(delta=float(delta), expires_at=expires_at, label=label)
+            _Overlay(delta=float(delta), expires_at=expires_at, label=label, added_at=now)
         )
-        self._touched_at[key] = now
 
     def apply_fill(self, account: str, symbol: str, is_buy: bool, size: float, label: str = "fill") -> None:
         """Overlay a fill. A buy moves the position up, a sell moves it down."""

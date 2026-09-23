@@ -1605,6 +1605,11 @@ class Strategy:
                 return "a session could not report its age"
             if age >= quiet_after:
                 return f"{session.name} has been quiet for {age:.0f}s"
+        awaiting = getattr(self.book, "awaiting_read", None)
+        if awaiting is not None and awaiting():
+            # A read was left unused because a fill arrived while it was in
+            # flight; the fill is held until a read sent after it confirms it.
+            return "a fill is waiting on a confirming read"
         if now - last_sync >= self.config.position_sync_interval_s:
             return "periodic"
         return ""

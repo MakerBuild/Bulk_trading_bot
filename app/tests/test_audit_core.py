@@ -271,3 +271,46 @@ async def test_a_close_that_raises_still_halts():
         strategy_module.cancel_all_orders = original
     assert obj._halt_reason is not None
     assert obj._stop.is_set()
+
+
+def test_a_fill_the_read_could_not_see_outlives_its_ordinary_ttl():
+    """Skipped and left to its two-second clock, the fill lapsed and the book
+    fell back to the position from before it -- a close sized from that went
+    out a second time."""
+    book = PositionBook(overlay_ttl_ms=20)
+    book.set_authoritative("m", BTC, 0.5)
+    time.sleep(0.02)                 # Windows' clock moves in ~15ms steps
+    sent = time.monotonic()
+    time.sleep(0.02)
+    book.apply_fill("m", BTC, is_buy=False, size=0.5)   # the close fills
+
+    book.apply_read("m", [P(BTC, 0.5)], requested_at=sent)
+    time.sleep(0.05)                                      # past its ordinary ttl
+
+    assert book.effective("m", BTC) == pytest.approx(0.0)
+    assert book.awaiting_read(), "nothing asked for a read to confirm it"
+
+
+def test_the_confirming_read_settles_it_without_counting_twice():
+    """A read sent after the fill can only include it, so it is written and
+    the overlay goes -- the fill is not added on top of an answer that has it."""
+    book = PositionBook(overlay_ttl_ms=20)
+    book.set_authoritative("m", BTC, 0.5)
+    time.sleep(0.02)                 # Windows' clock moves in ~15ms steps
+    sent = time.monotonic()
+    time.sleep(0.02)
+    book.apply_fill("m", BTC, is_buy=False, size=0.5)
+    book.apply_read("m", [P(BTC, 0.5)], requested_at=sent)
+
+    book.apply_read("m", [P(BTC, 0.0)], requested_at=time.monotonic())
+
+    assert book.effective("m", BTC) == pytest.approx(0.0)
+    assert book.authoritative("m", BTC) == pytest.approx(0.0)
+    assert not book.awaiting_read()
+
+
+def test_a_read_sent_after_every_fill_is_simply_applied():
+    book = PositionBook()
+    book.apply_fill("m", BTC, is_buy=True, size=0.1)
+    book.apply_read("m", [P(BTC, 0.1)], requested_at=time.monotonic())
+    assert book.effective("m", BTC) == pytest.approx(0.1), "the fill was counted twice"

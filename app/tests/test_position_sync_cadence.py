@@ -12,9 +12,12 @@ this is being prepared for has a hundred. Since the failure it guards against
 is measurable, the read now follows the evidence instead of the clock.
 """
 
+import time
+
 import pytest
 
 from bulkdn.config import Config, LegConfig, RiskConfig
+from bulkdn.positions import PositionBook
 from bulkdn.strategy import Strategy
 
 QUIET = 30.0  # ws_stale_timeout_s; the trigger is half of it
@@ -28,6 +31,7 @@ class FakeSession:
 
 def strategy(ages, sync_interval=60.0):
     obj = object.__new__(Strategy)
+    obj.book = PositionBook()
     obj.config = Config(
         markets=[
             LegConfig(symbol="BTC-USD", size=1.0, offset_bps=1.0,
@@ -116,3 +120,21 @@ def test_the_request_rate_it_replaces():
     counting the ones the staleness trigger makes unnecessary."""
     obj = strategy([0.0])
     assert obj.config.position_sync_interval_s / obj.config.reconcile_interval_s == 12
+
+
+def test_a_fill_awaiting_confirmation_is_read_at_once():
+    """A read left unused because a fill arrived mid-flight is followed by
+    one sent after the fill, not left for the periodic backstop."""
+    obj = strategy([0.0])
+    obj.book.set_authoritative("acct", "BTC-USD", 0.5)
+    time.sleep(0.02)                 # Windows' clock moves in ~15ms steps
+    sent = time.monotonic()
+    time.sleep(0.02)
+    obj.book.apply_fill("acct", "BTC-USD", is_buy=False, size=0.5)
+
+    class P:
+        symbol, size = "BTC-USD", 0.5
+
+    obj.book.apply_read("acct", [P()], requested_at=sent)
+
+    assert obj._sync_reason(time.monotonic(), time.monotonic()) != ""
