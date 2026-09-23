@@ -98,9 +98,19 @@ if not "!LOCAL!"=="!PUBLISHED!" (
 
 for /f "usebackq tokens=*" %%i in (`git rev-parse --short HEAD`) do set "REV=%%i"
 set "TMPDIR=%TEMP%\bulkdn-release-!RANDOM!"
+rem Into dist\ inside the project, which git ignores. It used to be the folder
+rem above the project, and for a checkout at C:\bulk-delta-neutral-bot that is
+rem C:\ itself, which an ordinary account cannot write to -- so the build got
+rem through the whole clone and then failed at the last step.
+if not exist "dist" mkdir "dist"
+if not exist "dist\" (
+    echo   Could not create the dist folder. Nothing was built.
+    pause
+    exit /b 1
+)
 rem An absolute path, because the zip is written by a .NET call that resolves
 rem relative paths against its own working directory, not this one.
-for %%A in ("..\bulkdn-!REV!.zip") do set "OUT=%%~fA"
+for %%A in ("dist\bulkdn-!REV!.zip") do set "OUT=%%~fA"
 
 echo   Cloning !REV! ...
 set "CLONED="

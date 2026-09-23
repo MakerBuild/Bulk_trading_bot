@@ -69,12 +69,24 @@ rem it did that.
     rem fetch with the other two unset -- and pip does not choke on a SOCKS
     rem address it was never given. The line is never echoed: it usually
     rem carries a password.
+    rem
+    rem Read with delayed expansion OFF, exactly as install.bat does and for the
+    rem same reason: with it on, every ! in a proxy password is taken for a
+    rem variable reference and deleted. install.bat has the full explanation.
+    rem The scope around the loop is left open, not closed -- closing it would
+    rem discard BOT_PROXY -- and delayed expansion is switched back on inside
+    rem it for the rest of this block, which reads it only as !BOT_PROXY!.
     set "BOT_PROXY="
     if exist "proxy.local" (
+        setlocal DisableDelayedExpansion
         for /f "usebackq tokens=* delims=" %%L in ("proxy.local") do (
             set "LINE=%%L"
-            if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "BOT_PROXY=%%L"
+            setlocal EnableDelayedExpansion
+            set "KEEP="
+            if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "KEEP=1"
+            for %%K in ("!KEEP!") do endlocal & if "%%~K"=="1" set "BOT_PROXY=%%L"
         )
+        setlocal EnableDelayedExpansion
     )
     if defined BOT_PROXY (
         echo   Using the proxy from proxy.local.
@@ -123,21 +135,79 @@ rem it did that.
 
         git merge --ff-only FETCH_HEAD
         if errorlevel 1 (
+            rem A fast-forward fails for two different reasons, and the fix
+            rem for one does nothing for the other -- the old message offered
+            rem `git checkout -- .` for both, which cannot repair a diverged
+            rem history and silently destroys uncommitted edits. So: work out
+            rem which it is before saying anything.
+            rem
+            rem   diverged     this copy has commits GitHub does not, and GitHub
+            rem                has commits this copy does not: nothing to
+            rem                fast-forward. Counted both ways with rev-list.
+            rem   uncommitted  a shipped file was edited, or a file is sitting
+            rem                where the update wants to put one. Read from
+            rem                status --porcelain, which leaves out ignored
+            rem                files -- settings.yaml, the key, app\state.
+            set "AHEAD=0"
+            set "BEHIND=0"
+            set "DIRTY="
+            set "DIVERGED="
+            for /f %%n in ('git rev-list --count FETCH_HEAD..HEAD 2^>nul') do set "AHEAD=%%n"
+            for /f %%n in ('git rev-list --count HEAD..FETCH_HEAD 2^>nul') do set "BEHIND=%%n"
+            if !AHEAD! GTR 0 if !BEHIND! GTR 0 set "DIVERGED=1"
+            for /f "delims=" %%s in ('git status --porcelain 2^>nul') do set "DIRTY=1"
             echo.
-            echo   Downloaded, but could not apply it. Almost always this means
-            echo   a file that ships with the bot was edited by hand, and git
-            echo   will not overwrite your edit without being told to. The line
-            echo   above names it.
+            echo   Downloaded, but could not apply it. Nothing was changed.
             echo.
             echo   Your own files are never the cause: settings.yaml, your key,
             echo   app\state and logs.txt are not tracked, so an update has
             echo   nothing to overwrite them with.
             echo.
-            echo   To throw away edits to the shipped files and update anyway:
-            echo.
-            echo       git checkout -- .
-            echo       update.bat
-            echo.
+            if defined DIVERGED (
+                echo   This copy has !AHEAD! commit^(s^) of its own that GitHub does not
+                echo   have, and GitHub has !BEHIND! new one^(s^). Git will not guess how
+                echo   to combine them. To keep yours on a branch of their own and
+                echo   move this folder to the published version:
+                echo.
+                echo       git branch my-changes
+                echo       git reset --keep FETCH_HEAD
+                echo       update.bat
+                echo.
+                echo   Nothing is lost: your commits stay on my-changes, and
+                echo   --keep refuses rather than overwrite a file you have
+                echo   edited but not committed.
+                echo.
+            )
+            if defined DIRTY (
+                echo   These files that ship with the bot were edited by hand, or
+                echo   are new and in the way of the update:
+                echo.
+                git status --short
+                echo.
+                echo   To set your edits aside, update, and then put them back:
+                echo.
+                echo       git stash push --include-untracked
+                echo       update.bat
+                echo       git stash pop
+                echo.
+                echo   If the pop reports a conflict, your edit and the update
+                echo   changed the same lines. Git keeps the stash until you have
+                echo   sorted it out, so nothing is lost.
+                echo.
+                echo   Or, ONLY if you do not want those edits: the command below
+                echo   DELETES every uncommitted change to the shipped files, for
+                echo   good. There is no undo.
+                echo.
+                echo       git checkout -- .
+                echo.
+            )
+            if not defined DIRTY if not defined DIVERGED (
+                echo   The message from git above says why. To see where this
+                echo   copy stands:
+                echo.
+                echo       git status
+                echo.
+            )
             pause
             exit /b 1
         )
@@ -209,6 +279,18 @@ rem it did that.
     echo.
     echo   Updating dependencies...
     call "%~dp0install.bat"
+    rem install.bat exits 1 on every failure it reports. The code was already
+    rem updated by then, so saying "Up to date" would send the operator off to
+    rem start a bot whose dependencies are missing or stale.
+    if errorlevel 1 (
+        echo.
+        echo   The code was updated, but installing its dependencies FAILED --
+        echo   the reason is above. The bot may not start, or may run with the
+        echo   old ones. Fix what it says, then run install.bat again.
+        echo.
+        pause
+        exit /b 1
+    )
 
     echo.
     echo   Up to date. Your settings and key were left alone.
