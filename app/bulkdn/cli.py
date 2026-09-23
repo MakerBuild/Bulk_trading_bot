@@ -560,6 +560,9 @@ class Runtime:
             pool=[session.pubkey for session in self.pool],
             max_groups=self.config.max_groups,
             max_takers=self.config.max_takers,
+            # Sessions under one key share a socket, so the client is the
+            # master -- the same fact Strategy._trees groups by.
+            owner={session.pubkey: id(session.client) for session in self.pool},
         )
         return strategy
 

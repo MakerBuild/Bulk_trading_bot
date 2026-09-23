@@ -178,3 +178,50 @@ def test_a_group_can_say_what_each_taker_owes():
     assert group.share_for("t1") == 0.6
     assert group.share_for("t2") == 0.4
     assert group.share_for("stranger") == 0.0
+
+
+# -- two masters ------------------------------------------------------------
+#
+# A dry run with 6 + 6 accounts drew m2s1 -> m1s2, m2s4 and m2s2 -> m2s3, m1s1:
+# two of three groups had a taker under the maker's own master. The maker now
+# comes from one master and every taker from the other.
+
+TWO_MASTERS = {f"m1-{n}": 1 for n in range(6)} | {f"m2-{n}": 2 for n in range(6)}
+
+
+def _two_masters(**kwargs):
+    return pairing(pool=list(TWO_MASTERS), owner=TWO_MASTERS, **kwargs)
+
+
+@pytest.mark.parametrize("seed", range(50))
+def test_no_taker_shares_its_makers_master(seed):
+    book = _two_masters(max_groups=3, max_takers=2, rng=random.Random(seed))
+    for _ in range(3):
+        _id, group = book.draw("BTC-USD")
+        mine = TWO_MASTERS[group.maker]
+        assert all(TWO_MASTERS[t] != mine for t in group.takers), str(group)
+
+
+def test_it_still_fills_the_pool():
+    """Three groups of three need nine accounts, and twelve across two masters
+    have them whichever way the first draws fell."""
+    for seed in range(50):
+        book = _two_masters(max_groups=3, max_takers=2, rng=random.Random(seed))
+        drawn = [book.draw("BTC-USD") for _ in range(3)]
+        assert all(d is not None for d in drawn)
+        assert all(len(g.takers) == 2 for _id, g in drawn)
+
+
+def test_takers_shrink_rather_than_cross_back_into_the_makers_master():
+    """One account per master: one taker, not two."""
+    owner = {"a1": 1, "b1": 2}
+    book = pairing(pool=list(owner), owner=owner, max_takers=2)
+    _id, group = book.draw("BTC-USD")
+    assert {owner[a] for a in group.accounts} == {1, 2}
+    assert len(group.takers) == 1
+
+
+def test_one_master_draws_as_it_always_did():
+    """Single mode: there is no other tree, so any account may cover."""
+    owner = dict.fromkeys(POOL, 1)
+    assert pairing(owner=owner).draw("BTC-USD") is not None

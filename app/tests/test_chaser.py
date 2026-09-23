@@ -276,3 +276,20 @@ async def test_an_offset_of_zero_is_used_rather_than_read_as_absent():
     hand the market's offset to a cycle that drew zero."""
     on_the_touch = await _resting_price(params_offset=2.0, roles_offset=0.0)
     assert on_the_touch != await _resting_price(params_offset=2.0, roles_offset=None)
+
+
+# The cap on one resting order had the same problem as the offset. A dry run
+# with three groups open placed 600 orders and every one of them was 0.003176
+# BTC, the last cap any group drew. A group now carries its own.
+
+
+async def test_the_cycles_own_order_cap_is_the_one_used():
+    chaser, book, master, _s = build(max_order_size=0.25)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    roles = LegRoles(
+        BTC, maker=MASTER, taker=SUB1, maker_is_buy=True, reduce_only=False,
+        max_order_size=0.4,
+    )
+
+    await chaser.step(roles, LegState(symbol=BTC, target_size=1.0))
+    assert master.placed[0]["size"] == 0.4

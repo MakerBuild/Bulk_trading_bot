@@ -86,6 +86,9 @@ class LegRoles:
     # the chaser on the market's own number, which is every leg that is
     # not drawn from a pool.
     offset_bps: float | None = None
+    # This cycle's cap on one resting order, for the same reason. None
+    # leaves the chaser on the market's shared number.
+    max_order_size: float | None = None
 
     @property
     def key(self) -> str:

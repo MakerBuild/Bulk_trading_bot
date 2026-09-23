@@ -19,6 +19,13 @@ This is the rule that makes the arithmetic safe, not a tidiness preference.
 **A group never contains an account twice.** Pairing an account with itself
 nets to nothing, trades nothing, and still pays two taker fees.
 
+**With more than one master, a group spans two of them.** The maker comes
+from one master's tree and every taker from another's. A group's accounts are
+not meant to trade with each other -- the hedge goes to the book, and our own
+orders are pulled out of its path first -- but when one does anyway, between
+two masters it is a trade like any other, and inside one tree it is a
+self-trade the fee tier does not count.
+
 **Concurrency is capped.** A hundred accounts allow fifty groups, which is
 fifty resting orders being chased and fifty hedges chasing them, against an
 exchange that answered 429 to two accounts polling every five seconds. The cap
@@ -122,6 +129,10 @@ class Pairing:
     pool: list[str]
     max_groups: int = 5
     max_takers: int = 1
+    # Which master each account belongs to, keyed by pubkey. Empty, or one
+    # master for the whole pool, draws from anyone: there is no other tree to
+    # cover a maker from, and refusing would mean no groups at all.
+    owner: dict[str, object] = field(default_factory=dict)
     rng: random.Random = field(default_factory=random.Random)
     busy: set[str] = field(default_factory=set)
     active: dict[int, Group] = field(default_factory=dict)
@@ -132,8 +143,25 @@ class Pairing:
         """Accounts not currently in a group, in pool order."""
         return [account for account in self.pool if account not in self.busy]
 
+    @property
+    def _split(self) -> bool:
+        """Whether the pool spans more than one master."""
+        return len({self.owner.get(account) for account in self.pool}) > 1
+
+    def _partners(self, maker: str) -> list[str]:
+        """Free accounts that may cover this maker: another master's."""
+        mine = self.owner.get(maker)
+        return [
+            account for account in self.free
+            if account != maker and self.owner.get(account) != mine
+        ]
+
     def can_draw(self, takers: int = 1) -> bool:
-        return len(self.active) < self.max_groups and len(self.free) >= takers + 1
+        if len(self.active) >= self.max_groups:
+            return False
+        if not self._split:
+            return len(self.free) >= takers + 1
+        return any(len(self._partners(maker)) >= takers for maker in self.free)
 
     def draw(
         self,
@@ -155,8 +183,13 @@ class Pairing:
         if wanted < 1:
             return None
 
-        chosen = self.rng.sample(self.free, wanted + 1)
-        maker, takers_drawn = chosen[0], tuple(chosen[1:])
+        if self._split:
+            makers = [m for m in self.free if len(self._partners(m)) >= wanted]
+            maker = self.rng.choice(makers)
+            takers_drawn = tuple(self.rng.sample(self._partners(maker), wanted))
+        else:
+            chosen = self.rng.sample(self.free, wanted + 1)
+            maker, takers_drawn = chosen[0], tuple(chosen[1:])
         group = Group(
             symbol=symbol,
             maker=maker,

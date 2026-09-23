@@ -732,6 +732,7 @@ class Strategy:
                 takers=group.takers,
                 shares=group.shares,
                 offset_bps=leg.offset_bps,
+                max_order_size=leg.max_order_size,
             )
 
         leg = self.state.legs.get(key)
@@ -1518,7 +1519,9 @@ class Strategy:
             return 0.0
         return leg.offset_span.pick() if leg.offset_span else leg.offset_bps
 
-    def _size_for_cycle(self, symbol: str, configured_size: float) -> float:
+    def _size_for_cycle(
+        self, symbol: str, configured_size: float, key: str | None = None
+    ) -> float:
         """This cycle's size for one leg, redrawn when it was written as a range.
 
         A fixed size repeats exactly, and an exact repeat is a shape in the
@@ -1559,9 +1562,16 @@ class Strategy:
         # The chaser reads its cap from this object on every step, so writing
         # to it is what makes a redrawn cap take effect. Clamped for the same
         # reason the size is.
+        #
+        # A drawn group also keeps its own copy on its leg. The params are one
+        # object per market, so with three groups open every one of them
+        # rested whichever cap was drawn last -- three makers, one order size.
+        cap = min(config_leg.max_order_size, ceiling)
         params = getattr(self.chaser, "params", {}).get(symbol)
         if params is not None:
-            params.max_order_size = min(config_leg.max_order_size, ceiling)
+            params.max_order_size = cap
+        if key is not None and key in self._groups:
+            self.state.leg(key, symbol).max_order_size = cap
         log.info(
             "%s: this cycle %g (drawn from %s)",
             symbol, drawn, span if span is not None else cap_span,
@@ -1763,7 +1773,7 @@ class Strategy:
                 self.title.set_cycle(self.state.cycle_index)
                 log.info("=== %s cycle %d ===", key, leg.cycle_index)
                 await self._leg_open(
-                    key, self._size_for_cycle(symbol, configured_size)
+                    key, self._size_for_cycle(symbol, configured_size, key)
                 )
 
             if self._stop.is_set():

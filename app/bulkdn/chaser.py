@@ -198,7 +198,11 @@ class Chaser:
         if target is None:
             return ChaseOutcome(symbol, "skipped", "no reference price")
 
-        desired = round_size(min(remaining, params.max_order_size), spec)
+        cap = (
+            params.max_order_size if roles.max_order_size is None
+            else roles.max_order_size
+        )
+        desired = round_size(min(remaining, cap), spec)
         if desired < spec.lot_size:
             return ChaseOutcome(symbol, "skipped", "desired size below lot")
 

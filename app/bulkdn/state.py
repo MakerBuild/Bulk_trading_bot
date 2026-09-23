@@ -99,6 +99,10 @@ class LegState:
     # offset it has been resting at rather than jumping to a new one
     # mid-order. None means the leg follows its market's fixed number.
     offset_bps: float | None = None
+    # This cycle's cap on one resting order, drawn with the size. Held per
+    # leg for the reason the offset is: the chaser's params are one object
+    # per market, so a cap written there is whichever group drew last.
+    max_order_size: float | None = None
     cycle_index: int = 0
     # Order IDs that were replaced but whose cancels were never confirmed.
     # Swept on the next chase pass so a failed cancel can't leave a duplicate
