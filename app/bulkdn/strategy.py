@@ -955,9 +955,10 @@ class Strategy:
 
         `state.legs` keeps a finished group's leg on purpose -- the state file
         is what a restart reads to find positions -- but the group is dropped
-        from `_groups` on release, and `_roles_for_key` then falls through to
-        the configured pair, whose side is the constant True. Every group that
-        had ever finished was counted, and counted as a buy.
+        from `_groups` on release. Its leg then carried no side of its own:
+        `_roles_for_key` used to fall through to the configured pair, whose
+        side is the constant True, and now resolves it to nothing. Every
+        group that had ever finished was counted, and counted as a buy.
 
         `_groups` is current, but not yet. `_run_group` fills it, and
         `_run_group` is a task: the dispatcher draws, spawns it, and comes
@@ -1073,8 +1074,8 @@ class Strategy:
             return
 
         # Live groups, for the reason spelled out in `_least_crowded_side`:
-        # a released leg resolves to the configured pair rather than to the
-        # group that owned it, so its side is not its own.
+        # a released leg no longer has a group to take its side from, and
+        # has no order of ours on the book either.
         #
         # Every cancel here is a round trip the hedge waits behind, ~360ms
         # each on a live run -- and the hedge's cost rises with every one of

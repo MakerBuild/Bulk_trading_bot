@@ -218,11 +218,17 @@ async def test_an_unanswered_hedge_stays_reserved_until_a_read_settles_it():
     with pytest.raises(HedgeInDoubt):
         await hedger.hedge(OPEN_BTC, mark_price=PRICE)
 
-    # Still reserved, well past the ordinary two-second reservation.
-    assert hedger.in_flight.total(BTC) == pytest.approx(-0.10)
-    for entry in hedger.in_flight._entries[BTC]:
-        entry.expires_at = min(entry.expires_at, entry.sent_at + 25.0)
-    assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.0)
+    # Still reserved, well past the ordinary two-second reservation: the
+    # clock is moved five seconds on, which an ordinary entry would not live.
+    import bulkdn.hedger as hedger_mod
+
+    real_monotonic = hedger_mod.time.monotonic
+    hedger_mod.time.monotonic = lambda: real_monotonic() + 5.0
+    try:
+        assert hedger.in_flight.total(BTC) == pytest.approx(-0.10)
+        assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.0)
+    finally:
+        hedger_mod.time.monotonic = real_monotonic
 
     # A read that began after it was sent now carries whatever it did.
     import time
