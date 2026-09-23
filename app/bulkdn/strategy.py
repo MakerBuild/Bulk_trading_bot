@@ -2040,6 +2040,44 @@ class Strategy:
                 log.debug("could not redraw the status block: %s", describe(exc))
             await asyncio.sleep(interval_s)
 
+    async def _until_legs_finish(
+        self,
+        legs: list[asyncio.Task],
+        supervisor: asyncio.Task,
+        worker: asyncio.Task,
+    ) -> None:
+        """Wait for the legs, and fail the run if a watcher dies before them.
+
+        Only the legs used to be awaited. The supervisor (risk limits,
+        liquidation guard, reconciler) and the hedge worker ran beside them
+        unobserved, so either could end -- by raising, or by returning with
+        nothing asking it to -- and trading carried on without it. Their
+        exceptions surfaced only in the final `gather`, which discards them.
+
+        A watcher that ends after the run has been asked to stop is doing its
+        job: the supervisor returns once it has triggered a halt.
+        """
+        watchers = {supervisor: "risk supervisor", worker: "hedge worker"}
+        watched: set[asyncio.Task] = {*legs, *watchers}
+        while not all(task.done() for task in legs):
+            done, _ = await asyncio.wait(watched, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                watched.discard(task)
+                if task in watchers:
+                    name = watchers[task]
+                    if not task.cancelled() and task.exception() is not None:
+                        raise RuntimeError(
+                            f"the {name} died: {describe(task.exception())}"
+                        ) from task.exception()
+                    if not self._stop.is_set():
+                        raise RuntimeError(f"the {name} stopped on its own")
+                elif task.exception() is not None:
+                    # One leg raising must not leave the others trading on
+                    # alone; the caller cancels them on the way out.
+                    task.result()
+        for task in legs:
+            task.result()
+
     async def run(self) -> None:
         """Run both legs, each on its own clock, until they finish or a halt.
 
@@ -2068,16 +2106,7 @@ class Strategy:
             # here -- they differ in which accounts reached the pool, and
             # that was settled before this point.
             legs = [asyncio.create_task(self._dispatch_groups(sizes))]
-            # One leg raising must not leave the other trading on alone, so the
-            # first exception cancels the rest before it propagates.
-            done, pending = await asyncio.wait(
-                legs, return_when=asyncio.FIRST_EXCEPTION
-            )
-            for task in pending:
-                task.cancel()
-            for task in done:
-                task.result()
-            await asyncio.gather(*pending, return_exceptions=True)
+            await self._until_legs_finish(legs, supervisor, worker)
 
             if self._stop_requested:
                 # The legs left their loops without reaching the end of a phase,
@@ -2106,6 +2135,26 @@ class Strategy:
         except asyncio.CancelledError:
             log.warning("interrupted -- cancelling strategy orders")
             await cancel_all_orders(self.all_sessions, self.symbols)
+            raise
+        except Exception as exc:
+            # Anything else used to leave straight through `finally`, which
+            # stops the hedge worker but pulls nothing: every other group's
+            # resting order stayed on the book, and a fill on one of them
+            # landed with no hedge coming. One 429 inside a residual sweep
+            # was enough.
+            log.critical(
+                "run failed (%s) -- cancelling every resting order", describe(exc)
+            )
+            try:
+                await cancel_all_orders(self.all_sessions, self.symbols)
+            except Exception as cancel_exc:  # noqa: BLE001 - still report the cause
+                log.critical(
+                    "COULD NOT CANCEL resting orders: %s -- cancel them by hand "
+                    "now; nothing is hedging them",
+                    describe(cancel_exc),
+                )
+            with contextlib.suppress(Exception):
+                self._log_open_positions()
             raise
         finally:
             self._stop.set()
