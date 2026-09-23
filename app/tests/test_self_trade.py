@@ -441,3 +441,28 @@ async def test_the_worker_still_hedges_normally():
     await asyncio.wait_for(worker, 2)
 
     assert obj.hedger.hedged == ["g1:" + BTC]
+
+
+# -- a replacement placed during the cancel is not forgotten -----------------
+
+
+async def test_an_order_replaced_mid_cancel_keeps_its_new_id():
+    """The chaser runs as its own task and can replace the order while the
+    cancel is in flight. Clearing `leg.oid` blindly afterwards dropped the
+    replacement's id: an order left resting that nothing tracked."""
+    obj = strategy()
+    roles = register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    leg = obj.state.leg("g1:" + BTC)
+    session = obj.sessions["maker-a"]
+    real_cancel = session.cancel
+
+    async def cancel_while_chaser_replaces(symbol, oid):
+        await real_cancel(symbol, oid)
+        leg.oid = "oid-replacement"            # the chaser, meanwhile
+
+    session.cancel = cancel_while_chaser_replaces
+
+    await obj._clear_hedge_path(roles)
+
+    assert session.cancelled == [(BTC, "oid-1")]
+    assert leg.oid == "oid-replacement", "the replacement was forgotten"

@@ -955,8 +955,14 @@ class Strategy:
             in_path.append((session, leg))
 
         async def pull(session, leg) -> None:
+            # Taken before the await. The chaser is a separate task and can
+            # replace this order while the cancel is in flight; clearing
+            # `leg.oid` blindly afterwards then dropped the REPLACEMENT's id --
+            # an order left resting that nothing tracked, free to fill the
+            # leg past its size.
+            oid = leg.oid
             try:
-                await session.cancel(roles.symbol, leg.oid)
+                await session.cancel(roles.symbol, oid)
             except Exception as exc:  # noqa: BLE001 - the hedge still goes
                 log.warning(
                     "%s: could not pull its %s order out of the hedge's path "
@@ -964,7 +970,8 @@ class Strategy:
                     session.name, roles.symbol, describe(exc),
                 )
                 return
-            leg.oid = None
+            if leg.oid == oid:
+                leg.oid = None
 
         await asyncio.gather(*(pull(session, leg) for session, leg in in_path))
 
