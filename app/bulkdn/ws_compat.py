@@ -49,7 +49,7 @@ log = logging.getLogger(__name__)
 
 _PATCHED = False
 _insecure_ssl = False
-_auto_bypass = True
+_auto_bypass = False
 _bypass_latched = False
 
 # The SDK's default is short enough that a cold connection can miss it.
@@ -61,14 +61,16 @@ _PING_INTERVAL = 20.0
 _PING_TIMEOUT = 60.0
 
 
-def set_ssl_options(*, insecure: bool = False, auto_bypass: bool = True) -> None:
+def set_ssl_options(*, insecure: bool = False, auto_bypass: bool = False) -> None:
     """Configure TLS behaviour before connecting.
 
     `insecure` skips verification outright; `auto_bypass` keeps verification on
-    but retries once without it if the certificate is rejected. Auto-bypass is
-    the default because the live endpoints have been observed serving
-    certificates that fail verification, and a bot that cannot open its account
-    stream cannot hedge.
+    but retries once without it if the certificate is rejected. Both default
+    to off, as `ws_ssl_auto_bypass` does in the config: the certificate
+    failures that once made the bypass necessary came from the system store,
+    and verification now goes through certifi's bundle. A caller that does not
+    pass the setting -- a tool, a test, a future entry point -- must not get
+    unverified TLS by omission.
     """
     global _insecure_ssl, _auto_bypass, _bypass_latched
     _insecure_ssl = insecure
@@ -308,7 +310,7 @@ def _robust_fill_from_api(cls, data: dict) -> Fill:
     return fill
 
 
-def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = True) -> None:
+def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = False) -> None:
     """Install the patches. Idempotent."""
     global _PATCHED
     set_ssl_options(insecure=insecure_ssl, auto_bypass=auto_bypass)
