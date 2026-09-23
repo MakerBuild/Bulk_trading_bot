@@ -39,6 +39,7 @@ from bulk_api.common import (
     Topic,
     TransactionSigner,
 )
+from bulk_api.messages import SubscriptionRequest
 from bulk_api.messages.trade import CancelAll, CancelOrder, LimitOrder, MarketOrder, OrderResponse
 
 Action = Any  # LimitOrder | MarketOrder | CancelOrder | CancelAll
@@ -52,6 +53,58 @@ class OrderRejected(Exception):
     def __init__(self, message: str, responses: Sequence[OrderResponse] | None = None):
         super().__init__(message)
         self.responses = list(responses or [])
+
+
+class TransactionRejected(OrderRejected):
+    """The exchange refused the whole transaction, not one action inside it.
+
+    Bad signature, rate limit, malformed envelope: the reply to OUR request id
+    came back with a status other than "ok". The SDK raises a bare
+    `RuntimeError` for this, which is indistinguishable from a timeout or a
+    dropped socket -- and `AccountSession.submit` read every such error as "no
+    answer". So a key the exchange refused on every order never moved the
+    reject streak, the kill switch that exists for exactly that never tripped,
+    and the strategy looped place -> reject -> cancel for as long as anyone let
+    it, each pass marking the symbol "in doubt" and asking for a position read.
+
+    It is an `OrderRejected` because that is what callers already handle as
+    "the exchange answered no": nothing was applied, and nothing is in doubt.
+    `responses` is empty -- there are no per-action statuses -- and `detail`
+    carries whatever the exchange said.
+    """
+
+    def __init__(self, message: str, detail: Any = None):
+        super().__init__(message, [])
+        self.detail = detail
+
+
+_RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "ratelimit", "too many", "429", "throttl")
+
+
+def is_rate_limited(exc: BaseException) -> bool:
+    """Whether a refusal is the exchange throttling us rather than saying no.
+
+    Judged from the text, which is all a refusal carries: the reply has no
+    code for it that this bot has seen.
+    """
+    text = f"{exc} {getattr(exc, 'detail', '') or ''}".lower()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+class SubmissionInDoubt(RuntimeError):
+    """A request was failed on the socket without an answer addressed to it.
+
+    The SDK's `_handle_error_response` fails EVERY pending request on a socket
+    when an `error` frame arrives, whether or not the frame says which request
+    it is about. One socket carries every account under a key, so an error
+    caused by one account's order would otherwise be booked as a rejection on
+    all of them -- and counted toward each one's kill switch.
+
+    When the frame cannot be tied to a request id, nobody can say whose it
+    was, so nobody is told "rejected". Everyone pending is told "in doubt"
+    instead, which is the honest reading: the request may or may not have
+    been applied, and a position read will settle it.
+    """
 
 
 class RoutedWsClient(BulkWebSocketClient):
@@ -90,32 +143,55 @@ class RoutedWsClient(BulkWebSocketClient):
         # `_handle_message`.
         self._dispatch_owner: str | None = None
         self._owner_warned = False
-        # Set only while `connect` has the signer hidden from the base class.
-        self._hidden_signer = None
+        # When an update last named an account this socket does not carry.
+        # See `_warn_unknown_owner`.
+        self._unknown_owner_warned_at: float | None = None
 
     # -- connection --------------------------------------------------------
 
-    async def connect(self) -> bool:
-        """Connect, subscribing to *this* client's account rather than the signer's.
+    def _intended_subscriptions(self) -> list[SubscriptionRequest]:
+        """Every account this socket carries, then the tickers.
 
-        The base implementation auto-subscribes to `signer.public_key`, which is
-        wrong for a sub-account session. Hiding the signer for the duration of
-        the call suppresses that branch; the account subscription is then issued
-        explicitly. On reconnect the stored subscription list is replayed
-        instead, so this only applies to the first connect.
+        The same set, in the same order, that the base class and the old
+        per-account loop issued between them on a first connect.
         """
-        had_subscriptions = bool(self.subscriptions)
-        # Hidden, not discarded: `_signing_key` still sees it, so a submission
-        # that lands inside this window signs normally instead of failing with
-        # "signer not configured". A live run hit exactly that while the
-        # emergency stop tried to cancel orders during a reconnect.
-        self._hidden_signer = self.signer
-        self.signer = None
-        try:
-            connected = await super().connect()
-        finally:
-            self.signer = self._hidden_signer
-            self._hidden_signer = None
+        subs = [SubscriptionRequest("account", {"user": pubkey}) for pubkey in self.accounts]
+        subs += [
+            SubscriptionRequest("ticker", {"symbol": symbol})
+            for symbol in (getattr(self, "symbols", None) or [])
+        ]
+        return subs
+
+    async def connect(self) -> bool:
+        """Connect, subscribing to *this* client's accounts rather than the signer's.
+
+        The base implementation has two branches. With a stored subscription
+        list it replays that list; with none -- a first connect -- it
+        subscribes to `signer.public_key` and the tickers. The signer's own
+        account is wrong for a socket carrying sub-accounts, so the first
+        connect is steered into the replay branch instead, by recording the
+        full intended set BEFORE the base call.
+
+        This replaces hiding the signer for the duration of the call, which
+        worked but was a trap: for as long as `connect` ran, `self.signer` was
+        None, and a submission that landed in that window -- the emergency
+        stop cancelling orders during a reconnect, seen live -- failed with
+        "signer not configured" until a second field was added to paper over
+        it. Nothing needs hiding now, so there is nothing to restore.
+
+        Recording first also fixes a partial resubscription. The old path
+        subscribed the accounts one `send` at a time after the base call, and
+        each `send` appended to `subscriptions` as it went. A connect that died
+        between two of them left the list holding only the accounts that got
+        through -- and every later reconnect replays the list, so the missing
+        accounts were never subscribed again. Fills on them arrived on no
+        socket at all. Recorded up front, a failed first connect leaves the
+        whole set behind for the next attempt to replay.
+        """
+        if not self.subscriptions:
+            self.subscriptions = self._intended_subscriptions()
+
+        connected = await super().connect()
 
         if connected:
             # A socket that has just come up has been silent for zero seconds.
@@ -126,10 +202,6 @@ class RoutedWsClient(BulkWebSocketClient):
             # heal worked, the re-check saw 31s of silence belonging to a socket
             # that no longer existed, and the kill switch fired anyway.
             self.last_message_at = time.monotonic()
-
-        if connected and not had_subscriptions:
-            for pubkey in self.accounts:
-                await self.subscribe_account(pubkey)
         return connected
 
     async def _handle_message(self, data: dict) -> None:
@@ -153,7 +225,11 @@ class RoutedWsClient(BulkWebSocketClient):
         if isinstance(data, dict) and data.get("type") == "account":
             self._dispatch_owner = _owner_of(data, self.accounts)
             if self._dispatch_owner is None:
-                self._warn_unattributable(data)
+                stranger = _claimed_owner(data)
+                if stranger is not None:
+                    self._warn_unknown_owner(stranger)
+                else:
+                    self._warn_unattributable(data)
             try:
                 await super()._handle_message(data)
             finally:
@@ -183,17 +259,126 @@ class RoutedWsClient(BulkWebSocketClient):
             data.get("topic"),
         )
 
+    def _warn_unknown_owner(self, named: str) -> None:
+        """Say that an update named an account this socket does not carry.
+
+        It used to be believed. `_owner_of` returned whatever string sat under
+        a `user`/`account`/`u` key, every session compared it with its own
+        pubkey, none matched, and the update -- a fill, a position -- was
+        dropped by all of them without a word. Now it reads as "cannot tell",
+        which re-reads positions over HTTP, and this says why.
+
+        Rate-limited rather than once-only: unlike the missing-field case, this
+        is a fact about individual messages, and one that keeps happening is
+        worth seeing more than once in a long run -- but not once per frame.
+        """
+        now = time.monotonic()
+        last = self._unknown_owner_warned_at
+        if last is not None and now - last < UNKNOWN_OWNER_WARN_EVERY_S:
+            return
+        self._unknown_owner_warned_at = now
+        log.warning(
+            "an account update names %s, which is not one of the %d account(s) "
+            "on this socket -- not attributing it to any of them; positions "
+            "will be re-read over HTTP",
+            short_pubkey(named), len(self.accounts),
+        )
+
     @property
     def message_owner(self) -> str | None:
         """The account the update being dispatched belongs to, if it says."""
         return self._dispatch_owner
 
+    # -- answers to our requests -------------------------------------------
+
+    async def _handle_post_response(self, data: dict) -> None:
+        """Fail a refused transaction as a rejection, not as a bare error.
+
+        The SDK resolves a non-"ok" reply with `RuntimeError("Order request
+        failed: ...")`. The reply carries our request id, so it is an answer
+        to exactly one request -- and an answer that says no. Raising it as
+        `TransactionRejected` is what lets `AccountSession.submit` count it
+        toward the reject streak instead of filing it with the timeouts.
+
+        An "ok" reply is left to the SDK, which parses the per-action
+        statuses.
+        """
+        response_data = data.get("data") if isinstance(data, dict) else None
+        payload = response_data.get("payload") if isinstance(response_data, dict) else None
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status == "ok":
+            await super()._handle_post_response(data)
+            return
+
+        future = self.pending_requests.pop(data.get("id"), None)
+        log.error("transaction refused by the exchange: %s", response_data)
+        if future is not None and not future.done():
+            future.set_exception(
+                TransactionRejected(
+                    f"transaction refused: {_refusal_text(response_data)}",
+                    response_data,
+                )
+            )
+        await self._emit_event(Topic.ERROR, response_data)
+
+    async def _handle_error_response(self, data: dict) -> None:
+        """Fail only the request an `error` frame is about, when it says.
+
+        The SDK fails every pending request on the socket with the frame's
+        message. On a socket carrying every account under a key, that turned
+        one account's refused order into a "failure" on every other account
+        with a request in flight -- and with rejections now counted, it would
+        have tripped their kill switches for something they did not do.
+
+        With an id that matches a pending request, that request alone is
+        rejected: it is a direct answer. Without one, nobody can say whose
+        error it was, so every pending request is failed as IN DOUBT rather
+        than rejected. Failing them at all, rather than leaving them to time
+        out, keeps the SDK's reason for doing so: a submission waiting ten
+        seconds for a reply that is not coming stalls a chase loop for ten
+        seconds, and "in doubt" already makes the caller re-read positions.
+        """
+        error_data = data.get("error") if isinstance(data, dict) else None
+        if not isinstance(error_data, dict):
+            error_data = {}
+        message = error_data.get("message") or "websocket error"
+        request_id = data.get("id", error_data.get("id"))
+
+        if request_id is not None:
+            # Named, so it is about that request and no other. One that is no
+            # longer waiting -- it already timed out -- is logged and left:
+            # the requests still pending did nothing to earn it.
+            future = self.pending_requests.pop(request_id, None)
+            log.error("request %s refused on the socket: %s", request_id, message)
+            if future is not None and not future.done():
+                future.set_exception(
+                    TransactionRejected(f"request refused: {message}", error_data)
+                )
+        else:
+            log.error(
+                "socket error naming no request we are waiting on (%s) -- %d "
+                "pending request(s) on this socket are now in doubt, not rejected",
+                message, len(self.pending_requests),
+            )
+            pending = list(self.pending_requests.items())
+            self.pending_requests.clear()
+            for _request_id, waiting in pending:
+                if not waiting.done():
+                    waiting.set_exception(
+                        SubmissionInDoubt(f"unattributed socket error: {message}")
+                    )
+        await self._emit_event(Topic.ERROR, error_data)
+
     # -- routed submission -------------------------------------------------
 
     @property
     def _signing_key(self):
-        """The key that signs, whether or not `connect` is hiding it."""
-        return self.signer or self._hidden_signer
+        """The key that signs.
+
+        A property for the callers that predate `connect` no longer hiding
+        the signer; it is simply `self.signer` now.
+        """
+        return self.signer
 
     async def submit(
         self,
@@ -240,6 +425,9 @@ class RoutedWsClient(BulkWebSocketClient):
 
         tx = {
             "actions": payload_actions,
+            # A decimal string, as the SDK sends it on every signed path, WS
+            # and HTTP alike. `bulkdn.tx` sends a number instead, on purpose;
+            # see there.
             "nonce": f"{nonce}",
             "account": account,
             "signer": signer.public_key,
@@ -274,7 +462,11 @@ class RoutedWsClient(BulkWebSocketClient):
             "id": request_id,
         }
 
-        future: asyncio.Future = asyncio.Future()
+        # From the running loop, not `asyncio.Future()`, which binds to
+        # whatever `get_event_loop` returns -- deprecated outside a running
+        # loop, and a different loop from the one resolving it if a caller
+        # ever arrives through `asyncio.run` in a thread.
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
         self.pending_requests[request_id] = future
         try:
             await self.ws.send(json.dumps(request))
@@ -338,40 +530,38 @@ class AccountSession:
         A fill that landed while the socket was down therefore shows up as a
         position difference and is corrected once, not twice.
 
-        The delay doubles, so six attempts span about a minute rather than the
-        seven seconds three flat ones did. That came from a subscriber's log:
-        the socket dropped, and all three reconnects were refused by the
-        exchange's own front end with `HTTP 502` inside seven seconds. A
-        gateway is rarely back that quickly, and the run halted on an outage
-        it had barely waited out -- cancelling its orders and leaving the
-        operator to restart it by hand.
+        The delay doubles, so the six attempts wait 2+4+8+16+30 = 60 seconds
+        between them rather than the seven seconds three flat ones did. That is
+        the WAITING alone. Each attempt can itself take up to the socket's open
+        timeout (`ws_compat._OPEN_TIMEOUT`, 30s) when the far end accepts the
+        TCP connection and then says nothing, so the worst case is 60 + 6 x 30,
+        about four minutes, and a refused connection -- DNS, `HTTP 502` --
+        fails in well under a second and leaves it near the one minute. The
+        docstring used to promise "about a minute" flat, which was only ever
+        the fast-failure case.
+
+        The patience came from a subscriber's log: the socket dropped, and all
+        three reconnects were refused by the exchange's own front end with
+        `HTTP 502` inside seven seconds. A gateway is rarely back that quickly,
+        and the run halted on an outage it had barely waited out -- cancelling
+        its orders and leaving the operator to restart it by hand.
 
         Patience is nearly free here and impatience is not. The pair stays
         hedged while the socket is down -- the reconciler works over HTTP -- so
         a minute of trying costs a minute of not trading, while giving up costs
         a halt.
+
+        **The budget belongs to the socket, not to the session.** Every account
+        under a key shares one client, and each of their sessions used to spend
+        its own six attempts on it, one after another: eleven accounts on a
+        dead socket was eleven budgets, up to three-quarters of an hour, before
+        the supervisor could conclude what the first one already knew. Now the
+        attempts run once per client and every session on it waits for, and
+        shares, the same outcome. See `reconnect_client`.
         """
-        for attempt in range(1, attempts + 1):
-            # Closing a socket that is already broken is expected to fail.
-            with contextlib.suppress(Exception):
-                await self.client.disconnect()
-            try:
-                if await self.client.connect():
-                    log.warning(
-                        "%s: WebSocket reconnected on attempt %d", self.name, attempt
-                    )
-                    return True
-            except Exception as exc:  # noqa: BLE001 - every failure is the same here
-                log.warning(
-                    "%s: reconnect attempt %d/%d failed: %s",
-                    self.name, attempt, attempts, describe(exc),
-                )
-            if attempt < attempts:
-                # Doubling, capped: a gateway that is down stays down for
-                # longer than a socket that merely blipped, and hammering it
-                # every two seconds neither helps it nor us.
-                await asyncio.sleep(min(delay * 2 ** (attempt - 1), 30.0))
-        return False
+        return await reconnect_client(
+            self.client, label=self.name, attempts=attempts, delay=delay
+        )
 
     async def disconnect(self) -> None:
         try:
@@ -432,6 +622,28 @@ class AccountSession:
             # session is the only thing that knows which of them this is.
             kwargs.setdefault("account", self.pubkey)
             responses = await self.client.submit(actions, **kwargs)
+        except OrderRejected as exc:
+            # The whole transaction was refused -- bad signature, rate limit,
+            # a malformed envelope. That is an answer, and a definite one:
+            # nothing in it was applied, so nothing is in doubt.
+            #
+            # It used to land in the branch below with the timeouts, which
+            # left the reject streak untouched. A key the exchange refused on
+            # every order therefore never tripped the kill switch built for
+            # it, and the strategy looped place -> reject -> cancel, each pass
+            # asking for a position read that could only say "nothing
+            # happened".
+            self._settle(actions)
+            if count_rejects and not is_rate_limited(exc):
+                self.reject_streak += 1
+                self.last_reject = str(exc)
+            elif count_rejects:
+                # Throttled, not refused for cause. The streak halts the run
+                # and closes every account at market, and a burst of 429s on a
+                # shared socket reached five inside five seconds of chasing --
+                # an outage of a few seconds is no reason to do that.
+                log.warning("%s: throttled by the exchange: %s", self.name, describe(exc))
+            raise
         except Exception:
             # No answer came back. The actions may have executed anyway, so
             # every symbol they touched is now in doubt until a position read
@@ -443,10 +655,7 @@ class AccountSession:
                     self.unconfirmed[symbol] = at
             raise
 
-        for action in actions:
-            symbol = getattr(action, "symbol", None)
-            if symbol:
-                self.unconfirmed.pop(symbol, None)
+        self._settle(actions)
 
         rejected = [r for r in responses if r.is_error()]
         if rejected:
@@ -465,6 +674,13 @@ class AccountSession:
             self.reject_streak = 0
             self.last_reject = ""
         return responses
+
+    def _settle(self, actions: Sequence[Action]) -> None:
+        """An answer came back, so these symbols are no longer in doubt."""
+        for action in actions:
+            symbol = getattr(action, "symbol", None)
+            if symbol:
+                self.unconfirmed.pop(symbol, None)
 
     async def place_limit(
         self,
@@ -503,7 +719,25 @@ class AccountSession:
             actions.append(CancelOrder(symbol=symbol, oid=cancel_oid))
         actions.append(order)
 
-        responses = await self.submit(actions)
+        try:
+            responses = await self.submit(actions)
+        except OrderRejected as exc:
+            # A rejection of the BATCH is not necessarily a rejection of the
+            # order. In a cancel+replace the cancel half is refused whenever
+            # the old order filled first -- a race this strategy loses
+            # routinely -- and the new order beside it may well have been
+            # accepted and be resting. Reported only as "rejected", the
+            # chaser forgot it: an order on the book that nothing tracked,
+            # free to fill the leg past its size.
+            #
+            # So the exception says what became of the order itself: its id,
+            # and whether its own status was an acceptance. A whole-
+            # transaction refusal has no per-action statuses and is never
+            # `placed`. Attached rather than returned, because every other
+            # caller of `submit` relies on a rejection raising.
+            exc.order_id = _safe_order_id(order)
+            exc.placed = _order_accepted(order, actions, exc.responses)
+            raise
         # order_id() is a deterministic hash of the signed fields, so it is
         # known once seqno/nonce/pubkey have been stamped on by submit().
         return order.order_id(), responses
@@ -554,6 +788,117 @@ class AccountSession:
 
     def open_orders(self) -> list[dict]:
         return self.http.get_open_orders(self.pubkey)
+
+
+# How long the outcome of one reconnect speaks for the socket. The supervisor
+# heals sessions one after another, so the siblings of a session that just
+# gave up ask about the same socket within milliseconds; ten seconds covers
+# that pass with room to spare and is well short of the next one.
+RECONNECT_SHARE_S = 10.0
+
+# Bumped whenever ANY socket reconnects. A failure is shared with the next
+# caller only while this is unchanged: one socket coming back is proof the
+# network did, and the supervisor retries the ones that failed before it for
+# exactly that reason. A shared failure must not refuse that retry.
+_reconnect_generation = 0
+
+
+async def reconnect_client(
+    client, *, label: str, attempts: int = 6, delay: float = 2.0
+) -> bool:
+    """Reconnect one socket once, however many sessions ask.
+
+    Three cases, in order:
+
+    * A reconnect of this client is already running: wait for it and take
+      its answer. Sessions healed concurrently join one attempt sequence
+      rather than each tearing down the socket the other is building.
+    * One finished moments ago (`RECONNECT_SHARE_S`): a success stands if the
+      socket is still up, so a sibling asking next does not disconnect the
+      socket that was just restored; a failure stands if no socket anywhere
+      has come back since, so a sibling asking next does not spend another
+      full budget against the same dead endpoint.
+    * Otherwise run the attempts.
+
+    The state lives on the client object because the client IS the socket --
+    which is also how `Strategy._trees` groups sessions by key.
+    """
+    running = getattr(client, "_bulkdn_reconnect", None)
+    if running is not None and not running.done():
+        log.info("%s: joining the reconnect already under way on this socket", label)
+        return await _await_shared(client, running)
+
+    outcome = getattr(client, "_bulkdn_reconnect_outcome", None)
+    if outcome is not None:
+        ok, generation, at = outcome
+        if time.monotonic() - at < RECONNECT_SHARE_S:
+            if ok and client.is_connected:
+                log.info("%s: this socket was reconnected moments ago", label)
+                return True
+            if not ok and generation == _reconnect_generation:
+                log.warning(
+                    "%s: this socket gave up reconnecting moments ago and "
+                    "nothing has come back since -- not retrying it again",
+                    label,
+                )
+                return False
+
+    task = asyncio.ensure_future(_reconnect_attempts(client, label, attempts, delay))
+    client._bulkdn_reconnect = task
+    client._bulkdn_reconnect_waiters = 0
+    return await _await_shared(client, task)
+
+
+async def _await_shared(client, task: asyncio.Future) -> bool:
+    """Wait on a shared reconnect without letting one waiter cancel it for all.
+
+    Shielded, so a session whose own caller is cancelled does not take the
+    reconnect away from the siblings waiting on it. Counted, so when the LAST
+    waiter is cancelled -- shutdown -- the attempts stop too, rather than
+    running on in the background and reopening a socket after the run ended.
+    """
+    client._bulkdn_reconnect_waiters = getattr(client, "_bulkdn_reconnect_waiters", 0) + 1
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if client._bulkdn_reconnect_waiters <= 1 and not task.done():
+            task.cancel()
+        raise
+    finally:
+        client._bulkdn_reconnect_waiters -= 1
+
+
+async def _reconnect_attempts(client, label: str, attempts: int, delay: float) -> bool:
+    for attempt in range(1, attempts + 1):
+        # Closing a socket that is already broken is expected to fail.
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+        try:
+            if await client.connect():
+                log.warning("%s: WebSocket reconnected on attempt %d", label, attempt)
+                _record_reconnect(client, True)
+                return True
+        except Exception as exc:  # noqa: BLE001 - every failure is the same here
+            log.warning(
+                "%s: reconnect attempt %d/%d failed: %s",
+                label, attempt, attempts, describe(exc),
+            )
+        if attempt < attempts:
+            # Doubling, capped: a gateway that is down stays down for
+            # longer than a socket that merely blipped, and hammering it
+            # every two seconds neither helps it nor us.
+            await asyncio.sleep(min(delay * 2 ** (attempt - 1), 30.0))
+    # Recorded only on a finished run. A reconnect cancelled at shutdown
+    # proved nothing about the socket and leaves no verdict behind.
+    _record_reconnect(client, False)
+    return False
+
+
+def _record_reconnect(client, ok: bool) -> None:
+    global _reconnect_generation
+    if ok:
+        _reconnect_generation += 1
+    client._bulkdn_reconnect_outcome = (ok, _reconnect_generation, time.monotonic())
 
 
 def build_pool(
@@ -642,6 +987,19 @@ def _owner_of(message: dict, accounts: Sequence[str] = ()) -> str | None:
     in there; how it is wrapped -- a prefix, a separator, a case -- is the
     exchange's business and not something to encode a guess about. Matching
     what we asked for is exact where it matters and indifferent to the rest.
+
+    A payload field is believed only if it names one of `accounts`. It used to
+    be believed whatever it said: a string under `user`, `account` or `u` that
+    was some other key -- a counterparty, a referrer, a field that merely
+    shares the name -- came back as the owner, every session on the socket
+    compared it with its own pubkey, and the update was dropped by all of them
+    in silence. Naming someone we do not carry is now "cannot tell", which the
+    handlers answer with an HTTP re-read; `_claimed_owner` lets the client say
+    so in the log.
+
+    With no `accounts` to check against there is nothing to validate, and the
+    named value is returned as before. Every `RoutedWsClient` carries at least
+    one account, so that is only ever a caller outside a socket.
     """
     topic = message.get("topic")
     if isinstance(topic, str) and topic:
@@ -649,6 +1007,16 @@ def _owner_of(message: dict, accounts: Sequence[str] = ()) -> str | None:
             if pubkey and pubkey in topic:
                 return pubkey
 
+    named = _claimed_owner(message)
+    if named is None:
+        return None
+    if accounts and named not in accounts:
+        return None
+    return named
+
+
+def _claimed_owner(message: dict) -> str | None:
+    """Whatever a payload field says the owner is, checked against nothing."""
     layers = [message]
     inner = message.get("data")
     if isinstance(inner, dict):
@@ -659,6 +1027,29 @@ def _owner_of(message: dict, accounts: Sequence[str] = ()) -> str | None:
             if isinstance(value, str) and value:
                 return value
     return None
+
+
+# How often to repeat the warning about updates naming an account this socket
+# does not carry. Once a minute is enough to see that it keeps happening in a
+# long run without one line per frame.
+UNKNOWN_OWNER_WARN_EVERY_S = 60.0
+
+
+def _refusal_text(response_data: Any) -> str:
+    """The exchange's own words for a refused transaction, briefly.
+
+    Used as the rejection message, which ends up in `last_reject` and so in
+    the halt reason. The full reply is logged separately at ERROR.
+    """
+    if isinstance(response_data, dict):
+        payload = response_data.get("payload")
+        for source in (payload, response_data):
+            if isinstance(source, dict):
+                for key in ("message", "error", "reason", "status"):
+                    value = source.get(key)
+                    if value:
+                        return str(value)
+    return str(response_data)
 
 
 class NoSubAccount(Exception):
@@ -755,3 +1146,22 @@ def _safe_order_id(action: Action) -> str | None:
         return action.order_id()
     except Exception:
         return None
+
+
+def _order_accepted(
+    order: Action, actions: Sequence[Action], responses: Sequence[OrderResponse]
+) -> bool:
+    """Whether the exchange's status for `order` within a batch was an acceptance.
+
+    Found by order id where the response carries one, and otherwise by
+    position -- responses come back one per action, in order -- but only when
+    the counts agree, since a positional match against a short list would
+    read some other action's status as this one's.
+    """
+    oid = _safe_order_id(order)
+    mine = None
+    if oid:
+        mine = next((r for r in responses if getattr(r, "order_id", None) == oid), None)
+    if mine is None and len(responses) == len(actions):
+        mine = responses[next(i for i, a in enumerate(actions) if a is order)]
+    return mine is not None and not mine.is_error()

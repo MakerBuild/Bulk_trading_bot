@@ -22,7 +22,7 @@ import time
 import base58
 from bulk_api.common.signer import SignatureDomain, TransactionSigner
 
-from .retry import post_with_retry
+from .retry import post_signed
 
 
 def write_u64(value: int) -> bytes:
@@ -31,6 +31,48 @@ def write_u64(value: int) -> bytes:
 
 def write_u32(value: int) -> bytes:
     return struct.pack("<I", value)
+
+
+class TxResult(tuple):
+    """What `sign_and_submit` returns: `(request, status, response)` plus a verdict.
+
+    Still a 3-tuple, so every caller that unpacks `tx, status, body = ...`
+    keeps working. The additions are attributes:
+
+    * `uncertain` -- True when the outcome is NOT known. Some attempt may have
+      reached the exchange without an answer (a read timeout, a dropped
+      connection, a gateway 5xx), and the answer that did come back is not an
+      acceptance. The usual shape: the first POST was applied, its response
+      was lost, and the replay of the same signed bytes was refused because
+      its nonce had already been used. Reading that refusal as "failed" is
+      how a transfer gets repeated by hand. Callers should say UNKNOWN and
+      tell the operator to check the balances before trying again.
+    * `accepted` -- the exchange said "ok".
+
+    An `accepted` result is never `uncertain`: an "ok" is an answer about this
+    nonce, whichever attempt it came back on.
+    """
+
+    def __new__(cls, request: dict, status: int, response: dict, *, uncertain: bool = False):
+        self = super().__new__(cls, (request, status, response))
+        self.uncertain = bool(uncertain) and not accepted(status, response)
+        return self
+
+    @property
+    def request(self) -> dict:
+        return self[0]
+
+    @property
+    def status(self) -> int:
+        return self[1]
+
+    @property
+    def response(self) -> dict:
+        return self[2]
+
+    @property
+    def accepted(self) -> bool:
+        return accepted(self.status, self.response)
 
 
 def sign_and_submit(
@@ -43,11 +85,22 @@ def sign_and_submit(
     account: str | None = None,
     nonce: int | None = None,
     timeout: int = 30,
-) -> tuple[dict, int, dict]:
+) -> TxResult:
     """Sign one action and POST it, returning (request, status, response).
 
     `account` defaults to the signer's own key. Pass a sub-account pubkey to act
     on it with the master's key.
+
+    The result is a `TxResult`: it unpacks as the 3-tuple above, and its
+    `uncertain` attribute is True when the outcome is unknown -- an attempt
+    may have been applied without its answer arriving, and the final answer
+    is not an acceptance. For a non-idempotent action (a transfer, a
+    sub-account creation) that must be reported as UNKNOWN, never as a plain
+    failure. See `TxResult`.
+
+    If every attempt fails without any answer, `bulkdn.retry.RetryExhausted`
+    is raised; its own `uncertain` attribute says the same thing about the
+    attempts that were made.
     """
     signer = TransactionSigner(private_key)
     target = account or signer.public_key
@@ -66,6 +119,11 @@ def sign_and_submit(
 
     tx = {
         "actions": [action_json],
+        # A JSON number, unlike the string the SDK sends for orders. Left as
+        # it is on purpose: transfers and createSubAccount have been confirmed
+        # live in exactly this form, and the string form has not been tried on
+        # them. Python writes the integer exactly; a switch would be a change
+        # to signed, money-moving requests made for tidiness alone.
         "nonce": nonce,
         "account": target,
         "signer": signer.public_key,
@@ -74,13 +132,15 @@ def sign_and_submit(
 
     # Retried as the same bytes, so a lost response is replayed under the same
     # nonce rather than becoming a second transaction. See bulkdn.retry.
-    response = post_with_retry(f"{http_url}/order", json=tx, timeout=timeout)
+    response, uncertain = post_signed(f"{http_url}/order", json=tx, timeout=timeout)
     try:
         body = response.json()
     except ValueError:
         body = {"raw": response.text}
-    return tx, response.status_code, body
+    if not isinstance(body, dict):
+        body = {"raw": body}
+    return TxResult(tx, response.status_code, body, uncertain=uncertain)
 
 
 def accepted(status: int, body: dict) -> bool:
-    return status == 200 and body.get("status") == "ok"
+    return status == 200 and isinstance(body, dict) and body.get("status") == "ok"

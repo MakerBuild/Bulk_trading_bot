@@ -149,26 +149,33 @@ def test_a_cancel_rejection_records_nothing():
 
 # -- the signer during a reconnect ------------------------------------------
 #
-# `connect` hides the signer from the base class to suppress its auto-subscribe
-# to the signer's own pubkey. Anything submitted inside that window used to
-# fail with "signer not configured" -- seen live, when an emergency stop tried
-# to cancel the master's orders while the socket was being re-established.
+# `connect` used to hide the signer from the base class to suppress its
+# auto-subscribe to the signer's own pubkey. Anything submitted inside that
+# window failed with "signer not configured" -- seen live, when an emergency
+# stop tried to cancel the master's orders while the socket was being
+# re-established. It now steers the base class into its replay branch instead,
+# so the signer is never out of place at all.
 
 
-def test_a_hidden_signer_still_signs():
+async def test_the_signer_stays_in_place_for_the_whole_connect(monkeypatch):
+    from bulk_api import BulkWebSocketClient
+
     from bulkdn.accounts import RoutedWsClient
 
     client = RoutedWsClient.__new__(RoutedWsClient)
     client.signer = "the-key"
-    client._hidden_signer = None
-    assert client._signing_key == "the-key"
+    client.subscriptions = []
+    client.accounts = ["MASTER", "SUB1"]
+    client.symbols = ["BTC-USD"]
+    seen = []
 
-    # What connect() does for the duration of the base call.
-    client._hidden_signer, client.signer = client.signer, None
-    assert client._signing_key == "the-key", "a submission here would have failed"
+    async def base_connect(self):
+        seen.append((self.signer, self._signing_key))
+        return True
 
-    client.signer, client._hidden_signer = client._hidden_signer, None
-    assert client._signing_key == "the-key"
+    monkeypatch.setattr(BulkWebSocketClient, "connect", base_connect)
+    assert await client.connect() is True
+    assert seen == [("the-key", "the-key")], "a submission here would have failed"
 
 
 def test_no_signer_at_all_is_still_refused():
@@ -176,5 +183,4 @@ def test_no_signer_at_all_is_still_refused():
 
     client = RoutedWsClient.__new__(RoutedWsClient)
     client.signer = None
-    client._hidden_signer = None
     assert client._signing_key is None

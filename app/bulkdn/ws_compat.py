@@ -240,18 +240,68 @@ def _first(data: dict, *names: str, default: Any = None) -> Any:
     return default
 
 
+# Where a fill's side may be stated. `isBuy`/`b` are what the stream sends; a
+# `side` string is accepted too, in the spellings an exchange tends to use.
+_SIDE_WORDS = {"buy": True, "b": True, "bid": True, "sell": False, "s": False,
+               "a": False, "ask": False}
+
+
+def _fill_is_buy(data: dict) -> bool | None:
+    """True for a buy, False for a sell, None when the fill does not say."""
+    flag = _first(data, "isBuy", "b")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, (int, float)) and flag in (0, 1):
+        return bool(flag)
+    if isinstance(flag, str) and flag.lower() in ("true", "false"):
+        return flag.lower() == "true"
+    word = _first(data, "side")
+    if isinstance(word, str):
+        return _SIDE_WORDS.get(word.strip().lower())
+    return None
+
+
 @classmethod
 def _robust_fill_from_api(cls, data: dict) -> Fill:
-    """Parse a fill from either the long or short field spelling."""
+    """Parse a fill from either the long or short field spelling.
+
+    **A fill that does not say which side it was on is not booked.** The side
+    used to default to False -- a SELL -- when neither `isBuy` nor `b` was
+    present, so a buy that arrived without its flag was booked as a sell of
+    the same size: the book then read the leg as off by TWICE the fill, and
+    the hedger sent an order to correct an imbalance that did not exist and
+    create one that did.
+
+    Such a fill comes back with size 0, which is this module's existing
+    convention for "unparseable" (see point 1 in the module docstring): the
+    fill handler returns on a size of zero, and the SDK's inventory and
+    open-order bookkeeping treat it as nothing. The symbol is kept, so it is
+    still clear in the log which market it was, and `side_missing` is set on
+    it for anything that wants to tell the two cases apart. What the fill did
+    is not lost: the position it changed is read back over HTTP by the
+    reconciler, which is where a hedge is derived from in any case.
+    """
+    is_buy = _fill_is_buy(data)
+    size = float(_first(data, "size", "sz", default=0) or 0)
+    if is_buy is None and size:
+        log.error(
+            "fill without a side, NOT booked: symbol=%r order=%r size=%s "
+            "fields=%s -- positions will be corrected from the exchange's own "
+            "record, not from a guess at the direction",
+            _first(data, "symbol", "sym"), _first(data, "orderId", "oid"), size,
+            sorted(data),
+        )
+        size = 0.0
     fill = cls(
         symbol=_first(data, "symbol", "sym", default="") or "",
         order_id=_first(data, "orderId", "oid", default="") or "",
         price=float(_first(data, "price", "px", default=0) or 0),
-        size=float(_first(data, "size", "sz", default=0) or 0),
-        side=Side.BUY if _first(data, "isBuy", "b", default=False) else Side.SELL,
+        size=size,
+        side=Side.BUY if is_buy else Side.SELL,
         timestamp=int(_first(data, "timestamp", "ts", default=0) or 0),
         is_maker=bool(_first(data, "maker", "mk", default=False)),
     )
+    fill.side_missing = is_buy is None
     # v1.0.17 trade id, used to drop replayed fills. Not a field on Fill
     # upstream, so it is attached here.
     fill.trade_id = _first(data, "tradeId", "tid")
@@ -274,10 +324,19 @@ def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = True) -> 
     )
 
     import bulk_api.api.bulk_ws as bulk_ws_module
-    import websockets.asyncio.client as websockets_client
 
+    # The SDK's own reference, and only that. `bulk_ws` did
+    # `from websockets.asyncio.client import connect as ws_connect`, so the
+    # name it calls lives in its module and is replaced there.
+    #
+    # `websockets.asyncio.client.connect` used to be replaced as well, which
+    # changed `websockets.connect` for the whole process: every other library
+    # opening a socket got this module's keepalive overrides and its TLS
+    # bypass latch, and a test or tool importing websockets after this ran
+    # saw a function that was not websockets'. Nothing in the SDK or in this
+    # bot reaches the global name -- `bulk_ws.connect` is the only caller --
+    # so the global patch bought nothing for what it put at risk.
     bulk_ws_module.ws_connect = _connect_with_ssl_fallback  # type: ignore[attr-defined]
-    websockets_client.connect = _connect_with_ssl_fallback  # type: ignore[attr-defined]
 
     _PATCHED = True
     log.debug("WebSocket compatibility patches applied")

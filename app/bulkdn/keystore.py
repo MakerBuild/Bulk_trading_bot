@@ -31,12 +31,16 @@ import contextlib
 import json
 import os
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 
 import nacl.pwhash
 import nacl.secret
 import nacl.utils
 from nacl.exceptions import CryptoError
+
+from .state import REPLACE_ATTEMPTS, REPLACE_RETRY_DELAY_S
 
 PASSWORD_ENV = "BULK_KEY_PASSWORD"
 
@@ -234,17 +238,56 @@ def save(path: str, secret: str, password: str) -> None:
 
     directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    temp = os.path.join(directory, f".{os.path.basename(path)}.tmp")
-    with open(temp, "w", encoding="utf-8") as handle:
-        json.dump(envelope, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp, path)
+    # A fresh, uniquely named temp file rather than a fixed
+    # `.private_key.local.tmp`. With a fixed name two saves at once -- the
+    # menu and a second window, say -- wrote the same file and one moved the
+    # other's half-written envelope into place; and a save that died left
+    # that name behind for the next one to trip over. `mkstemp` also creates
+    # it readable by the owner only on POSIX, so the envelope is never
+    # briefly world-readable before the chmod below.
+    fd, temp = tempfile.mkstemp(
+        dir=directory, prefix=f".{os.path.basename(path)}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(envelope, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _replace_with_retry(temp, path)
+    except BaseException:
+        # Including KeyboardInterrupt: an encrypted key left lying next to
+        # the real one under a temp name is a copy nobody knows to erase.
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
 
     # Best effort: on POSIX drop the group and other bits. Windows ignores it.
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
+
+
+def _replace_with_retry(temp: str, path: str) -> None:
+    """`os.replace`, retried while Windows has the destination locked.
+
+    The same fix `StateStore._replace_with_retry` carries, for the same
+    reason: on Windows the rename fails with a sharing violation whenever
+    another process has the destination open -- OneDrive syncing it, an
+    antivirus scanning a file that just changed, the search indexer. A key
+    file is exactly what a scanner looks at. The lock lasts milliseconds, and
+    the temp file is complete and fsynced before the first attempt, so a
+    retry risks nothing. Same schedule too, so there is one number to tune.
+    """
+    delay = REPLACE_RETRY_DELAY_S
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 def is_encrypted(path: str) -> bool:

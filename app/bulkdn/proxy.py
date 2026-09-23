@@ -29,6 +29,8 @@ import os
 import pathlib
 import urllib.parse
 
+from .retry import describe
+
 log = logging.getLogger(__name__)
 
 PROXY_FILE = "proxy.local"
@@ -82,7 +84,9 @@ def load(path: str = PROXY_FILE) -> str | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        log.warning("could not read %s (%s) -- continuing without a proxy", path, exc)
+        log.warning(
+            "could not read %s (%s) -- continuing without a proxy", path, describe(exc)
+        )
         return None
 
     lines = [
@@ -112,23 +116,33 @@ def validate(url: str, *, source: str = PROXY_FILE) -> str:
     # the missing-scheme case would otherwise be reported as
     # "'proxy.example.com' is not a proxy scheme", which tells someone who
     # simply forgot the `http://` nothing at all.
+    # Every message below names the address through `redacted`. These reach
+    # the screen and the log file, and the log file is what operators send on
+    # when asking for help -- with the proxy password in it, verbatim, before.
+    shown = redacted(url)
     if "://" not in url:
         raise ProxyError(
-            f"{source}: '{url}' has no scheme. Write it as "
+            f"{source}: '{shown}' has no scheme. Write it as "
             "http://host:port or socks5h://host:port"
         )
 
     parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        # `.port` raises on a non-numeric port, with the port text in the
+        # message -- raised from here it would escape as a bare ValueError.
+        raise ProxyError(f"{source}: '{shown}' has a port that is not a number") from None
     if parsed.scheme not in ("http", "https", "socks5", "socks5h", "socks4", "socks4a"):
         raise ProxyError(
             f"{source}: '{parsed.scheme}' is not a proxy scheme this understands. "
             "Use http, https, socks5 or socks5h"
         )
     if not parsed.hostname:
-        raise ProxyError(f"{source}: '{url}' has no host")
-    if parsed.port is None:
+        raise ProxyError(f"{source}: '{shown}' has no host")
+    if port is None:
         raise ProxyError(
-            f"{source}: '{url}' has no port. Proxies need one, e.g. :1080"
+            f"{source}: '{shown}' has no port. Proxies need one, e.g. :1080"
         )
     if parsed.scheme.startswith("socks"):
         _require_socks_support(source)
@@ -160,14 +174,24 @@ def _require_socks_support(source: str) -> None:
 
 
 def redacted(url: str) -> str:
-    """The address with any password replaced, for logs and screens."""
-    parsed = urllib.parse.urlsplit(url)
-    if not parsed.password:
+    """The address with any password replaced, for logs and screens.
+
+    Works on the text rather than on `urlsplit`'s fields, because it has to
+    hold for exactly the addresses `validate` is about to refuse: one with no
+    scheme (`user:pw@host:1080`, where `urlsplit` reads `user` as the scheme
+    and finds no password at all), one with a port that is not a number
+    (where `.port` raises). Everything between the scheme and the LAST `@` is
+    credentials; whatever follows the first `:` in it is the password.
+    """
+    scheme, sep, rest = url.partition("://")
+    if not sep:
+        scheme, rest = "", url
+    userinfo, at, hostpart = rest.rpartition("@")
+    if not at or ":" not in userinfo:
         return url
-    host = parsed.hostname or ""
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-    return f"{parsed.scheme}://{parsed.username}:***@{host}"
+    user = userinfo.split(":", 1)[0]
+    prefix = f"{scheme}://" if sep else ""
+    return f"{prefix}{user}:***@{hostpart}"
 
 
 def apply(url: str | None) -> None:
