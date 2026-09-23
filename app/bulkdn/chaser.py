@@ -118,9 +118,10 @@ class Chaser:
         self.params = params
         self.price_stale_timeout_s = price_stale_timeout_s
         self._placed_at: dict[str, float] = {}
-        # Legs that waited out their patience and now rest on the touch. By
-        # symbol, not by order id: the decision belongs to the leg, and a
-        # replacement should not start the wait over.
+        # Orders the order map has shown at least once. Once seen, an order's
+        # absence means it is gone -- filled or cancelled -- rather than not
+        # yet acknowledged. See `may_be_resting`.
+        self._seen: set[str] = set()
 
     # -- sizing ------------------------------------------------------------
 
@@ -277,21 +278,38 @@ class Chaser:
     def may_be_resting(self, session: AccountSession, oid: str | None) -> bool:
         """Whether this order could still be on the book.
 
-        Yes if the order map has it, and yes for one placed too recently for
-        its acknowledgement to have arrived -- it may be resting already with
-        nothing here to say so. No only for an order that has had time to show
-        up and is gone: filled, which is the usual reason a hedge is running.
+        Yes if the order map has it. No if the map has shown it before and no
+        longer does: it was filled or cancelled, and filled is the usual reason
+        a hedge is running. The acknowledgement grace is only for an order the
+        map has never shown -- one placed so recently it may already be resting
+        with nothing here to say so.
+
+        It used to apply the grace by age alone, so any order younger than
+        ACK_GRACE_S counted as possibly resting even after it had shown up and
+        gone. On the touch an order is re-placed about every second, and 49%
+        of maker fills on a live run landed inside that window: each one still
+        sent a cancel for an order that no longer existed, and the hedge waited
+        a second round trip behind it -- the median went from one (~330ms) to
+        two (~650ms).
         """
         if not oid:
             return False
         if oid in session.client.get_order_map():
+            self._seen.add(oid)
             return True
+        if oid in self._seen:
+            return False
         return time.monotonic() - self._placed_at.get(oid, 0.0) < ACK_GRACE_S
 
     def _resting_order(self, session: AccountSession, leg: LegState):
         if not leg.oid:
             return None
-        return session.client.get_order_map().get(leg.oid)
+        order = session.client.get_order_map().get(leg.oid)
+        if order is not None:
+            # Every chase step passes through here, so an order that rests
+            # for a step is recorded as acknowledged well before it fills.
+            self._seen.add(leg.oid)
+        return order
 
     async def _place(
         self,
@@ -371,6 +389,7 @@ class Chaser:
         leg.price = None
         leg.size = None
         self._placed_at.pop(oid, None)
+        self._seen.discard(oid)
 
     async def _sweep_stale(self, session: AccountSession, leg: LegState) -> None:
         """Cancel any superseded order that is somehow still on the book.

@@ -327,3 +327,32 @@ async def test_an_order_not_yet_acknowledged_is_assumed_resting():
     master.client.order_map.pop(leg.oid)
 
     assert chaser.may_be_resting(master, leg.oid)
+
+
+async def test_an_order_seen_and_then_gone_is_not_resting_however_young():
+    """Filled a moment after it showed up: nothing is left to cancel.
+
+    Judging by age alone kept 49% of a live run's maker fills inside the
+    acknowledgement grace, and each of them cancelled an order that was
+    already gone before the hedge could go out.
+    """
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    assert chaser.may_be_resting(master, leg.oid)      # shown in the map
+    master.client.order_map.pop(leg.oid)                 # and filled, at once
+
+    assert not chaser.may_be_resting(master, leg.oid)
+
+
+async def test_a_chase_step_records_the_order_as_acknowledged():
+    """The step that sees an order resting is what marks it as seen."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    await chaser.step(OPEN_BTC, leg)                     # held: sees it resting
+    master.client.order_map.pop(leg.oid)
+
+    assert not chaser.may_be_resting(master, leg.oid)
