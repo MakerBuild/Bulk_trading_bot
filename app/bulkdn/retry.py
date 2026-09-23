@@ -267,6 +267,16 @@ def post_signed(
                 return response, uncertain
         except Exception as exc:
             if not is_transient(exc):
+                # Not worth another attempt -- but not necessarily nothing.
+                # An earlier attempt may already have reached the exchange,
+                # and a reply that came back malformed means this one did.
+                # Raised bare, it lost that: the menu counted the transfer as
+                # refused and sent the rest of the plan, and an operator
+                # retrying by hand moved the money twice.
+                if uncertain or isinstance(exc, _ANSWERED_BADLY):
+                    raise RetryExhausted(
+                        f"POST {url}", attempt, exc, uncertain=True
+                    ) from exc
                 raise
             last = exc
             if not _never_sent(exc):
@@ -284,6 +294,14 @@ def post_signed(
     raise RetryExhausted(
         f"POST {url}", attempts, last or Exception("unknown"), uncertain=uncertain
     )
+
+
+# Errors that mean an answer DID come back, only not one that could be read:
+# the request reached the other end, so whatever it asked for may be done.
+_ANSWERED_BADLY = (
+    requests.exceptions.ContentDecodingError,
+    requests.exceptions.TooManyRedirects,
+)
 
 
 def _never_sent(exc: BaseException) -> bool:

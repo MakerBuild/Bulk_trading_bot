@@ -479,3 +479,24 @@ def test_a_walk_since_a_time_stops_at_it_when_pages_are_newest_first(monkeypatch
 
     assert total.volume_usd == 3.0
     assert asked == [None, "p2"], "it walked past the point it was asked to stop at"
+
+
+def test_a_bad_last_word_after_a_lost_one_stays_uncertain(monkeypatch):
+    """Attempt 1 timed out after the transfer was applied; attempt 2 failed in
+    a way not worth retrying. Raised bare, that lost the 'may have applied',
+    the menu called the transfer refused, and a retry by hand moved it twice."""
+    from bulkdn.retry import RetryExhausted
+
+    with pytest.raises(RetryExhausted) as caught:
+        transfer(monkeypatch, [requests.ReadTimeout("lost"),
+                               requests.exceptions.TooManyRedirects("proxy loop")])
+    assert caught.value.uncertain is True
+
+
+def test_a_reply_that_came_back_unreadable_is_uncertain(monkeypatch):
+    """A garbled answer is still an answer: the request got there."""
+    from bulkdn.retry import RetryExhausted
+
+    with pytest.raises(RetryExhausted) as caught:
+        transfer(monkeypatch, [requests.exceptions.ContentDecodingError("gzip")])
+    assert caught.value.uncertain is True
