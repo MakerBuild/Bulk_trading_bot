@@ -20,11 +20,15 @@ app/state/*
 # The private key. Read from BULK_PRIVATE_KEY, or from this file as a
 # fallback. Never commit it.
 private_key.local
-# The keystore writes the encrypted envelope to .private_key.local.tmp and
-# renames it over the key file, so for a moment -- or for good, if the write is
-# interrupted -- that file holds the key. Named outright, and every other temp
-# file with it: nothing that ends in .tmp is ever meant to be committed.
-.private_key.local.tmp
+# Copies of it under another name. Notepad's "Save As" adds .txt, and a
+# backup gets .bak or .old -- each a key file git would otherwise offer to
+# commit with `git add -A`.
+private_key.local.*
+# The keystore writes the encrypted envelope to a uniquely named temp file
+# beside the key -- .private_key.local.<random>.tmp -- and renames it over
+# the key file, so for a moment, or for good if the write is interrupted,
+# that file holds the key. Nothing that ends in .tmp is ever meant to be
+# committed.
 *.tmp
 .*.tmp
 
@@ -32,6 +36,7 @@ private_key.local
 # same reason as the key: install.bat creates it, and the line an operator puts
 # in it usually carries a password.
 proxy.local
+proxy.local.*
 .env
 
 # The operator's own settings. `app/settings.default.yaml` is what ships; the
@@ -40,6 +45,7 @@ proxy.local
 # anyone who had changed a size.
 settings.yaml
 settings.*.yaml
+settings.yaml.*
 !app/settings.default.yaml
 
 # The log file, and the two rollovers the handler keeps. Written into the
