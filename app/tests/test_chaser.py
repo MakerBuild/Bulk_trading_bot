@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+import pytest
+
 from bulkdn.chaser import ChaseParams, Chaser
 from bulkdn.feed import Quote
 from bulkdn.hedger import LegRoles
@@ -356,3 +358,22 @@ async def test_a_chase_step_records_the_order_as_acknowledged():
     master.client.order_map.pop(leg.oid)
 
     assert not chaser.may_be_resting(master, leg.oid)
+
+
+# -- the order cap is floored at the price the order goes out at ------------
+
+
+async def test_a_cap_drawn_at_a_higher_price_is_lifted_to_the_minimum():
+    """The cap was floored at $50 when it was drawn, at $143.37: 0.35 SOL.
+    At $142 that is $49.70, refused -- and five refusals in a row halt."""
+    sol = MarketSpec(symbol=BTC, tick_size=0.01, lot_size=0.01, min_notional=50.0)
+    quote = Quote(BTC, best_bid=142.0, best_ask=142.1, mark_price=142.05, age_s=0.0)
+    chaser, book, master, _s = build(quote=quote, max_order_size=0.35)
+    chaser.feed.specs[BTC] = sol
+    book.set_authoritative(MASTER, BTC, 0.0)
+
+    await chaser.step(OPEN_BTC, LegState(symbol=BTC, target_size=2.0))
+
+    placed = master.placed[0]
+    assert placed["size"] * placed["price"] >= 50.0, "an order under the minimum went out"
+    assert placed["size"] == pytest.approx(0.36)

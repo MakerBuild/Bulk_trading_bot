@@ -44,7 +44,7 @@ from dataclasses import dataclass
 from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
 from .hedger import LegRoles
-from .marketdata import chase_price, distance_bps, round_size
+from .marketdata import chase_price, distance_bps, min_order_size, round_size
 from .retry import describe
 from .positions import PositionBook
 from .state import LegState
@@ -209,6 +209,12 @@ class Chaser:
             params.max_order_size if roles.max_order_size is None
             else roles.max_order_size
         )
+        # The cap was floored at the market minimum when it was drawn, at
+        # that moment's price. A cap sitting one lot above $50 is under it
+        # after a fraction of a percent of price move, and every order sized
+        # at it is refused -- five in a row is the kill switch. So it is
+        # floored again here, at the price this order goes out at.
+        cap = max(cap, min_order_size(spec, target))
         desired = round_size(min(remaining, cap), spec)
         if desired < spec.lot_size:
             return ChaseOutcome(symbol, "skipped", "desired size below lot")
