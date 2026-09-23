@@ -1804,16 +1804,20 @@ class Strategy:
         symbol = leg.symbol
 
         while not self._stop.is_set():
-            if self.config.cycles and leg.cycle_index >= self.config.cycles:
-                return
-            reached = await self._target_reached()
-            if reached:
-                log.info("%s: execution target reached: %s", key, reached)
-                return
-
             # A restart lands mid-cycle, so each phase is entered only if this
             # leg has not already passed it.
             if leg.phase in (Phase.IDLE, Phase.COMPLETE):
+                # Only at a cycle boundary. These used to run first on every
+                # pass, so a group resumed mid-cycle after its target had been
+                # met -- or on a leg whose count had reached `cycles` -- simply
+                # returned: released as finished, positions still open, and
+                # nothing left that would close them.
+                if self.config.cycles and leg.cycle_index >= self.config.cycles:
+                    return
+                reached = await self._target_reached()
+                if reached:
+                    log.info("%s: execution target reached: %s", key, reached)
+                    return
                 leg.cycle_index += 1
                 # Shown as one number, so it follows whichever leg is ahead.
                 self.state.cycle_index = max(
@@ -1833,7 +1837,13 @@ class Strategy:
 
             if self._stop.is_set():
                 return
-            if leg.phase == Phase.HOLD:
+            # EXIT as well as HOLD: a leg resumed after a restart mid-exit is
+            # already in EXIT, matched none of the branches above, and fell
+            # straight through to COMPLETE -- released as finished with the
+            # positions it was closing still open. `_leg_exit` re-derives its
+            # target from what the maker actually holds, so entering it again
+            # picks the close up where it stopped.
+            if leg.phase in (Phase.HOLD, Phase.EXIT):
                 await self._leg_exit(key)
 
             if self._stop.is_set():

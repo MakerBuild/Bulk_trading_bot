@@ -7,7 +7,9 @@ what, nothing can close it, and the exposure sits there hedged-but-unattended
 until someone reads the numbers by hand.
 """
 
+import asyncio
 import random
+import types
 
 import pytest
 
@@ -281,3 +283,88 @@ def test_positions_inside_a_restored_group_are_its_own(tmp_path):
     remember(obj)
     obj.restore_groups()
     obj._refuse_unowned_positions()
+
+
+# -- a resumed cycle is finished, not dropped --------------------------------
+#
+# A group resumed in EXIT matched no branch of `_run_leg` and was marked
+# COMPLETE at once; one resumed after its target was met, or past `cycles`,
+# returned before doing anything. Either way it was released as finished with
+# its positions still open, and nothing would ever close them.
+
+
+
+def runner(tmp_path, *, phase, cycles=0, target=None, cycle_index=1):
+    obj = strategy(tmp_path)
+    key = remember(obj, phase=phase)
+    obj.state.leg(key).cycle_index = cycle_index
+    obj._stop = asyncio.Event()
+    obj.symbols = [BTC]
+    obj.config = types.SimpleNamespace(cycles=cycles)
+    obj.title = types.SimpleNamespace(set_cycle=lambda n: None)
+    obj.guard = types.SimpleNamespace(reset_symbol=lambda *a, **k: None)
+    obj.notifier = types.SimpleNamespace(cycle_complete=lambda **k: asyncio.sleep(0))
+    obj._roles_for_key = lambda k: None
+    ran = []
+
+    async def reached():
+        return target
+
+    async def progress():
+        return ""
+
+    async def phase_step(name, next_phase):
+        async def step(k, *args):
+            ran.append(name)
+            obj.state.leg(k).phase = next_phase
+        return step
+
+    obj._target_reached = reached
+    obj.progress_detail = progress
+    return obj, key, ran, phase_step
+
+
+async def _wire(obj, phase_step):
+    obj._leg_open = await phase_step("open", Phase.OPEN)
+    obj._leg_hold = await phase_step("hold", Phase.HOLD)
+    obj._leg_exit = await phase_step("exit", Phase.EXIT)
+
+
+async def test_a_group_resumed_mid_exit_finishes_its_exit(tmp_path):
+    obj, key, ran, phase_step = runner(tmp_path, phase=Phase.EXIT)
+    await _wire(obj, phase_step)
+
+    await obj._run_leg(key, 0.25, once=True)
+
+    assert ran == ["exit"], "the close it was in the middle of never ran"
+
+
+async def test_a_met_target_does_not_drop_a_resumed_hold(tmp_path):
+    obj, key, ran, phase_step = runner(
+        tmp_path, phase=Phase.HOLD, target="volume reached"
+    )
+    await _wire(obj, phase_step)
+
+    await obj._run_leg(key, 0.25, once=True)
+
+    assert ran == ["exit"]
+
+
+async def test_a_spent_cycle_count_does_not_drop_a_resumed_open(tmp_path):
+    obj, key, ran, phase_step = runner(tmp_path, phase=Phase.OPEN, cycles=1)
+    await _wire(obj, phase_step)
+
+    await obj._run_leg(key, 0.25, once=True)
+
+    assert ran == ["hold", "exit"]
+
+
+async def test_a_met_target_still_stops_a_new_cycle(tmp_path):
+    obj, key, ran, phase_step = runner(
+        tmp_path, phase=Phase.COMPLETE, target="volume reached"
+    )
+    await _wire(obj, phase_step)
+
+    await obj._run_leg(key, 0.25, once=True)
+
+    assert ran == []
