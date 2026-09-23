@@ -871,6 +871,14 @@ class Strategy:
         # Live groups, for the reason spelled out in `_least_crowded_side`:
         # a released leg resolves to the configured pair rather than to the
         # group that owned it, so its side is not its own.
+        #
+        # Every cancel here is a round trip the hedge waits behind, ~360ms
+        # each on a live run -- and the hedge's cost rises with every one of
+        # them: under 500ms it gave back 0.8bps against the maker's price,
+        # over a second 2.6bps. So an order already filled is not cancelled
+        # (70% of maker fills took the whole order, and the cancel still went
+        # first), and the ones that are cancelled go out together.
+        in_path = []
         for key, group in list(self._groups.items()):
             leg = self.state.legs.get(key)
             if group.symbol != roles.symbol or leg is None or not leg.oid:
@@ -881,6 +889,11 @@ class Strategy:
             session = self.sessions.get(other.maker)
             if session is None:
                 continue
+            if not self.chaser.may_be_resting(session, leg.oid):
+                continue
+            in_path.append((session, leg))
+
+        async def pull(session, leg) -> None:
             try:
                 await session.cancel(roles.symbol, leg.oid)
             except Exception as exc:  # noqa: BLE001 - the hedge still goes
@@ -889,8 +902,10 @@ class Strategy:
                     "(%s) -- hedging anyway, which may trade against it",
                     session.name, roles.symbol, describe(exc),
                 )
-                continue
+                return
             leg.oid = None
+
+        await asyncio.gather(*(pull(session, leg) for session, leg in in_path))
 
     async def _refreshed(self) -> bool:
         """Re-read positions because the book is known to be behind.

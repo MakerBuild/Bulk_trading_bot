@@ -452,33 +452,48 @@ class Hedger:
                 f" {touch}" if touch else "",
             )
 
-            sent = 0.0
-            for pubkey, piece in slices:
-                signed = piece if is_buy else -piece
-                # Reserve before sending. The fill for this order may arrive
-                # before `market()` returns, and the reservation has to already
-                # be there for the fill handler to retire it.
-                self.in_flight.add(roles.key, signed)
-                try:
-                    await self.sessions[pubkey].market(
+            # Every slice at once. They go to different accounts, so nothing
+            # orders them, and sending them in turn made each wait out the one
+            # before: on a live run the second slice landed ~350ms after the
+            # first, every time, while the price it was chasing moved on.
+            #
+            # Reserve before sending. The fill for an order may arrive before
+            # `market()` returns, and the reservation has to already be there
+            # for the fill handler to retire it.
+            for _pubkey, piece in slices:
+                self.in_flight.add(roles.key, piece if is_buy else -piece)
+            results = await asyncio.gather(
+                *(
+                    self.sessions[pubkey].market(
                         symbol, is_buy, piece, reduce_only=roles.reduce_only
                     )
-                except Exception:
+                    for pubkey, piece in slices
+                ),
+                return_exceptions=True,
+            )
+            sent = 0.0
+            failures: list[BaseException] = []
+            for (_pubkey, piece), result in zip(slices, results, strict=True):
+                if isinstance(result, BaseException):
                     # This slice never made it, so its exposure is still real.
                     # Releasing only its reservation lets the next trigger
                     # retry exactly the part that failed -- the slices that did
                     # go out are covered and must not be hedged twice.
-                    self.in_flight.consume(roles.key, signed)
-                    if sent > 0:
-                        # Some of it is covered. The reconciler re-derives the
-                        # remainder from positions, so the partial cover is not
-                        # lost; raising here still reports the failure.
-                        log.warning(
-                            "hedge %s: %d of %d slices sent before failing",
-                            symbol, len(slices), len(slices),
-                        )
-                    raise
-                sent += piece
+                    self.in_flight.consume(roles.key, piece if is_buy else -piece)
+                    failures.append(result)
+                else:
+                    sent += piece
+            if failures:
+                if sent > 0:
+                    # Some of it is covered. The reconciler re-derives the
+                    # remainder from positions, so the partial cover is not
+                    # lost; raising here still reports the failure.
+                    log.warning(
+                        "hedge %s: %d of %d slices sent, %d failed",
+                        symbol, len(slices) - len(failures), len(slices),
+                        len(failures),
+                    )
+                raise failures[0]
             size = sent
 
             if price > 0:

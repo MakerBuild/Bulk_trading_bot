@@ -60,6 +60,16 @@ class FakeFeed:
         return 85_000.0
 
 
+class FakeChaser:
+    """Every order is on the book unless named as filled."""
+
+    def __init__(self):
+        self.filled = set()
+
+    def may_be_resting(self, session, oid):
+        return bool(oid) and oid not in self.filled
+
+
 def strategy(*, actionable=1.0):
     obj = object.__new__(Strategy)
     obj.state = StrategyState()
@@ -67,6 +77,7 @@ def strategy(*, actionable=1.0):
     obj.sessions = {}
     obj.feed = FakeFeed()
     obj.hedger = FakeHedger(actionable)
+    obj.chaser = FakeChaser()
     obj._rng = random.Random(4)
     obj._stop = asyncio.Event()
     obj._book_suspect = False
@@ -356,3 +367,32 @@ def test_a_group_that_has_turned_around_counts_on_the_side_it_is_now_resting():
     register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True, phase=Phase.EXIT)
     # Opened BUY, now closing, so it rests a SELL -- the bid is free.
     assert obj._least_crowded_side(BTC) is True
+
+
+# -- not waiting on a cancel that has nothing to cancel ----------------------
+#
+# A live run put the first hedge ~730ms behind its maker fill, and the hedge's
+# price got worse with every hundred of them. The cancel went first every time,
+# although 70% of maker fills had taken the whole order: nothing left to pull.
+
+
+async def test_an_order_already_filled_is_not_cancelled():
+    obj = strategy()
+    roles = register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    obj.chaser.filled.add("oid-1")
+
+    await obj._clear_hedge_path(roles)
+
+    assert obj.sessions["maker-a"].cancelled == []
+
+
+async def test_a_remainder_still_resting_is_pulled_as_before():
+    obj = strategy()
+    roles = register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    register(obj, "g2:" + BTC, "maker-b", maker_is_buy=True, oid="oid-2")
+    obj.chaser.filled.add("oid-1")
+
+    await obj._clear_hedge_path(roles)
+
+    assert obj.sessions["maker-a"].cancelled == []
+    assert obj.sessions["maker-b"].cancelled == [(BTC, "oid-2")]

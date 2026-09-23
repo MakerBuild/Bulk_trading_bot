@@ -274,6 +274,20 @@ class Chaser:
 
     # -- helpers -----------------------------------------------------------
 
+    def may_be_resting(self, session: AccountSession, oid: str | None) -> bool:
+        """Whether this order could still be on the book.
+
+        Yes if the order map has it, and yes for one placed too recently for
+        its acknowledgement to have arrived -- it may be resting already with
+        nothing here to say so. No only for an order that has had time to show
+        up and is gone: filled, which is the usual reason a hedge is running.
+        """
+        if not oid:
+            return False
+        if oid in session.client.get_order_map():
+            return True
+        return time.monotonic() - self._placed_at.get(oid, 0.0) < ACK_GRACE_S
+
     def _resting_order(self, session: AccountSession, leg: LegState):
         if not leg.oid:
             return None

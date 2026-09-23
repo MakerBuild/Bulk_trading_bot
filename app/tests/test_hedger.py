@@ -5,6 +5,8 @@ position state, so it is idempotent and self-correcting rather than dependent
 on seeing exactly one event per fill.
 """
 
+import asyncio
+
 import pytest
 
 from bulkdn.hedger import Hedger, HedgeLimitExceeded, InFlight, LegRoles
@@ -585,3 +587,69 @@ def test_an_account_with_no_session_is_named_by_its_pubkey():
 
     assert said.startswith("on ")
     assert "STRANG" in said and "1234" in said, said
+
+
+# -- every slice at once ----------------------------------------------------
+#
+# Sent in turn, each slice waited out the round trip of the one before: on a
+# live run the second landed ~350ms after the first, every time, while the
+# price the hedge was chasing kept moving.
+
+
+class SlowSession(FakeSession):
+    """Answers after a delay, and records how many orders were in flight."""
+
+    live = 0
+    peak = 0
+
+    def __init__(self, name, pubkey, fails=False):
+        super().__init__(name, pubkey)
+        self.fails = fails
+
+    async def market(self, symbol, is_buy, size, reduce_only=False):
+        SlowSession.live += 1
+        SlowSession.peak = max(SlowSession.peak, SlowSession.live)
+        try:
+            await asyncio.sleep(0.05)
+            if self.fails:
+                raise RuntimeError("rejected")
+            return await super().market(symbol, is_buy, size, reduce_only)
+        finally:
+            SlowSession.live -= 1
+
+
+def split_hedger(fails=()):
+    SlowSession.live = SlowSession.peak = 0
+    book = PositionBook(overlay_ttl_ms=5000)
+    sessions = {MASTER: FakeSession("master", MASTER)}
+    for name in ("t1", "t2", "t3"):
+        sessions[name] = SlowSession(name, name, fails=name in fails)
+    hedger = Hedger(book=book, sessions=sessions, specs={BTC: SPEC},
+                    tolerance_lots=1.0, in_flight_ttl_ms=5000)
+    for pubkey in sessions:
+        book.set_authoritative(pubkey, BTC, 0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
+    return hedger, sessions
+
+
+async def test_the_slices_of_one_hedge_go_out_together():
+    hedger, sessions = split_hedger()
+
+    await hedger.hedge(split_roles(), mark_price=PRICE)
+
+    assert SlowSession.peak == 3, "a slice waited for the one before it"
+    assert sum(o["size"] for n in ("t1", "t2", "t3") for o in sessions[n].orders) \
+        == pytest.approx(0.10)
+
+
+async def test_a_failed_slice_releases_only_its_own_reservation():
+    """The slices that went out are covered and must not be hedged twice."""
+    hedger, sessions = split_hedger(fails=("t2",))
+    roles = split_roles()
+
+    with pytest.raises(RuntimeError):
+        await hedger.hedge(roles, mark_price=PRICE)
+
+    t2_share = dict(hedger._slice(roles, 0.10, SPEC))["t2"]
+    assert hedger.in_flight.total(roles.key) == pytest.approx(-(0.10 - t2_share))
+    assert sessions["t1"].orders and sessions["t3"].orders

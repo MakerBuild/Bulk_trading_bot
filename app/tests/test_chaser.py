@@ -293,3 +293,37 @@ async def test_the_cycles_own_order_cap_is_the_one_used():
 
     await chaser.step(roles, LegState(symbol=BTC, target_size=1.0))
     assert master.placed[0]["size"] == 0.4
+
+
+# -- whether an order can still be in a hedge's way -------------------------
+
+
+async def test_an_order_in_the_map_may_be_resting():
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+
+    assert chaser.may_be_resting(master, leg.oid)
+
+
+async def test_a_filled_order_is_not_resting():
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    master.client.order_map.pop(leg.oid)                 # filled
+    chaser._placed_at[leg.oid] -= 60                     # and acknowledged long ago
+
+    assert not chaser.may_be_resting(master, leg.oid)
+
+
+async def test_an_order_not_yet_acknowledged_is_assumed_resting():
+    """It may be on the book with nothing here to say so yet."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    master.client.order_map.pop(leg.oid)
+
+    assert chaser.may_be_resting(master, leg.oid)
