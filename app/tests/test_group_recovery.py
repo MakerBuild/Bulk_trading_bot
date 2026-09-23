@@ -373,3 +373,51 @@ async def test_a_met_target_still_stops_a_new_cycle(tmp_path):
     await obj._run_leg(key, 0.25, once=True)
 
     assert ran == []
+
+
+# -- cycles counts the run, across a restart ---------------------------------
+
+
+def test_a_restart_mid_run_keeps_the_runs_counts():
+    """Counted afresh by each process, `cycles: 10` could trade twenty."""
+    state = StrategyState()
+    assert state.begin_run(100.0) is True
+    state.groups_started = 9
+    state.cycle_index = 8
+
+    revived = StrategyState.from_dict(state.to_dict())
+    assert revived.begin_run(200.0) is False, "an interrupted run started over"
+    assert (revived.groups_started, revived.cycle_index) == (9, 8)
+
+
+def test_a_run_that_ended_starts_the_next_one_from_zero():
+    state = StrategyState()
+    state.begin_run(100.0)
+    state.groups_started, state.cycle_index = 10, 10
+    state.clear_baseline()                      # ended on its own terms
+
+    assert state.begin_run(300.0) is True
+    assert (state.groups_started, state.cycle_index) == (0, 0)
+
+
+async def test_the_dispatcher_counts_from_the_state_file(tmp_path):
+    obj = strategy(tmp_path)
+    obj.state.begin_run(1.0)
+    obj.state.groups_started = 3
+    obj._stop = asyncio.Event()
+    obj.symbols = [BTC]
+    obj.config = types.SimpleNamespace(cycles=3, chase_interval_s=0.01)
+    obj._restored = []
+    obj._forget_finished_groups = lambda keep: None
+
+    async def not_reached():
+        return None
+
+    obj._target_reached = not_reached
+    drawn = []
+    obj.pairing.draw = lambda *a, **k: drawn.append(1)
+    obj._least_crowded_side = lambda symbol: True
+
+    await asyncio.wait_for(obj._dispatch_groups({BTC: 0.1}), 2)
+
+    assert drawn == [], "a resumed run drew past its cycles"

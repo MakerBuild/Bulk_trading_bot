@@ -772,6 +772,7 @@ async def cmd_flatten(
         # like it had done nothing.
         needs_reset = (
             state.summary_phase != Phase.IDLE or state.legs or state.has_baseline
+            or state.run_started_at > 0
         )
         if dry_run and needs_reset:
             # A dry run submits nothing, and the state file is something. It

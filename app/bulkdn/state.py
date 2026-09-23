@@ -143,6 +143,15 @@ class StrategyState:
     # which cannot be true of any run.
     baseline_self_trade_usd: float = 0.0
     baseline_at: float = 0.0
+    # When the run now under way began, and how many groups it has started.
+    # `cycles` is judged against `groups_started`, and `cycle_index` counts
+    # the groups it has finished. Persisted for the same reason as the
+    # baseline: a restart mid-run continues the run, and counting from zero
+    # again let `cycles: 10` trade up to twenty. Zero means no run is under
+    # way; `begin_run` starts the counts over only then. Cleared with the
+    # baseline, when a run ends on its own terms or is flattened.
+    run_started_at: float = 0.0
+    groups_started: int = 0
 
     @property
     def has_baseline(self) -> bool:
@@ -153,6 +162,20 @@ class StrategyState:
         self.baseline_volume_usd = 0.0
         self.baseline_self_trade_usd = 0.0
         self.baseline_at = 0.0
+        self.run_started_at = 0.0
+
+    def begin_run(self, now: float) -> bool:
+        """Start a run's counts, unless one is already under way. True if new.
+
+        The counts are kept past the end of a run -- the closing report reads
+        them -- and started over here, when the next one begins.
+        """
+        if self.run_started_at > 0.0:
+            return False
+        self.run_started_at = now
+        self.groups_started = 0
+        self.cycle_index = 0
+        return True
 
     def leg(self, key: str, symbol: str | None = None) -> LegState:
         """The leg filed under `key`, created on first ask.
@@ -226,6 +249,8 @@ class StrategyState:
             baseline_volume_usd=float(data.get("baseline_volume_usd", 0.0)),
             baseline_self_trade_usd=float(data.get("baseline_self_trade_usd", 0.0)),
             baseline_at=float(data.get("baseline_at", 0.0)),
+            run_started_at=float(data.get("run_started_at", 0.0)),
+            groups_started=int(data.get("groups_started", 0)),
         )
 
 

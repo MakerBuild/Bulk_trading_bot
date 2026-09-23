@@ -2096,7 +2096,13 @@ class Strategy:
         # counted here because a drawn group lives for exactly one cycle under
         # a key of its own: the per-leg count in `_run_leg` never passed 1,
         # so `cycles: 1` traded until someone pressed stop.
-        started = len(restored)
+        #
+        # Taken from the state file rather than counted afresh: a restart
+        # mid-run continues the run, and counting from zero again let
+        # `cycles: 10` trade up to twenty. The resumed groups were counted
+        # when they were first drawn. A file written before the count was
+        # kept knows only about those.
+        started = max(self.state.groups_started, len(restored))
         try:
             while not self._stop.is_set():
                 for task in [t for t in running if t.done()]:
@@ -2128,6 +2134,8 @@ class Strategy:
 
                 group_id, group = drawn
                 started += 1
+                self.state.groups_started = started
+                self._persist()
                 # The configured size, not a draw from it. `_run_leg` draws
                 # once when it opens the leg, so drawing here too spent a draw
                 # that was immediately overwritten -- and logged it as the
@@ -2229,7 +2237,11 @@ class Strategy:
             # in front of it, while the group still held its accounts: every
             # cycle waited on Telegram and on paging through every account's
             # history before the accounts went back to the pool.
-            self.notifier.send_soon(self._cycle_report(key, leg.cycle_index))
+            # For a group, the run's count: its own leg lives for one cycle,
+            # so its index is always 1 and every report said "cycle 1 of N".
+            self.notifier.send_soon(
+                self._cycle_report(key, self.state.cycle_index if once else leg.cycle_index)
+            )
             if once:
                 return
 
@@ -2522,6 +2534,9 @@ class Strategy:
             await self._recover()
             # After recovery, so an interrupted run is recognised as one and
             # keeps the count it already had.
+            if self.state.begin_run(time.time()):
+                self._persist()
+            self.title.set_cycle(self.state.cycle_index)
             await self.capture_target_baseline()
 
             # One task, which starts and reaps the groups itself. The legs
