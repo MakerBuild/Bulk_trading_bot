@@ -258,3 +258,52 @@ def test_a_cross_key_trade_is_still_counted_only_once(monkeypatch):
 
 def test_no_trees_is_no_trading(monkeypatch):
     assert realised_for_trees(_one_page(monkeypatch, []), []) == Realised()
+
+
+# -- collecting margin back to the master -----------------------------------
+
+
+def test_collect_sweeps_each_sub_into_its_own_master(monkeypatch):
+    """Every sub under every key, each into the master that owns it."""
+    _balances(monkeypatch, {
+        "one-sub-a": 10.009,
+        "one-sub-b": 0.0,
+        "two-sub-a": 25.0,
+    }, confirm=True)
+
+    sent = []
+
+    class Result:
+        ok = True
+        response_json = {}
+
+    def submit_transfer(*, http_url, private_key, domain, from_pubkey,
+                        to_pubkey, margin_amount):
+        sent.append((private_key, from_pubkey, to_pubkey, margin_amount))
+        return Result()
+
+    import bulkdn.subaccounts as subaccounts_mod
+
+    monkeypatch.setattr(subaccounts_mod, "submit_transfer", submit_transfer)
+
+    menu._collect_to_master(StubConfig(TREES))
+
+    assert sent == [
+        # Floored: 10.01 is more than the account holds.
+        ("key-one", "one-sub-a", "key-one-master", 10.0),
+        ("key-two", "two-sub-a", "key-two-master", 25.0),
+    ]
+
+
+def test_collect_submits_nothing_unconfirmed(monkeypatch):
+    _balances(monkeypatch, {"one-sub-a": 5.0, "one-sub-b": 5.0, "two-sub-a": 5.0},
+              confirm=False)
+
+    import bulkdn.subaccounts as subaccounts_mod
+
+    def submit_transfer(**_kw):
+        raise AssertionError("submitted without a yes")
+
+    monkeypatch.setattr(subaccounts_mod, "submit_transfer", submit_transfer)
+
+    menu._collect_to_master(StubConfig(TREES))

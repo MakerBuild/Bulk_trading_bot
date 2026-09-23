@@ -471,6 +471,68 @@ def _balance_subaccounts(config: Config) -> None:
     _pause()
 
 
+def _collect_to_master(config: Config) -> None:
+    """Sweep every sub-account's transferable margin up to its own master.
+
+    Each tree into its own master, for the same reason Balance stays inside
+    one tree: the key that signs owns both ends, and a sub under another key
+    has no master here to be swept into.
+    """
+    from .subaccounts import submit_transfer
+    from bulk_api.common import SignatureDomain
+
+    trees = _trees(config)
+    alone = len(trees) == 1
+    plan: list[tuple[Tree, str, float]] = []
+
+    for tree in trees:
+        if not tree.subs:
+            print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)} "
+                  "owns no sub-accounts yet")
+            continue
+
+        print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)}")
+        print(f"  {'sub-account':<22} {'transferable':>14}")
+        for label, pk in tree.labelled(alone)[1:]:
+            bal = _transferable(config, pk)
+            print(f"  {label + ' ' + short_pubkey(pk):<22} {bal:>14.2f}")
+            # Floored, not rounded: rounding 10.005 up asks for a cent the
+            # account does not have, and the whole transfer is refused for it.
+            amount = int(bal * 100) / 100
+            if amount > 0.01:
+                plan.append((tree, pk, amount))
+
+    if not plan:
+        print("\n  nothing to collect")
+        _pause()
+        return
+
+    print("\n  planned transfers:")
+    for tree, src, amount in plan:
+        print(f"    {short_pubkey(src)} -> {short_pubkey(tree.master)}  {amount:,.2f}")
+    print(f"\n  total {sum(a for _, _, a in plan):,.2f}")
+    print("  Margin backing an open position stays where it is -- only the")
+    print("  transferable balance moves.")
+
+    if not _confirm(f"Submit {len(plan)} transfer(s) to the master account."):
+        print("  aborted")
+        _pause()
+        return
+
+    for tree, src, amount in plan:
+        result = submit_transfer(
+            http_url=config.http_url,
+            private_key=tree.private_key,
+            domain=SignatureDomain[config.signature_domain_name],
+            from_pubkey=src,
+            to_pubkey=tree.master,
+            margin_amount=amount,
+        )
+        state = "ok" if result.ok else f"FAILED {result.response_json}"
+        print(f"    {short_pubkey(src)} -> {short_pubkey(tree.master)} {amount:,.2f}: {state}")
+    _pause()
+
+
 def _encrypt_key(config: Config) -> None:
     cmd_encrypt_key(config)
     _pause()
@@ -774,9 +836,10 @@ def _accounts_menu(config: Config, config_path: str) -> None:
         print("\n" + _box("ACCOUNTS MANAGEMENT", [
             "1. Create New Subaccount",
             "2. Balance All Subaccounts",
-            f"3. Encrypt Private Key   [{state}]",
-            "4. Erase Local Data",
-            "5. Back",
+            "3. Collect Funds to Main",
+            f"4. Encrypt Private Key   [{state}]",
+            "5. Erase Local Data",
+            "6. Back",
         ]))
         print(f"  {keys} master key(s) in private_key.local")
         choice = _ask("\n  > ")
@@ -785,12 +848,14 @@ def _accounts_menu(config: Config, config_path: str) -> None:
         elif choice == "2":
             _balance_subaccounts(config)
         elif choice == "3":
+            _collect_to_master(config)
+        elif choice == "4":
             _encrypt_key(config)
             state = _key_state(PRIVATE_KEY_FILE)
-        elif choice == "4":
+        elif choice == "5":
             _erase_data(config, config_path)
             state = _key_state(PRIVATE_KEY_FILE)
-        elif choice in ("5", "0"):
+        elif choice in ("6", "0"):
             return
 
 

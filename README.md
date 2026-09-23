@@ -69,7 +69,7 @@ that for you. Once the master has a balance, create a sub-account from
 1. Start                  begin trading
 2. Active Strategy        what is open right now
 3. History                past fills
-4. Accounts Management    sub-accounts, balances, key, erase local data
+4. Accounts Management    sub-accounts, balances, collect to master, key, erase local data
 5. Configuration          targets and progress
 6. Close All Positions    cancel everything and flatten
 ```
