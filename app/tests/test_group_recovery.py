@@ -251,7 +251,10 @@ async def test_recovery_reconciles_the_restored_groups_not_the_pair(tmp_path, mo
     async def cancel_all(sessions, symbols):
         return None
 
-    monkeypatch.setattr(strategy_mod, "sync_positions_http", lambda s, b: None)
+    async def no_read(sessions, book):
+        return None
+
+    monkeypatch.setattr(strategy_mod, "sync_positions", no_read)
     monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
     monkeypatch.setattr(strategy_mod, "reconcile_net", reconcile_net)
     obj.hedger = object()
@@ -303,7 +306,9 @@ def runner(tmp_path, *, phase, cycles=0, target=None, cycle_index=1):
     obj.config = types.SimpleNamespace(cycles=cycles)
     obj.title = types.SimpleNamespace(set_cycle=lambda n: None)
     obj.guard = types.SimpleNamespace(reset_symbol=lambda *a, **k: None)
-    obj.notifier = types.SimpleNamespace(cycle_complete=lambda **k: asyncio.sleep(0))
+    obj.notifier = types.SimpleNamespace(
+        cycle_complete=lambda **k: asyncio.sleep(0), send_soon=lambda coro: coro.close()
+    )
     obj._roles_for_key = lambda k: None
     ran = []
 

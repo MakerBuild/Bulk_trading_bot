@@ -301,13 +301,16 @@ async def test_the_hedge_resumes_once_the_read_succeeds(tmp_path):
 
     hedged = []
 
-    async def hedge(roles, mark_price=None):
+    async def hedge(roles, mark_price=None, suspended=None):
         hedged.append(roles.symbol)
 
     strategy.hedger.hedge = hedge
 
     async def good_read(max_age_s=0.0):
-        return None
+        # A read that began now: later than the suspicion, so it answers it.
+        import time
+
+        strategy._read_started_at = time.monotonic()
 
     strategy._sync_positions = good_read
     strategy._hedge_queue.put_nowait(btc)

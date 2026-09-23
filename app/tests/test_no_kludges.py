@@ -14,6 +14,7 @@ import re
 import pytest
 
 from bulkdn import menu, strategy
+from bulkdn.state import StrategyState
 
 PKG = pathlib.Path(strategy.__file__).parent
 SOURCES = {p.stem: p.read_text(encoding="utf-8") for p in PKG.glob("*.py")}
@@ -61,7 +62,7 @@ async def test_the_loop_keeps_turning_during_a_history_read(monkeypatch):
 
     from bulkdn import strategy as strategy_module
 
-    def slow(http, trees):
+    def slow(http, trees, since_ms=None):
         real_time.sleep(0.3)  # a blocking read, as requests would be
         raise RuntimeError("not the point of this test")
 
@@ -80,6 +81,8 @@ async def test_the_loop_keeps_turning_during_a_history_read(monkeypatch):
             client = None
 
         master = sub1 = _S()
+        # `_read_totals` reads the run's start from it.
+        state = StrategyState()
         # Read across every account the run trades, so the stub needs the map
         # rather than just the pair.
         sessions = {"EXAMPLE": _S()}

@@ -8,7 +8,7 @@ the exchange rejects both.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
+from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from typing import Any
 
 BPS = Decimal(10_000)
@@ -91,6 +91,27 @@ def round_size(size: float, spec: MarketSpec) -> float:
     or exceed the position being closed on a reduce-only order.
     """
     return _quantize(abs(size), spec.lot_size, ROUND_DOWN)
+
+
+def min_order_size(spec: MarketSpec, price: float | None) -> float:
+    """The smallest size, in base units, this market accepts at `price`.
+
+    The larger of one lot and the minimum notional, and the notional is
+    rounded UP to a lot. Rounding it down -- through `round_size`, which is
+    right for everything else -- lands just under the minimum: SOL at
+    $143.37 with a 0.01 lot gave 0.34, which is $48.75 against a $50 floor,
+    and every order sized at that "floor" was refused until the reject
+    streak ended the run.
+
+    Without a price the notional cannot be expressed in base units, so the
+    lot stands alone.
+    """
+    if not price or price <= 0 or spec.min_notional <= 0:
+        return spec.lot_size
+    return max(
+        spec.lot_size,
+        _quantize(spec.min_notional / price, spec.lot_size, ROUND_CEILING),
+    )
 
 
 def chase_price(
@@ -219,3 +240,19 @@ def touch_text(feed, symbol: str) -> str:
         return f"{name}={price:.8f} {name}sz={size:.8f}"
 
     return f"{side(bid, bid_size, 'bid')} {side(ask, ask_size, 'ask')}"
+
+
+def epoch_seconds(timestamp: float) -> float:
+    """Seconds since the epoch, from a stamp in s, ms, us or ns.
+
+    The exchange stamps fills in nanoseconds and tickers in milliseconds, and
+    the book's unit is whatever the message carried. Judged by magnitude,
+    which is unambiguous for any date this bot will see.
+    """
+    if timestamp > 1e17:
+        return timestamp / 1e9
+    if timestamp > 1e14:
+        return timestamp / 1e6
+    if timestamp > 1e11:
+        return timestamp / 1e3
+    return float(timestamp)

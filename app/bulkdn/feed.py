@@ -15,10 +15,16 @@ from dataclasses import dataclass
 from collections.abc import Sequence
 
 from .accounts import AccountSession
-from .marketdata import MarketSpec
+from .marketdata import MarketSpec, epoch_seconds
 from .retry import describe
 
 log = logging.getLogger(__name__)
+
+# How far outside the book's own touch the mark may sit before the book is
+# taken to be frozen rather than merely quiet, and how old the book must be.
+# See `MarketFeed.quote`.
+_FROZEN_BOOK_BPS = 10.0
+_FROZEN_BOOK_AGE_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -57,6 +63,7 @@ class MarketFeed:
         self.session = session
         self.symbols = list(symbols)
         self.specs: dict[str, MarketSpec] = {}
+        self._frozen_warned: set[str] = set()
 
     def load_specs(self) -> dict[str, MarketSpec]:
         """Fetch tick size, lot size, and min notional over HTTP.
@@ -132,8 +139,33 @@ class MarketFeed:
         mark_price = ticker.mark_price if ticker else None
         age_s = 0.0
         if ticker and ticker.timestamp:
-            # Ticker timestamps are epoch milliseconds.
-            age_s = max(0.0, time.time() - (ticker.timestamp / 1000.0))
+            age_s = max(0.0, time.time() - epoch_seconds(ticker.timestamp))
+
+        # A book that stopped updating -- its delta subscription failed, which
+        # is tolerated, or the stream for it went quiet -- still answers with
+        # a touch, and the chaser priced maker-only orders off it: rejected as
+        # crossing, or resting where the market left long ago. Age alone
+        # cannot tell a frozen book from a quiet one, so it is judged against
+        # the ticker: a book whose touch the mark has left by more than
+        # `_FROZEN_BOOK_BPS` is not describing this market. It is dropped, and
+        # the price falls back to the mark, as with no book at all.
+        if book is not None and mark_price and best_bid and best_ask:
+            updated = getattr(book, "last_update_time", None)
+            book_age = time.time() - epoch_seconds(updated) if updated else 0.0
+            band = _FROZEN_BOOK_BPS / 10_000
+            outside = mark_price < best_bid * (1 - band) or mark_price > best_ask * (1 + band)
+            if outside and book_age > _FROZEN_BOOK_AGE_S:
+                if symbol not in self._frozen_warned:
+                    self._frozen_warned.add(symbol)
+                    log.warning(
+                        "%s: book looks frozen (%.0fs old, touch %g/%g, mark %g) "
+                        "-- pricing off the mark until it moves",
+                        symbol, book_age, best_bid, best_ask, mark_price,
+                    )
+                best_bid = best_ask = bid_size = ask_size = None
+            elif symbol in self._frozen_warned and not outside:
+                self._frozen_warned.discard(symbol)
+                log.info("%s: book is updating again", symbol)
 
         return Quote(
             symbol=symbol,

@@ -12,7 +12,10 @@ The window. Totals came from the account's whole fill history, so once the
 lifetime figure passed `burn_usd` the target was met before a single order was
 placed, on that run and on every run after it -- a live session ended in one
 second with `execution target reached: burned $-3.0795 of $3.00`. The target is
-now the distance travelled since the run began.
+now the distance travelled since the run began: the history is read from the
+moment the run started (`since_ms`), not as a lifetime total with the start's
+lifetime total subtracted -- the walk stops at a page cap, and past it the two
+totals stop growing and their difference stops meaning anything.
 """
 
 import logging
@@ -90,11 +93,13 @@ def totals(monkeypatch):
     """Replace the fill-history read with the number under test."""
     from bulkdn import strategy as strategy_module
 
-    def fake(http, trees):
+    def fake(http, trees, since_ms=None):
         fake.reads += 1
+        fake.since_ms = since_ms
         return fake.value
 
     fake.reads = 0
+    fake.since_ms = None
 
     monkeypatch.setattr(strategy_module, "realised_for_trees", fake)
     return fake
@@ -152,14 +157,20 @@ async def test_a_positive_total_never_reaches_the_target(totals):
 
 
 async def test_the_account_history_before_the_run_does_not_count(totals):
-    """The reported bug: $3.08 burned last week ended the next run instantly."""
-    assert await reached(3.0, -3.0795, totals, baseline=-3.0795) is None
+    """The reported bug: $3.08 burned last week ended the next run instantly.
+
+    The walk is asked for fills from the run's start and nothing earlier.
+    """
+    await reached(3.0, 0.0, totals)
+    assert totals.since_ms == pytest.approx(1.0 * 1000)
 
 
 async def test_only_what_this_run_burned_counts(totals):
-    """Started at -3.08, now at -5.08: this run has burned $2, not $5.08."""
-    assert await reached(3.0, -5.0795, totals, baseline=-3.0795) is None
-    assert await reached(2.0, -5.0795, totals, baseline=-3.0795)
+    """What the walk since the start returns is the whole of this run's spend:
+    nothing is subtracted from it, so a history past the page cap cannot turn
+    the difference into nonsense."""
+    assert await reached(3.0, -2.0, totals, baseline=-3.0795) is None
+    assert await reached(2.0, -2.0, totals, baseline=-3.0795)
 
 
 async def test_without_a_baseline_nothing_is_judged(totals):
@@ -172,14 +183,14 @@ async def test_without_a_baseline_nothing_is_judged(totals):
 
 
 async def test_a_volume_target_also_counts_from_the_start(totals):
-    totals.value = FakeTotals(0.0, volume=1500.0)
+    totals.value = FakeTotals(0.0, volume=500.0)
     strategy = FakeStrategy(
         ExecutionTarget(volume_usd=1000.0), _started_at(0.0, volume=1000.0)
     )
-    # 1500 - 1000 = 500 done of 1000.
+    # 500 done since the start, of 1000.
     assert await strategy.reached() is None
 
-    totals.value = FakeTotals(0.0, volume=2000.0)
+    totals.value = FakeTotals(0.0, volume=1000.0)
     # The answer is cached for TARGET_FRESHNESS_S, because the read walks
     # every account's paginated fill history. In a run these two checks are
     # half a minute apart; here they are consecutive lines.
@@ -198,7 +209,7 @@ async def test_the_self_trade_figure_counts_from_the_start(totals, caplog):
         volume progress: $0.00 / $1000000.00 qualifying
         (of which $127113.97 traded between your own accounts)
     """
-    totals.value = FakeTotals(0.0, volume=1500.0, self_trade=1200.0)
+    totals.value = FakeTotals(0.0, volume=500.0, self_trade=200.0)
     strategy = FakeStrategy(
         ExecutionTarget(volume_usd=10_000.0),
         _started_at(0.0, volume=1000.0, self_trade=1000.0),
@@ -211,7 +222,7 @@ async def test_the_self_trade_figure_counts_from_the_start(totals, caplog):
         for record in caplog.records
         if "volume progress" in record.getMessage()
     )
-    # 1500 - 1000 = 500 done, of which 1200 - 1000 = 200 was with ourselves.
+    # 500 done since the start, of which 200 was with ourselves.
     assert "$500.00 / $10000.00" in line
     assert "$200.00 traded between your own accounts" in line
 
@@ -219,12 +230,14 @@ async def test_the_self_trade_figure_counts_from_the_start(totals, caplog):
 async def test_the_part_can_never_be_larger_than_the_whole(totals):
     """The property the old line broke. $127,113.97 of $0.00 was exactly
     that, and it is what made the mismatch visible in the first place."""
-    totals.value = FakeTotals(0.0, volume=1500.0, self_trade=1200.0)
+    totals.value = FakeTotals(0.0, volume=500.0, self_trade=200.0)
     state = _started_at(0.0, volume=1000.0, self_trade=1000.0)
     await FakeStrategy(ExecutionTarget(volume_usd=10_000.0), state).reached()
 
-    done = totals.value.qualifying_volume_usd - state.baseline_volume_usd
-    ours = totals.value.self_trade_volume_usd - state.baseline_self_trade_usd
+    # Both read over the same window, so neither is a lifetime figure.
+    assert totals.since_ms == pytest.approx(state.baseline_at * 1000)
+    done = totals.value.qualifying_volume_usd
+    ours = totals.value.self_trade_volume_usd
     assert 0.0 <= ours <= done
 
 

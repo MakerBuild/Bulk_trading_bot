@@ -247,3 +247,11 @@ def test_scaling_the_leg_brings_the_cap_down_with_it():
     leg = usd_leg(max_order_notional_usd=750.0)
     scaled = leg.size / 4
     assert min(leg.max_order_size, scaled) == pytest.approx(scaled)
+
+
+def test_a_size_that_needs_all_the_margin_is_scaled_not_used():
+    """Fitting exactly left nothing for an adverse move mid-hedge."""
+    legs = [leg(BTC, 0.01)]  # $80 of margin at 10x
+    result = plan(legs, {"master": 85.0, "sub1": 85.0})
+    assert result.scaled
+    assert result.budget_usd == pytest.approx(85.0 * 0.25, rel=1e-6)

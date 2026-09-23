@@ -9,7 +9,8 @@ import asyncio
 
 import pytest
 
-from bulkdn.hedger import Hedger, HedgeLimitExceeded, InFlight, LegRoles
+from bulkdn.accounts import OrderRejected
+from bulkdn.hedger import Hedger, HedgeInDoubt, HedgeLimitExceeded, InFlight, LegRoles
 from bulkdn.marketdata import MarketSpec
 from bulkdn.positions import PositionBook
 
@@ -192,15 +193,62 @@ async def test_failed_hedge_releases_its_reservation_so_it_retries():
     book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
 
     async def boom(*args, **kwargs):
-        raise RuntimeError("rejected")
+        raise OrderRejected("rejected")
 
     sub1.market = boom
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OrderRejected):
         await hedger.hedge(OPEN_BTC, mark_price=PRICE)
 
     # Exposure is still real, so the next attempt must see it.
     assert hedger.in_flight.total(BTC) == 0.0
     assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.10)
+
+
+async def test_an_unanswered_hedge_stays_reserved_until_a_read_settles_it():
+    """A timeout may have traded. Re-hedging it is how three duplicates went out."""
+    book, hedger, _master, sub1 = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
+
+    async def timeout(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    sub1.market = timeout
+    with pytest.raises(HedgeInDoubt):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    # Still reserved, well past the ordinary two-second reservation.
+    assert hedger.in_flight.total(BTC) == pytest.approx(-0.10)
+    for entry in hedger.in_flight._entries[BTC]:
+        entry.expires_at = min(entry.expires_at, entry.sent_at + 25.0)
+    assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.0)
+
+    # A read that began after it was sent now carries whatever it did.
+    import time
+
+    hedger.in_flight.settle_doubtful(time.monotonic() + 1)
+    assert hedger.in_flight.total(BTC) == 0.0
+
+
+def test_a_read_that_began_before_the_slice_does_not_settle_it():
+    in_flight = InFlight(ttl_ms=2000)
+    import time
+
+    before = time.monotonic() - 1
+    in_flight.add(BTC, -0.10)
+    in_flight.hold_in_doubt(BTC, -0.10)
+    in_flight.settle_doubtful(before)
+    assert in_flight.total(BTC) == pytest.approx(-0.10)
+
+
+def test_each_reservation_expires_on_its_own_clock():
+    """A new hedge must not keep an old half-filled one alive."""
+    in_flight = InFlight(ttl_ms=2000)
+    in_flight.add(BTC, -0.10)
+    in_flight._entries[BTC][0].expires_at = 0.0  # long gone
+    in_flight.add(BTC, -0.05)
+    assert in_flight.total(BTC) == pytest.approx(-0.05)
 
 
 def test_in_flight_only_consumes_same_direction_fills():
@@ -612,7 +660,7 @@ class SlowSession(FakeSession):
         try:
             await asyncio.sleep(0.05)
             if self.fails:
-                raise RuntimeError("rejected")
+                raise OrderRejected("rejected")
             return await super().market(symbol, is_buy, size, reduce_only)
         finally:
             SlowSession.live -= 1
@@ -647,9 +695,82 @@ async def test_a_failed_slice_releases_only_its_own_reservation():
     hedger, sessions = split_hedger(fails=("t2",))
     roles = split_roles()
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(OrderRejected):
         await hedger.hedge(roles, mark_price=PRICE)
 
     t2_share = dict(hedger._slice(roles, 0.10, SPEC))["t2"]
     assert hedger.in_flight.total(roles.key) == pytest.approx(-(0.10 - t2_share))
     assert sessions["t1"].orders and sessions["t3"].orders
+
+
+# -- an unanswered slice holds only what is still reserved ------------------
+
+
+async def test_a_slice_that_filled_before_its_timeout_is_not_counted_twice():
+    """The fill came in on the stream and retired the reservation; only the
+    reply was lost. Re-reserving the full size read the leg as over-hedged,
+    and the next hedge would have gone the other way."""
+    book, hedger, _master, sub1 = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
+
+    async def fills_then_times_out(symbol, is_buy, size, reduce_only=False):
+        book.apply_fill(SUB1, BTC, is_buy=is_buy, size=size)
+        hedger.note_taker_fill(OPEN_BTC.key, size if is_buy else -size)
+        raise asyncio.TimeoutError()
+
+    sub1.market = fills_then_times_out
+    with pytest.raises(HedgeInDoubt):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    assert hedger.in_flight.total(BTC) == pytest.approx(0.0)
+    assert hedger.effective_net(OPEN_BTC) == pytest.approx(0.0)
+
+
+async def test_a_reply_slower_than_the_reservation_ttl_still_holds_the_slice():
+    """Timed from the send, a 2s reservation was gone before a 10s timeout
+    could say anything, and nothing was left to hold."""
+    book, hedger, _master, sub1 = build(ttl_ms=20)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
+
+    async def slow_timeout(*args, **kwargs):
+        await asyncio.sleep(0.1)                 # five times the ttl
+        raise asyncio.TimeoutError()
+
+    sub1.market = slow_timeout
+    with pytest.raises(HedgeInDoubt):
+        await hedger.hedge(OPEN_BTC, mark_price=PRICE)
+
+    assert hedger.in_flight.total(BTC) == pytest.approx(-0.10)
+
+
+def test_an_answered_reservation_goes_back_on_the_ordinary_clock():
+    import time
+
+    in_flight = InFlight(ttl_ms=2000, doubt_ttl_s=30.0)
+    in_flight.add(BTC, -0.10, awaiting_answer=True)
+    entry = in_flight._entries[BTC][0]
+    assert entry.expires_at - entry.sent_at >= 30.0
+
+    in_flight.answered(BTC)
+    assert entry.expires_at <= time.monotonic() + 2.0
+
+
+# -- nothing goes out once the caller says stop ------------------------------
+
+
+async def test_a_hedge_that_waited_on_the_lock_rechecks_before_sending():
+    """The caller's check came before the wait for this lock, and the
+    liquidation guard can start closing out meanwhile."""
+    book, hedger, _master, sub1 = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.10)
+
+    result = await hedger.hedge(OPEN_BTC, mark_price=PRICE, suspended=lambda: True)
+
+    assert sub1.orders == []
+    assert result.skipped_reason == "hedging suspended"

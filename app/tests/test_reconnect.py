@@ -17,6 +17,7 @@ import asyncio
 import pytest
 
 from bulkdn.risk import Violation
+from bulkdn.strategy import Strategy
 
 
 class FakeClient:
@@ -75,6 +76,8 @@ class FakeRisk:
 class FakeStrategy:
     """Only the parts of Strategy that _healed touches."""
 
+    _mark_book_suspect = Strategy._mark_book_suspect
+
     def __init__(self, master, sub1):
         self.master = master
         self.sub1 = sub1
@@ -107,12 +110,12 @@ def no_http_resync(monkeypatch):
     """The resync reads the exchange; count it instead of calling it."""
     from bulkdn import strategy
 
-    def record(sessions, book):
+    async def record(sessions, book):
         for session in sessions:
             if hasattr(session, "_owner"):
                 session._owner.resyncs += 1
 
-    monkeypatch.setattr(strategy, "sync_positions_http", record)
+    monkeypatch.setattr(strategy, "sync_positions", record)
     return record
 
 

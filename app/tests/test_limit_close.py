@@ -354,6 +354,10 @@ def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None
         improve_ticks = 1
 
     class Market:
+        # The limit close reads its tick improvement from the first market
+        # switched on, not from markets[0], which may be switched off.
+        improve_ticks = 1
+
         def __init__(self, symbol, enabled=True):
             self.symbol = symbol
             self.enabled = enabled

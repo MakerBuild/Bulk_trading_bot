@@ -23,6 +23,8 @@ Two mechanisms, and only one of them is load-bearing:
 import asyncio
 import random
 
+import pytest
+
 from bulkdn.pairing import Group, Pairing
 from bulkdn.state import Phase, StrategyState
 from bulkdn.strategy import Strategy
@@ -51,7 +53,7 @@ class FakeHedger:
     def actionable_hedge(self, roles, price):
         return self.actionable
 
-    async def hedge(self, roles, mark_price=None):
+    async def hedge(self, roles, mark_price=None, suspended=None):
         self.hedged.append(roles.key)
 
 
@@ -210,7 +212,7 @@ async def test_the_path_is_cleared_before_the_hedge_not_after():
         order.append("clear")
         await real_clear(roles)
 
-    async def hedge(roles, mark_price=None):
+    async def hedge(roles, mark_price=None, suspended=None):
         order.append("hedge")
         obj.hedger.hedged.append(roles.key)
 
@@ -466,3 +468,71 @@ async def test_an_order_replaced_mid_cancel_keeps_its_new_id():
 
     assert session.cancelled == [(BTC, "oid-1")]
     assert leg.oid == "oid-replacement", "the replacement was forgotten"
+
+
+# -- one unanswered slice does not stop the pool ------------------------------
+
+
+async def test_an_unanswered_slice_does_not_suspect_the_whole_book():
+    """Marking the book suspect stopped every hedge in the pool until a
+    full read finished, while every other group's makers filled unhedged."""
+    from bulkdn.hedger import HedgeInDoubt
+
+    obj = strategy()
+    roles = register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
+    reads = []
+
+    async def read(max_age_s=0.0):
+        reads.append(max_age_s)
+
+    async def unanswered(roles, mark_price=None, suspended=None):
+        raise HedgeInDoubt("no answer")
+
+    obj._sync_positions = read
+    obj.hedger.hedge = unanswered
+
+    with pytest.raises(HedgeInDoubt):
+        await obj._hedge_leg(roles)
+    assert obj._book_suspect is False, "every other leg would now wait"
+
+    await asyncio.sleep(0.01)
+    assert reads, "nothing settled the unanswered slice"
+    assert obj._hedge_queue.get_nowait() == "g1:" + BTC, "the leg was not re-evaluated"
+
+
+# -- a signal for a leg whose hedge just finished is not dropped -------------
+
+
+async def test_a_signal_during_the_read_is_not_lost():
+    """Finished tasks were pruned before the read; a task that ended during
+    it was still listed, and the new signal was folded into it -- dropped."""
+    obj = strategy()
+    key = "g1:" + BTC
+    register(obj, key, "maker-a", maker_is_buy=True)
+    release = asyncio.Event()
+    calls = []
+
+    async def hedge(roles, mark_price=None, suspended=None):
+        calls.append(roles.key)
+        if len(calls) == 1:
+            await release.wait()
+
+    async def refreshed():
+        release.set()                 # the running hedge finishes meanwhile
+        await asyncio.sleep(0.01)
+        obj._book_suspect = False
+        return True
+
+    obj.hedger.hedge = hedge
+    obj._refreshed = refreshed
+
+    worker = asyncio.create_task(obj._hedge_worker())
+    obj._hedge_queue.put_nowait(key)
+    await asyncio.sleep(0.02)                      # first hedge is running
+    obj._book_suspect = True
+    obj._hedge_queue.put_nowait(key)               # new fill, read pending
+    await asyncio.sleep(0.1)
+    obj._stop.set()
+    await asyncio.wait_for(worker, 2)
+
+    assert calls == [key, key], "the second signal was dropped"

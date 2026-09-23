@@ -82,6 +82,10 @@ class PositionBook:
     overlay_ttl_ms: int = 2000
     _authoritative: dict[Key, float] = field(default_factory=dict)
     _overlays: dict[Key, list[_Overlay]] = field(default_factory=dict)
+    # When each key last heard from the stream -- a position update or a
+    # fill. An HTTP read is only allowed to overwrite a key the stream has
+    # not spoken about since the read was sent. See `apply_read`.
+    _touched_at: dict[Key, float] = field(default_factory=dict)
 
     # -- writes ------------------------------------------------------------
 
@@ -95,6 +99,7 @@ class PositionBook:
         key = (account, symbol)
         self._authoritative[key] = float(size)
         self._overlays.pop(key, None)
+        self._touched_at[key] = time.monotonic()
 
     def apply_snapshot(self, account: str, positions: Iterable) -> None:
         """Replace all of an account's positions from a full snapshot.
@@ -103,22 +108,52 @@ class PositionBook:
         positions it considers closed, and a stale non-zero entry here would
         make the hedger chase a position that no longer exists.
         """
-        stale = [key for key in self._authoritative if key[0] == account]
-        for key in stale:
-            self._authoritative[key] = 0.0
-            self._overlays.pop(key, None)
-        for position in positions:
-            self.set_authoritative(account, position.symbol, position.size)
+        # Built first and written in one pass. It used to zero every position
+        # of the account and then write the real ones, and anything reading
+        # in between -- another thread, when this ran from one -- saw the
+        # account flat and sized a full hedge the wrong way.
+        fresh = {(account, p.symbol): float(p.size) for p in positions}
+        for key in [key for key in self._authoritative if key[0] == account]:
+            fresh.setdefault(key, 0.0)
+        for (acct, symbol), size in fresh.items():
+            self.set_authoritative(acct, symbol, size)
+
+    def apply_read(self, account: str, positions: Iterable, requested_at: float) -> list[str]:
+        """Apply an HTTP position read, keeping anything newer than it.
+
+        An HTTP read answers with the state at the moment the exchange served
+        it, ~320ms after it was sent from here. A fill or position update that
+        reached us over the stream in that window is NEWER than the answer,
+        and `apply_snapshot` would write the older number over it and drop the
+        fill's overlay: the book then reads the fill as never having happened,
+        and the reconciler, which runs right after the read, hedges it again.
+
+        So a key the stream has touched since `requested_at` is left alone.
+        Everything else is replaced, including zeroing what the exchange no
+        longer lists. Returns the symbols that were skipped, for the log.
+        """
+        fresh = {(account, p.symbol): float(p.size) for p in positions}
+        for key in [key for key in self._authoritative if key[0] == account]:
+            fresh.setdefault(key, 0.0)
+        skipped = []
+        for (acct, symbol), size in fresh.items():
+            if self._touched_at.get((acct, symbol), 0.0) > requested_at:
+                skipped.append(symbol)
+                continue
+            self.set_authoritative(acct, symbol, size)
+        return skipped
 
     def add_overlay(self, account: str, symbol: str, delta: float, label: str = "") -> None:
         """Optimistically shift a position before the exchange confirms it."""
         if delta == 0:
             return
         key = (account, symbol)
-        expires_at = time.monotonic() + (self.overlay_ttl_ms / 1000.0)
+        now = time.monotonic()
+        expires_at = now + (self.overlay_ttl_ms / 1000.0)
         self._overlays.setdefault(key, []).append(
             _Overlay(delta=float(delta), expires_at=expires_at, label=label)
         )
+        self._touched_at[key] = now
 
     def apply_fill(self, account: str, symbol: str, is_buy: bool, size: float, label: str = "fill") -> None:
         """Overlay a fill. A buy moves the position up, a sell moves it down."""

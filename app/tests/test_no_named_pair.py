@@ -59,7 +59,7 @@ ALLOWED = {
     ("strategy.py", "self.master = master"),
     ("strategy.py", "self.sub1 = sub1"),
     # Any account's HTTP client will do; this one is to hand.
-    ("strategy.py", "realised_for_trees, self.master.http, self._trees()"),
+    ("strategy.py", "realised_for_trees, self.master.http, self._trees(),"),
     # The configured pair's own roles, which is what a leg with no group
     # falls back to and the only place the pair is the answer.
     ("strategy.py", "master, sub1 = self.master.pubkey, self.sub1.pubkey"),

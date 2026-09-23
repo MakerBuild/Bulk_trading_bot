@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from .marketdata import MarketSpec, round_size
+from .marketdata import MarketSpec, min_order_size, round_size
 
 log = logging.getLogger(__name__)
 
@@ -206,10 +206,7 @@ def resolve_notionals(
             # 0.0001, around forty cents, but refuses any order under $50: a
             # $25 cap passed the lot test, sized every resting order at $25,
             # and had all of them rejected. Five in a row is the kill switch.
-            floor = max(
-                spec.lot_size,
-                round_size(spec.min_notional / price, spec) if spec.min_notional else 0.0,
-            )
+            floor = min_order_size(spec, price)
             asked = round_size(leg.max_order_notional_usd / price, spec)
             leg.max_order_size = max(asked, floor)
             if asked < floor:
@@ -232,6 +229,12 @@ def resolve_notionals(
             # zero cap sized every order at zero and the leg never placed
             # anything -- silently, because nothing about it is an error.
             leg.max_order_size = leg.size
+
+
+# The most of an account's available margin one cycle may take. The rest is
+# what stands between an individually directional account and liquidation
+# while its hedge is in flight, and what pays the cycle's fees.
+MARGIN_HEADROOM = 0.8
 
 
 def plan_sizes(
@@ -271,18 +274,25 @@ def plan_sizes(
         raise InsufficientMargin("could not price the legs -- no market data")
 
     # The configured size is used as written whenever both accounts can carry
-    # it. The fraction is a fallback, not a permanent cap: an operator who
-    # sized a cycle deliberately should get that cycle.
-    if required <= smallest:
+    # it with headroom to spare. The fraction is a fallback, not a permanent
+    # cap: an operator who sized a cycle deliberately should get that cycle --
+    # but not one that takes every dollar of margin. Each account is
+    # individually directional, so an account at 100% has nothing between one
+    # adverse move while its hedge is in flight and its liquidation.
+    if required <= smallest * MARGIN_HEADROOM:
         scale = 1.0
         budget = smallest
     else:
-        budget = smallest * max_margin_fraction
-        scale = budget / required
+        # Capped by the headroom too, and never above the configured size: a
+        # fraction of 1.0 used to give a budget over the requirement, and the
+        # "scaled" cycle came out LARGER than written, on all of the margin.
+        budget = smallest * min(max_margin_fraction, MARGIN_HEADROOM)
+        scale = min(1.0, budget / required)
         log.warning(
             "configured sizes need $%.2f of margin but only $%.2f is available "
-            "-- scaling every leg to %.1f%% so the cycle fits inside $%.2f",
-            required, smallest, scale * 100, budget,
+            "(%.0f%% of it may be used) -- scaling every leg to %.1f%% so the "
+            "cycle fits inside $%.2f",
+            required, smallest, MARGIN_HEADROOM * 100, scale * 100, budget,
         )
 
     planned: list[LegSizing] = []

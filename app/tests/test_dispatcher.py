@@ -22,7 +22,7 @@ from bulkdn.strategy import Strategy
 BTC = "BTC-USD"
 
 
-def strategy(tmp_path, pool_size=8, max_groups=3, cycles_each=None):
+def strategy(tmp_path, pool_size=8, max_groups=3, cycles_each=None, cycles=0):
     obj = object.__new__(Strategy)
     obj.config = Config(
         markets=[
@@ -31,6 +31,7 @@ def strategy(tmp_path, pool_size=8, max_groups=3, cycles_each=None):
                       max_distance_bps=5.0),
         ],
         mode="pool",
+        cycles=cycles,
         chase_interval_s=0.001,
         risk=RiskConfig(),
         private_key="x",
@@ -236,3 +237,19 @@ def test_the_dispatcher_does_not_draw_a_size_run_leg_will_redraw(tmp_path):
     asyncio.run(drive())
     assert drawn == [], "the dispatcher drew a size that _run_leg redraws"
     assert obj.started == [7.5], "the configured size must arrive untouched"
+
+
+def test_cycles_caps_the_groups_a_pool_run_starts(tmp_path):
+    """Each group is its own one-cycle leg, so the run counts them instead."""
+    obj = strategy(tmp_path, max_groups=3, cycles=2)
+
+    async def run_group(group_id, group, size):
+        obj.started.append(group_id)
+
+    obj._run_group = run_group
+
+    async def drive():
+        await asyncio.wait_for(obj._dispatch_groups({BTC: 1.0}), timeout=5)
+
+    asyncio.run(drive())
+    assert len(obj.started) == 2

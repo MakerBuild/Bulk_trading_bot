@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Sequence
 
 from .accounts import AccountSession, OrderRejected
@@ -27,35 +28,93 @@ log = logging.getLogger(__name__)
 
 
 async def sync_positions(sessions: Sequence[AccountSession], book: PositionBook) -> None:
-    """Async wrapper around the HTTP position sync.
+    """Read every account's positions over HTTP, and apply them on the loop.
 
-    The SDK's HTTP client is synchronous, so this is offloaded to a thread --
-    calling it directly from the event loop would stall the WebSocket receive
-    loop and delay every fill and hedge behind a network round-trip.
+    The SDK's HTTP client is synchronous, so the READS go to a thread --
+    calling them from the event loop would stall the WebSocket receive loop
+    and delay every fill and hedge behind a round trip per account.
+
+    The WRITES do not. The book is the event loop's: fills and position
+    updates land in it from there, and the hedger reads it from there. This
+    used to apply each account's answer from the worker thread, racing both.
     """
-    await asyncio.to_thread(sync_positions_http, sessions, book)
+    reads, failures = await asyncio.to_thread(_read_all, list(sessions))
+    for session, parsed, requested_at in reads:
+        _apply(session, parsed, requested_at, book)
+    _raise_first(failures)
 
 
 def sync_positions_http(sessions: Sequence[AccountSession], book: PositionBook) -> None:
-    """Load authoritative positions for every account over HTTP.
+    """Load authoritative positions for every account over HTTP, blocking.
 
-    Called before the strategy makes any decision, so the first hedge
-    evaluation sees real positions rather than an empty book.
+    Only for callers with no event loop to protect -- the command line
+    before anything is connected, and tests. Anything running beside a live
+    socket uses `sync_positions`.
     """
+    reads, failures = _read_all(list(sessions))
+    for session, parsed, requested_at in reads:
+        _apply(session, parsed, requested_at, book)
+    _raise_first(failures)
+
+
+def _raise_first(failures: list[tuple[AccountSession, BaseException]]) -> None:
+    """Report a partial read as the failure it is, after keeping what worked."""
+    if not failures:
+        return
+    session, exc = failures[0]
+    if len(failures) > 1:
+        log.error(
+            "position read failed on %d account(s): %s",
+            len(failures), ", ".join(s.name for s, _ in failures),
+        )
+    raise exc
+
+
+def _read_all(
+    sessions: Sequence[AccountSession],
+) -> tuple[list[tuple[AccountSession, list, float]], list[tuple[AccountSession, BaseException]]]:
+    """Each account's positions, with when its request was sent, and what failed.
+
+    One account's failure does not throw the rest away. It used to: a single
+    429 on one account of a hundred discarded ninety-nine good answers, and
+    the caller -- waiting on a fresh book to hedge -- waited for all of them
+    again.
+    """
+    reads = []
+    failures = []
     for session in sessions:
-        data = session.full_account()
+        requested_at = time.monotonic()
+        try:
+            data = session.full_account()
+        except Exception as exc:  # noqa: BLE001 - reported once the rest are in
+            failures.append((session, exc))
+            continue
         positions = data.get("positions") or []
         parsed = [
             _SimplePosition(symbol=p.get("symbol", ""), size=float(p.get("size", 0.0)))
             for p in positions
             if p.get("symbol")
         ]
-        book.apply_snapshot(session.pubkey, parsed)
-        if parsed:
-            summary = " ".join(f"{p.symbol}={p.size:+.8f}" for p in parsed)
-            log.info("%s positions: %s", session.name, summary)
-        else:
-            log.info("%s has no open positions", session.name)
+        reads.append((session, parsed, requested_at))
+    return reads, failures
+
+
+def _apply(session: AccountSession, parsed: list, requested_at: float, book: PositionBook) -> None:
+    # `apply_read`, not `apply_snapshot`: the answer is ~320ms old by the time
+    # it lands, and a fill that reached us over the stream meanwhile is newer
+    # than it. Overwriting that fill is how the reconciler came to hedge the
+    # same exposure twice.
+    skipped = book.apply_read(session.pubkey, parsed, requested_at)
+    if parsed:
+        summary = " ".join(f"{p.symbol}={p.size:+.8f}" for p in parsed)
+        log.info("%s positions: %s", session.name, summary)
+    else:
+        log.info("%s has no open positions", session.name)
+    if skipped:
+        log.debug(
+            "%s: kept the stream's newer %s over the HTTP read",
+            session.name, ", ".join(sorted(skipped)),
+        )
 
 
 class _SimplePosition:
@@ -125,7 +184,10 @@ async def flatten(
     passes rather than trusted from the local book.
     """
     for attempt in range(1, max_passes + 1):
-        sync_positions_http(list(sessions.values()), book)
+        # Off the loop: this runs inside a live strategy (a group's residual
+        # sweep, the emergency stop), and a blocking read here froze every
+        # other group's hedges for a round trip per account.
+        await sync_positions(list(sessions.values()), book)
 
         outstanding = []
         for session in sessions.values():
@@ -160,21 +222,22 @@ async def flatten(
                     rounded,
                     session.name,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - the next close still goes
                 log.error(
-                    "flatten: failed to close %s on %s: %s", symbol, session.name, exc
+                    "flatten: failed to close %s on %s: %s",
+                    symbol, session.name, describe(exc),
                 )
 
         # Give the exchange a moment to settle before re-reading.
         await asyncio.sleep(1.0)
 
-    sync_positions_http(list(sessions.values()), book)
+    await sync_positions(list(sessions.values()), book)
     leftovers = [
         f"{session.name} {symbol}={book.authoritative(session.pubkey, symbol):+.8f}"
         for session in sessions.values()
         for symbol in symbols
-        if abs(book.authoritative(session.pubkey, symbol))
-        >= feed.specs[symbol].lot_size
+        if symbol in feed.specs
+        and abs(book.authoritative(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
     ]
     if leftovers:
         log.error(
@@ -274,7 +337,16 @@ async def flatten_limit(
                 current = resting.get(key)
                 if current is not None:
                     order = session.client.get_order_map().get(current)
-                    if order is not None and order.price == target and order.size >= rounded:
+                    # Already the touch counts as in place: `target` steps past
+                    # the best price on our side, and when that best price is
+                    # this order, chasing it walked the close across the spread
+                    # one tick per pass.
+                    own_touch = quote.best_bid if is_buy else quote.best_ask
+                    if (
+                        order is not None
+                        and order.price in (target, own_touch)
+                        and order.size >= rounded
+                    ):
                         continue
 
                 try:
@@ -312,7 +384,8 @@ async def flatten_limit(
         f"{session.name} {symbol}={book.authoritative(session.pubkey, symbol):+.8f}"
         for session in sessions.values()
         for symbol in symbols
-        if abs(book.authoritative(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
+        if symbol in feed.specs
+        and abs(book.authoritative(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
     ]
     log.warning(
         "limit close: gave up after %.0f minutes with %s still open. Orders are "

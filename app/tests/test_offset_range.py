@@ -11,6 +11,7 @@ and landed on one tick -- queued behind each other, in public, every cycle.
 Rotating the accounts does not separate two orders at the same price.
 """
 
+import asyncio
 
 from bulkdn.config import Config, RiskConfig, _leg_from_dict
 from bulkdn.pairing import Group
@@ -31,6 +32,7 @@ def strategy(offset):
         risk=RiskConfig(),
         private_key="x",
     )
+    obj._stop = asyncio.Event()
     return obj
 
 

@@ -32,10 +32,11 @@ import logging
 import time
 from dataclasses import dataclass
 
-from .accounts import AccountSession, short_pubkey
-from .marketdata import MarketSpec, round_notional, round_size, touch_text
+from .accounts import AccountSession, OrderRejected, short_pubkey
+from .marketdata import MarketSpec, min_order_size, round_notional, round_size, touch_text
 from .impact import ImpactBook
 from .positions import PositionBook
+from .retry import describe
 
 log = logging.getLogger(__name__)
 
@@ -51,15 +52,13 @@ class HedgeLimitExceeded(Exception):
 
 @dataclass(frozen=True)
 class LegRoles:
-    """Which account rests the limit order and which one hedges it.
+    """Which account rests the limit order and which ones hedge it.
 
-    The roles swap between phases, and that swap is the whole reason a single
-    rule covers both entry and exit:
-
-        OPEN  BTC: maker=master (buying long),  taker=sub1
-        OPEN  SOL: maker=sub1   (buying long),  taker=master
-        EXIT  BTC: maker=sub1   (closing short), taker=master
-        EXIT  SOL: maker=master (closing short), taker=sub1
+    In a drawn group the maker rests the order in both phases -- buying (or
+    selling) to open, then the opposite, reduce-only, to close -- and the
+    hedgers cover each fill with market orders the other way, split by
+    `shares`. The hedge rule is the same in both phases: bring the sum of
+    every account in the leg back to zero.
     """
 
     symbol: str
@@ -135,46 +134,162 @@ class InFlight:
 
     Entries expire. If a fill is never seen -- a dropped frame, a rejected
     order -- the reservation must not pin net exposure at a false zero forever.
+
+    Each reservation expires on its own clock. It used to be one running total
+    per key with one expiry, and every `add` pushed that expiry out for the
+    whole total: a slice that half-filled left its unfilled half reserved for
+    as long as new hedges kept arriving, and the pair sat under-hedged by it.
+
+    A slice whose order got no answer at all is different again. It may have
+    executed -- that is what a timeout means -- so releasing it re-hedges
+    exposure that may already be covered (a live run sent three duplicate
+    hedges this way), and letting it lapse after the usual couple of seconds
+    does the same a little later. It is held as *doubtful* instead, for up to
+    `doubt_ttl_s`, and retired by `settle_doubtful` once a position read that
+    began after it was sent has replaced the guess with the exchange's answer.
     """
 
-    def __init__(self, ttl_ms: int = 2000):
+    def __init__(self, ttl_ms: int = 2000, doubt_ttl_s: float = 30.0):
         self.ttl_s = ttl_ms / 1000.0
-        self._value: dict[str, float] = {}
-        self._expires: dict[str, float] = {}
+        self.doubt_ttl_s = doubt_ttl_s
+        self._entries: dict[str, list[_Reservation]] = {}
 
-    def add(self, symbol: str, delta: float) -> None:
-        self._value[symbol] = self.total(symbol) + delta
-        self._expires[symbol] = time.monotonic() + self.ttl_s
+    def add(self, symbol: str, delta: float, *, awaiting_answer: bool = False) -> None:
+        """Reserve `delta` against `symbol`.
+
+        `awaiting_answer` is for an order just sent: its reservation must not
+        lapse while the request is still open. The ordinary TTL is two
+        seconds and the request timeout is ten, so a reservation timed from
+        the send was gone before a slow answer could say what happened --
+        and whatever `hold_in_doubt` moved over then was a guess, not the
+        remainder. `answered` starts the ordinary clock once the reply is in;
+        `doubt_ttl_s` bounds it meanwhile, in case no reply ever is.
+        """
+        if delta == 0:
+            return
+        now = time.monotonic()
+        self._entries.setdefault(symbol, []).append(
+            _Reservation(
+                delta=delta,
+                sent_at=now,
+                expires_at=now + (self.doubt_ttl_s if awaiting_answer else self.ttl_s),
+                awaiting=awaiting_answer,
+            )
+        )
+
+    def answered(self, symbol: str) -> None:
+        """Start the ordinary clock on reservations whose order has replied."""
+        now = time.monotonic()
+        for entry in self._entries.get(symbol, ()):
+            if entry.awaiting:
+                entry.awaiting = False
+                entry.expires_at = now + self.ttl_s
+
+    def hold_in_doubt(self, symbol: str, delta: float) -> None:
+        """Keep what is still reserved of `delta` until a fresh read settles it.
+
+        Only what is still reserved. A fill for the order may already have
+        arrived on the stream and retired part or all of the reservation
+        while the request itself went unanswered; re-reserving the full size
+        then counted the filled part twice -- the net read as over-hedged,
+        and the next hedge would have gone the other way. Moving the
+        remainder keeps the total exactly as it was and changes only how
+        long it lives.
+        """
+        if delta == 0:
+            return
+        reserved = sum(
+            abs(entry.delta)
+            for entry in self._live(symbol)
+            if not entry.doubtful and (entry.delta > 0) == (delta > 0)
+        )
+        moved = min(abs(delta), reserved)
+        if moved <= 0:
+            return
+        signed = moved if delta > 0 else -moved
+        self.consume(symbol, signed)
+        now = time.monotonic()
+        self._entries.setdefault(symbol, []).append(
+            _Reservation(
+                delta=signed, sent_at=now, expires_at=now + self.doubt_ttl_s,
+                doubtful=True,
+            )
+        )
+
+    def settle_doubtful(self, read_started_at: float) -> None:
+        """Drop doubtful reservations a position read has since accounted for.
+
+        Only those sent before the read began: the read reflects whatever
+        they did, so the book now carries it and the reservation would count
+        it twice.
+        """
+        for symbol in list(self._entries):
+            self._entries[symbol] = [
+                entry for entry in self._entries[symbol]
+                if not (entry.doubtful and entry.sent_at < read_started_at)
+            ]
+            if not self._entries[symbol]:
+                del self._entries[symbol]
 
     def consume(self, symbol: str, delta: float) -> None:
         """Retire part of a reservation as its fill arrives.
 
         Only reduces toward zero, and only for fills in the same direction as
         the outstanding reservation -- a maker fill on the other side must not
-        cancel out a pending hedge.
+        cancel out a pending hedge. Oldest first, ordinary before doubtful: a
+        fill is far likelier to belong to an order that is being answered.
         """
-        current = self.total(symbol)
-        if current == 0 or delta == 0:
+        if delta == 0:
             return
-        if current > 0 and delta > 0:
-            self._value[symbol] = max(0.0, current - delta)
-        elif current < 0 and delta < 0:
-            self._value[symbol] = min(0.0, current - delta)
+        entries = self._live(symbol)
+        remaining = abs(delta)
+        for entry in sorted(entries, key=lambda e: (e.doubtful, e.sent_at)):
+            if remaining <= 0:
+                break
+            if (entry.delta > 0) != (delta > 0):
+                continue
+            taken = min(abs(entry.delta), remaining)
+            remaining -= taken
+            entry.delta -= taken if entry.delta > 0 else -taken
+        self._entries[symbol] = [e for e in entries if e.delta != 0]
+        if not self._entries[symbol]:
+            del self._entries[symbol]
 
     def total(self, symbol: str) -> float:
-        if time.monotonic() > self._expires.get(symbol, 0.0):
-            self._value.pop(symbol, None)
-            self._expires.pop(symbol, None)
-            return 0.0
-        return self._value.get(symbol, 0.0)
+        return sum(entry.delta for entry in self._live(symbol))
 
     def clear(self, symbol: str | None = None) -> None:
         if symbol is None:
-            self._value.clear()
-            self._expires.clear()
+            self._entries.clear()
         else:
-            self._value.pop(symbol, None)
-            self._expires.pop(symbol, None)
+            self._entries.pop(symbol, None)
+
+    def _live(self, symbol: str) -> list[_Reservation]:
+        now = time.monotonic()
+        entries = [e for e in self._entries.get(symbol, ()) if now <= e.expires_at]
+        if entries:
+            self._entries[symbol] = entries
+        else:
+            self._entries.pop(symbol, None)
+        return entries
+
+
+@dataclass
+class _Reservation:
+    delta: float
+    sent_at: float
+    expires_at: float
+    doubtful: bool = False
+    # Sent, and no reply yet. See `InFlight.add`.
+    awaiting: bool = False
+
+
+class HedgeInDoubt(Exception):
+    """A hedge slice got no answer: it may or may not have executed.
+
+    Its reservation is held until a fresh position read settles it. The caller
+    should treat the book as suspect and read before hedging again.
+    """
 
 
 class Hedger:
@@ -262,9 +377,7 @@ class Hedger:
         so the lot stands alone. That is the old behaviour, and it is only
         reached when the feed has no reference price at all.
         """
-        if not price or price <= 0 or spec.min_notional <= 0:
-            return spec.lot_size
-        return max(spec.lot_size, round_size(spec.min_notional / price, spec))
+        return min_order_size(spec, price)
 
     def _destination(self, slices: list[tuple[str, float]]) -> str:
         """Where a hedge is going, named so the fills under it can be matched.
@@ -367,15 +480,28 @@ class Hedger:
             return 0.0
         return net
 
-    async def hedge(self, roles: LegRoles, mark_price: float | None = None) -> HedgeResult:
+    async def hedge(
+        self,
+        roles: LegRoles,
+        mark_price: float | None = None,
+        suspended=None,
+    ) -> HedgeResult:
         """Bring `roles.symbol` back to neutral, if it has drifted.
 
         Safe to call redundantly -- it is a no-op when already neutral.
+
+        `suspended`, when given, is asked once the leg's lock is held -- the
+        last point before anything is sent. The caller's own check comes
+        before the wait for this lock, and the liquidation guard can start
+        closing out during that wait; a hedge sent after it would open the
+        opposite of each close.
         """
         symbol = roles.symbol
         spec = self.specs[symbol]
 
         async with self._lock(roles.key):
+            if suspended is not None and suspended():
+                return HedgeResult(symbol, 0.0, 0.0, False, "hedging suspended")
             net = self.effective_net(roles)
             tolerance = self.tolerance(symbol)
 
@@ -461,38 +587,62 @@ class Hedger:
             # `market()` returns, and the reservation has to already be there
             # for the fill handler to retire it.
             for _pubkey, piece in slices:
-                self.in_flight.add(roles.key, piece if is_buy else -piece)
-            results = await asyncio.gather(
-                *(
-                    self.sessions[pubkey].market(
-                        symbol, is_buy, piece, reduce_only=roles.reduce_only
-                    )
-                    for pubkey, piece in slices
-                ),
-                return_exceptions=True,
-            )
+                self.in_flight.add(
+                    roles.key, piece if is_buy else -piece, awaiting_answer=True
+                )
             sent = 0.0
             failures: list[BaseException] = []
-            for (_pubkey, piece), result in zip(slices, results, strict=True):
-                if isinstance(result, BaseException):
-                    # This slice never made it, so its exposure is still real.
-                    # Releasing only its reservation lets the next trigger
-                    # retry exactly the part that failed -- the slices that did
-                    # go out are covered and must not be hedged twice.
-                    self.in_flight.consume(roles.key, piece if is_buy else -piece)
-                    failures.append(result)
-                else:
-                    sent += piece
-            if failures:
+            doubtful: list[BaseException] = []
+            try:
+                results = await asyncio.gather(
+                    *(
+                        self.sessions[pubkey].market(
+                            symbol, is_buy, piece, reduce_only=roles.reduce_only
+                        )
+                        for pubkey, piece in slices
+                    ),
+                    return_exceptions=True,
+                )
+                for (_pubkey, piece), result in zip(slices, results, strict=True):
+                    signed = piece if is_buy else -piece
+                    if isinstance(result, OrderRejected):
+                        # The exchange answered no, so this slice never traded
+                        # and its exposure is still real. Releasing only its
+                        # reservation lets the next trigger retry exactly the
+                        # part that failed -- the slices that did go out are
+                        # covered and must not be hedged twice.
+                        self.in_flight.consume(roles.key, signed)
+                        failures.append(result)
+                    elif isinstance(result, BaseException):
+                        # No answer at all -- a timeout or a dropped socket. It
+                        # may have executed, and treating it as never sent is
+                        # how a live run hedged the same exposure three times.
+                        # What is still reserved of it is held until a
+                        # position read says what happened.
+                        self.in_flight.hold_in_doubt(roles.key, signed)
+                        doubtful.append(result)
+                    else:
+                        sent += piece
+            finally:
+                # The replies are in -- or the wait was cut off -- so whatever
+                # is still reserved for these slices goes onto the ordinary
+                # clock. The doubtful ones already moved to their own.
+                self.in_flight.answered(roles.key)
+            if failures or doubtful:
                 if sent > 0:
                     # Some of it is covered. The reconciler re-derives the
                     # remainder from positions, so the partial cover is not
                     # lost; raising here still reports the failure.
                     log.warning(
-                        "hedge %s: %d of %d slices sent, %d failed",
-                        symbol, len(slices) - len(failures), len(slices),
-                        len(failures),
+                        "hedge %s: %d of %d slices sent, %d rejected, %d unanswered",
+                        symbol, len(slices) - len(failures) - len(doubtful),
+                        len(slices), len(failures), len(doubtful),
                     )
+                if doubtful:
+                    raise HedgeInDoubt(
+                        f"{symbol}: {len(doubtful)} hedge slice(s) got no answer "
+                        f"({describe(doubtful[0])}) -- held until positions are re-read"
+                    ) from doubtful[0]
                 raise failures[0]
             size = sent
 

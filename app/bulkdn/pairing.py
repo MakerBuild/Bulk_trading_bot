@@ -221,6 +221,17 @@ class Pairing:
         self.busy.update(group.accounts)
         self._next_id = max(self._next_id, group_id)
 
+    def skip_ids_through(self, group_id: int) -> None:
+        """Never hand out `group_id` or anything below it.
+
+        Ids started at 1 in every process, while the state file keeps each
+        finished group's leg under its id. A new `g1` then inherited the old
+        `g1`'s leg: its offset, its order cap and its cycle count -- so a
+        changed cap in the settings was ignored for exactly those groups, and
+        a leg that had already done its cycles did nothing at all.
+        """
+        self._next_id = max(self._next_id, group_id)
+
     def release(self, group_id: int) -> Group | None:
         """Hand a finished group's accounts back to the pool."""
         group = self.active.pop(group_id, None)

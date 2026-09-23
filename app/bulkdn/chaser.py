@@ -122,6 +122,14 @@ class Chaser:
         # absence means it is gone -- filled or cancelled -- rather than not
         # yet acknowledged. See `may_be_resting`.
         self._seen: set[str] = set()
+        # When each leg, in its current direction, first put an order on the
+        # book. Patience is measured from here, not from the current order:
+        # every drift replace reset the old clock, so in a market that kept
+        # moving away the order was re-placed at its offset forever and never
+        # moved onto the touch -- the opposite of "unfilled for this long".
+        self._chasing_since: dict[tuple[str, bool], float] = {}
+        # Orders kept after a replace was refused. See `_place`.
+        self._adopted: set[str] = set()
 
     # -- sizing ------------------------------------------------------------
 
@@ -162,6 +170,7 @@ class Chaser:
                 await self._cancel(session, leg, symbol)
             leg.complete = True
             leg.tightened = False
+            self._chasing_since.pop(self._chase_key(roles), None)
             return ChaseOutcome(symbol, "complete", f"remaining={remaining:.8f}")
 
         if quote.age_s > self.price_stale_timeout_s:
@@ -169,11 +178,8 @@ class Chaser:
                 symbol, "skipped", f"stale price ({quote.age_s:.1f}s old)"
             )
 
-        resting_for = (
-            time.monotonic() - self._placed_at[leg.oid]
-            if leg.oid and leg.oid in self._placed_at
-            else 0.0
-        )
+        since = self._chasing_since.get(self._chase_key(roles))
+        resting_for = time.monotonic() - since if leg.oid and since else 0.0
         was_tightened = leg.tightened
         # The cycle's own offset when one was drawn, the market's otherwise.
         # `params` is built once per symbol, so every group on that market
@@ -221,6 +227,29 @@ class Chaser:
 
         drift = distance_bps(resting.price, target)
         undersized = resting.size < desired - spec.lot_size
+        # More on the book than the leg still needs -- an order adopted after a
+        # replace whose cancel half failed because the old one had filled, or
+        # a position that moved some other way. Left alone it fills the leg
+        # past its size; nothing else caps what a leg can put on.
+        #
+        # Only for an adopted order. For any other, a fill can reach the book
+        # before the order map shrinks the order, and the check would fire on
+        # every such fill.
+        oversized = (
+            leg.oid in self._adopted and resting.size > remaining + spec.lot_size / 2
+        )
+        if oversized:
+            return await self._place(
+                session, roles, leg, target, desired, replace_oid=leg.oid,
+                reason=f"resting {resting.size:.8f} > remaining {remaining:.8f}",
+            )
+        # Our own order is the touch. `chase_price` steps `improve_ticks` past
+        # the best price on our side, and that best price IS this order, so
+        # following it stepped past ourselves: one replace per tick, walking
+        # the order across the spread and giving it away. Being the touch is
+        # the goal; the price only has to move when someone else is ahead.
+        own_touch = quote.best_bid if roles.maker_is_buy else quote.best_ask
+        at_the_touch = own_touch is not None and resting.price == own_touch
 
         if tightening_now:
             # Below max_distance_bps, so the drift rule would have held this
@@ -247,7 +276,7 @@ class Chaser:
         # moved the target rounds to the same tick and nothing is sent, so a
         # transaction costs only when the book actually changed.
         if was_tightened:
-            if resting.price != target:
+            if resting.price != target and not at_the_touch:
                 return await self._place(
                     session, roles, leg, target, desired, replace_oid=leg.oid,
                     reason=f"following the touch {resting.price:g} -> {target:g}",
@@ -344,7 +373,22 @@ class Chaser:
             # Python SDK has no message type for that action.
             if replace_oid:
                 leg.remember_stale(replace_oid)
-            log.warning("%s: chase order rejected: %s", symbol, exc)
+            placed_oid = getattr(exc, "order_id", None)
+            if getattr(exc, "placed", False) and placed_oid:
+                # The batch was refused as a whole because its CANCEL half
+                # failed -- typically the old order had just filled -- but the
+                # new order was accepted and is resting. Dropping its id left
+                # an order nothing tracked: the next pass placed another, and
+                # the leg filled past its size. Adopted instead; the next pass
+                # resizes it if the fill left it too big.
+                log.warning(
+                    "%s: replace refused but the new order rests (%s) -- keeping it",
+                    symbol, describe(exc),
+                )
+                self._track(roles, leg, placed_oid, price, size)
+                self._adopted.add(placed_oid)
+                return ChaseOutcome(symbol, "placed", "adopted after a refused cancel")
+            log.warning("%s: chase order rejected: %s", symbol, describe(exc))
             return ChaseOutcome(symbol, "skipped", f"rejected: {exc}")
 
         if replace_oid:
@@ -353,10 +397,7 @@ class Chaser:
             # later pass is cheaper than trusting it.
             leg.remember_stale(replace_oid)
 
-        leg.oid = oid
-        leg.price = price
-        leg.size = size
-        self._placed_at[oid] = time.monotonic()
+        self._track(roles, leg, oid, price, size)
 
         action = "replaced" if replace_oid else "placed"
         log.info(
@@ -371,6 +412,32 @@ class Chaser:
             f" [{reason}]" if reason else "",
         )
         return ChaseOutcome(symbol, action, reason, price, size)
+
+    @staticmethod
+    def _chase_key(roles: LegRoles) -> tuple[str, bool]:
+        # The direction is part of it: the same leg chases one way to open and
+        # the other to close, and patience spent opening says nothing about
+        # how long the close has waited.
+        return (roles.key, roles.reduce_only)
+
+    def _track(
+        self, roles: LegRoles, leg: LegState, oid: str, price: float, size: float
+    ) -> None:
+        """Record `oid` as the leg's resting order."""
+        previous = leg.oid
+        if previous and previous != oid:
+            # Replaced. The stale list sweeps it if it is somehow still there;
+            # these two only ever grew, by one entry per replace for the life
+            # of the process.
+            self._placed_at.pop(previous, None)
+            self._seen.discard(previous)
+            self._adopted.discard(previous)
+        leg.oid = oid
+        leg.price = price
+        leg.size = size
+        now = time.monotonic()
+        self._placed_at[oid] = now
+        self._chasing_since.setdefault(self._chase_key(roles), now)
 
     async def _cancel(self, session: AccountSession, leg: LegState, symbol: str) -> None:
         oid = leg.oid
