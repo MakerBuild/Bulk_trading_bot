@@ -694,11 +694,16 @@ async def cmd_run(config: Config, dry_run: bool) -> int:
         stopper.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await stopper
-        await runtime.stop()
-        # Cycle reports and halt alerts go out in the background. asyncio.run
-        # cancels anything still pending the moment this returns, so the last
-        # of them -- often the one that matters -- gets a few seconds to land.
-        await runtime.notifier.drain()
+        try:
+            await runtime.stop()
+        finally:
+            # Cycle reports and halt alerts go out in the background.
+            # asyncio.run cancels anything still pending the moment this
+            # returns, so the last of them -- often the one that matters --
+            # gets a few seconds to land. In a `finally` of its own: a socket
+            # that failed to close used to skip this, and the halt alert that
+            # explained the failure was cancelled unsent.
+            await runtime.notifier.drain()
 
 
 async def cmd_flatten(
