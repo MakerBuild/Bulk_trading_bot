@@ -22,6 +22,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -78,7 +79,12 @@ class TransactionRejected(OrderRejected):
         self.detail = detail
 
 
-_RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "ratelimit", "too many", "429", "throttl")
+_RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "ratelimit", "too many", "throttl")
+# The status code on its own, not as digits inside a longer number. The
+# refusal's text carries the whole response -- ids, nonces, prices -- and a
+# bare substring match read "bad signature" with a 429 somewhere in a nonce as
+# throttling, which then did not count toward the reject streak.
+_STATUS_429 = re.compile(r"(?<![0-9.])429(?![0-9.])")
 
 
 def is_rate_limited(exc: BaseException) -> bool:
@@ -88,7 +94,9 @@ def is_rate_limited(exc: BaseException) -> bool:
     code for it that this bot has seen.
     """
     text = f"{exc} {getattr(exc, 'detail', '') or ''}".lower()
-    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS) or bool(
+        _STATUS_429.search(text)
+    )
 
 
 class NotSent(RuntimeError):

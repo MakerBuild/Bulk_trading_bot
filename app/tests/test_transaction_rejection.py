@@ -380,3 +380,20 @@ async def test_a_submission_that_never_left_counts_toward_the_streak():
 
     assert session.reject_streak == 1
     assert "BTC-USD" not in session.unconfirmed, "an order that never left is not in doubt"
+
+
+def test_429_inside_a_longer_number_is_not_throttling():
+    """The refusal carries the whole response; a nonce containing 429 made a
+    bad signature read as throttling, so it never counted toward the streak."""
+    from bulkdn.accounts import OrderRejected, is_rate_limited
+
+    refusal = OrderRejected("bad signature (nonce 1790152942913560)", [])
+    assert not is_rate_limited(refusal)
+
+
+def test_a_429_status_is_still_throttling():
+    from bulkdn.accounts import OrderRejected, is_rate_limited
+
+    assert is_rate_limited(OrderRejected("HTTP 429: slow down", []))
+    assert is_rate_limited(OrderRejected("status=429", []))
+    assert is_rate_limited(OrderRejected("Too Many Requests", []))
