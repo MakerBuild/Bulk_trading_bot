@@ -31,7 +31,7 @@ from collections.abc import Callable, Sequence
 import requests
 from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
-from .retry import describe
+from .retry import describe, post_signed
 from bulk_api.common import (
     OrderStatus,
     Side,
@@ -399,6 +399,33 @@ class RoutedWsClient(BulkWebSocketClient):
         """
         return self.signer
 
+    def signed_transaction(self, actions: Sequence[Action], account: str) -> dict:
+        """The same signed transaction `submit` sends, for sending over HTTP.
+
+        For when the socket is the problem. The exchange takes this exact
+        envelope at `/order` -- the SDK's own HTTP path posts it there -- and
+        unlike the SDK's, it names the account, so it works for a sub-account.
+        """
+        signer = self._signing_key
+        if not signer:
+            raise NotSent("signer not configured")
+        if self.accounts and account not in self.accounts:
+            raise NotSent(f"this connection does not carry {short_pubkey(account)}")
+        nonce = int(time.time_ns())
+        payload_actions = []
+        for index, action in enumerate(actions):
+            action.seqno = index
+            action.nonce = nonce
+            action.pubkey = account
+            payload_actions.append(action.to_api())
+        tx = {
+            "actions": payload_actions,
+            "nonce": f"{nonce}",
+            "account": account,
+            "signer": signer.public_key,
+        }
+        return signer.sign_transaction(tx, self.signature_domain)
+
     async def submit(
         self,
         actions: Sequence[Action],
@@ -537,7 +564,11 @@ class AccountSession:
     async def connect(self) -> None:
         if not await self.client.connect():
             raise RuntimeError(f"{self.name}: failed to connect to WebSocket")
-        log.info("%s connected (account=%s)", self.name, short_pubkey(self.pubkey))
+        if self.pubkey:
+            log.info("%s connected (account=%s)", self.name, short_pubkey(self.pubkey))
+        else:
+            # The market data socket, which carries no account.
+            log.info("%s connected (order book and tickers only)", self.name)
 
     async def reconnect(self, attempts: int = 6, delay: float = 2.0) -> bool:
         """Try to restore a dropped socket. True if the stream is back.
@@ -794,9 +825,55 @@ class AccountSession:
         )
 
     async def cancel_all(self, symbols: Sequence[str]) -> list[OrderResponse]:
-        return await self.submit(
-            [CancelAll(symbols=list(symbols))], count_rejects=False
+        """Cancel every order in `symbols`, over HTTP if the socket cannot.
+
+        A live stop showed why: one socket had stalled, every cancel-all on
+        its six accounts timed out after ten seconds each, and the run exited
+        not knowing whether orders were still resting. Cancel-all is the one
+        action safe to send twice -- a second finds nothing and changes
+        nothing -- so when the socket is known to be behind, or does not
+        answer, the same signed cancel goes to `/order` over HTTP instead.
+        """
+        action = [CancelAll(symbols=list(symbols))]
+        if not self.dry_run and self._socket_unreliable():
+            return await self._cancel_all_http(symbols)
+        try:
+            return await self.submit(action, count_rejects=False)
+        except OrderRejected:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the HTTP path says what failed
+            if self.dry_run:
+                raise
+            log.warning(
+                "%s: cancel-all over the socket failed (%s) -- sending it over HTTP",
+                self.name, describe(exc),
+            )
+            return await self._cancel_all_http(symbols)
+
+    def _socket_unreliable(self) -> bool:
+        if not self.client.is_connected:
+            return True
+        return time.monotonic() < getattr(self, "stream_lagging_until", 0.0)
+
+    async def _cancel_all_http(self, symbols: Sequence[str]) -> list[OrderResponse]:
+        tx = self.client.signed_transaction([CancelAll(symbols=list(symbols))], self.pubkey)
+        base_url = getattr(self.http, "base_url", None)
+        if not base_url:
+            raise NotSent("no HTTP endpoint to send the cancel to")
+        response, _uncertain = await asyncio.to_thread(
+            post_signed, f"{base_url}/order", json=tx, timeout=10
         )
+        try:
+            body = response.json()
+        except ValueError:
+            body = {"raw": response.text}
+        status = body.get("status") if isinstance(body, dict) else None
+        if response.status_code != 200 or status not in (None, "ok"):
+            raise RuntimeError(
+                f"cancel-all over HTTP answered {response.status_code}: {body}"
+            )
+        log.info("%s: cancelled all orders in %s over HTTP", self.name, ", ".join(symbols))
+        return []
 
     # -- state queries -----------------------------------------------------
 
@@ -992,6 +1069,32 @@ def build_pool(
             )
 
     return sessions
+
+
+def market_data_session(
+    *, ws_url: str, http, symbols: Sequence[str], dry_run: bool = False
+) -> AccountSession:
+    """A socket of its own for the order book and tickers, carrying no account.
+
+    The book used to ride on the first master's socket, with every fill and
+    position update of that master's accounts behind it in one queue. BTC's
+    book is by far the busiest stream there is, and when it surged the queue
+    backed up: on two live runs that socket alone fell 7 to 32 seconds behind
+    (17 fills over two seconds late, against one on the other socket). Its
+    hedges timed out while executing, its fills were counted twice -- and the
+    book the chaser priced from was as old as the queue, so a "passive" order
+    crossed the real market and was refused thirty seconds running.
+
+    Apart, a surge in the book delays only the book, and fills arrive on
+    sockets that carry nothing else.
+    """
+    client = RoutedWsClient(
+        url=ws_url,
+        symbols=list(symbols),
+        accounts=[],
+        dry_run=dry_run,
+    )
+    return AccountSession(name="market", pubkey="", client=client, http=http, dry_run=dry_run)
 
 
 # Where the exchange names the account an update is about. The field is not

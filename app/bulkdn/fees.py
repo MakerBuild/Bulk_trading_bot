@@ -172,6 +172,29 @@ class Realised:
     # True when some account's history was longer than the walk would read,
     # so these totals are a lower bound. See `realised_for_account`.
     truncated: bool = False
+    # Money in minus money out on the trades themselves, fees apart: a sell
+    # adds its notional, a buy subtracts it. Taken from every row, like fees,
+    # because each row is one of OUR accounts' own side of a trade -- a trade
+    # between two of ours is in both histories and nets to nothing, which is
+    # exactly what it cost.
+    cash_usd: float = 0.0
+    # How far the rows moved each market's position, summed over accounts.
+    # With `cash_usd` and a price this gives the trading result of the walk;
+    # see `price_result_usd`.
+    base_by_symbol: dict[str, float] = field(default_factory=dict)
+
+    def price_result_usd(self, prices: dict[str, float]) -> float:
+        """What the trades made or lost on price alone, fees excluded.
+
+        Cash from the trades, plus whatever position they left valued at
+        `prices`. The pool is hedged, so that position is dust and the price
+        barely matters -- which is what makes the figure trustworthy mid-run:
+        it is the spread and slippage paid, not a directional bet. Negative
+        is a cost.
+        """
+        return self.cash_usd + sum(
+            base * prices.get(symbol, 0.0) for symbol, base in self.base_by_symbol.items()
+        )
 
     @property
     def qualifying_volume_usd(self) -> float:
@@ -235,9 +258,17 @@ class Realised:
         """
         total = cls()
         for fill in rows:
-            notional = float(fill.get("amount") or 0.0) * float(fill.get("price") or 0.0)
+            amount = float(fill.get("amount") or 0.0)
+            notional = amount * float(fill.get("price") or 0.0)
             total.fills += 1
             total.fees_usd += _fee_of(fill, user)
+            bought = _is_buy(fill)
+            if bought is not None:
+                total.cash_usd += -notional if bought else notional
+                symbol = fill.get("symbol") or fill.get("sym") or ""
+                total.base_by_symbol[symbol] = (
+                    total.base_by_symbol.get(symbol, 0.0) + (amount if bought else -amount)
+                )
 
             trade = _trade_key(fill)
             if seen is not None:
@@ -257,7 +288,30 @@ class Realised:
             volume_usd=self.volume_usd + other.volume_usd,
             self_trade_volume_usd=self.self_trade_volume_usd + other.self_trade_volume_usd,
             truncated=self.truncated or other.truncated,
+            cash_usd=self.cash_usd + other.cash_usd,
+            base_by_symbol={
+                symbol: self.base_by_symbol.get(symbol, 0.0) + other.base_by_symbol.get(symbol, 0.0)
+                for symbol in {*self.base_by_symbol, *other.base_by_symbol}
+            },
         )
+
+
+def _is_buy(fill: dict) -> bool | None:
+    """Which side THIS account was on, or None when the row does not say.
+
+    `isBuy` is the side of the account whose history it is, which is what a
+    cash flow needs. A row without it is left out of the price result rather
+    than guessed.
+    """
+    value = fill.get("isBuy", fill.get("b"))
+    if isinstance(value, bool):
+        return value
+    side = str(fill.get("side") or "").lower()
+    if side in ("buy", "b", "bid"):
+        return True
+    if side in ("sell", "s", "ask"):
+        return False
+    return None
 
 
 # Fields that describe one account's VIEW of a trade rather than the trade:

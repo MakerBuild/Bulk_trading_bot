@@ -134,7 +134,9 @@ class PositionBook:
         for (acct, symbol), size in fresh.items():
             self.set_authoritative(acct, symbol, size)
 
-    def apply_read(self, account: str, positions: Iterable, requested_at: float) -> list[str]:
+    def apply_read(
+        self, account: str, positions: Iterable, requested_at: float, force: bool = False
+    ) -> list[str]:
         """Apply an HTTP position read, keeping anything newer than it.
 
         An HTTP read answers with the state at the moment the exchange served
@@ -162,6 +164,15 @@ class PositionBook:
         * Otherwise the answer is written, zeroing what the exchange no longer
           lists, and the overlays it accounts for are dropped.
 
+        `force` writes the answer for every key. "Arrived after the request"
+        means "newer" only while the stream keeps up. From a socket running
+        tens of seconds behind, a position update or fill that lands during
+        the read is OLDER than the answer: keeping the update left the book on
+        a position the account no longer held, and keeping the fill counted
+        it twice -- a live run hedged one group four times over that way. The
+        caller forces it for such a socket, and keeps hedges waiting on reads
+        until the socket catches up.
+
         Returns the symbols that were skipped, for the log.
         """
         fresh = {(account, p.symbol): float(p.size) for p in positions}
@@ -170,11 +181,15 @@ class PositionBook:
         skipped = []
         now = time.monotonic()
         for key, size in fresh.items():
-            if self._position_at.get(key, 0.0) > requested_at:
+            if force:
+                pass
+            elif self._position_at.get(key, 0.0) > requested_at:
                 skipped.append(key[1])
                 self._awaiting_read.discard(key)
                 continue
-            later = [o for o in self._overlays.get(key, ()) if o.added_at > requested_at]
+            later = [] if force else [
+                o for o in self._overlays.get(key, ()) if o.added_at > requested_at
+            ]
             if later:
                 skipped.append(key[1])
                 # Held well past the ordinary TTL: the confirming read is

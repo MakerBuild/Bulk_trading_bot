@@ -44,6 +44,8 @@ class FakeStrategy:
     # groups them.
     _read_totals = Strategy._read_totals
     _trees = Strategy._trees
+    _spread_cost = Strategy._spread_cost
+    _cost_text = Strategy._cost_text
     all_sessions = Strategy.all_sessions
 
     def __init__(self, target, state=None):
@@ -66,6 +68,13 @@ class FakeStrategy:
 
         self.master = Session()
         self.sub1 = Session()
+
+        class Feed:
+            @staticmethod
+            def reference_price(_symbol):
+                return 80_000.0
+
+        self.feed = Feed()
         # Every account the run trades. The history is read across all of
         # them, not the first pair -- in pool mode that pair is two of a
         # hundred and ten.
@@ -334,3 +343,59 @@ async def test_a_failed_read_is_not_remembered(totals, monkeypatch):
     strategy._read_totals = boom
     assert await strategy.reached() is None
     assert strategy._target_answer == (0.0, None), "a failure was cached"
+
+
+# -- the cost is split into what is ours to change --------------------------
+
+
+def test_the_price_result_is_what_the_balances_lost_besides_fees():
+    """Checked against a live run to the cent: $36.56 = $22.08 + $14.49.
+
+    Maker buys at 100, the hedge sells at 99.9 on another account: 0.1 lost
+    on price per unit, whatever the fees were.
+    """
+    from bulkdn.fees import Realised
+
+    rows_maker = [{"isBuy": True, "amount": 2.0, "price": 100.0, "fee": 0.0,
+                   "symbol": "BTC-USD", "slot": 1, "sequence": 0}]
+    rows_hedge = [{"isBuy": False, "amount": 2.0, "price": 99.9, "fee": -0.07,
+                   "symbol": "BTC-USD", "slot": 2, "sequence": 0}]
+    total = Realised.from_fills(rows_maker, set()) + Realised.from_fills(rows_hedge, set())
+
+    assert total.price_result_usd({"BTC-USD": 99.95}) == pytest.approx(-0.2)
+    assert total.fees_usd == pytest.approx(-0.07)
+
+
+def test_an_open_remainder_is_valued_at_the_price():
+    from bulkdn.fees import Realised
+
+    rows = [{"isBuy": True, "amount": 1.0, "price": 100.0, "fee": 0.0,
+             "symbol": "BTC-USD", "slot": 1, "sequence": 0}]
+    total = Realised.from_fills(rows, set())
+    assert total.price_result_usd({"BTC-USD": 101.0}) == pytest.approx(1.0)
+
+
+async def test_the_progress_line_shows_fees_and_spread_apart(totals, caplog):
+    from bulkdn.fees import Realised
+
+    value = Realised(fees_usd=-22.08, cash_usd=-14.49, base_by_symbol={"BTC-USD": 0.0})
+    totals.value = value
+    strategy = FakeStrategy(ExecutionTarget(volume_usd=1e9))
+    with caplog.at_level(logging.INFO):
+        await strategy.reached()
+    line = next(r.getMessage() for r in caplog.records if "cost so far" in r.getMessage())
+    assert "fees $22.08" in line
+    assert "spread/slippage $14.49" in line
+    assert "= $36.57" in line
+
+
+async def test_the_reading_that_reaches_the_target_is_the_one_shown(totals):
+    """The status block sat at 97.5% for twenty minutes after the log said
+    the target was met: the reaching read returned before it was stored."""
+    from bulkdn.fees import Realised
+
+    totals.value = Realised(volume_usd=101_795.50, fees_usd=-17.30)
+    strategy = FakeStrategy(ExecutionTarget(volume_usd=100_000.0))
+    strategy._progress = (16.70, 97_541.91)
+    assert await strategy.reached()
+    assert strategy._progress == pytest.approx((17.30, 101_795.50))

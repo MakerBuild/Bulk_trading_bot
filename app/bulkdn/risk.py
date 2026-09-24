@@ -44,12 +44,16 @@ class RiskMonitor:
         feed: MarketFeed,
         sessions: dict[str, AccountSession],
         symbols: Sequence[str],
+        watch: Sequence[AccountSession] = (),
     ):
         self.config = config
         self.book = book
         self.feed = feed
         self.sessions = sessions
         self.symbols = list(symbols)
+        # Sockets that carry no account but must stay up -- the market data
+        # one. Checked for silence and drops, and nothing else.
+        self.watch = list(watch)
         # The live groups, as (label, symbol, accounts), when the run has any.
         # Set by the strategy. See `check`.
         self.groups: Callable[[], list[tuple[str, str, tuple[str, ...]]]] | None = None
@@ -156,6 +160,7 @@ class RiskMonitor:
                     )
                 )
 
+        for session in [*self.sessions.values(), *self.watch]:
             if session.dry_run:
                 continue
 

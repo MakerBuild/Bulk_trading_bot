@@ -39,7 +39,7 @@ from .fees import burned_usd as _burned
 from .fees import realised_for_trees
 from .hedger import Hedger, HedgeInDoubt, HedgeLimitExceeded, HedgeResult, LegRoles
 from .liquidation import LiquidationGuard, recent_liquidations
-from .marketdata import round_notional, round_size, touch_text
+from .marketdata import epoch_seconds, round_notional, round_size, touch_text
 from .sizing import draw_sizes, resolve_notionals
 from .notify import Notifier
 from .accounts import short_pubkey
@@ -73,6 +73,12 @@ log = logging.getLogger(__name__)
 # How long after an unanswered submission a change in that symbol might still
 # be our own.
 DOUBT_WINDOW_S = 120.0
+
+# A fill that reaches us this much later than its socket's usual delay says the
+# socket is running behind; the socket is then distrusted for this long, renewed
+# by every further sign of it. See `_note_stream_lag`.
+STREAM_LAG_S = 1.5
+STREAM_LAG_HOLD_S = 30.0
 # And how often we may say so before treating the symbol as faulty. Counted
 # over a window rather than for the life of the process: the bound is meant to
 # catch a fault that keeps recurring, and a run lasting hours will collect
@@ -203,6 +209,9 @@ class Strategy:
         self._started_at = time.monotonic()
         # burned, qualifying volume -- as of the last progress read.
         self._progress: tuple[float, float] = (0.0, 0.0)
+        # Spread and slippage paid so far this run, fees apart. See
+        # `_spread_cost`.
+        self._spread_usd: float | None = None
         # When each recent reconnect happened. Older entries fall out of the
         # window on their own, so a drop an hour ago says nothing about this one.
         self._reconnect_times: list[float] = []
@@ -467,6 +476,7 @@ class Strategy:
             size = float(fill.size or 0.0)
             if size <= 0:
                 return
+            self._note_fill_delay(session, fill)
 
             # A replayed fill (typically after a reconnect) must not be applied
             # to the book twice. Re-evaluating the hedge is still safe -- it is
@@ -689,8 +699,13 @@ class Strategy:
             )
             return False
 
+        # Once per market per incident, not once per account in it: one
+        # unanswered hedge moving two accounts is one event, and counting it
+        # twice spent two thirds of the budget on it -- a live run printed
+        # "4/3" on its second incident.
+        for symbol in {event.symbol for event in explainable}:
+            self._doubt_deferrals.setdefault(symbol, []).append(now)
         for event in explainable:
-            self._doubt_deferrals.setdefault(event.symbol, []).append(now)
             log.warning(
                 "%s -- but an order of ours in %s went unanswered, and a fresh "
                 "read of both accounts has now replaced the guess. Carrying on "
@@ -720,6 +735,13 @@ class Strategy:
                 # so a guess here would overwrite the truth for two accounts
                 # out of three.
                 self._mark_book_suspect()
+                return
+            if self._stream_lagging(session):
+                # Behind by an unknown amount, so this is an OLD position, and
+                # `set_authoritative` would write it over whatever is newer. A
+                # live run did exactly that: the stream on one socket fell
+                # thirty seconds behind, its stale updates outranked a fresh
+                # read, and the hedger sold a position that was already hedged.
                 return
 
             self.book.set_authoritative(session.pubkey, symbol, float(update.size or 0.0))
@@ -751,6 +773,8 @@ class Strategy:
                 # snapshot does not mention.
                 self._mark_book_suspect()
                 return
+            if self._stream_lagging(session):
+                return  # stale, for the reason in the position handler
 
             positions = [
                 p for p in (getattr(snapshot, "positions", None) or [])
@@ -1011,6 +1035,13 @@ class Strategy:
         try:
             # Before the market order, not after: our own remainder is
             # resting on exactly the side it is about to sweep.
+            if self._waiting_on_a_lagging_read(roles):
+                # One of this leg's sockets is behind, and no read has begun
+                # since it was noticed. The book for these accounts may count
+                # a fill twice or hold a stale position, and a hedge sized
+                # from it is a market order paid in full. The read is under
+                # way (`_note_stream_lag` started it) and requeues this leg.
+                return HedgeResult(roles.symbol, 0.0, 0.0, False, "waiting for a read")
             await self._clear_hedge_path(roles)
             if self._hedging_suspended:
                 # The guard started closing while the path was being cleared.
@@ -1030,6 +1061,12 @@ class Strategy:
             # unhedged. The unanswered slice is already held reserved against
             # this leg, which is what keeps it from being hedged twice; the
             # read only settles that sooner, so it runs beside trading.
+            #
+            # No answer at all is also a socket that has stopped keeping up.
+            for pubkey in roles.hedgers:
+                session = self.sessions.get(pubkey)
+                if session is not None:
+                    self._note_stream_lag(session, "a hedge got no answer")
             self._settle_doubt_soon(roles.key)
             raise
         finally:
@@ -1118,6 +1155,120 @@ class Strategy:
                 leg.oid = None
 
         await asyncio.gather(*(pull(session, leg) for session, leg in in_path))
+
+    async def _paused_for_a_lagging_socket(self, key: str, roles: LegRoles, leg) -> bool:
+        """Hold a leg with an account on a socket that has fallen behind.
+
+        Its maker order cannot be managed -- every replace and cancel on a
+        stalled socket times out -- and its fills cannot be hedged on time:
+        on a live run the chaser kept placing on a stalled maker for two
+        minutes ("could not clear a possibly-resting order ... the leg may
+        open larger than its size") while that group's hedges timed out one
+        after another. Opening more of a position that cannot be managed is
+        the wrong trade at any price.
+
+        So the leg's resting order is pulled -- cancel-all, which goes over
+        HTTP when the socket cannot carry it -- and nothing is placed until
+        the socket has kept up for `STREAM_LAG_HOLD_S`. Hedging is not paused:
+        what is already open still has to be covered.
+        """
+        lagging = [
+            self.sessions[p] for p in roles.accounts
+            if p in self.sessions and self._stream_lagging(self.sessions[p])
+        ]
+        paused = self.__dict__.setdefault("_paused_legs", set())
+        if not lagging:
+            if key in paused:
+                paused.discard(key)
+                log.info("%s: its sockets have caught up -- resuming", key)
+            return False
+        if key not in paused:
+            paused.add(key)
+            log.warning(
+                "%s: pausing its orders while %s's socket is behind",
+                key, lagging[0].name,
+            )
+            maker = self.sessions.get(roles.maker)
+            if maker is not None:
+                try:
+                    await maker.cancel_all([roles.symbol])
+                except Exception as exc:  # noqa: BLE001 - retried by the orphan sweep
+                    log.error("%s: could not pull its order: %s", key, describe(exc))
+                leg.oid = None
+        return True
+
+    def _note_fill_delay(self, session: AccountSession, fill) -> None:
+        """Judge a socket by how late this fill reached us over it.
+
+        Measured against the lowest delay the socket has shown, not against
+        zero: this machine's clock and the exchange's differ by some fixed
+        amount, and only what is above it is lateness.
+        """
+        stamp = float(getattr(fill, "timestamp", 0) or 0)
+        if stamp <= 0:
+            return
+        delay = time.time() - epoch_seconds(stamp)
+        floors = self.__dict__.setdefault("_fill_delay_floor", {})
+        client = id(session.client)
+        floor = min(floors.get(client, delay), delay)
+        floors[client] = floor
+        if delay - floor > STREAM_LAG_S:
+            self._note_stream_lag(session, f"a fill arrived {delay - floor:.1f}s late")
+
+    def _note_stream_lag(self, session: AccountSession, why: str) -> None:
+        """Distrust one socket's stream for a while, and read positions now.
+
+        Seen live on a $110k run: one socket fell 7 to 30 seconds behind. Its
+        hedges timed out while executing, its fills arrived after a position
+        read had already counted them and were counted again, and its stale
+        position updates outranked fresh reads -- one group was hedged back
+        and forth four times before it settled.
+
+        While a socket is behind, positions for its accounts come from HTTP,
+        which kept up: its stream updates are ignored, reads overwrite them
+        (`apply_read(force=True)`), and a leg with an account on it waits for
+        a read begun after the lag was noticed. Legs on other sockets trade
+        on untouched.
+        """
+        now = time.monotonic()
+        noticed = self.__dict__.setdefault("_lag_noticed_at", {})
+        client = id(session.client)
+        fresh = now >= getattr(session, "stream_lagging_until", 0.0)
+        noticed[client] = now
+        for other in self.all_sessions:
+            if other.client is session.client:
+                other.stream_lagging_until = now + STREAM_LAG_HOLD_S
+        if fresh:
+            log.warning(
+                "%s: its socket is running behind (%s) -- positions for its "
+                "accounts come from reads, not the stream, for %.0fs",
+                session.name, why, STREAM_LAG_HOLD_S,
+            )
+        for key, group in list(getattr(self, "_groups", {}).items()):
+            if any(
+                self.sessions.get(p) is not None and self.sessions[p].client is session.client
+                for p in group.accounts
+            ):
+                self._settle_doubt_soon(key)
+
+    @staticmethod
+    def _stream_lagging(session: AccountSession) -> bool:
+        return time.monotonic() < getattr(session, "stream_lagging_until", 0.0)
+
+    def _waiting_on_a_lagging_read(self, roles: LegRoles) -> bool:
+        """Whether this leg has an account on a socket noticed lagging since
+        the last read began."""
+        noticed = getattr(self, "_lag_noticed_at", {})
+        if not noticed:
+            return False
+        read_began = getattr(self, "_read_started_at", 0.0)
+        for pubkey in roles.accounts:
+            session = self.sessions.get(pubkey)
+            if session is None:
+                continue
+            if noticed.get(id(session.client), 0.0) > read_began:
+                return True
+        return False
 
     def _settle_doubt_soon(self, key: str) -> None:
         """Re-read positions in the background for a leg with an unanswered slice.
@@ -1419,7 +1570,10 @@ class Strategy:
         restored = False
         failed = []
         stale_after = self.risk.config.ws_stale_timeout_s
-        for session in self.all_sessions:
+        # The market data socket too: it carries no account, but a book that
+        # has stopped arriving is a book every order is priced from.
+        watched = [*self.all_sessions, *getattr(self.risk, "watch", ())]
+        for session in watched:
             if session.dry_run:
                 continue
             # `is_connected` alone is not enough: a half-open socket reports
@@ -1703,11 +1857,18 @@ class Strategy:
                     # here lands in its path; the next tick re-places it.
                     await asyncio.sleep(self.config.chase_interval_s)
                     continue
+                if await self._paused_for_a_lagging_socket(key, roles, leg):
+                    await asyncio.sleep(self.config.chase_interval_s)
+                    continue
                 try:
                     await self.chaser.step(roles, leg)
                 except Exception as exc:  # noqa: BLE001 - retried next tick
                     log.error("chase step for %s failed: %s", key, describe(exc))
                     await self._clear_orphans(key)
+                    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                        maker = self.sessions.get(roles.maker)
+                        if maker is not None:
+                            self._note_stream_lag(maker, "an order got no answer")
 
             self._persist()
 
@@ -2443,7 +2604,7 @@ class Strategy:
         exposure = sum(self.risk.net_exposure_usd(s) for s in self.symbols)
         elapsed = humanise(time.monotonic() - self._started_at)
         note = self._halt_reason or self._stop_requested or "S = stop and cancel"
-        lines.append(f"  burned ${burned:,.2f}   off-hedge ${exposure:,.0f}   "
+        lines.append(f"  {self._cost_text(burned)}   off-hedge ${exposure:,.0f}   "
                      f"running {elapsed}   |   {note}")
         return lines
 
@@ -2451,12 +2612,60 @@ class Strategy:
         """Keep the status block current while the legs work."""
         from .screen import SCREEN
 
+        refreshing: asyncio.Task | None = None
         while not self._stop.is_set():
+            # The totals were only read when the dispatcher asked whether the
+            # target was met, and once it was, nothing asked again: the groups
+            # still open went on closing for twenty minutes under a block that
+            # no longer moved. Re-read on the same freshness clock meanwhile.
+            read_at, _answer = getattr(self, "_target_answer", (0.0, None))
+            if (
+                self.config.target.measures_fills
+                and time.monotonic() - read_at >= TARGET_FRESHNESS_S
+                and (refreshing is None or refreshing.done())
+            ):
+                refreshing = asyncio.create_task(self._refresh_totals())
             try:
                 SCREEN.update(self.status_lines())
             except Exception as exc:  # noqa: BLE001 - never stop a run over a redraw
                 log.debug("could not redraw the status block: %s", describe(exc))
             await asyncio.sleep(interval_s)
+
+    async def _refresh_totals(self) -> None:
+        """Re-read spend and volume for the status block, and log the cost."""
+        try:
+            totals = await self._read_totals()
+        except Exception as exc:  # noqa: BLE001 - cosmetic
+            log.debug("could not refresh the totals: %s", describe(exc))
+            return
+        burned = _burned(totals.fees_usd)
+        self._spread_usd = self._spread_cost(totals)
+        answer = getattr(self, "_target_answer", (0.0, None))[1]
+        self._target_answer = (time.monotonic(), answer)
+        self._progress = (burned, totals.qualifying_volume_usd)
+        log.info("cost so far: %s", self._cost_text(burned))
+
+    async def _final_cost_report(self) -> None:
+        """Read the totals once more at the end, log them, and show them.
+
+        The last redraw is what stays on screen after the run, so it has to
+        be the final figure -- not one taken minutes before the last group
+        closed.
+        """
+        if not self.config.target.measures_fills:
+            return
+        await self._refresh_totals()
+        burned, volume = self._progress
+        log.info(
+            "run cost: %s on $%s of qualifying volume",
+            self._cost_text(burned), f"{volume:,.2f}",
+        )
+        from .screen import SCREEN
+
+        try:
+            SCREEN.update(self.status_lines())
+        except Exception as exc:  # noqa: BLE001 - cosmetic
+            log.debug("could not redraw the final status block: %s", describe(exc))
 
     async def _last_hedge_pass(self) -> None:
         """Hedge whatever filled while a stop was pulling the orders.
@@ -2565,6 +2774,9 @@ class Strategy:
                 await self._last_hedge_pass()
                 self._log_open_positions()
 
+            # Before the baseline is cleared: the totals are read from it.
+            await self._final_cost_report()
+
             if self._halt_reason:
                 raise Halted(self._halt_reason)
 
@@ -2650,12 +2862,14 @@ class Strategy:
             # would report one number while the stop rule acted on another.
             burned = _burned(totals.fees_usd)
             volume = totals.qualifying_volume_usd
+            self._spread_usd = self._spread_cost(totals)
 
         parts = []
         if target.burn_usd > 0:
             parts.append(f"burn ${burned:,.4f} / ${target.burn_usd:,.2f}")
         if target.volume_usd > 0:
             parts.append(f"volume ${volume:,.2f} / ${target.volume_usd:,.2f}")
+        parts.append(self._cost_text(burned))
         # Cached for the status block, which redraws every second and must not
         # pay for a fill-history walk to do it.
         self._progress = (burned, volume)
@@ -2664,6 +2878,39 @@ class Strategy:
         if detail:
             self.title.set_note(detail)
         return detail
+
+    def _spread_cost(self, totals) -> float | None:
+        """Spread and slippage paid since the run began, as a positive cost.
+
+        Everything the trades lost on price, fees apart: the gap between each
+        maker fill and the hedges that covered it, spread paid on closes, and
+        the like. Together with the fees it is what the accounts' balances
+        went down by -- checked against a live run to the cent ($36.56 =
+        $22.08 fees + $14.49 of this).
+
+        None when a market with a position change has no price to value it.
+        """
+        prices = {}
+        for symbol, base in getattr(totals, "base_by_symbol", {}).items():
+            if abs(base) < 1e-12:
+                continue
+            price = self.feed.reference_price(symbol)
+            if not price:
+                return None
+            prices[symbol] = price
+        if not hasattr(totals, "price_result_usd"):
+            return None
+        return -totals.price_result_usd(prices)
+
+    def _cost_text(self, burned: float) -> str:
+        """`fees $X + spread/slippage $Y = $Z`, or fees alone when Y is unknown."""
+        spread = getattr(self, "_spread_usd", None)
+        if spread is None:
+            return f"fees ${burned:,.2f}"
+        return (
+            f"fees ${burned:,.2f} + spread/slippage ${spread:,.2f} "
+            f"= ${burned + spread:,.2f}"
+        )
 
     async def _read_totals(self):
         """The fill history, read without stopping everything else.
@@ -2770,6 +3017,10 @@ class Strategy:
 
         burned = _burned(totals.fees_usd)
         volume = totals.qualifying_volume_usd
+        self._spread_usd = self._spread_cost(totals)
+        # Split, because only one part of it is ours to change: fees follow
+        # the schedule, spread and slippage follow how the bot trades.
+        log.info("cost so far: %s", self._cost_text(burned))
 
         answer = None
         if target.burn_usd > 0 and burned >= target.burn_usd:
@@ -2781,13 +3032,16 @@ class Strategy:
         # half a minute would turn one unreachable endpoint into a run that
         # cannot notice its own goal.
         self._target_answer = (time.monotonic(), answer)
-        if answer:
-            return answer
-
         # The status block redraws every second off this, and used to get it
         # only when a cycle finished -- so a six-minute OPEN phase showed
         # `$0 / $250,000  0.0%` while the log beside it counted past $19,000.
+        #
+        # Before the early return, not after it: the reading that REACHED the
+        # target was the one never shown, and the block sat at 97.5% for the
+        # rest of the run while the log said the target was met.
         self._progress = (burned, volume)
+        if answer:
+            return answer
 
         if target.burn_usd > 0:
             log.info("burn progress: $%.4f / $%.2f", burned, target.burn_usd)

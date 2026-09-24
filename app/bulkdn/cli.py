@@ -22,6 +22,7 @@ from bulk_api.common import SignatureDomain
 
 from .accounts import (
     build_pool,
+    market_data_session,
     verify_sub_account,
 )
 from .chaser import Chaser
@@ -242,7 +243,12 @@ class Runtime:
         self.title = WindowTitle(cycles=config.cycles)
         self.book = PositionBook(overlay_ttl_ms=config.overlay_ttl_ms)
         self.impact = ImpactBook(config.http_url)
-        self.feed = MarketFeed(self.master, self.symbols)
+        # On a socket of its own; see `market_data_session`.
+        self.market_data = market_data_session(
+            ws_url=config.ws_url, http=self.master.http,
+            symbols=self.symbols, dry_run=dry_run,
+        )
+        self.feed = MarketFeed(self.market_data, self.symbols)
         self.store = StateStore(config.state_file)
 
     @staticmethod
@@ -387,6 +393,7 @@ class Runtime:
         """
         for session in self._one_per_socket():
             await session.connect()
+        await self.market_data.connect()
 
     def _one_per_socket(self) -> list:
         """One session for each distinct socket, in pool order."""
@@ -410,6 +417,9 @@ class Runtime:
         """
         for session in self._one_per_socket():
             await session.disconnect()
+        market_data = getattr(self, "market_data", None)
+        if market_data is not None:
+            await market_data.disconnect()
 
     def apply_sizing(self) -> None:
         """Turn the configured sizes into sizes both accounts can carry.
@@ -569,6 +579,7 @@ class Runtime:
             feed=self.feed,
             sessions=self.sessions,
             symbols=self.symbols,
+            watch=[self.market_data],
         )
         strategy = Strategy(
             config=self.config,

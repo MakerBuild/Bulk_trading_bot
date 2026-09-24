@@ -315,7 +315,9 @@ async def test_starting_opens_every_socket_once():
         Session("m1", one), Session("m1s1", one), Session("m1s2", one),
         Session("m2", two), Session("m2s1", two), Session("m2s2", two),
     ]
+    runtime.market_data = Session("market", FakeClient("market"))
 
     await cli.Runtime._connect_all(runtime)
 
-    assert opened == ["m1", "m2"], "one dial per socket, and every socket"
+    # The market data socket is its own, so fills never queue behind the book.
+    assert opened == ["m1", "m2", "market"], "one dial per socket, and every socket"

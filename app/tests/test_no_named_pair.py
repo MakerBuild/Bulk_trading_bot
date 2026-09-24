@@ -42,9 +42,9 @@ BULKDN = pathlib.Path(__file__).resolve().parent.parent / "bulkdn"
 ALLOWED = {
     # The pool's first two, which is where the names come from.
     ("cli.py", "self.master, self.sub1 = self.pool[0], self.pool[1]"),
-    # One socket carries the market feed; a second would be a second
-    # subscription to the same public data.
-    ("cli.py", "self.feed = MarketFeed(self.master, self.symbols)"),
+    # The market data socket borrows an HTTP client for the exchange's public
+    # endpoints (specs, ticker); any key's would do, and the first is at hand.
+    ("cli.py", "ws_url=config.ws_url, http=self.master.http,"),
     # The gate is about who owns the build, not about who trades.
     ("cli.py", "decision = check_referral_access(self.master.pubkey, self.config.access)"),
     # Parent-child is a claim about two specific accounts, and it is guarded

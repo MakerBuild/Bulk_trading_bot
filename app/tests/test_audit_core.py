@@ -314,3 +314,168 @@ def test_a_read_sent_after_every_fill_is_simply_applied():
     book.apply_fill("m", BTC, is_buy=True, size=0.1)
     book.apply_read("m", [P(BTC, 0.1)], requested_at=time.monotonic())
     assert book.effective("m", BTC) == pytest.approx(0.1), "the fill was counted twice"
+
+
+# -- a socket that falls behind --------------------------------------------
+#
+# Seen live: one socket fell 7-30s behind; late fills were counted twice and
+# its stale position updates outranked fresh reads.
+
+
+def _lag_strategy():
+    client_a, client_b = object(), object()
+    a1 = types.SimpleNamespace(name="a1", pubkey="a1", client=client_a)
+    a2 = types.SimpleNamespace(name="a2", pubkey="a2", client=client_a)
+    b1 = types.SimpleNamespace(name="b1", pubkey="b1", client=client_b)
+    obj = object.__new__(Strategy)
+    obj.sessions = {s.pubkey: s for s in (a1, a2, b1)}
+    obj._groups = {}
+    obj._stop = asyncio.Event()
+    return obj, a1, a2, b1
+
+
+def test_a_late_fill_marks_its_whole_socket_as_behind():
+    obj, a1, a2, b1 = _lag_strategy()
+    now = time.time()
+    obj._note_fill_delay(a1, types.SimpleNamespace(timestamp=now * 1e9))
+    assert not Strategy._stream_lagging(a1)
+
+    obj._note_fill_delay(a1, types.SimpleNamespace(timestamp=(now - 10) * 1e9))
+    assert Strategy._stream_lagging(a1) and Strategy._stream_lagging(a2)
+    assert not Strategy._stream_lagging(b1), "another socket was blamed"
+
+
+def test_a_clock_offset_alone_is_not_lateness():
+    """This machine's clock may differ from the exchange's by seconds."""
+    obj, a1, _a2, _b1 = _lag_strategy()
+    skewed = time.time() - 5
+    for _ in range(3):
+        obj._note_fill_delay(a1, types.SimpleNamespace(timestamp=skewed * 1e9))
+    assert not Strategy._stream_lagging(a1)
+
+
+def test_a_leg_on_a_lagging_socket_waits_for_a_read_begun_after():
+    obj, a1, _a2, b1 = _lag_strategy()
+    obj._read_started_at = time.monotonic()
+    obj._note_stream_lag(a1, "test")
+    on_a = LegRoles(symbol=BTC, maker="a1", taker="b1", maker_is_buy=True, reduce_only=False)
+    assert obj._waiting_on_a_lagging_read(on_a)
+
+    obj._read_started_at = time.monotonic() + 1
+    assert not obj._waiting_on_a_lagging_read(on_a)
+
+
+def test_a_forced_read_overrules_the_stream():
+    book = PositionBook(overlay_ttl_ms=60_000)
+    sent = time.monotonic() - 0.001
+    book.set_authoritative("m", BTC, 0.5)  # a stale update, landing mid-read
+    book.apply_read("m", [P(BTC, 0.2)], requested_at=sent, force=True)
+    assert book.effective("m", BTC) == pytest.approx(0.2)
+
+
+# -- the book has a socket of its own ------------------------------------------
+
+
+def test_the_market_data_socket_carries_no_account():
+    """Fills queued behind the book on a shared socket arrived up to 32s late."""
+    from bulkdn.accounts import market_data_session
+
+    session = market_data_session(ws_url="wss://example.invalid", http=None, symbols=[BTC])
+    assert session.client.accounts == []
+    subs = session.client._intended_subscriptions()
+    assert subs and all(sub.type == "ticker" for sub in subs)
+
+
+def test_a_dropped_market_data_socket_is_a_violation():
+    book = PositionBook()
+    risk = _risk(book)
+    dropped = types.SimpleNamespace(
+        name="market", pubkey="", dry_run=False, is_connected=False,
+        last_message_age_s=0.0, reject_streak=0, last_reject="",
+    )
+    risk.watch = [dropped]
+    kinds = {(v.kind, "market" in v.detail) for v in risk.check()}
+    assert ("disconnected", True) in kinds
+
+
+# -- a cancel-all that the socket cannot carry goes over HTTP ------------------
+
+
+async def test_cancel_all_goes_over_http_when_the_socket_is_down(monkeypatch):
+    """A stalled socket timed out six cancel-alls in a row on a live stop."""
+    from bulkdn import accounts
+
+    sent = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"status": "ok"}
+
+    def post(url, json, timeout):
+        sent.append((url, json))
+        return Response(), False
+
+    monkeypatch.setattr(accounts, "post_signed", post)
+    client = types.SimpleNamespace(
+        is_connected=False,
+        signed_transaction=lambda actions, account: {"account": account, "actions": ["x"]},
+    )
+    session = accounts.AccountSession(
+        name="m1s4", pubkey="SUB", client=client,
+        http=types.SimpleNamespace(base_url="https://api.example"),
+    )
+    await session.cancel_all([BTC])
+    assert sent == [("https://api.example/order", {"account": "SUB", "actions": ["x"]})]
+
+
+async def test_a_socket_that_times_out_falls_back_to_http(monkeypatch):
+    from bulkdn import accounts
+
+    sent = []
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"status": "ok"}
+
+    monkeypatch.setattr(accounts, "post_signed", lambda url, json, timeout: (sent.append(url) or Response(), False))
+
+    async def stalled(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    client = types.SimpleNamespace(
+        is_connected=True, submit=stalled,
+        signed_transaction=lambda actions, account: {"account": account},
+    )
+    session = accounts.AccountSession(
+        name="m1", pubkey="M", client=client,
+        http=types.SimpleNamespace(base_url="https://api.example"),
+    )
+    await session.cancel_all([BTC])
+    assert sent == ["https://api.example/order"]
+
+
+async def test_a_leg_on_a_lagging_socket_pulls_its_order_and_waits():
+    obj, a1, _a2, b1 = _lag_strategy()
+    pulled = []
+
+    async def cancel_all(symbols):
+        pulled.append(symbols)
+
+    a1.cancel_all = cancel_all
+    roles = LegRoles(symbol=BTC, maker="a1", taker="b1", maker_is_buy=True, reduce_only=False)
+    leg = types.SimpleNamespace(oid="resting")
+
+    assert await obj._paused_for_a_lagging_socket("g1", roles, leg) is False
+
+    obj._note_stream_lag(b1, "test")  # the HEDGER's socket fell behind
+    assert await obj._paused_for_a_lagging_socket("g1", roles, leg) is True
+    assert pulled == [[BTC]] and leg.oid is None
+
+    b1.stream_lagging_until = 0.0
+    assert await obj._paused_for_a_lagging_socket("g1", roles, leg) is False
