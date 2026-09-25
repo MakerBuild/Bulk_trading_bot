@@ -661,7 +661,7 @@ class Strategy:
                         continue
                     try:
                         # size > 0 is long, so closing it is a sell.
-                        await session.market(symbol, size < 0, rounded, reduce_only=True)
+                        await session.close_market(symbol, size < 0, rounded)
                         log.critical(
                             "closed %s %.8f on %s after %s",
                             symbol, rounded, session.name, label,

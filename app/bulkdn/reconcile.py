@@ -171,6 +171,29 @@ async def reconcile_net(
     return corrections
 
 
+async def _read_what_can_be_read(
+    sessions: dict[str, AccountSession], book: PositionBook
+) -> None:
+    """Re-read positions for a flatten, carrying on past accounts that fail.
+
+    A flatten used to stop at the first failed read: one 429 on one account
+    abandoned the rest of an emergency stop, possibly after some closes had
+    gone out -- one side of a pair closed and the other left open. The reads
+    that worked are applied either way; an account whose read failed is closed
+    from the last position known for it. Every close is reduce-only, so a
+    stale size can come up short or be refused, never open anything, and the
+    next pass reads again.
+    """
+    try:
+        await sync_positions(list(sessions.values()), book)
+    except Exception as exc:  # noqa: BLE001 - the accounts that answered still close
+        log.error(
+            "flatten: could not re-read every account (%s) -- closing from the "
+            "last known positions for the rest",
+            describe(exc),
+        )
+
+
 async def flatten(
     sessions: dict[str, AccountSession],
     book: PositionBook,
@@ -189,7 +212,7 @@ async def flatten(
         # Off the loop: this runs inside a live strategy (a group's residual
         # sweep, the emergency stop), and a blocking read here froze every
         # other group's hedges for a round trip per account.
-        await sync_positions(list(sessions.values()), book)
+        await _read_what_can_be_read(sessions, book)
 
         outstanding = []
         for session in sessions.values():
@@ -221,7 +244,7 @@ async def flatten(
             # A long is closed by selling, a short by buying.
             is_buy = size < 0
             try:
-                await session.market(symbol, is_buy, rounded, reduce_only=True)
+                await session.close_market(symbol, is_buy, rounded)
                 log.info(
                     "flatten: %s %s %.8f on %s",
                     "BUY" if is_buy else "SELL",
@@ -238,7 +261,7 @@ async def flatten(
         # Give the exchange a moment to settle before re-reading.
         await asyncio.sleep(1.0)
 
-    await sync_positions(list(sessions.values()), book)
+    await _read_what_can_be_read(sessions, book)
     leftovers = [
         f"{session.name} {symbol}={book.effective(session.pubkey, symbol):+.8f}"
         for session in sessions.values()

@@ -182,6 +182,10 @@ class FakeSession:
         self.closed.append((symbol, is_buy, size, reduce_only))
         return []
 
+    async def close_market(self, symbol, is_buy, size):
+        # Through `market`, which tests replace to watch or refuse the close.
+        return await self.market(symbol, is_buy, size, reduce_only=True)
+
 
 class Bot:
     """Just enough Strategy to exercise the guard's decision."""

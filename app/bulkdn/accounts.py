@@ -912,10 +912,21 @@ class AccountSession:
         return time.monotonic() < getattr(self, "stream_lagging_until", 0.0)
 
     async def _cancel_all_http(self, symbols: Sequence[str]) -> list[OrderResponse]:
-        tx = self.client.signed_transaction([CancelAll(symbols=list(symbols))], self.pubkey)
+        await self._post_http([CancelAll(symbols=list(symbols))], "cancel-all")
+        log.info("%s: cancelled all orders in %s over HTTP", self.name, ", ".join(symbols))
+        return []
+
+    async def _post_http(self, actions: Sequence[Action], what: str) -> dict:
+        """Send the same signed transaction to `/order`, bypassing the socket.
+
+        Only for actions that are harmless to send twice, because the socket
+        attempt before this one may have executed without answering: a
+        cancel-all, or a reduce-only close.
+        """
+        tx = self.client.signed_transaction(list(actions), self.pubkey)
         base_url = getattr(self.http, "base_url", None)
         if not base_url:
-            raise NotSent("no HTTP endpoint to send the cancel to")
+            raise NotSent(f"no HTTP endpoint to send the {what} to")
         response, _uncertain = await asyncio.to_thread(
             post_signed, f"{base_url}/order", json=tx, timeout=10
         )
@@ -925,11 +936,52 @@ class AccountSession:
             body = {"raw": response.text}
         status = body.get("status") if isinstance(body, dict) else None
         if response.status_code != 200 or status not in (None, "ok"):
-            raise RuntimeError(
-                f"cancel-all over HTTP answered {response.status_code}: {body}"
+            raise RuntimeError(f"{what} over HTTP answered {response.status_code}: {body}")
+        return body if isinstance(body, dict) else {"body": body}
+
+    async def close_market(self, symbol: str, is_buy: bool, size: float) -> None:
+        """A reduce-only market close, over HTTP when the socket cannot carry it.
+
+        For taking positions down -- the emergency stop and the liquidation
+        guard -- which fire precisely when something is wrong, and often it is
+        the socket. Closes went over the socket alone: with one group's two
+        accounts on two masters, a dead socket on one let the other side close
+        and left this side open, a lone leg with nothing managing it.
+
+        Safe to send twice, which is what makes the fallback allowed: a socket
+        attempt that timed out may have executed, and a second reduce-only
+        close can take the position to flat but never past it. The caller
+        re-reads positions to see what actually closed; the HTTP answer is not
+        parsed per action.
+
+        Not for hedges. A hedge opens exposure, and sending one twice is the
+        double hedge this bot has spent most of its history preventing.
+        """
+        def order() -> MarketOrder:
+            return MarketOrder(
+                symbol=symbol,
+                side=Side.BUY if is_buy else Side.SELL,
+                size=size,
+                reduce_only=True,
             )
-        log.info("%s: cancelled all orders in %s over HTTP", self.name, ", ".join(symbols))
-        return []
+
+        if not self.dry_run and self._socket_unreliable():
+            await self._post_http([order()], "close")
+            log.info("%s: sent the %s close over HTTP -- the socket is down or behind",
+                     self.name, symbol)
+            return
+        try:
+            await self.submit([order()])
+        except OrderRejected:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the HTTP path says what failed
+            if self.dry_run:
+                raise
+            log.warning(
+                "%s: %s close over the socket failed (%s) -- sending it over HTTP",
+                self.name, symbol, describe(exc),
+            )
+            await self._post_http([order()], "close")
 
     # -- state queries -----------------------------------------------------
 
