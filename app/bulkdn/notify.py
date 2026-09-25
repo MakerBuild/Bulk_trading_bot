@@ -14,6 +14,7 @@ sends nothing.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import logging
 import os
@@ -36,6 +37,13 @@ _TIMEOUT_S = 15
 # say exactly what the rest of the bot is using -- and the Notifier is built
 # deep inside Runtime, far from where the proxy file was read.
 _PROXY_ENV = ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+
+# Alert lines are gathered for this long and sent as one message, so an
+# emergency stop that logs a dozen critical lines in a second arrives as one
+# message rather than a dozen -- and a loop logging the same failure does not
+# flood the chat. At most _ALERT_MAX_LINES per message; the rest are counted.
+_ALERT_BATCH_S = 2.0
+_ALERT_MAX_LINES = 15
 
 # Said once per process, not once per message: a run sends one per cycle, and
 # the same warning every few minutes buries everything else in the log.
@@ -93,10 +101,50 @@ class Notifier:
         # nothing else holds can be garbage-collected mid-flight -- the message
         # then never arrives, and nothing anywhere says so.
         self._pending: set[asyncio.Task] = set()
+        # See `AlertHandler`: lines waiting for the next alert message, and the
+        # loop they are handed to from whatever thread logged them.
+        self._alerts: list[str] = []
+        self._alerts_dropped = 0
+        self._alert_loop: asyncio.AbstractEventLoop | None = None
+        self._alert_timer: asyncio.TimerHandle | None = None
 
     @property
     def enabled(self) -> bool:
         return self.config.enabled
+
+    def alert(self, line: str) -> None:
+        """Queue one line for the next alert message. Safe from any thread.
+
+        Position reads run in worker threads and log from there, so this hands
+        the line to the loop rather than touching anything itself.
+        """
+        loop = self._alert_loop
+        if not self.enabled or loop is None or loop.is_closed():
+            return
+        with contextlib.suppress(RuntimeError):  # the loop closed in between
+            loop.call_soon_threadsafe(self._queue_alert, line)
+
+    def _queue_alert(self, line: str) -> None:
+        if len(self._alerts) < _ALERT_MAX_LINES:
+            self._alerts.append(line)
+        else:
+            self._alerts_dropped += 1
+        if self._alert_timer is None:
+            self._alert_timer = asyncio.get_running_loop().call_later(
+                _ALERT_BATCH_S, self._flush_alerts
+            )
+
+    def _flush_alerts(self) -> None:
+        if self._alert_timer is not None:
+            self._alert_timer.cancel()
+            self._alert_timer = None
+        if not self._alerts:
+            return
+        text = "\n".join(self._alerts)
+        if self._alerts_dropped:
+            text += f"\n... and {self._alerts_dropped} more -- see logs.txt"
+        self._alerts, self._alerts_dropped = [], 0
+        self.send_soon(self.error(text))
 
     async def send(self, text: str, *, prefix: str = "") -> None:
         """Deliver one message. Silent no-op when Telegram is not configured."""
@@ -236,6 +284,9 @@ class Notifier:
         second before shutdown -- is cancelled mid-send. Bounded, because a
         Telegram outage must not hold up the process exiting.
         """
+        # Alerts still gathering go now: the process is about to exit, and
+        # the line that says why is usually among them.
+        self._flush_alerts()
         pending = [task for task in self._pending if not task.done()]
         if not pending:
             return
@@ -249,6 +300,50 @@ class Notifier:
             )
             for task in still:
                 task.cancel()
+
+
+class AlertHandler(logging.Handler):
+    """Forwards the log lines that need a person to Telegram.
+
+    The bot is left alone for hours, and until now only halts, cycles and the
+    start and end of a run reached Telegram. A crash, "COULD NOT CLOSE ... by
+    hand" and "MANUAL ACTION REQUIRED" went to the log alone -- the lines that
+    most need someone, in a file nobody reads until later.
+
+    Forwarded: every CRITICAL line except the halt's own (it has a message of
+    its own already), a crash, and a flatten that could not finish.
+    """
+
+    def __init__(self, notifier: Notifier):
+        super().__init__(level=logging.ERROR)
+        self.notifier = notifier
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # A failed send logs a warning from here, and must not come back.
+        if record.name == __name__:
+            return
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 - a bad format string is not our problem here
+            return
+        if record.levelno >= logging.CRITICAL:
+            if message.startswith(("HALT:", "halted:")):
+                return
+        elif "MANUAL ACTION REQUIRED" in message:
+            pass
+        elif message == "run failed" and record.exc_info and record.exc_info[1]:
+            message = f"run failed: {describe(record.exc_info[1])}"
+        else:
+            return
+        self.notifier.alert(message)
+
+    def attach(self, logger: logging.Logger) -> None:
+        """Start forwarding. Called from inside the running loop."""
+        self.notifier._alert_loop = asyncio.get_running_loop()
+        logger.addHandler(self)
+
+    def detach(self, logger: logging.Logger) -> None:
+        logger.removeHandler(self)
 
 
 def _split(text: str) -> list[str]:

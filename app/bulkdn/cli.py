@@ -30,7 +30,7 @@ from .chaser import Chaser
 from .console import watch_for_stop
 from .config import Config, ConfigError, load_config
 from .feed import MarketFeed
-from .notify import Notifier
+from .notify import AlertHandler, Notifier
 from .referral import AccessDenied
 from .referral import check_access as check_referral_access
 from .window import WindowTitle
@@ -667,6 +667,17 @@ def _print_stop_banner() -> None:
 
 async def cmd_run(config: Config, dry_run: bool) -> int:
     runtime = Runtime(config, dry_run)
+    # For the whole run, startup included: the lines that need a person --
+    # a crash, a close that failed -- reach Telegram and not only the log.
+    alerts = AlertHandler(runtime.notifier)
+    alerts.attach(log)
+    try:
+        return await _run(runtime, config, dry_run)
+    finally:
+        alerts.detach(log)
+
+
+async def _run(runtime: Runtime, config: Config, dry_run: bool) -> int:
     if dry_run:
         # Its own file, and an empty one every time. Nothing a dry run
         # records exists on the exchange, so there is nothing in it for a
