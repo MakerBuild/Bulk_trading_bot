@@ -665,19 +665,25 @@ def _print_stop_banner() -> None:
     print()
 
 
-async def cmd_run(config: Config, dry_run: bool) -> int:
+async def cmd_run(config: Config, dry_run: bool, *, on_strategy=None) -> int:
+    """Run the strategy until its target, a stop, or a halt.
+
+    `on_strategy` is handed the Strategy once it is built, for a caller that
+    has to reach into a run it did not start by hand -- the Telegram control
+    loop, which answers /status and /stop from it.
+    """
     runtime = Runtime(config, dry_run)
     # For the whole run, startup included: the lines that need a person --
     # a crash, a close that failed -- reach Telegram and not only the log.
     alerts = AlertHandler(runtime.notifier)
     alerts.attach(log)
     try:
-        return await _run(runtime, config, dry_run)
+        return await _run(runtime, config, dry_run, on_strategy)
     finally:
         alerts.detach(log)
 
 
-async def _run(runtime: Runtime, config: Config, dry_run: bool) -> int:
+async def _run(runtime: Runtime, config: Config, dry_run: bool, on_strategy=None) -> int:
     if dry_run:
         # Its own file, and an empty one every time. Nothing a dry run
         # records exists on the exchange, so there is nothing in it for a
@@ -688,6 +694,8 @@ async def _run(runtime: Runtime, config: Config, dry_run: bool) -> int:
         runtime.store = StateStore(path)
     await runtime.start()
     strategy = runtime.build_strategy()
+    if on_strategy is not None:
+        on_strategy(strategy)
     await runtime.notifier.run_started(
         endpoint=config.http_url,
         master=runtime.master.pubkey,
@@ -1275,6 +1283,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="actually submit orders (without this, orders are only logged)",
     )
 
+    tg = sub.add_parser(
+        "telegram",
+        help="listen for commands from the Telegram bot in settings.yaml "
+             "(/run, /stop, /close, /status)",
+    )
+    tg.add_argument(
+        "--live", action="store_true",
+        help="runs and closes started from Telegram trade real funds",
+    )
     sub.add_parser("status", help="print positions, orders, and persisted state")
     sub.add_parser("check", help="validate config and account wiring")
 
@@ -1371,6 +1388,10 @@ def main(argv: list[str] | None = None) -> int:
                     timeout_s=args.limit_timeout,
                 )
             )
+        if args.command == "telegram":
+            from .telegram_control import serve
+
+            return asyncio.run(serve(config, dry_run))
         if args.command == "status":
             return asyncio.run(cmd_status(config))
         if args.command == "check":

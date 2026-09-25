@@ -362,6 +362,13 @@ max_margin_fraction: 0.25
 #  A failed message never affects trading. If proxy.local holds an http(s)
 #  proxy, messages go through it too; a SOCKS proxy is not applied to them.
 #
+#  The same bot can also take COMMANDS: menu item "Telegram Control", or
+#  `run.bat telegram --live`. Leave that window open and, from the phone:
+#  /run (or /run 100000 for a volume target), /stop, /close, /status, /log.
+#  /run and /close ask for a one-time code first. Only the user_ids above are
+#  answered, and the key password is asked once when the window is started --
+#  after a server reboot it has to be started again by hand.
+#
 #  Sub-accounts are not configured anywhere: the bot finds every one of them
 #  from its master at startup. (Older files had a `sub1_pubkey` line here; it
 #  is no longer read and can be deleted.)

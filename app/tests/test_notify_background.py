@@ -53,7 +53,7 @@ def test_an_http_proxy_is_used_for_telegram(monkeypatch):
     for name in notify._PROXY_ENV:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("https_proxy", "http://user:pw@proxy.example:8080")
-    assert notify._telegram_proxy() == "http://user:pw@proxy.example:8080"
+    assert notify.telegram_proxy() == "http://user:pw@proxy.example:8080"
 
 
 def test_a_socks_proxy_is_skipped_with_one_warning(monkeypatch, caplog):
@@ -62,8 +62,8 @@ def test_a_socks_proxy_is_skipped_with_one_warning(monkeypatch, caplog):
     monkeypatch.setenv("https_proxy", "socks5h://proxy.example:1080")
     monkeypatch.setattr(notify, "_socks_warned", False)
 
-    assert notify._telegram_proxy() is None
-    assert notify._telegram_proxy() is None
+    assert notify.telegram_proxy() is None
+    assert notify.telegram_proxy() is None
     warnings = [m for m in caplog.messages if "not applied to Telegram" in m]
     assert len(warnings) == 1
 
@@ -71,7 +71,7 @@ def test_a_socks_proxy_is_skipped_with_one_warning(monkeypatch, caplog):
 def test_no_proxy_configured_goes_direct(monkeypatch):
     for name in notify._PROXY_ENV:
         monkeypatch.delenv(name, raising=False)
-    assert notify._telegram_proxy() is None
+    assert notify.telegram_proxy() is None
 
 
 def test_the_token_stays_out_of_a_repr():

@@ -50,7 +50,7 @@ _ALERT_MAX_LINES = 15
 _socks_warned = False
 
 
-def _telegram_proxy() -> str | None:
+def telegram_proxy() -> str | None:
     """The proxy Telegram traffic should use, or None to go direct.
 
     aiohttp speaks HTTP proxies natively but needs `aiohttp_socks` for SOCKS,
@@ -158,7 +158,7 @@ class Notifier:
 
         try:
             async with aiohttp.ClientSession() as session:
-                proxy = _telegram_proxy()
+                proxy = telegram_proxy()
                 for chunk in _split(body):
                     for user_id in self.config.user_ids:
                         await self._send_one(session, user_id, chunk, proxy=proxy)

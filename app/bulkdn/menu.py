@@ -312,6 +312,38 @@ def _start(config: Config) -> None:
     _pause()
 
 
+def _telegram(config: Config) -> None:
+    """Hand the bot over to Telegram until Ctrl+C."""
+    from .telegram_control import serve
+
+    if not config.telegram.enabled:
+        print("\n  Telegram is not set up yet:")
+        print("    1. In Telegram, message @BotFather, send /newbot, copy the token")
+        print("    2. Message @userinfobot to get your numeric user id")
+        print("    3. Put both in the telegram: block of settings.yaml")
+        print("  Then come back here.")
+        _pause()
+        return
+    print("\n  The bot will take commands from Telegram: /run, /stop, /close,")
+    print("  /status, /log. Leave this window open; Ctrl+C returns to the menu.")
+    print("\n  1. dry run  -- /run and /close submit nothing")
+    print("  2. live     -- /run and /close trade REAL FUNDS")
+    print("  0. back")
+    choice = _ask("\n  > ")
+    if choice not in ("1", "2"):
+        return
+    live = choice == "2"
+    if live and not _confirm("Let Telegram start live runs and close positions at market."):
+        print("  aborted")
+        _pause()
+        return
+    try:
+        asyncio.run(serve(_fresh(config), dry_run=not live))
+    except KeyboardInterrupt:
+        print("\n  Telegram control stopped.")
+    _pause()
+
+
 def _active_strategy(config: Config) -> None:
     asyncio.run(cmd_status(_fresh(config)))
     _pause()
@@ -1861,6 +1893,7 @@ MAIN_ITEMS = (
     "Configuration",
     CLOSE_ALL_LABEL,
     "Logs",
+    "Telegram Control",
 )
 
 
@@ -1879,6 +1912,7 @@ def run_menu(config: Config, config_path: str) -> int:
         "Configuration": lambda: _configuration(config, config_path),
         CLOSE_ALL_LABEL: lambda: _close_all(config),
         "Logs": _logs,
+        "Telegram Control": lambda: _telegram(config),
     }
     actions = {
         str(number): handlers[label]
