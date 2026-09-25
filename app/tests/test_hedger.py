@@ -760,7 +760,9 @@ def test_an_answered_reservation_goes_back_on_the_ordinary_clock():
     in_flight = InFlight(ttl_ms=2000, doubt_ttl_s=30.0)
     in_flight.add(BTC, -0.10, awaiting_answer=True)
     entry = in_flight._entries[BTC][0]
-    assert entry.expires_at - entry.sent_at >= 30.0
+    # Not `>= 30.0`: (t + 30) - t is 29.999999999999996 for some t -- this
+    # failed only on a machine seconds after boot, where t is small.
+    assert entry.expires_at - entry.sent_at == pytest.approx(30.0)
 
     in_flight.answered(BTC)
     assert entry.expires_at <= time.monotonic() + 2.0
