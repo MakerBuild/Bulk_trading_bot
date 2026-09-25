@@ -480,3 +480,56 @@ async def test_nothing_starts_without_telegram_configured(capsys):
     config.telegram = types.SimpleNamespace(enabled=False, user_ids=[], bot_token="")
     assert await tc.serve(config, dry_run=True) == 1
     assert "BotFather" in capsys.readouterr().out
+
+
+# -- switching between live and dry ----------------------------------------------------
+
+
+async def test_going_live_takes_a_confirmed_button():
+    h = Harness(dry_run=True)
+    ask = await h.say("🔁 Live / Dry run")
+    assert "real funds" in ask.text
+    assert h.c.dry_run is True, "it switched before it was confirmed"
+
+    reply = await h.c.press(button(ask, "🔴"))
+    assert h.c.dry_run is False and "LIVE" in reply.text
+
+    h.c.pending = None
+    await h.start_run()
+    assert h.runs[0][1] is False, "the next run did not trade live"
+    h.release.set()
+    await h.settle()
+
+
+async def test_back_to_dry_and_cancel():
+    h = Harness(dry_run=False)
+    ask = await h.say("/mode")
+    assert "Cancelled" in (await h.c.press(button(ask, "❌"))).text
+    assert h.c.dry_run is False
+
+    ask = await h.say("/mode")
+    await h.c.press(button(ask, "🧪"))
+    assert h.c.dry_run is True
+
+
+async def test_no_switching_while_something_runs():
+    """A run and its own close must not trade different money."""
+    h = Harness(dry_run=True)
+    await h.start_run()
+    reply = await h.say("🔁 Live / Dry run")
+    assert "in progress" in reply.text and not reply.buttons
+    assert h.c.dry_run is True
+    h.release.set()
+    await h.settle()
+
+
+async def test_a_switch_confirmed_after_a_run_started_does_nothing():
+    h = Harness(dry_run=True)
+    ask = await h.say("/mode")
+    h.c.pending, pending = None, h.c.pending   # a run slips in between
+    await h.start_run()
+    h.c.pending = pending
+    reply = await h.c.press(button(ask, "🔴"))
+    assert "mode unchanged" in reply.text and h.c.dry_run is True
+    h.release.set()
+    await h.settle()

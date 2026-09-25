@@ -76,8 +76,11 @@ KEYBOARD = {
     "⏹ Stop": "/stop",
     "🛑 Close all": "/close",
     "📜 Log": "/log",
+    "🔁 Live / Dry run": "/mode",
 }
-_KEYBOARD_ROWS = [["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"], ["📜 Log"]]
+_KEYBOARD_ROWS = [
+    ["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"], ["📜 Log", "🔁 Live / Dry run"],
+]
 
 # Spelled out down to the lines to paste: install.bat creates settings.yaml
 # once and never touches it again, so a file made before Telegram existed has
@@ -103,7 +106,8 @@ HELP = (
     "▶️ Run -- start a run with the targets in settings.yaml\n"
     "⏹ Stop -- stop the run and cancel its orders; positions stay\n"
     "🛑 Close all -- close every position at market (stops a run first)\n"
-    "📜 Log -- the last lines of logs.txt\n\n"
+    "📜 Log -- the last lines of logs.txt\n"
+    "🔁 Live / Dry run -- switch whether runs and closes trade real funds\n\n"
     "<b>Typed</b>\n"
     "/run 250k -- a run with this volume target\n"
     "/log 30 -- more log lines"
@@ -323,6 +327,8 @@ class Controller:
             return self._ask_run(args)
         if command == "/close":
             return self._ask_close()
+        if command == "/mode":
+            return self._ask_mode()
         if command == "/yes":
             return self._confirm(args)
         return Reply(f"Unknown command {html.escape(command)}.", keyboard=True)
@@ -441,6 +447,33 @@ class Controller:
             [[("✅ Yes, close all", f"close:{code}"), ("❌ Cancel", f"cancel:{code}")]],
         )
 
+    def _ask_mode(self) -> Reply:
+        """Offer the other mode. Only while nothing is running.
+
+        A run keeps the mode it started with, and a close takes the mode at
+        the moment it is confirmed -- switching underneath either would leave
+        a run and its own close trading different money.
+        """
+        if self.busy:
+            return Reply(
+                f"Now <b>{self.mode_word}</b>. A {self.work_kind} is in progress -- "
+                "switch once it is over."
+            )
+        if self.dry_run:
+            code = self._new_pending("live")
+            return Reply(
+                "Now <b>DRY-RUN</b>: nothing is sent to the exchange.\n"
+                "Switch to <b>LIVE</b>? After that, Run and Close all trade "
+                "<b>real funds</b>.",
+                [[("🔴 Switch to LIVE", f"live:{code}"), ("❌ Cancel", f"cancel:{code}")]],
+            )
+        code = self._new_pending("dry")
+        return Reply(
+            "Now <b>LIVE</b>: Run and Close all trade real funds.\n"
+            "Switch to <b>DRY-RUN</b>?",
+            [[("🧪 Switch to DRY-RUN", f"dry:{code}"), ("❌ Cancel", f"cancel:{code}")]],
+        )
+
     def _new_pending(self, action: str, volume: float | None = None) -> str:
         code = self.make_code()
         self.pending = Pending(action, code, self.clock() + CONFIRM_TTL_S, volume)
@@ -472,6 +505,14 @@ class Controller:
             previous = self.work if self.busy else None
             self._start("close", self._do_close(previous))
             return Reply("🛑 Closing every position at market -- I will report when done.")
+        if pending.action in ("live", "dry"):
+            if self.busy:
+                return Reply(f"A {self.work_kind} started meanwhile -- mode unchanged.")
+            self.dry_run = pending.action == "dry"
+            log.warning("telegram control switched to %s", self.mode_word)
+            if self.dry_run:
+                return Reply("🧪 Now <b>DRY-RUN</b>: nothing is sent to the exchange.")
+            return Reply("🔴 Now <b>LIVE</b>: Run and Close all trade real funds.")
         return Reply("Nothing to confirm.")
 
     # -- work --------------------------------------------------------------

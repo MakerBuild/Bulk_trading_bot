@@ -322,9 +322,11 @@ def _telegram(config: Config) -> None:
         return
     print("\n  The bot will take commands from Telegram: /run, /stop, /close,")
     print("  /status, /log. Leave this window open; Ctrl+C returns to the menu.")
-    print("\n  1. dry run  -- /run and /close submit nothing")
-    print("  2. live     -- /run and /close trade REAL FUNDS")
+    print("\n  Start in:")
+    print("  1. dry run  -- Run and Close all submit nothing")
+    print("  2. live     -- Run and Close all trade REAL FUNDS")
     print("  0. back")
+    print("\n  Either way the Live / Dry run button in Telegram can switch it later.")
     choice = _ask("\n  > ")
     if choice not in ("1", "2"):
         return
