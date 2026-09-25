@@ -320,12 +320,24 @@ class Runtime:
             ",".join(self.symbols),
             self.config.mode,
         )
+        self.load_specs(strict=trading)
+
+        # Orders left resting by a run that died come off first, before any
+        # check below can stop this start. Recovery cancels them too, but only
+        # after the referral gate, sizing and leverage -- and a restart after a
+        # crash is exactly when the indexer may be down or margin short, which
+        # left the dead run's orders on the book to fill with nothing hedging
+        # them. The sockets are not up yet, so this goes over HTTP, and a
+        # failure is logged rather than raised: it must not become the thing
+        # that stops the start either.
+        if trading and not self.dry_run:
+            await cancel_all_orders(self.pool, self.symbols)
+
         # Before anything is placed. A gate that tripped later would abandon
         # open positions and leave the pair directional.
         if trading:
             self.check_access()
 
-        self.load_specs(strict=trading)
         if verify and self._same_tree(self.master, self.sub1):
             verify_sub_account(self.master, self.sub1)
 

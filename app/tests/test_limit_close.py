@@ -539,3 +539,39 @@ def test_a_trading_run_still_refuses_an_unlisted_market():
 
     with pytest.raises(RuntimeError, match="ETHH-USD is not listed"):
         feed.load_specs()
+
+
+# -- a restart pulls the dead run's orders before anything can stop it --------
+
+
+def test_a_trading_start_cancels_before_the_gate_can_refuse(monkeypatch):
+    """A restart after a crash is when the indexer may be down or margin
+    short. Those checks ran first, and a refusal left the dead run's orders
+    resting, free to fill with nothing hedging them."""
+    import pytest
+
+    from bulkdn import cli
+
+    runtime = object.__new__(cli.Runtime)
+    runtime.dry_run = False
+    runtime.master = runtime.sub1 = type("S", (), {"pubkey": "m1", "client": object()})()
+    runtime.pool = ["m1-session"]
+    runtime.symbols = [BTC]
+    runtime.config = type("C", (), {"mode": "multi"})()
+    runtime.feed = type("F", (), {"load_specs": lambda self, strict=True: None,
+                                  "specs": {BTC: None}})()
+    cancelled = []
+
+    async def cancel_all(sessions, symbols):
+        cancelled.append((list(sessions), list(symbols)))
+
+    monkeypatch.setattr(cli, "cancel_all_orders", cancel_all)
+
+    def indexer_down(*_a):
+        raise RuntimeError("referral indexer unavailable")
+
+    runtime.check_access = indexer_down
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(runtime.start(verify=False, trading=True))
+    assert cancelled == [(["m1-session"], [BTC])], "the dead run's orders were left"
