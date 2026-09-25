@@ -13,6 +13,7 @@ import pathlib
 import pytest
 
 from bulkdn import menu
+from bulkdn.scripts import script
 
 
 class StubConfig:
@@ -325,7 +326,7 @@ def test_a_missing_template_is_reported_not_guessed(workspace, monkeypatch, caps
 
     run(monkeypatch, state, ["5", "yes", ""])
     out = capsys.readouterr().out
-    assert "FAILED" in out and "update.bat" in out
+    assert "FAILED" in out and script("update") in out
     assert settings.read_text(encoding="utf-8") == EDITED_SETTINGS
 
 
@@ -345,7 +346,7 @@ def test_the_virtualenv_is_reported_as_a_manual_step(workspace, monkeypatch, cap
     run(monkeypatch, state, ["0"])
     out = capsys.readouterr().out
     assert ".venv" in out
-    assert "install.bat" in out
+    assert script("install") in out, "it named a script this system does not have"
 
 
 def test_no_venv_no_note(workspace, monkeypatch, capsys):
