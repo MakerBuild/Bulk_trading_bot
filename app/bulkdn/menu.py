@@ -314,14 +314,10 @@ def _start(config: Config) -> None:
 
 def _telegram(config: Config) -> None:
     """Hand the bot over to Telegram until Ctrl+C."""
-    from .telegram_control import serve
+    from .telegram_control import SETUP_HELP, serve
 
     if not config.telegram.enabled:
-        print("\n  Telegram is not set up yet:")
-        print("    1. In Telegram, message @BotFather, send /newbot, copy the token")
-        print("    2. Message @userinfobot to get your numeric user id")
-        print("    3. Put both in the telegram: block of settings.yaml")
-        print("  Then come back here.")
+        print(SETUP_HELP)
         _pause()
         return
     print("\n  The bot will take commands from Telegram: /run, /stop, /close,")

@@ -63,6 +63,24 @@ LOG_LINES_MAX = 30
 # phone, and nothing a status message needs.
 _ACCOUNT_LINE = re.compile(r"^\s{2}\S+\s+[1-9A-HJ-NP-Za-km-z]{32,44}\s*$")
 
+# Spelled out down to the lines to paste: install.bat creates settings.yaml
+# once and never touches it again, so a file made before Telegram existed has
+# no telegram: block to "fill in".
+SETUP_HELP = """
+  Telegram is not set up yet.
+
+    1. In Telegram, message @BotFather, send /newbot and copy the token.
+    2. Message @userinfobot to get your numeric user id.
+    3. Open the chat with your new bot and press Start.
+    4. In settings.yaml, fill in the telegram: block -- or, if the file has
+       none, add these lines at the end (not indented):
+
+telegram:
+  bot_token: "123456789:AAE-your-token-here"
+  user_ids: [123456789]
+
+  Then start this again."""
+
 HELP = (
     "<b>commands</b>\n"
     "/status -- the run, or positions and orders when idle\n"
@@ -430,10 +448,7 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
 
     telegram = config.telegram
     if not telegram.enabled:
-        print(
-            "Telegram is not configured. Put the bot token from @BotFather and "
-            "your numeric user id in the telegram: block of settings.yaml.",
-        )
+        print(SETUP_HELP)
         return 1
 
     notifier = Notifier(telegram)
