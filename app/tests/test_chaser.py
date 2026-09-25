@@ -377,3 +377,68 @@ async def test_a_cap_drawn_at_a_higher_price_is_lifted_to_the_minimum():
     placed = master.placed[0]
     assert placed["size"] * placed["price"] >= 50.0, "an order under the minimum went out"
     assert placed["size"] == pytest.approx(0.36)
+
+
+# -- two of our own groups on one side ----------------------------------------
+#
+# The "already the touch" check knew only the leg's own order. With another of
+# our groups at the touch, each saw a stranger ahead and stepped past it, once
+# a chase interval each, walking toward the far side a tick at a time.
+
+G1 = LegRoles(BTC, maker=MASTER, taker=SUB1, maker_is_buy=True, reduce_only=False, id="g1")
+G2 = LegRoles(BTC, maker=SUB1, taker=MASTER, maker_is_buy=True, reduce_only=False, id="g2")
+
+
+def touch_of(*sessions, stranger=100_000.0):
+    """The best bid: the highest of our resting bids and the stranger's."""
+    ours = [o.price for s in sessions for o in s.client.order_map.values()]
+    return max([stranger, *ours])
+
+
+async def test_two_of_our_groups_on_one_side_do_not_outbid_each_other():
+    chaser, book, master, sub1 = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    leg1 = LegState(symbol=BTC, target_size=1.0, tightened=True)
+    leg2 = LegState(symbol=BTC, target_size=1.0, tightened=True)
+
+    for _ in range(6):
+        for roles, leg in ((G1, leg1), (G2, leg2)):
+            bid = touch_of(master, sub1)
+            chaser.feed._quote = Quote(
+                BTC, best_bid=bid, best_ask=100_010.0, mark_price=100_005.0, age_s=0.0
+            )
+            await chaser.step(roles, leg)
+
+    prices = {o.price for s in (master, sub1) for o in s.client.order_map.values()}
+    assert prices == {100_000.5}, f"our own groups walked the bid up to {max(prices)}"
+    assert len(master.placed) + len(sub1.placed) == 2, "each step was a replace"
+
+
+async def test_a_strangers_touch_is_still_stepped_past():
+    chaser, book, _master, sub1 = build()
+    book.set_authoritative(SUB1, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0, tightened=True)
+
+    await chaser.step(G2, leg)
+
+    assert sub1.placed[0]["price"] == 100_000.5
+
+
+async def test_a_level_our_order_has_left_is_a_strangers_again():
+    """Filled or cancelled, it no longer holds the level."""
+    chaser, book, master, sub1 = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    book.set_authoritative(SUB1, BTC, 0.0)
+    leg1 = LegState(symbol=BTC, target_size=1.0, tightened=True)
+    leg2 = LegState(symbol=BTC, target_size=1.0, tightened=True)
+    await chaser.step(G1, leg1)                          # ours at 100_000.5
+    chaser._seen.add(leg1.oid)
+    master.client.order_map.clear()                      # ... and filled
+
+    chaser.feed._quote = Quote(                          # a stranger joined there
+        BTC, best_bid=100_000.5, best_ask=100_010.0, mark_price=100_005.0, age_s=0.0
+    )
+    await chaser.step(G2, leg2)
+
+    assert sub1.placed[0]["price"] == 100_001.0

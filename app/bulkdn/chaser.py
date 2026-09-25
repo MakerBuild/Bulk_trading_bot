@@ -130,6 +130,11 @@ class Chaser:
         self._chasing_since: dict[tuple[str, bool], float] = {}
         # Orders kept after a replace was refused. See `_place`.
         self._adopted: set[str] = set()
+        # Every order this chaser has placed that may still rest, across all
+        # legs: oid -> (symbol, is_buy, maker pubkey). One Chaser serves every
+        # group, so this is how a leg tells another group's order at the touch
+        # from a stranger's. See `_ours_at`.
+        self._ours: dict[str, tuple[str, bool, str]] = {}
 
     # -- sizing ------------------------------------------------------------
 
@@ -205,6 +210,20 @@ class Chaser:
         if target is None:
             return ChaseOutcome(symbol, "skipped", "no reference price")
 
+        # The best price on our side may be another of our own groups. Stepping
+        # past it -- which `chase_price` does to any best price -- starts a
+        # walk: that group sees a stranger ahead, steps past this one, and the
+        # two climb toward the far side a tick at a time, each step a replace
+        # and a tick given away. Joining the level ends it; only a stranger's
+        # price is worth stepping past.
+        own_touch = quote.best_bid if roles.maker_is_buy else quote.best_ask
+        if own_touch is not None and self._ours_at(
+            symbol, roles.maker_is_buy, own_touch, except_oid=leg.oid
+        ):
+            beyond = target > own_touch if roles.maker_is_buy else target < own_touch
+            if beyond:
+                target = own_touch
+
         cap = (
             params.max_order_size if roles.max_order_size is None
             else roles.max_order_size
@@ -254,7 +273,6 @@ class Chaser:
         # following it stepped past ourselves: one replace per tick, walking
         # the order across the spread and giving it away. Being the touch is
         # the goal; the price only has to move when someone else is ahead.
-        own_touch = quote.best_bid if roles.maker_is_buy else quote.best_ask
         at_the_touch = own_touch is not None and resting.price == own_touch
 
         if tightening_now:
@@ -438,12 +456,39 @@ class Chaser:
             self._placed_at.pop(previous, None)
             self._seen.discard(previous)
             self._adopted.discard(previous)
+            self._ours.pop(previous, None)
+        self._ours[oid] = (roles.symbol, roles.maker_is_buy, roles.maker)
         leg.oid = oid
         leg.price = price
         leg.size = size
         now = time.monotonic()
         self._placed_at[oid] = now
         self._chasing_since.setdefault(self._chase_key(roles), now)
+
+    def _ours_at(
+        self, symbol: str, is_buy: bool, price: float, except_oid: str | None
+    ) -> bool:
+        """Whether another leg's order of ours rests at `price` on this side.
+
+        Read from the order maps, not from what was placed: an order that
+        filled or was cancelled no longer holds the level. Entries whose order
+        is gone are dropped as they are found, once the order map has shown
+        them or their acknowledgement grace has passed.
+        """
+        now = time.monotonic()
+        found = False
+        for oid, (sym, buy, maker) in list(self._ours.items()):
+            if oid == except_oid or sym != symbol or buy != is_buy:
+                continue
+            session = self.sessions.get(maker)
+            order = session.client.get_order_map().get(oid) if session else None
+            if order is None:
+                if oid in self._seen or now - self._placed_at.get(oid, 0.0) > ACK_GRACE_S:
+                    self._ours.pop(oid, None)
+                continue
+            if order.price == price:
+                found = True
+        return found
 
     async def _cancel(self, session: AccountSession, leg: LegState, symbol: str) -> None:
         oid = leg.oid
