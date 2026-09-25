@@ -149,7 +149,7 @@ because the book is the loop's: fills and position updates land in it there and 
 reads it there.
 
 `apply_read` keeps anything newer than the read. The answer is roughly a round trip old
-when it lands (~320ms from Bishkek to Tokyo), and a fill that reached us over the stream
+when it lands (~320ms from a PC far from Tokyo), and a fill that reached us over the stream
 in that window is newer than it; writing the read over it made the fill vanish and the
 reconciler hedged it again. So a key the stream has touched since the request was sent is
 skipped.
