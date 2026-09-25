@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 from collections.abc import Callable, Sequence
@@ -526,6 +527,57 @@ class RoutedWsClient(BulkWebSocketClient):
             raise
 
 
+# A chase re-price waits once its socket has carried this many submissions in
+# the last second, for at most CHASE_YIELD_MAX_S. Nothing else waits: a hedge
+# or a cancel is the thing a re-price should make room for, not queue behind.
+#
+# Far from the exchange each submission held its caller for a ~320ms round trip, and
+# that alone kept bursts short. From Tokyo a burst of partial fills becomes a
+# burst of hedges in milliseconds, and the exchange's limit is not published.
+# Normal chasing is about one re-price per second per group, so this binds
+# only when something else is already busy on the socket.
+CHASE_SENDS_PER_S = 8
+CHASE_YIELD_MAX_S = 1.0
+
+
+class SendPacer:
+    """Counts one socket's submissions, so a re-price can yield to the rest."""
+
+    def __init__(self) -> None:
+        self._sent: deque[float] = deque()
+
+    def note(self) -> None:
+        self._sent.append(time.monotonic())
+
+    def _recent(self, now: float) -> int:
+        while self._sent and now - self._sent[0] >= 1.0:
+            self._sent.popleft()
+        return len(self._sent)
+
+    async def room_for_chase(self) -> None:
+        """Wait while the socket is busy, up to CHASE_YIELD_MAX_S.
+
+        Bounded rather than strict: the limit is a guess at the exchange's, and
+        a re-price held indefinitely leaves an order resting at a stale price,
+        which costs more than one submission over a guessed number.
+        """
+        deadline = time.monotonic() + CHASE_YIELD_MAX_S
+        while True:
+            now = time.monotonic()
+            if self._recent(now) < CHASE_SENDS_PER_S or now >= deadline:
+                return
+            await asyncio.sleep(min(self._sent[0] + 1.0 - now, deadline - now) + 0.001)
+
+
+# One pacer per socket, not per account: subaccounts share their master's
+# socket, and it is the socket the exchange counts.
+_PACERS: dict[int, SendPacer] = {}
+
+
+def pacer_for(client: object) -> SendPacer:
+    return _PACERS.setdefault(id(client), SendPacer())
+
+
 @dataclass
 class AccountSession:
     """One account: its WS client, its label, and its cached market specs."""
@@ -671,6 +723,7 @@ class AccountSession:
             # Named explicitly: one socket may carry several accounts, and the
             # session is the only thing that knows which of them this is.
             kwargs.setdefault("account", self.pubkey)
+            pacer_for(self.client).note()
             responses = await self.client.submit(actions, **kwargs)
         except NotSent as exc:
             # Nothing left this process, so nothing is in doubt -- and a fault
@@ -777,6 +830,9 @@ class AccountSession:
             actions.append(CancelOrder(symbol=symbol, oid=cancel_oid))
         actions.append(order)
 
+        # Only here: a resting order -- the chaser's, or a limit close's -- is
+        # the one submission that can afford to wait.
+        await pacer_for(self.client).room_for_chase()
         try:
             responses = await self.submit(actions)
         except OrderRejected as exc:

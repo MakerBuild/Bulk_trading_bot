@@ -92,6 +92,14 @@ DEFERRAL_WINDOW_S = 900.0
 # sent a READ_LAG_S later cannot. See `_settled_after_waiting`.
 SHRINK_RECHECK_DELAYS_S = (1.0, 2.0)
 
+# How long a leg's hedge task waits before hedging AGAIN for fills that came in
+# while it was busy. The first hedge after a fill still goes at once. From
+# far away a hedge pass took ~650ms, so a maker order eaten by ten small trades
+# was hedged in one or two orders; from Tokyo it would be ten, each with its
+# own cancel. Hedge loss measured nearly flat in delay (2.04bps at 300-500ms),
+# so gathering them costs little.
+HEDGE_COALESCE_S = 0.1
+
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
 
@@ -961,6 +969,9 @@ class Strategy:
                 log.error("hedge for %s failed: %s", leg_key, describe(exc))
             if leg_key not in again or self._stop.is_set():
                 return
+            # More fills arrived meanwhile. Let the rest of the burst land, so
+            # the next pass hedges them in one order rather than one each.
+            await asyncio.sleep(HEDGE_COALESCE_S)
 
     def _least_crowded_side(self, symbol: str) -> bool:
         """The side fewest live legs are resting on, for the next group.
