@@ -399,3 +399,59 @@ async def test_the_reading_that_reaches_the_target_is_the_one_shown(totals):
     strategy._progress = (16.70, 97_541.91)
     assert await strategy.reached()
     assert strategy._progress == pytest.approx((17.30, 101_795.50))
+
+
+# -- the status block's refresh never shows a lifetime as this run ------------
+#
+# 2026-09-25 17:02: the status loop started before recovery captured the
+# baseline, so its first read walked every account's lifetime history. It
+# landed forty seconds later, after the run had begun, and the log said
+# "cost so far: $0.00" and then, one second on, the accounts' lifetime totals.
+
+
+def _refreshing_strategy(read):
+    from bulkdn.state import StrategyState
+    from bulkdn.strategy import Strategy
+
+    s = Strategy.__new__(Strategy)
+    s.state = StrategyState()
+    s._progress = None
+    s._spread_cost = lambda totals: 0.0
+    s._cost_text = lambda burned: f"${burned:,.2f}"
+    s._read_totals = read
+    return s
+
+
+async def test_no_refresh_before_the_run_has_a_start():
+    from bulkdn.fees import Realised
+
+    calls = []
+
+    async def read():
+        calls.append(True)
+        return Realised(fees_usd=-500.0, volume_usd=2_000_000.0)
+
+    s = _refreshing_strategy(read)
+    await s._refresh_totals()
+
+    assert calls == [], "it read a lifetime history with nothing to count from"
+    assert s._progress is None
+
+
+async def test_a_read_that_began_before_the_baseline_is_dropped():
+    from bulkdn.fees import Realised
+
+    s = None
+    reads = []
+
+    async def read():
+        reads.append(True)
+        s.state.baseline_at = 1_790_000_100.0     # captured while this was reading
+        return Realised(fees_usd=-500.0, volume_usd=2_000_000.0)
+
+    s = _refreshing_strategy(read)
+    s.state.baseline_at = 1_790_000_000.0
+    await s._refresh_totals()
+
+    assert reads, "the read never ran"
+    assert s._progress is None, "a read over another window was shown as this run"

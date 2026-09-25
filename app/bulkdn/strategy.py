@@ -2671,12 +2671,25 @@ class Strategy:
             await asyncio.sleep(interval_s)
 
     async def _refresh_totals(self) -> None:
-        """Re-read spend and volume for the status block, and log the cost."""
+        """Re-read spend and volume for the status block, and log the cost.
+
+        Only once the run has a baseline, and only if it is still the same one
+        when the read comes back. The status loop starts before recovery has
+        captured the baseline, so its first read had no start to count from
+        and walked each account's LIFETIME history -- forty seconds over
+        twelve accounts, landing after the run had begun and printing the
+        accounts' lifetime fees and volume one second after "$0.00".
+        """
+        if not self.state.has_baseline:
+            return
+        since = self.state.baseline_at
         try:
             totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - cosmetic
             log.debug("could not refresh the totals: %s", describe(exc))
             return
+        if not self.state.has_baseline or self.state.baseline_at != since:
+            return  # the run's window moved while this was reading
         burned = _burned(totals.fees_usd)
         self._spread_usd = self._spread_cost(totals)
         answer = getattr(self, "_target_answer", (0.0, None))[1]
