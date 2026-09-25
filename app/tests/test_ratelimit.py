@@ -2,7 +2,7 @@
 
 From Tokyo a twelve-account walk went out in a fraction of a second and the
 exchange answered with a wall of 429s -- on the fill history, and on the
-position reads the hedger relies on. From Bishkek the round trip alone had
+position reads the hedger relies on. From far away the round trip alone had
 spaced the same requests out.
 """
 

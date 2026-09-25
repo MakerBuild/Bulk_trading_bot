@@ -3,7 +3,7 @@
 The exchange rate-limits `/account` hard -- it once answered 429 to two
 accounts polling every five seconds -- and the bot reads it from many places:
 positions, fill history, fee tier, risk events, the menu. None of them paced
-itself. From Bishkek none needed to: each request held its caller for a
+itself. Far from the exchange none needed to: each request held its caller for a
 ~320ms round trip, which spaced a twelve-account walk over four seconds.
 
 From Tokyo the same walk goes out in a fraction of a second, and the first run
@@ -12,7 +12,7 @@ the hedger depends on through the same endpoint.
 
 So every `/account` request to the exchange's host waits for its turn, at most
 one per MIN_INTERVAL_S across the whole process -- the pace the bot kept from
-Bishkek, which the exchange accepted for months. A 429 holds everyone back
+far away, which the exchange accepted for months. A 429 holds everyone back
 for THROTTLE_PAUSE_S more, rather than letting the next request walk into the
 same wall.
 
