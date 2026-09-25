@@ -1638,6 +1638,67 @@ def _markets(config: Config, config_path: str) -> None:
             return
 
 
+def _print_run(
+    title: str, http, trees, config: Config,
+    started: float, ended: float | None, *, with_targets: bool,
+) -> None:
+    """One run's spend, split the way the run screen splits it.
+
+    Fees and spread/slippage apart, because only one of the two is ours to
+    change. The spread is what the trades lost on price, fees excluded; the
+    run ends flat, so it is the cash the trades moved, and a leftover
+    position (an unfinished run) is valued at the market.
+    """
+    import datetime
+
+    from .fees import burned_usd, realised_for_trees
+
+    run = realised_for_trees(
+        http, [tree.accounts for tree in trees],
+        since_ms=started * 1000,
+        until_ms=ended * 1000 if ended else None,
+    )
+    prices = {}
+    for symbol, base in run.base_by_symbol.items():
+        if abs(base) > 1e-12:
+            try:
+                ticker = http.get_ticker(symbol)
+                prices[symbol] = float(ticker.get("markPrice") or ticker.get("lastPrice") or 0.0)
+            except Exception:  # noqa: BLE001 - shown as unknown below
+                prices[symbol] = 0.0
+    priced = all(prices.get(symbol) for symbol, base in run.base_by_symbol.items() if abs(base) > 1e-12)
+    burned = burned_usd(run.fees_usd)
+    spread = -run.price_result_usd(prices) if priced else None
+    volume = run.volume_usd
+
+    def when(ts: float) -> str:
+        return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+    span = f"{when(started)} -> {when(ended)}" if ended else f"since {when(started)}"
+    minutes = ((ended or datetime.datetime.now().timestamp()) - started) / 60
+    print(f"\n  {title}")
+    print(f"    {span}  ({minutes:,.0f} min, {run.fills} fills)")
+    print(f"    fees          ${burned:,.2f}")
+    if spread is None:
+        print("    spread/slip   unknown -- no price for the position still open")
+    else:
+        print(f"    spread/slip   ${spread:,.2f}")
+        print(f"    total cost    ${burned + spread:,.2f}")
+    print(f"    volume        ${volume:,.2f}  (all fills)")
+    print(f"    self-trades   ${run.self_trade_volume_usd:,.2f}  (between your own accounts)")
+    if volume > 0 and spread is not None:
+        per = 100_000 / volume
+        print(
+            f"    per $100k     fees ${burned * per:,.2f} + spread ${spread * per:,.2f}"
+            f" = ${(burned + spread) * per:,.2f}"
+        )
+    if with_targets:
+        if config.target.burn_usd > 0:
+            print(f"    burn target   ${burned:,.4f} of ${config.target.burn_usd:,.2f}")
+        if config.target.volume_usd > 0:
+            print(f"    volume target ${run.qualifying_volume_usd:,.2f} of ${config.target.volume_usd:,.2f}")
+
+
 def _target_progress(config: Config) -> None:
     """Realised spend and volume, for this run and for the account's lifetime.
 
@@ -1660,31 +1721,22 @@ def _target_progress(config: Config) -> None:
     print(f"    qualifying    ${totals.qualifying_volume_usd:,.2f}  (referral window)")
     print(f"    fee tier      ${totals.tier_volume_usd:,.2f}  (docs say self-trades do not count)")
 
-    print("\n  THIS RUN", end="")
-    if not state.has_baseline:
-        print("\n    not started -- the target is measured from the next start")
-    else:
-        # Read from the run's start, the way the stop check reads it. The
-        # run now records a start time and zero baselines, so subtracting
-        # those from a lifetime walk printed the lifetime totals here as
-        # "this run".
-        run = realised_for_trees(
-            http, [tree.accounts for tree in trees],
-            since_ms=state.baseline_at * 1000,
+    # An unfinished run first: its counts are still live, and the next start
+    # resumes it. Then the last run that ended -- which is what the operator
+    # opens this screen to see, and what used to read "not started" the moment
+    # a run finished, because its counts had just been cleared.
+    if state.has_baseline:
+        _print_run(
+            "CURRENT RUN  (unfinished -- the next start resumes it)",
+            http, trees, config, state.baseline_at, None, with_targets=True,
         )
-        burned = burned_usd(run.fees_usd)
-        volume = run.qualifying_volume_usd
-        print()
-        print(f"    burned        ${burned:,.4f}", end="")
-        if config.target.burn_usd > 0:
-            print(f"  of ${config.target.burn_usd:,.2f}")
-        else:
-            print("  (no burn target)")
-        print(f"    qualifying    ${volume:,.2f}", end="")
-        if config.target.volume_usd > 0:
-            print(f"  of ${config.target.volume_usd:,.2f}")
-        else:
-            print("  (no volume target)")
+    if state.last_run_started_at > 0.0:
+        _print_run(
+            "LAST RUN", http, trees, config,
+            state.last_run_started_at, state.last_run_ended_at, with_targets=False,
+        )
+    elif not state.has_baseline:
+        print("\n  LAST RUN\n    none recorded yet -- shown after the next run ends")
 
     # One line per master. The tier is a fact about a master account, so
     # with several keys there is no single "the" tier to print -- and the

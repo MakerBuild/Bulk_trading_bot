@@ -152,6 +152,19 @@ class StrategyState:
     # baseline, when a run ends on its own terms or is flattened.
     run_started_at: float = 0.0
     groups_started: int = 0
+    # The window of the last run that ENDED, as epoch seconds. Kept when the
+    # run's own counts are cleared, so the Progress screen can still say what
+    # that run cost after it is over -- the counts it used to read from were
+    # cleared at exactly that moment, and it said "not started".
+    last_run_started_at: float = 0.0
+    last_run_ended_at: float = 0.0
+
+    def remember_run(self, now: float) -> None:
+        """Record the run that is ending, before its counts are cleared."""
+        started = self.baseline_at or self.run_started_at
+        if started > 0.0:
+            self.last_run_started_at = started
+            self.last_run_ended_at = now
 
     @property
     def has_baseline(self) -> bool:
@@ -251,6 +264,8 @@ class StrategyState:
             baseline_at=float(data.get("baseline_at", 0.0)),
             run_started_at=float(data.get("run_started_at", 0.0)),
             groups_started=int(data.get("groups_started", 0)),
+            last_run_started_at=float(data.get("last_run_started_at", 0.0)),
+            last_run_ended_at=float(data.get("last_run_ended_at", 0.0)),
         )
 
 

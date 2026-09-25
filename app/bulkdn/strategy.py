@@ -2784,6 +2784,7 @@ class Strategy:
             # next start measures a new one. Kept after a stop or a halt
             # instead: those are interruptions, and resuming should not hand
             # back progress that was already paid for.
+            self.state.remember_run(time.time())
             self.state.clear_baseline()
             self._persist()
 

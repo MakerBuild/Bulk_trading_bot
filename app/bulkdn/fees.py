@@ -437,6 +437,7 @@ def _row_time_ms(row: dict) -> float | None:
 def realised_for_account(
     http, user: str, tree: set[str], limit: int = 1000, max_pages: int = 20,
     seen: set | None = None, since_ms: float | None = None,
+    until_ms: float | None = None,
 ) -> Realised:
     """Walk an account's fill history and total spend and volume.
 
@@ -476,6 +477,14 @@ def realised_for_account(
             newest_first = len(known) >= 2 and known[0] >= known[-1]
             reached_back = newest_first and known[-1] < since_ms
             counted = [row for row, t in zip(rows, times, strict=True) if t is None or t >= since_ms]
+        if until_ms is not None:
+            # A window with an end, for a run that has finished: whatever was
+            # traded after it belongs to someone else's figure. Only filtered,
+            # never used to stop the walk -- newest-first pages start after it.
+            counted = [
+                row for row in counted
+                if (_row_time_ms(row) is None or _row_time_ms(row) <= until_ms)
+            ]
         total = total + Realised.from_fills(counted, tree, seen, user=user)
         # On the page as served, not as filtered: an oldest-first history has
         # whole pages from before `since_ms`, and there is more after them.

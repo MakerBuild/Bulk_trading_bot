@@ -17,6 +17,7 @@ import logging
 import logging.handlers
 import os
 import sys
+import time
 
 from bulk_api.common import SignatureDomain
 
@@ -809,6 +810,7 @@ async def cmd_flatten(
             # over with it. Without this, resuming after a flatten would carry
             # the interrupted run's spend into what the operator reads as a
             # fresh one.
+            state.remember_run(time.time())
             state.clear_baseline()
             runtime.store.save(state)
             log.info("state reset to IDLE")
