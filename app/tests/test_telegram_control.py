@@ -1,8 +1,9 @@
 """Running the bot from Telegram.
 
 What matters is what a chat window must never do: answer a stranger, start or
-close anything without a fresh confirmation, run two pieces of work on the same
-accounts, or replay commands typed while the process was off.
+close anything without a fresh confirmation, act on a button from an old
+message, run two pieces of work on the same accounts, or replay commands typed
+while the process was off.
 """
 
 import asyncio
@@ -11,7 +12,7 @@ import types
 import pytest
 
 from bulkdn import telegram_control as tc
-from bulkdn.telegram_control import Controller, PollConflict, TelegramPoller
+from bulkdn.telegram_control import Controller, PollConflict, Reply, TelegramPoller
 
 
 def settings(volume=100_000.0):
@@ -33,6 +34,15 @@ class FakeStrategy:
         return ["  g1:BTC-USD OPEN cycle 1", "  volume ###  $5,000 / $100,000  5.0%"]
 
 
+def button(reply: Reply, label_start: str) -> str:
+    """The callback data of the button whose label starts with `label_start`."""
+    for row in reply.buttons or []:
+        for label, data in row:
+            if label.startswith(label_start):
+                return data
+    raise AssertionError(f"no {label_start!r} button in {reply.buttons}")
+
+
 class Harness:
     """A Controller with its runs, closes and clock under the test's control."""
 
@@ -45,7 +55,7 @@ class Harness:
         self.release = asyncio.Event()
         self.strategy = FakeStrategy()
         self.status_text = status_text
-        self.codes = iter(["1111", "2222", "3333", "4444"])
+        self.codes = iter(["c1", "c2", "c3", "c4"])
         self.c = Controller(
             self.config, dry_run,
             run_fn=self.run, flatten_fn=self.flatten, status_fn=self.status,
@@ -68,74 +78,127 @@ class Harness:
     async def send(self, text):
         self.sent.append(text)
 
+    async def say(self, text) -> Reply:
+        return await self.c.handle(text)
+
+    async def start_run(self):
+        ask = await self.say("▶️ Run")
+        reply = await self.c.press(button(ask, "▶️ Start"))
+        await self.settle()
+        return reply
+
     async def settle(self):
         for _ in range(5):
             await asyncio.sleep(0)
 
 
-# -- nothing that spends goes without a fresh code ---------------------------
+# -- the buttons ---------------------------------------------------------------
 
 
-async def test_run_waits_for_its_code():
+async def test_the_keyboard_buttons_are_the_commands():
     h = Harness()
-    reply = await h.c.handle("/run")
-    assert "/yes 1111" in reply and "LIVE" in reply
+    assert "Idle" in (await h.say("📊 Status")).text
+    assert "Nothing is running" in (await h.say("⏹ Stop")).text
+    assert (await h.say("/help")).keyboard, "help does not bring the keyboard back"
+    assert (await h.say("hello")).keyboard
+
+
+async def test_run_starts_only_from_its_start_button():
+    h = Harness()
+    ask = await h.say("▶️ Run")
+    assert "LIVE" in ask.text and "volume $100,000" in ask.text
     assert h.runs == [], "a run started before it was confirmed"
 
-    await h.c.handle("/yes 1111")
+    reply = await h.c.press(button(ask, "▶️ Start"))
     await h.settle()
-    assert len(h.runs) == 1
+    assert len(h.runs) == 1 and "Starting" in reply.text
+    h.release.set()
+    await h.settle()
 
 
-async def test_a_wrong_code_cancels_rather_than_allowing_another_guess():
+async def test_cancel_cancels():
     h = Harness()
-    await h.c.handle("/run")
-    assert "wrong code" in await h.c.handle("/yes 9999")
-    assert "nothing to confirm" in await h.c.handle("/yes 1111")
+    ask = await h.say("▶️ Run")
+    assert "Cancelled" in (await h.c.press(button(ask, "❌"))).text
+    assert "expired" in (await h.c.press(button(ask, "▶️ Start"))).text
     assert h.runs == []
 
 
-async def test_a_code_lapses():
+async def test_a_button_on_an_old_message_does_nothing():
+    """And does not cancel the question that is actually open."""
     h = Harness()
-    await h.c.handle("/run")
-    h.now += tc.CONFIRM_TTL_S + 1
-    assert "nothing to confirm" in await h.c.handle("/yes 1111")
+    old = await h.say("▶️ Run")
+    new = await h.say("🛑 Close all")
+
+    assert "expired" in (await h.c.press(button(old, "▶️ Start"))).text
     assert h.runs == []
-
-
-async def test_close_waits_for_its_code():
-    h = Harness()
-    reply = await h.c.handle("/close")
-    assert "every position at market" in reply and "/yes 1111" in reply
-    assert h.closes == []
-    await h.c.handle("/yes 1111")
+    await h.c.press(button(new, "✅"))
     await h.settle()
+    assert h.closes == [False], "the stale press cancelled the live question"
+
+
+async def test_a_button_is_spent_by_its_first_press():
+    h = Harness()
+    ask = await h.say("🛑 Close all")
+    await h.c.press(button(ask, "✅"))
+    await h.settle()
+    assert "expired" in (await h.c.press(button(ask, "✅"))).text
     assert h.closes == [False]
 
 
-# -- one piece of work at a time ---------------------------------------------
+async def test_a_button_lapses():
+    h = Harness()
+    ask = await h.say("▶️ Run")
+    h.now += tc.CONFIRM_TTL_S + 1
+    assert "expired" in (await h.c.press(button(ask, "▶️ Start"))).text
+    assert h.runs == []
+
+
+async def test_a_forged_press_with_the_wrong_action_does_nothing():
+    """A run's code on a close's action is not a close."""
+    h = Harness()
+    ask = await h.say("▶️ Run")
+    code = button(ask, "▶️ Start").split(":")[1]
+    assert "expired" in (await h.c.press(f"close:{code}")).text
+    await h.settle()
+    assert h.closes == [] and h.runs == []
+
+
+async def test_typed_confirmation_still_works_and_one_wrong_guess_ends_it():
+    h = Harness()
+    await h.say("/run")
+    assert "Wrong code" in (await h.say("/yes nope")).text
+    assert "Nothing to confirm" in (await h.say("/yes c1")).text
+
+    await h.say("/run")
+    await h.say("/yes c2")
+    await h.settle()
+    assert len(h.runs) == 1
+    h.release.set()
+    await h.settle()
+
+
+# -- one piece of work at a time -------------------------------------------------
 
 
 async def test_a_second_run_is_refused_while_one_is_going():
     h = Harness()
-    await h.c.handle("/run")
-    await h.c.handle("/yes 1111")
-    await h.settle()
-
-    assert "already in progress" in await h.c.handle("/run")
+    await h.start_run()
+    assert "already in progress" in (await h.say("▶️ Run")).text
     h.release.set()
     await h.settle()
 
 
 async def test_a_volume_target_applies_to_that_run_only():
     h = Harness()
-    await h.c.handle("/run 250k")
-    await h.c.handle("/yes 1111")
+    ask = await h.say("/run 250k")
+    assert "$250,000" in ask.text
+    await h.c.press(button(ask, "▶️ Start"))
     await h.settle()
 
     config, dry_run = h.runs[0]
     assert config.target.volume_usd == 250_000
-    assert h.config.target.volume_usd == 100_000, "the next /run would inherit it"
+    assert h.config.target.volume_usd == 100_000, "the next run would inherit it"
     assert dry_run is False
     h.release.set()
     await h.settle()
@@ -143,39 +206,34 @@ async def test_a_volume_target_applies_to_that_run_only():
 
 async def test_a_dry_control_loop_starts_dry_runs():
     h = Harness(dry_run=True)
-    assert "DRY-RUN" in await h.c.handle("/run")
-    await h.c.handle("/yes 1111")
-    await h.settle()
+    assert "DRY-RUN" in (await h.say("▶️ Run")).text
+    h.c.pending = None
+    await h.start_run()
     assert h.runs[0][1] is True
     h.release.set()
     await h.settle()
 
 
-# -- stop and close against a run --------------------------------------------
+# -- stop and close against a run --------------------------------------------------
 
 
 async def test_stop_is_the_s_key():
     h = Harness()
-    assert "nothing is running" in await h.c.handle("/stop")
-    await h.c.handle("/run")
-    await h.c.handle("/yes 1111")
-    await h.settle()
-
-    reply = await h.c.handle("/stop")
+    await h.start_run()
+    reply = await h.say("⏹ Stop")
     assert h.strategy.stops == ["telegram"]
-    assert "positions stay" in reply
+    assert "positions stay" in reply.text
     h.release.set()
     await h.settle()
 
 
 async def test_close_during_a_run_stops_it_first_then_closes():
     h = Harness()
-    await h.c.handle("/run")
-    await h.c.handle("/yes 1111")
-    await h.settle()
+    await h.start_run()
 
-    await h.c.handle("/close")
-    await h.c.handle("/yes 2222")
+    ask = await h.say("🛑 Close all")
+    assert "Stop the current run" in ask.text
+    await h.c.press(button(ask, "✅"))
     await h.settle()
     assert h.strategy.stops, "it closed underneath a live run"
     assert h.closes == [], "it closed before the run had stopped"
@@ -198,31 +256,30 @@ async def test_close_during_startup_does_not_wait_out_the_whole_run():
         return 0
 
     h.c.run_fn = slow_start
-    await h.c.handle("/run")
-    await h.c.handle("/yes 1111")
-    await h.c.handle("/close")
-    await h.c.handle("/yes 2222")
+    await h.start_run()
+    ask = await h.say("🛑 Close all")
+    await h.c.press(button(ask, "✅"))
     await h.settle()
 
     started.set()                    # the strategy exists now
     await asyncio.sleep(0.6)
-    assert h.strategy.stops == ["telegram /close"]
+    assert h.strategy.stops == ["telegram close"]
     h.release.set()
     await h.settle()
     assert h.closes == [False]
 
 
-# -- answers -----------------------------------------------------------------
+# -- answers -------------------------------------------------------------------------
 
 
-async def test_status_during_a_run_is_the_screen_block():
+async def test_status_during_a_run_is_the_screen_block_with_a_refresh():
     h = Harness()
-    await h.c.handle("/run")
-    await h.c.handle("/yes 1111")
-    await h.settle()
+    await h.start_run()
 
-    reply = await h.c.handle("/status")
-    assert "g1:BTC-USD OPEN cycle 1" in reply and "LIVE run" in reply
+    reply = await h.say("📊 Status")
+    assert "g1:BTC-USD OPEN cycle 1" in reply.text and "LIVE run" in reply.text
+    again = await h.c.press(button(reply, "🔄"))
+    assert "g1:BTC-USD OPEN cycle 1" in again.text
     h.release.set()
     await h.settle()
 
@@ -234,9 +291,9 @@ async def test_idle_status_leaves_out_the_account_pubkeys():
         "positions:\n  BTC-USD    net=+0.00000000  all flat\n"
     )
     h = Harness(status_text=listing)
-    reply = await h.c.handle("/status")
-    assert "all flat" in reply
-    assert "ZZZZZZZZ" not in reply
+    reply = await h.say("📊 Status")
+    assert "all flat" in reply.text
+    assert "ZZZZZZZZ" not in reply.text
 
 
 async def test_log_sends_the_tail(tmp_path):
@@ -245,16 +302,19 @@ async def test_log_sends_the_tail(tmp_path):
     h = Harness()
     h.c.log_path = str(path)
 
-    reply = await h.c.handle("/log 3")
-    assert "line 39" in reply and "line 37" in reply and "line 36" not in reply
-    assert "2026-09-25" not in reply
+    reply = await h.say("/log 3")
+    assert "line 39" in reply.text and "line 37" in reply.text and "line 36" not in reply.text
+    assert "2026-09-25" not in reply.text
+    assert "line 39" in (await h.say("📜 Log")).text
 
 
-async def test_unknown_and_plain_text():
-    h = Harness()
-    assert "/help" in await h.c.handle("/frobnicate")
-    assert await h.c.handle("hello") is None
-    assert "/run" in await h.c.handle("/help@SomeBot")
+def test_buttons_render_as_telegram_markup():
+    inline = Reply("x", [[("▶️ Start", "run:c1"), ("❌ Cancel", "cancel:c1")]]).markup()
+    assert inline["inline_keyboard"][0][1] == {"text": "❌ Cancel", "callback_data": "cancel:c1"}
+    keyboard = Reply("x", keyboard=True).markup()
+    labels = [b["text"] for row in keyboard["keyboard"] for b in row]
+    assert set(labels) == set(tc.KEYBOARD), "a keyboard button that no command answers"
+    assert Reply("x").markup() is None
 
 
 def test_amounts_are_read_the_way_people_type_them():
@@ -265,7 +325,7 @@ def test_amounts_are_read_the_way_people_type_them():
     assert tc._parse_amount("lots") is None
 
 
-# -- who is answered -----------------------------------------------------------
+# -- who is answered ---------------------------------------------------------------------
 
 
 def test_only_listed_senders_are_answered():
@@ -282,7 +342,15 @@ def test_a_listed_id_in_someone_elses_group_is_still_judged_by_sender():
     assert tc.authorised_text(update, {7}, set()) is None
 
 
-# -- polling -------------------------------------------------------------------
+def test_a_button_is_judged_by_who_pressed_it():
+    """A button in a group message can be pressed by anyone in the group."""
+    ours = {"callback_query": {"id": "q", "from": {"id": 7}, "data": "close:c1"}}
+    theirs = {"callback_query": {"id": "q", "from": {"id": 9}, "data": "close:c1"}}
+    assert tc.authorised_press(ours, {7}, set()) is not None
+    assert tc.authorised_press(theirs, {7}, set()) is None
+
+
+# -- polling ---------------------------------------------------------------------------------
 
 
 class FakeResponse:
@@ -301,13 +369,13 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, answers):
-        self.answers = list(answers)
+    def __init__(self, answers=None):
+        self.answers = list(answers or [])
         self.calls = []
 
     def post(self, url, json, timeout, proxy):
-        self.calls.append(json)
-        status, payload = self.answers.pop(0)
+        self.calls.append((url.rsplit("/", 1)[-1], json))
+        status, payload = self.answers.pop(0) if self.answers else (200, {"ok": True, "result": True})
         return FakeResponse(status, payload)
 
 
@@ -321,8 +389,9 @@ async def test_commands_sent_while_off_are_dropped_at_start():
 
     assert await poller.skip_backlog(session) == 1
     await poller.updates(session)
-    assert session.calls[1]["offset"] == 42, "the backlog was not confirmed away"
-    assert session.calls[2]["offset"] == 42
+    assert session.calls[1][1]["offset"] == 42, "the backlog was not confirmed away"
+    assert session.calls[2][1]["offset"] == 42
+    assert "callback_query" in session.calls[2][1]["allowed_updates"], "buttons are never heard"
 
 
 async def test_a_second_poller_on_the_token_is_reported():
@@ -331,14 +400,32 @@ async def test_a_second_poller_on_the_token_is_reported():
         await poller.updates(FakeSession([(409, {"ok": False})]))
 
 
-# -- the loop as a whole ---------------------------------------------------------
+# -- the loop as a whole -----------------------------------------------------------------------
+
+
+async def test_a_press_spins_down_and_replaces_its_message():
+    h = Harness()
+    ask = await h.say("▶️ Run")
+    session = FakeSession()
+    api = tc.BotApi(session, "t")
+    update = {"callback_query": {
+        "id": "q1", "from": {"id": 7}, "data": button(ask, "❌"),
+        "message": {"message_id": 55, "chat": {"id": 7}},
+    }}
+    await tc._handle_update(update, api, h.c, {7}, set())
+
+    methods = [name for name, _ in session.calls]
+    assert methods == ["answerCallbackQuery", "editMessageText"]
+    edit = session.calls[1][1]
+    assert edit["message_id"] == 55 and edit["text"] == "Cancelled."
+    assert "reply_markup" not in edit, "the spent buttons were left on the message"
 
 
 async def test_the_loop_answers_ours_and_ignores_strangers(monkeypatch):
     sent = []
     batches = [
-        [{"update_id": 1, "message": {"from": {"id": 9}, "text": "/run"}},
-         {"update_id": 2, "message": {"from": {"id": 7}, "text": "/help"}}],
+        [{"update_id": 1, "message": {"from": {"id": 9}, "chat": {"id": 9}, "text": "/run"}},
+         {"update_id": 2, "message": {"from": {"id": 7}, "chat": {"id": 7}, "text": "/help"}}],
     ]
 
     class Poller:
@@ -353,12 +440,19 @@ async def test_the_loop_answers_ours_and_ignores_strangers(monkeypatch):
                 return batches.pop(0)
             raise asyncio.CancelledError()      # ends the loop like Ctrl+C
 
+    class Api:
+        def __init__(self, session, token):
+            pass
+
+        async def send(self, chat_id, reply):
+            sent.append((chat_id, reply))
+
     class Notifier:
         def __init__(self, config):
             pass
 
         async def send(self, text, **kw):
-            sent.append(text)
+            sent.append((None, text))
 
         async def drain(self):
             return None
@@ -367,6 +461,7 @@ async def test_the_loop_answers_ours_and_ignores_strangers(monkeypatch):
             return text
 
     monkeypatch.setattr(tc, "TelegramPoller", Poller)
+    monkeypatch.setattr(tc, "BotApi", Api)
     monkeypatch.setattr(tc, "Notifier", Notifier)
     config = settings()
     config.telegram = types.SimpleNamespace(enabled=True, user_ids=[7], bot_token="t")
@@ -374,10 +469,10 @@ async def test_the_loop_answers_ours_and_ignores_strangers(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await tc.serve(config, dry_run=True)
 
-    assert sent[0].startswith("control is on") and "DRY-RUN" in sent[0]
-    assert len(sent) == 2 and "/run" in sent[1] and "commands" in sent[1], (
-        "the stranger's /run was answered, or ours was not"
-    )
+    assert [chat for chat, _ in sent] == [7, 7], "the stranger's /run was answered"
+    hello, help_reply = sent[0][1], sent[1][1]
+    assert "DRY-RUN" in hello.text and hello.keyboard
+    assert "Buttons below" in help_reply.text
 
 
 async def test_nothing_starts_without_telegram_configured(capsys):

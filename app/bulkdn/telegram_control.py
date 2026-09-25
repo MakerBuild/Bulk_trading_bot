@@ -9,13 +9,19 @@ It is the same bot underneath. A run started here is `cmd_run` on a fresh copy
 of the settings, a close is `cmd_flatten`, and the idle status is `cmd_status`
 -- nothing here trades on its own account.
 
+Driven by buttons: a keyboard under the chat for the everyday commands, and
+Start / Cancel buttons on the message that asks for a confirmation. The slash
+commands still work for anyone who prefers typing.
+
 Three rules keep a chat window from being a way to lose money:
 
-* Only the ids in `telegram.user_ids` are answered. Anyone else who finds the
-  bot is ignored, and logged once.
+* Only the ids in `telegram.user_ids` are answered, judged by who sent the
+  message or pressed the button. Anyone else is ignored, and logged once.
 * Anything that spends -- starting a run, closing at market -- is confirmed
-  with a one-time code that lapses after a minute. A wrong code cancels it, so
-  a code cannot be guessed at leisure.
+  on a message that says exactly what will happen, and the confirmation is
+  one-time: its button carries a code that lapses after a minute, is spent by
+  the first press, and is superseded by the next question. A button on an old
+  message does nothing.
 * Commands sent while this process was not running are dropped at start. A
   /run typed yesterday into a dead chat must not fire the moment it comes back.
 
@@ -48,13 +54,13 @@ log = logging.getLogger(__name__)
 # Where every bulkdn module's lines end up, and so where alerts are read from.
 _BOT_LOG = logging.getLogger("bulkdn")
 
-# How long a confirmation code stays good.
+# How long a confirmation stays good.
 CONFIRM_TTL_S = 60.0
 # Seconds Telegram holds a getUpdates open waiting for a message.
 POLL_TIMEOUT_S = 25
-# Kept inside one of the notifier's chunks (1900 characters, header
-# included). A longer text is split, and a split through a <pre> leaves each
-# half with an unclosed tag -- which Telegram refuses outright.
+# Telegram refuses a message past 4096 characters, and the notifier splits
+# longer ones -- through a <pre> if need be, leaving each half with an unclosed
+# tag, which Telegram refuses outright. So bodies are kept well inside one.
 _MAX_TEXT = 1700
 LOG_LINES_DEFAULT = 15
 LOG_LINES_MAX = 30
@@ -62,6 +68,16 @@ LOG_LINES_MAX = 30
 # `cmd_status` lists every account's full pubkey. Useful at a desk, noise on a
 # phone, and nothing a status message needs.
 _ACCOUNT_LINE = re.compile(r"^\s{2}\S+\s+[1-9A-HJ-NP-Za-km-z]{32,44}\s*$")
+
+# The keyboard under the chat, and the command each of its buttons sends.
+KEYBOARD = {
+    "📊 Status": "/status",
+    "▶️ Run": "/run",
+    "⏹ Stop": "/stop",
+    "🛑 Close all": "/close",
+    "📜 Log": "/log",
+}
+_KEYBOARD_ROWS = [["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"], ["📜 Log"]]
 
 # Spelled out down to the lines to paste: install.bat creates settings.yaml
 # once and never touches it again, so a file made before Telegram existed has
@@ -82,19 +98,51 @@ telegram:
   Then start this again."""
 
 HELP = (
-    "<b>commands</b>\n"
-    "/status -- the run, or positions and orders when idle\n"
-    "/run -- start a run with the targets in settings.yaml\n"
-    "/run 100000 -- start a run with this volume target ($)\n"
-    "/stop -- stop the run and cancel its orders; positions stay\n"
-    "/close -- close every position at market (stops a run first)\n"
-    "/log [n] -- the last n lines of logs.txt\n"
-    "/yes CODE -- confirm a /run or /close"
+    "<b>Buttons below</b>\n"
+    "📊 Status -- the run, or positions and orders when idle\n"
+    "▶️ Run -- start a run with the targets in settings.yaml\n"
+    "⏹ Stop -- stop the run and cancel its orders; positions stay\n"
+    "🛑 Close all -- close every position at market (stops a run first)\n"
+    "📜 Log -- the last lines of logs.txt\n\n"
+    "<b>Typed</b>\n"
+    "/run 250k -- a run with this volume target\n"
+    "/log 30 -- more log lines"
 )
 
 
 class PollConflict(RuntimeError):
     """Telegram says another process is polling this bot token."""
+
+
+Buttons = list[list[tuple[str, str]]]
+
+
+@dataclass
+class Reply:
+    """A message to send: text, and optionally buttons under it.
+
+    `buttons` are inline, each a (label, callback data) pair. `keyboard` puts
+    the command keyboard under the chat instead -- a message carries one or the
+    other, never both.
+    """
+
+    text: str
+    buttons: Buttons | None = None
+    keyboard: bool = False
+
+    def markup(self) -> dict | None:
+        if self.buttons:
+            return {"inline_keyboard": [
+                [{"text": label, "callback_data": data} for label, data in row]
+                for row in self.buttons
+            ]}
+        if self.keyboard:
+            return {
+                "keyboard": [[{"text": label} for label in row] for row in _KEYBOARD_ROWS],
+                "resize_keyboard": True,
+                "is_persistent": True,
+            }
+        return None
 
 
 @dataclass
@@ -105,18 +153,18 @@ class Pending:
     volume: float | None = None
 
 
-class TelegramPoller:
-    """getUpdates, one batch at a time, remembering where it got to."""
+class BotApi:
+    """The few Bot API calls this needs, on one session."""
 
-    def __init__(self, token: str):
+    def __init__(self, session: aiohttp.ClientSession, token: str):
+        self.session = session
         self.token = token
-        self.offset: int | None = None
 
-    async def _call(self, session: aiohttp.ClientSession, method: str, **params) -> list:
-        async with session.post(
+    async def call(self, method: str, timeout_s: float = 20.0, **params):
+        async with self.session.post(
             f"https://api.telegram.org/bot{self.token}/{method}",
             json=params,
-            timeout=aiohttp.ClientTimeout(total=POLL_TIMEOUT_S + 15),
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
             proxy=telegram_proxy(),
         ) as response:
             if response.status == 409:
@@ -124,7 +172,53 @@ class TelegramPoller:
             payload = await response.json()
         if not payload.get("ok"):
             raise RuntimeError(f"telegram {method}: {payload.get('description', payload)}")
-        return payload.get("result") or []
+        return payload.get("result")
+
+    async def send(self, chat_id: int, reply: Reply) -> None:
+        params = {
+            "chat_id": chat_id,
+            "text": reply.text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        markup = reply.markup()
+        if markup:
+            params["reply_markup"] = markup
+        await self.call("sendMessage", **params)
+
+    async def edit(self, chat_id: int, message_id: int, reply: Reply) -> None:
+        """Replace a message's text and buttons -- used to spend a button."""
+        params = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": reply.text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply.buttons:
+            params["reply_markup"] = reply.markup()
+        try:
+            await self.call("editMessageText", **params)
+        except RuntimeError as exc:
+            # A refresh that found nothing new. Not a failure.
+            if "not modified" not in str(exc):
+                raise
+
+    async def answer(self, callback_id: str) -> None:
+        """Stop the button's spinner. Telegram expects it for every press."""
+        await self.call("answerCallbackQuery", callback_query_id=callback_id)
+
+
+class TelegramPoller:
+    """getUpdates, one batch at a time, remembering where it got to."""
+
+    def __init__(self, token: str):
+        self.token = token
+        self.offset: int | None = None
+
+    async def _call(self, session: aiohttp.ClientSession, **params) -> list:
+        api = BotApi(session, self.token)
+        return await api.call("getUpdates", timeout_s=POLL_TIMEOUT_S + 15, **params) or []
 
     async def skip_backlog(self, session: aiohttp.ClientSession) -> int:
         """Drop everything sent before now. Returns how many were dropped.
@@ -132,18 +226,18 @@ class TelegramPoller:
         `offset=-1` answers with the newest update only; confirming past it
         discards the rest on Telegram's side as well.
         """
-        latest = await self._call(session, "getUpdates", offset=-1, timeout=0)
+        latest = await self._call(session, offset=-1, timeout=0)
         if not latest:
             return 0
         self.offset = latest[-1]["update_id"] + 1
-        await self._call(session, "getUpdates", offset=self.offset, timeout=0)
+        await self._call(session, offset=self.offset, timeout=0)
         return len(latest)
 
     async def updates(self, session: aiohttp.ClientSession) -> list[dict]:
-        params = {"timeout": POLL_TIMEOUT_S, "allowed_updates": ["message"]}
+        params = {"timeout": POLL_TIMEOUT_S, "allowed_updates": ["message", "callback_query"]}
         if self.offset is not None:
             params["offset"] = self.offset
-        batch = await self._call(session, "getUpdates", **params)
+        batch = await self._call(session, **params)
         if batch:
             self.offset = batch[-1]["update_id"] + 1
         return batch
@@ -153,7 +247,7 @@ RunFn = Callable[..., Awaitable[int]]
 
 
 class Controller:
-    """Turns commands into runs, stops, closes and answers.
+    """Turns commands and button presses into runs, stops, closes and answers.
 
     Holds at most one piece of work at a time -- a run or a close -- because
     two of either on the same accounts is the double-hedging this bot has
@@ -182,7 +276,7 @@ class Controller:
         self.send = send
         self.log_path = log_path
         self.clock = clock
-        self.make_code = make_code or (lambda: f"{secrets.randbelow(10_000):04d}")
+        self.make_code = make_code or (lambda: secrets.token_hex(4))
         self.alerts = alerts
         self.pending: Pending | None = None
         self.work: asyncio.Task | None = None
@@ -203,19 +297,22 @@ class Controller:
     def _set_strategy(self, strategy) -> None:
         self.strategy = strategy
 
-    # -- commands ----------------------------------------------------------
+    # -- messages ------------------------------------------------------------
 
-    async def handle(self, text: str | None) -> str | None:
+    async def handle(self, text: str | None) -> Reply | None:
         """Answer one message from an authorised user. None means no reply."""
-        if not text or not text.startswith("/"):
+        if not text:
             return None
+        text = KEYBOARD.get(text.strip(), text)
+        if not text.startswith("/"):
+            return Reply("Use the buttons below.", keyboard=True)
         words = text.strip().split()
         # "/status@SomeBot" is what a command looks like in a group chat.
         command = words[0].lower().split("@")[0]
         args = words[1:]
 
         if command in ("/help", "/start"):
-            return HELP
+            return Reply(HELP, keyboard=True)
         if command == "/status":
             return await self._status()
         if command == "/log":
@@ -228,90 +325,120 @@ class Controller:
             return self._ask_close()
         if command == "/yes":
             return self._confirm(args)
-        return f"unknown command {html.escape(command)} -- /help"
+        return Reply(f"Unknown command {html.escape(command)}.", keyboard=True)
 
-    async def _status(self) -> str:
+    async def press(self, data: str) -> Reply:
+        """Answer a button press. The reply replaces the pressed message."""
+        action, _, code = (data or "").partition(":")
+        if action == "refresh":
+            return await self._status() if code == "status" else self._log([])
+        pending = self.pending
+        if pending is None or code != pending.code or self.clock() > pending.expires_at:
+            # Not cleared: a stale button on an old message must not cancel
+            # the question that is actually open.
+            return Reply("⌛ This button has expired. Ask again.")
+        self.pending = None
+        if action == "cancel":
+            return Reply("Cancelled.")
+        if action != pending.action:
+            return Reply("⌛ This button has expired. Ask again.")
+        return self._execute(pending)
+
+    # -- answers -----------------------------------------------------------------
+
+    async def _status(self) -> Reply:
+        refresh = [[("🔄 Refresh", "refresh:status")]]
         if self.busy and self.work_kind == "close":
-            return "closing positions -- /status again when it is done"
+            return Reply("Closing positions...", refresh)
         if self.busy:
             minutes = (self.clock() - self.work_started) / 60
             if self.strategy is None:
-                return f"<b>{self.mode_word} run starting</b> ({minutes:.0f} min)"
+                return Reply(f"<b>{self.mode_word} run starting</b> ({minutes:.0f} min)", refresh)
             try:
                 lines = self.strategy.status_lines()
             except Exception as exc:  # noqa: BLE001 - a status must never fail the run
-                return f"<b>{self.mode_word} run</b>, {minutes:.0f} min -- status unavailable: {html.escape(describe(exc))}"
+                return Reply(
+                    f"<b>{self.mode_word} run</b>, {minutes:.0f} min -- status unavailable: "
+                    f"{html.escape(describe(exc))}", refresh,
+                )
             body = "\n".join(line.strip() for line in lines if line.strip())
-            return f"<b>{self.mode_word} run</b>, {minutes:.0f} min\n<pre>{html.escape(body)}</pre>"
+            return Reply(
+                f"<b>{self.mode_word} run</b>, {minutes:.0f} min\n<pre>{html.escape(body)}</pre>",
+                refresh,
+            )
         try:
             text = await self.status_fn(copy.deepcopy(self.config))
         except Exception as exc:  # noqa: BLE001 - report it, keep listening
-            return f"idle -- could not read positions: {html.escape(describe(exc))}"
+            return Reply(f"Idle -- could not read positions: {html.escape(describe(exc))}", refresh)
         text = "\n".join(line for line in text.splitlines() if not _ACCOUNT_LINE.match(line))
-        return f"<b>idle</b> ({self.mode_word})\n<pre>{html.escape(text[-_MAX_TEXT:])}</pre>"
+        return Reply(
+            f"<b>Idle</b> ({self.mode_word})\n<pre>{html.escape(text[-_MAX_TEXT:])}</pre>", refresh,
+        )
 
-    def _log(self, args: list[str]) -> str:
+    def _log(self, args: list[str]) -> Reply:
         try:
             wanted = int(args[0]) if args else LOG_LINES_DEFAULT
         except ValueError:
-            return "usage: /log [number of lines]"
+            return Reply("Usage: /log 30")
         wanted = max(1, min(wanted, LOG_LINES_MAX))
         try:
             with open(self.log_path, encoding="utf-8", errors="replace") as handle:
                 lines = handle.readlines()[-wanted:]
         except OSError as exc:
-            return f"could not read {html.escape(self.log_path)}: {html.escape(str(exc))}"
+            return Reply(f"Could not read {html.escape(self.log_path)}: {html.escape(str(exc))}")
         # The date is the same on every line of a recent tail; the time is not.
         text = "".join(line[11:] if line[:4].isdigit() else line for line in lines)
-        return f"<pre>{html.escape(text[-_MAX_TEXT:])}</pre>"
+        return Reply(f"<pre>{html.escape(text[-_MAX_TEXT:])}</pre>", [[("🔄 Refresh", "refresh:log")]])
 
-    def _stop(self) -> str:
+    def _stop(self) -> Reply:
         if not self.busy:
-            return "nothing is running"
+            return Reply("Nothing is running.")
         if self.work_kind == "close":
-            return "a close is in progress -- it cannot be stopped halfway"
+            return Reply("A close is in progress -- it cannot be stopped halfway.")
         if self.strategy is None:
-            return "the run is still starting -- send /stop again in a few seconds"
+            return Reply("The run is still starting -- press Stop again in a few seconds.")
         self.strategy.request_stop("telegram")
-        return "stopping -- orders are cancelled, open positions stay. /close closes them."
+        return Reply("⏹ Stopping -- orders are cancelled, open positions stay. 🛑 Close all closes them.")
 
-    def _ask_run(self, args: list[str]) -> str:
+    def _goal(self, volume: float | None) -> str:
+        if volume is not None:
+            return f"volume target ${volume:,.0f}"
+        target = self.config.target
+        goals = []
+        if target.volume_usd > 0:
+            goals.append(f"volume ${target.volume_usd:,.0f}")
+        if target.burn_usd > 0:
+            goals.append(f"fees ${target.burn_usd:,.2f}")
+        if target.cycles > 0:
+            goals.append(f"{target.cycles} cycle(s)")
+        return ", ".join(goals) or "no target -- runs until Stop"
+
+    def _ask_run(self, args: list[str]) -> Reply:
         if self.busy:
-            return f"a {self.work_kind} is already in progress -- /stop it first"
+            return Reply(f"A {self.work_kind} is already in progress -- stop it first.")
         volume = None
         if args:
             volume = _parse_amount(args[0])
             if volume is None or volume <= 0:
-                return "usage: /run or /run 100000 (volume target in $)"
-        target = self.config.target
-        if volume is not None:
-            goal = f"volume target ${volume:,.0f}"
-        else:
-            goals = []
-            if target.volume_usd > 0:
-                goals.append(f"volume ${target.volume_usd:,.0f}")
-            if target.burn_usd > 0:
-                goals.append(f"fees ${target.burn_usd:,.2f}")
-            if target.cycles > 0:
-                goals.append(f"{target.cycles} cycle(s)")
-            goal = "targets from settings: " + (", ".join(goals) or "none -- runs until /stop")
+                return Reply("Usage: /run or /run 250k (volume target in $)")
         code = self._new_pending("run", volume)
         markets = ", ".join(leg.symbol for leg in self.config.active_legs)
-        return (
-            f"Start a <b>{self.mode_word}</b> run: {html.escape(self.config.mode)} mode, "
-            f"{html.escape(markets)}, {html.escape(goal)}.\n"
-            f"Confirm within {CONFIRM_TTL_S:.0f}s: /yes {code}"
+        other = "" if volume is not None else "\nAnother target: type /run 250k"
+        return Reply(
+            f"Start a <b>{self.mode_word}</b> run?\n"
+            f"{html.escape(self.config.mode)} mode, {html.escape(markets)}\n"
+            f"{html.escape(self._goal(volume))}{other}",
+            [[("▶️ Start", f"run:{code}"), ("❌ Cancel", f"cancel:{code}")]],
         )
 
-    def _ask_close(self) -> str:
+    def _ask_close(self) -> Reply:
         if self.busy and self.work_kind == "close":
-            return "a close is already in progress"
+            return Reply("A close is already in progress.")
         code = self._new_pending("close")
-        first = "stop the current run, then " if self.busy else ""
-        return (
-            f"This will {first}close <b>every position at market</b> on every "
-            f"account ({self.mode_word}).\n"
-            f"Confirm within {CONFIRM_TTL_S:.0f}s: /yes {code}"
+        first = "Stop the current run, then close" if self.busy else "Close"
+        return Reply(
+            f"{first} <b>every position at market</b> on every account ({self.mode_word})?",
+            [[("✅ Yes, close all", f"close:{code}"), ("❌ Cancel", f"cancel:{code}")]],
         )
 
     def _new_pending(self, action: str, volume: float | None = None) -> str:
@@ -319,25 +446,33 @@ class Controller:
         self.pending = Pending(action, code, self.clock() + CONFIRM_TTL_S, volume)
         return code
 
-    def _confirm(self, args: list[str]) -> str:
+    def _confirm(self, args: list[str]) -> Reply:
+        """The typed confirmation, `/yes CODE`, for anyone not using buttons."""
         pending, self.pending = self.pending, None
         if pending is None or self.clock() > pending.expires_at:
-            return "nothing to confirm -- it expired or was never asked"
+            return Reply("Nothing to confirm -- it expired or was never asked.")
         if not args or args[0] != pending.code:
             # Cleared either way: one wrong guess ends it.
-            return "wrong code -- cancelled. Ask again."
+            return Reply("Wrong code -- cancelled. Ask again.")
+        return self._execute(pending)
+
+    def _execute(self, pending: Pending) -> Reply:
         if pending.action == "run":
             if self.busy:
-                return f"a {self.work_kind} started meanwhile -- not starting another"
+                return Reply(f"A {self.work_kind} started meanwhile -- not starting another.")
             self._start("run", self._do_run(pending.volume))
-            return f"starting the {self.mode_word} run. /status to watch, /stop to stop."
+            return Reply(
+                f"▶️ Starting the <b>{self.mode_word}</b> run: "
+                f"{html.escape(self._goal(pending.volume))}.",
+                [[("📊 Status", "refresh:status")]],
+            )
         if pending.action == "close":
             if self.busy and self.work_kind == "close":
-                return "a close is already in progress"
+                return Reply("A close is already in progress.")
             previous = self.work if self.busy else None
             self._start("close", self._do_close(previous))
-            return "closing every position at market -- I will report when done."
-        return "nothing to confirm"
+            return Reply("🛑 Closing every position at market -- I will report when done.")
+        return Reply("Nothing to confirm.")
 
     # -- work --------------------------------------------------------------
 
@@ -354,9 +489,9 @@ class Controller:
             code = await self.run_fn(config, self.dry_run, on_strategy=self._set_strategy)
         except Exception as exc:  # noqa: BLE001 - reported, and the loop carries on
             log.exception("run started from telegram failed")
-            await self.send(f"⚠️ the run ended with an error: {html.escape(describe(exc))}\n/status to check.")
+            await self.send(f"⚠️ The run ended with an error: {html.escape(describe(exc))}")
         else:
-            await self.send(f"run ended (exit code {code}). /status to check, /run for another.")
+            await self.send(f"The run has ended (exit code {code}).")
         finally:
             self.strategy = None
 
@@ -368,7 +503,7 @@ class Controller:
             while not running.done() and self.strategy is None:
                 await asyncio.sleep(0.5)
             if self.strategy is not None:
-                self.strategy.request_stop("telegram /close")
+                self.strategy.request_stop("telegram close")
             # Waited for, not cancelled: a run cut off between sending an order
             # and hearing back leaves exactly the order nobody can account for.
             with contextlib.suppress(Exception):
@@ -381,13 +516,13 @@ class Controller:
             code = await self.flatten_fn(copy.deepcopy(self.config), self.dry_run)
         except Exception as exc:  # noqa: BLE001 - reported
             log.exception("close started from telegram failed")
-            await self.send(f"⚠️ close failed: {html.escape(describe(exc))} -- check /status now")
+            await self.send(f"⚠️ Close failed: {html.escape(describe(exc))} -- check Status now.")
             return
         finally:
             if self.alerts is not None:
                 self.alerts.detach(_BOT_LOG)
         verdict = "done" if code == 0 else f"finished with exit code {code}"
-        await self.send(f"close {verdict}. /status to check what is left.")
+        await self.send(f"🛑 Close {verdict}. Press Status to see what is left.")
 
     async def shutdown(self, timeout_s: float = 120.0) -> None:
         """Let work in progress finish before the process exits."""
@@ -413,23 +548,39 @@ def _parse_amount(text: str) -> float | None:
         return None
 
 
+def _sender_allowed(sender, allowed: set[int], strangers: set[int]) -> bool:
+    if sender in allowed:
+        return True
+    if sender is not None and sender not in strangers:
+        strangers.add(sender)
+        log.warning("telegram control: ignoring messages from user id %s", sender)
+    return False
+
+
 def authorised_text(update: dict, allowed: set[int], strangers: set[int]) -> str | None:
-    """The text of an update from an allowed user, or None.
+    """The text of a message from an allowed user, or None.
 
     Judged by who SENT it, not by the chat it is in: a group the bot was added
     to has members who are not on the list.
     """
     message = update.get("message") or {}
     sender = (message.get("from") or {}).get("id")
-    if sender not in allowed:
-        if sender is not None and sender not in strangers:
-            strangers.add(sender)
-            log.warning("telegram control: ignoring messages from user id %s", sender)
+    if not _sender_allowed(sender, allowed, strangers):
         return None
     text = message.get("text")
     if text:
         log.info("telegram command from %s: %s", sender, text[:60])
     return text
+
+
+def authorised_press(update: dict, allowed: set[int], strangers: set[int]) -> dict | None:
+    """A button press by an allowed user, or None. Judged by who pressed it."""
+    press = update.get("callback_query") or {}
+    sender = (press.get("from") or {}).get("id")
+    if not _sender_allowed(sender, allowed, strangers):
+        return None
+    log.info("telegram button from %s: %s", sender, (press.get("data") or "").split(":")[0])
+    return press
 
 
 async def capture_status(config) -> str:
@@ -440,6 +591,30 @@ async def capture_status(config) -> str:
     with contextlib.redirect_stdout(buffer):
         await cmd_status(config)
     return buffer.getvalue()
+
+
+async def _handle_update(update: dict, api: BotApi, controller: Controller,
+                         allowed: set[int], strangers: set[int]) -> None:
+    if "callback_query" in update:
+        press = authorised_press(update, allowed, strangers)
+        if press is None:
+            return
+        with contextlib.suppress(Exception):
+            await api.answer(press["id"])
+        reply = await controller.press(press.get("data") or "")
+        message = press.get("message") or {}
+        chat = (message.get("chat") or {}).get("id")
+        if chat is not None and message.get("message_id") is not None:
+            await api.edit(chat, message["message_id"], reply)
+        return
+
+    text = authorised_text(update, allowed, strangers)
+    if text is None:
+        return
+    reply = await controller.handle(text)
+    chat = ((update.get("message") or {}).get("chat") or {}).get("id")
+    if reply is not None and chat is not None:
+        await api.send(chat, reply)
 
 
 async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
@@ -464,6 +639,7 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
 
     try:
         async with aiohttp.ClientSession() as session:
+            api = BotApi(session, telegram.bot_token)
             try:
                 dropped = await poller.skip_backlog(session)
             except PollConflict:
@@ -473,9 +649,16 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
                 log.info("telegram control: ignored %d command(s) sent while it was off", dropped)
             log.info("telegram control is on (%s) for user id(s) %s",
                      controller.mode_word, ", ".join(map(str, sorted(allowed))))
-            print(f"\n  Telegram control is on ({controller.mode_word}). Send /help to the bot.")
+            print(f"\n  Telegram control is on ({controller.mode_word}). Use the buttons in the chat.")
             print("  Ctrl+C here stops listening; a run in progress is stopped first.\n")
-            await notifier.send(f"control is on (<b>{controller.mode_word}</b>). /help")
+            hello = Reply(f"✅ Control is on (<b>{controller.mode_word}</b>). Use the buttons below.",
+                          keyboard=True)
+            for user_id in sorted(allowed):
+                try:
+                    await api.send(user_id, hello)
+                except Exception as exc:  # noqa: BLE001 - one unreachable user must not stop it
+                    log.warning("telegram: could not message %s: %s", user_id,
+                                notifier._redacted(describe(exc)))
 
             while True:
                 try:
@@ -483,7 +666,7 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
                     backoff = 5.0
                 except PollConflict:
                     log.error("another process is polling this bot token -- is a second copy running?")
-                    await notifier.send("⚠️ another process is polling this bot -- is a second copy running?")
+                    await notifier.send("⚠️ Another process is polling this bot -- is a second copy running?")
                     await asyncio.sleep(30)
                     continue
                 except asyncio.CancelledError:
@@ -495,16 +678,12 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
                     continue
 
                 for update in batch:
-                    text = authorised_text(update, allowed, strangers)
-                    if text is None:
-                        continue
                     try:
-                        reply = await controller.handle(text)
-                    except Exception as exc:  # noqa: BLE001 - one bad command must not end the loop
-                        log.exception("telegram command failed")
-                        reply = f"⚠️ {html.escape(describe(exc))}"
-                    if reply:
-                        await notifier.send(reply)
+                        await _handle_update(update, api, controller, allowed, strangers)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # noqa: BLE001 - one bad update must not end the loop
+                        log.warning("telegram update failed: %s", notifier._redacted(describe(exc)))
     finally:
         await controller.shutdown()
         await notifier.drain()

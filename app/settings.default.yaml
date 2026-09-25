@@ -363,9 +363,10 @@ max_margin_fraction: 0.25
 #  proxy, messages go through it too; a SOCKS proxy is not applied to them.
 #
 #  The same bot can also take COMMANDS: menu item "Telegram Control", or
-#  `run.bat telegram --live`. Leave that window open and, from the phone:
-#  /run (or /run 100000 for a volume target), /stop, /close, /status, /log.
-#  /run and /close ask for a one-time code first. Only the user_ids above are
+#  `run.bat telegram --live`. Leave that window open, and the chat gets
+#  buttons: Status, Run, Stop, Close all, Log (/run 250k for another volume
+#  target). Run and Close all are confirmed with a button that works once, for
+#  a minute. Only the user_ids above are
 #  answered, and the key password is asked once when the window is started --
 #  after a server reboot it has to be started again by hand.
 #
