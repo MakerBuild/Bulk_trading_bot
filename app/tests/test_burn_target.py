@@ -43,6 +43,7 @@ class FakeStrategy:
     # accounts it reads are grouped by signing key the way the real run
     # groups them.
     _read_totals = Strategy._read_totals
+    _totals_failed = Strategy._totals_failed
     _trees = Strategy._trees
     _spread_cost = Strategy._spread_cost
     _cost_text = Strategy._cost_text
@@ -330,9 +331,14 @@ async def test_a_second_check_inside_the_window_does_not_read_again(totals):
     assert totals.reads == before, "the history was walked again inside the window"
 
 
-async def test_a_failed_read_is_not_remembered(totals, monkeypatch):
-    """Holding "not reached" for half a minute would turn one unreachable
-    endpoint into a run that cannot notice its own goal."""
+async def test_a_failed_read_is_held_only_briefly(totals, monkeypatch):
+    """Holding "not reached" for the whole freshness window would turn one
+    unreachable endpoint into a run slow to notice its own goal. Not holding
+    it at all retried every second, and from Tokyo kept a 429 going."""
+    import time
+
+    from bulkdn.strategy import TARGET_FRESHNESS_S, TARGET_RETRY_S
+
     strategy = FakeStrategy(
         ExecutionTarget(volume_usd=1000.0), _started_at(0.0, volume=0.0)
     )
@@ -342,7 +348,10 @@ async def test_a_failed_read_is_not_remembered(totals, monkeypatch):
 
     strategy._read_totals = boom
     assert await strategy.reached() is None
-    assert strategy._target_answer == (0.0, None), "a failure was cached"
+    read_at, answer = strategy._target_answer
+    assert answer is None, "a failure was recorded as an answer"
+    next_read_in = read_at + TARGET_FRESHNESS_S - time.monotonic()
+    assert 0 < next_read_in <= TARGET_RETRY_S + 0.5
 
 
 # -- the cost is split into what is ours to change --------------------------

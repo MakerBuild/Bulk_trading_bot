@@ -39,6 +39,7 @@ from .hedger import Hedger
 from .pairing import Pairing
 from .positions import PositionBook
 from . import proxy
+from . import ratelimit
 from . import screen as screen_mod
 from .reconcile import (
     cancel_all_orders,
@@ -1359,6 +1360,10 @@ def main(argv: list[str] | None = None) -> int:
     except proxy.ProxyError as exc:
         print(f"proxy error: {exc}", file=sys.stderr)
         return 1
+
+    # Before anything reads an account. See ratelimit for why every path
+    # through the transport, the SDK's included, has to share one pace.
+    ratelimit.install(config.http_url)
 
     dry_run = not getattr(args, "live", False)
     if not dry_run:

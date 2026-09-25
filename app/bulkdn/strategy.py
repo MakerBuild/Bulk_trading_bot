@@ -140,6 +140,12 @@ POSITION_FRESHNESS_S = 0.5
 # is already soft by design -- it is checked between cycles, never mid-
 # position -- so a late stop is the same kind of late it already was.
 TARGET_FRESHNESS_S = 30.0
+# How soon a FAILED read of the totals is tried again. A failure used to be
+# retried on the next pass of whatever asked -- about once a second from the
+# dispatcher and the status block alike -- and each retry was a twelve-account
+# walk of `/account`. From Tokyo the first 429 kept itself going that way: the
+# log showed the same warning every second until the run was stopped.
+TARGET_RETRY_S = 10.0
 
 
 def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
@@ -2688,6 +2694,7 @@ class Strategy:
             totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - cosmetic
             log.debug("could not refresh the totals: %s", describe(exc))
+            self._totals_failed()
             return
         if not self.state.has_baseline or self.state.baseline_at != since:
             return  # the run's window moved while this was reading
@@ -2911,6 +2918,7 @@ class Strategy:
                 totals = await self._read_totals()
             except Exception as exc:  # noqa: BLE001 - cosmetic
                 log.debug("could not read totals for the progress line: %s", describe(exc))
+                self._totals_failed()
                 return ""
             # Counted the same way the target counts, or the notification
             # would report one number while the stop rule acted on another.
@@ -2965,6 +2973,18 @@ class Strategy:
             f"fees ${burned:,.2f} + spread/slippage ${spread:,.2f} "
             f"= ${burned + spread:,.2f}"
         )
+
+    def _totals_failed(self) -> None:
+        """Hold off reading the totals again for TARGET_RETRY_S.
+
+        Done by aging the last read's timestamp rather than with a separate
+        clock, because every reader -- the target check, the status block, the
+        progress line -- already waits on that one. The answer it carried is
+        kept: a failure says nothing new about whether the target was met.
+        """
+        _read_at, answer = getattr(self, "_target_answer", (0.0, None))
+        retry_from = time.monotonic() - TARGET_FRESHNESS_S + TARGET_RETRY_S
+        self._target_answer = (retry_from, answer)
 
     async def _read_totals(self):
         """The fill history, read without stopping everything else.
@@ -3067,6 +3087,7 @@ class Strategy:
             totals = await self._read_totals()
         except Exception as exc:  # noqa: BLE001 - never block trading on this
             log.warning("could not read fill history for the execution target: %s", describe(exc))
+            self._totals_failed()
             return None
 
         burned = _burned(totals.fees_usd)
@@ -3081,10 +3102,10 @@ class Strategy:
             answer = f"burned ${burned:,.4f} of ${target.burn_usd:,.2f}"
         elif target.volume_usd > 0 and volume >= target.volume_usd:
             answer = f"qualifying volume ${volume:,.2f} of ${target.volume_usd:,.2f}"
-        # Cached only on a successful read. A failure is deliberately not
-        # remembered: it is reported as "not reached", and holding that for
-        # half a minute would turn one unreachable endpoint into a run that
-        # cannot notice its own goal.
+        # A failure is remembered too, but only for TARGET_RETRY_S and without
+        # an answer of its own (see `_totals_failed`): long enough not to
+        # hammer an endpoint that is refusing us, short enough that a goal
+        # reached meanwhile is still noticed within seconds.
         self._target_answer = (time.monotonic(), answer)
         # The status block redraws every second off this, and used to get it
         # only when a cycle finished -- so a six-minute OPEN phase showed
