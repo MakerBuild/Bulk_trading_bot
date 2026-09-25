@@ -41,6 +41,7 @@ from .cli import (
 )
 from .config import Config, ConfigError, LegConfig
 from .retry import describe
+from .scripts import script, venv_folder
 from . import proxy
 
 log = logging.getLogger(__name__)
@@ -846,7 +847,7 @@ def _delete(path: pathlib.Path, settings: pathlib.Path | None = None) -> str:
             if not template.exists():
                 return (
                     f"  FAILED  {_shown(path)}  ({_shown(template)} is missing, "
-                    "so there is nothing to reset to -- run update.bat)"
+                    f"so there is nothing to reset to -- run {script('update')})"
                 )
             shutil.copyfile(template, path)
             return f"  reset {_shown(path)} to the shipped defaults"
@@ -924,11 +925,11 @@ def _venv_note() -> list[str]:
     return [
         "",
         f"  Not removable from here: {_shown(venv)}  ({_human_size(_size_of(venv))})",
-        "    No settings live in it -- but your Windows username does, in",
+        "    No settings live in it -- but your username does, in",
         "    pyvenv.cfg, the activate scripts and the pip shims. The bot is",
         "    running from inside it, so it cannot delete itself.",
-        "    To finish: close this window, delete the app\\.venv folder,",
-        "    then run install.bat to build a fresh one.",
+        f"    To finish: close this window, delete the {venv_folder()} folder,",
+        f"    then run {script('install')} to build a fresh one.",
     ]
 
 

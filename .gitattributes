@@ -3,6 +3,12 @@
 # missed, and `goto` then falls off the end of the file.
 *.bat text eol=crlf
 
+# And shell scripts must reach Linux with LF. bash reads a carriage return as
+# part of the word before it: `then\r` is not `then`, and the script fails on
+# its first line with an error that shows nothing wrong -- whatever the
+# checkout settings of the Windows machine they were last committed from.
+*.sh text eol=lf
+
 # The vendored SDK. Git detects binary content on its own, but a wheel is a zip
 # and a single byte of line-ending conversion would produce an archive that
 # fails to open on someone else's machine, days later, with no clue as to why.

@@ -21,6 +21,8 @@ VENV_PYTHON = os.path.join(
     "Scripts" if os.name == "nt" else "bin",
     "python.exe" if os.name == "nt" else "python",
 )
+# Not bulkdn.scripts: this runs precisely when the package cannot be imported.
+_SCRIPT = "%s.bat" if os.name == "nt" else "./%s.sh"
 
 
 def _explain(problem: str) -> int:
@@ -32,14 +34,14 @@ def _explain(problem: str) -> int:
     if os.path.exists(VENV_PYTHON) and not sys.executable.startswith(venv_root):
         print(f"  expected: {VENV_PYTHON}\n", file=sys.stderr)
         print("Start it with the launcher instead:\n", file=sys.stderr)
-        print("  run.bat", file=sys.stderr)
+        print(f"  {_SCRIPT % 'run'}", file=sys.stderr)
         return 1
 
     # Right interpreter, wrong SDK build. The PyPI wheel omits the trailing
     # signature-domain byte the API requires, so it cannot sign anything the
     # exchange will accept -- see the Setup section of the README.
     print("\nDependencies are missing. Install them with:\n", file=sys.stderr)
-    print("  install.bat", file=sys.stderr)
+    print(f"  {_SCRIPT % 'install'}", file=sys.stderr)
     return 1
 
 

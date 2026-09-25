@@ -43,8 +43,11 @@ async def test_without_a_console_the_watcher_does_nothing(monkeypatch):
     assert asked == []
 
 
-def test_no_reader_off_windows(monkeypatch):
+def test_no_reader_on_linux_when_stdin_is_not_a_terminal(monkeypatch):
+    """A systemd service, a pipe: nothing to read keys from, and nothing to
+    put into cbreak mode."""
     monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "stdin", type("X", (), {"isatty": lambda self: False})())
     assert console._make_reader() is None
 
 

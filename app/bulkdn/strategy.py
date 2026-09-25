@@ -45,6 +45,7 @@ from .notify import Notifier
 from .accounts import short_pubkey
 from .pairing import Group, Pairing
 from .positions import PositionBook, SeenTrades
+from .scripts import script
 from .reconcile import (
     cancel_all_orders,
     flatten,
@@ -3135,7 +3136,7 @@ class Strategy:
             await cancel_all_orders(self.all_sessions, self.symbols)
             raise RuntimeError(
                 f"state file records a halt: {self.state.halted_reason}. "
-                "Read that reason first. Then `run.bat flatten --live` to clear "
+                f"Read that reason first. Then `{script('run')} flatten --live` to clear "
                 "it -- that cancels every order, closes both accounts "
                 "reduce-only (a no-op when they are already flat), and resets "
                 "the state to IDLE."

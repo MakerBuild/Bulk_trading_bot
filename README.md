@@ -199,6 +199,8 @@ Open it in Notepad, **Save As**, Encoding **UTF-8**.
 | `install.bat` | one-time setup |
 | `update.bat` | fetch the latest version; leaves your settings and keys alone |
 | `run.bat` | start the bot |
+| `install.sh`, `update.sh`, `run.sh` | the same three on Linux (Ubuntu 24.04) |
+| `service.sh` | Linux: keep Telegram control running across reboots (systemd) |
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your master key(s), one per line |
 | `proxy.local` | optional proxy, if BULK is blocked where you are |

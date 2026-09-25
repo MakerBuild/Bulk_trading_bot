@@ -30,6 +30,7 @@ import pathlib
 import urllib.parse
 
 from .retry import describe
+from .scripts import script, venv_python
 
 log = logging.getLogger(__name__)
 
@@ -168,8 +169,8 @@ def _require_socks_support(source: str) -> None:
     if missing:
         raise ProxyError(
             f"{source} asks for a SOCKS proxy but {' and '.join(missing)} "
-            "is not installed. Run install.bat again, or:\n"
-            "    app\\.venv\\Scripts\\python.exe -m pip install python-socks PySocks"
+            f"is not installed. Run {script('install')} again, or:\n"
+            f"    {venv_python()} -m pip install python-socks PySocks"
         )
 
 
