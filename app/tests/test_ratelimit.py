@@ -123,7 +123,7 @@ def test_installing_twice_does_not_stack(exchange):
 async def test_a_failed_target_read_waits_before_the_next(monkeypatch):
     from bulkdn import strategy as module
     from bulkdn.state import StrategyState
-    from bulkdn.strategy import Strategy
+    from bulkdn.strategy import NEVER, Strategy
 
     clock = [1000.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
@@ -133,7 +133,7 @@ async def test_a_failed_target_read_waits_before_the_next(monkeypatch):
     })()})()
     s.state = StrategyState()
     s.state.baseline_at = 1.0
-    s._target_answer = (0.0, None)
+    s._target_answer = (NEVER, None)
     reads = []
 
     async def refused():

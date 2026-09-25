@@ -147,6 +147,14 @@ TARGET_FRESHNESS_S = 30.0
 # log showed the same warning every second until the run was stopped.
 TARGET_RETRY_S = 10.0
 
+# "Never happened", for a monotonic timestamp. Not 0.0: on Linux the monotonic
+# clock counts from boot, and the bot starts as a service seconds after one.
+# With 0.0, `now - 0.0 < 30` held for the first half-minute of the machine's
+# life -- the target was taken as read moments ago and not read at all, and
+# the first position syncs waited out windows that had never begun. Found by
+# a test suite that failed only on a freshly booted Linux VM.
+NEVER = float("-inf")
+
 
 def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
     """How long a phase may run, in seconds. 0 means no limit.
@@ -237,7 +245,7 @@ class Strategy:
         # window on their own, so a drop an hour ago says nothing about this one.
         self._reconnect_times: list[float] = []
         self._sync_lock = asyncio.Lock()
-        self._synced_at = 0.0
+        self._synced_at = NEVER
         # How many fills arrived that could not be attributed to an account.
         # Counted rather than merely logged: if this is not zero at the end of
         # a run, the book was being rebuilt from HTTP rather than followed.
@@ -247,7 +255,7 @@ class Strategy:
         # it stands.
         self._book_suspect = False
         # The last execution-target answer, and when it was read.
-        self._target_answer: tuple[float, str | None] = (0.0, None)
+        self._target_answer: tuple[float, str | None] = (NEVER, None)
         # The largest size each leg may be drawn at, captured after the
         # margin plan has had its say. A range is written in the settings
         # file, but what the accounts can actually carry is decided at
@@ -1694,8 +1702,8 @@ class Strategy:
         position read is a single pair of HTTP calls, and running either twice
         as often would buy nothing.
         """
-        last_reconcile = 0.0
-        last_sync = 0.0
+        last_reconcile = NEVER
+        last_sync = NEVER
         while not self._stop.is_set():
             violations = self.risk.check()
             for pass_number in range(MAX_HEAL_PASSES):
@@ -2664,7 +2672,7 @@ class Strategy:
             # target was met, and once it was, nothing asked again: the groups
             # still open went on closing for twenty minutes under a block that
             # no longer moved. Re-read on the same freshness clock meanwhile.
-            read_at, _answer = getattr(self, "_target_answer", (0.0, None))
+            read_at, _answer = getattr(self, "_target_answer", (NEVER, None))
             if (
                 self.config.target.measures_fills
                 and time.monotonic() - read_at >= TARGET_FRESHNESS_S
@@ -2700,7 +2708,7 @@ class Strategy:
             return  # the run's window moved while this was reading
         burned = _burned(totals.fees_usd)
         self._spread_usd = self._spread_cost(totals)
-        answer = getattr(self, "_target_answer", (0.0, None))[1]
+        answer = getattr(self, "_target_answer", (NEVER, None))[1]
         self._target_answer = (time.monotonic(), answer)
         self._progress = (burned, totals.qualifying_volume_usd)
         log.info("cost so far: %s", self._cost_text(burned))
@@ -2906,7 +2914,7 @@ class Strategy:
         target = self.config.target
         if not target.measures_fills:
             return ""
-        read_at, _answer = getattr(self, "_target_answer", (0.0, None))
+        read_at, _answer = getattr(self, "_target_answer", (NEVER, None))
         if time.monotonic() - read_at < TARGET_FRESHNESS_S:
             # The target check read it moments ago. This ran after every
             # group's cycle and walked every account's whole fill history each
@@ -2982,7 +2990,7 @@ class Strategy:
         progress line -- already waits on that one. The answer it carried is
         kept: a failure says nothing new about whether the target was met.
         """
-        _read_at, answer = getattr(self, "_target_answer", (0.0, None))
+        _read_at, answer = getattr(self, "_target_answer", (NEVER, None))
         retry_from = time.monotonic() - TARGET_FRESHNESS_S + TARGET_RETRY_S
         self._target_answer = (retry_from, answer)
 

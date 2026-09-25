@@ -25,7 +25,7 @@ import pytest
 from bulkdn.config import ConfigError, ExecutionTarget
 from bulkdn.fees import burned_usd
 from bulkdn.state import StrategyState
-from bulkdn.strategy import Strategy
+from bulkdn.strategy import NEVER, Strategy
 
 
 class FakeTotals:
@@ -82,7 +82,7 @@ class FakeStrategy:
         self.sessions = {self.master.pubkey: self.master, self.sub1.pubkey: self.sub1}
         # No cached answer: each of these tests reads once and expects the
         # read to happen.
-        self._target_answer = (0.0, None)
+        self._target_answer = (NEVER, None)
 
     async def reached(self):
         return await Strategy._target_reached(self)
@@ -204,7 +204,7 @@ async def test_a_volume_target_also_counts_from_the_start(totals):
     # The answer is cached for TARGET_FRESHNESS_S, because the read walks
     # every account's paginated fill history. In a run these two checks are
     # half a minute apart; here they are consecutive lines.
-    strategy._target_answer = (0.0, None)
+    strategy._target_answer = (NEVER, None)
     assert await strategy.reached()
 
 
@@ -464,3 +464,38 @@ async def test_a_read_that_began_before_the_baseline_is_dropped():
 
     assert reads, "the read never ran"
     assert s._progress is None, "a read over another window was shown as this run"
+
+
+# -- a machine that booted a moment ago ------------------------------------------
+#
+# The monotonic clock counts from boot on Linux, and the bot starts as a
+# service seconds after one. A "never read" stored as 0.0 looked like a read
+# made moments ago: the target went unread for the machine's first half-minute.
+# Found by these tests failing only on a freshly booted Linux VM.
+
+
+async def test_the_target_is_read_on_a_machine_that_just_booted(totals, monkeypatch):
+    import bulkdn.strategy as module
+
+    monkeypatch.setattr(module.time, "monotonic", lambda: 5.0)   # five seconds after boot
+    strategy = FakeStrategy(ExecutionTarget(volume_usd=1000.0), _started_at(0.0))
+    before = totals.reads
+    await strategy.reached()
+    assert totals.reads == before + 1, "a read that never happened was taken as fresh"
+
+
+def test_the_strategy_starts_with_never_not_zero():
+    """The fakes above mirror this; this pins the real constructor."""
+    import inspect
+
+    source = inspect.getsource(Strategy.__init__)
+    assert "self._target_answer: tuple[float, str | None] = (NEVER, None)" in source
+    assert "self._synced_at = NEVER" in source
+    assert "(0.0, None)" not in inspect.getsource(Strategy)
+
+
+def test_never_is_older_than_any_window():
+    import math
+
+    assert math.isinf(NEVER) and NEVER < 0
+    assert 5.0 - NEVER > 3600, "a fresh boot would still be inside the window"

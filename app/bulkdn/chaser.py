@@ -241,7 +241,7 @@ class Chaser:
         resting = self._resting_order(session, leg)
 
         if resting is None:
-            if leg.oid and time.monotonic() - self._placed_at.get(leg.oid, 0.0) < ACK_GRACE_S:
+            if leg.oid and time.monotonic() - self._placed_at.get(leg.oid, float("-inf")) < ACK_GRACE_S:
                 return ChaseOutcome(symbol, "waiting", "awaiting order ack")
             if leg.oid:
                 # Gone from the book: filled, or cancelled behind our back.
@@ -352,7 +352,7 @@ class Chaser:
             return True
         if oid in self._seen:
             return False
-        return time.monotonic() - self._placed_at.get(oid, 0.0) < ACK_GRACE_S
+        return time.monotonic() - self._placed_at.get(oid, float("-inf")) < ACK_GRACE_S
 
     def _resting_order(self, session: AccountSession, leg: LegState):
         if not leg.oid:
@@ -483,7 +483,7 @@ class Chaser:
             session = self.sessions.get(maker)
             order = session.client.get_order_map().get(oid) if session else None
             if order is None:
-                if oid in self._seen or now - self._placed_at.get(oid, 0.0) > ACK_GRACE_S:
+                if oid in self._seen or now - self._placed_at.get(oid, float("-inf")) > ACK_GRACE_S:
                     self._ours.pop(oid, None)
                 continue
             if order.price == price:
