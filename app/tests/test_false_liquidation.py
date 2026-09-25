@@ -214,6 +214,9 @@ class Bot:
         self._settled_by_a_fresh_read = (
             Strategy._settled_by_a_fresh_read.__get__(self)
         )
+        self._settled_after_waiting = (
+            Strategy._settled_after_waiting.__get__(self)
+        )
 
     # the pieces the guard leans on
     async def _sync_positions(self, max_age_s=0.0):
@@ -265,8 +268,13 @@ def patch_confirm(monkeypatch, bot):
     monkeypatch.setattr("bulkdn.strategy.recent_liquidations", query)
 
 
+def no_waiting(monkeypatch):
+    monkeypatch.setattr("bulkdn.strategy.SHRINK_RECHECK_DELAYS_S", (0.0, 0.0))
+
+
 def run_guard(monkeypatch, bot):
     patch_confirm(monkeypatch, bot)
+    no_waiting(monkeypatch)
     bot.notifier = type("N", (), {"send_soon": lambda self, m: None,
                                   "halted": lambda self, r: r})()
     return asyncio.run(bot._guard_liquidation({ETH: None}))
@@ -426,6 +434,7 @@ async def test_a_shrink_that_a_fresh_read_undoes_is_not_a_close(monkeypatch):
     )
     bot = bot_with([event])
     patch_confirm(monkeypatch, bot)
+    no_waiting(monkeypatch)
     # What a fresh read finds: the position never shrank.
     bot.book.set_authoritative("master-KEY", ETH, 0.3066)
 
@@ -434,6 +443,50 @@ async def test_a_shrink_that_a_fresh_read_undoes_is_not_a_close(monkeypatch):
     assert acted is False, "a stale reading must not close five accounts"
     assert bot.halted is None
     assert bot._sync_calls >= 1, "it has to actually ask before deciding"
+
+
+async def test_a_first_re_read_that_is_still_stale_is_not_the_last_word(monkeypatch):
+    """Close to the exchange the immediate re-read can itself be served from
+    before our fill and confirm the stale shrink. When the exchange denies a
+    liquidation, a later read decides instead."""
+    event = Liquidation(
+        account="master-KEY", account_name="master", symbol=ETH,
+        previous=0.3066, current=0.2066,
+    )
+    bot = bot_with([event])
+    patch_confirm(monkeypatch, bot)
+    no_waiting(monkeypatch)
+    bot.book.set_authoritative("master-KEY", ETH, 0.2066)   # the stale reading
+
+    async def reads(max_age_s=0.0):
+        bot._sync_calls += 1
+        if bot._sync_calls >= 2:                            # a later one has it
+            bot.book.set_authoritative("master-KEY", ETH, 0.3066)
+
+    bot._sync_positions = reads
+    acted = await bot._guard_liquidation({ETH: None})
+
+    assert acted is False, "one stale re-read closed every account"
+    assert bot.halted is None
+    assert bot._sync_calls == 2
+
+
+async def test_a_confirmed_liquidation_is_not_kept_waiting(monkeypatch):
+    event = Liquidation(
+        account="master-KEY", account_name="master", symbol=ETH,
+        previous=0.3066, current=0.2066,
+    )
+    bot = bot_with([event], liquidated=True)
+    patch_confirm(monkeypatch, bot)
+    monkeypatch.setattr("bulkdn.strategy.SHRINK_RECHECK_DELAYS_S", (60.0,))
+    bot.book.set_authoritative("master-KEY", ETH, 0.2066)
+    bot.notifier = type("N", (), {"send_soon": lambda self, m: None,
+                                  "halted": lambda self, r: r})()
+
+    acted = await asyncio.wait_for(bot._guard_liquidation({ETH: None}), 5)
+
+    assert acted is True
+    assert bot._sync_calls == 1, "it re-read a liquidation the exchange confirmed"
 
 
 # -- nothing hedges while the guard closes out -------------------------------

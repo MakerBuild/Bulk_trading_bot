@@ -73,6 +73,17 @@ class SeenTrades:
 # the book for good.
 CONFIRM_HOLD_S = 30.0
 
+# How far the exchange's HTTP answer may trail its own stream. A read sent
+# shortly AFTER a fill or position update reached us can still be served from
+# state that predates it. From far away the ~320ms round trip hid this: by the
+# time a read sent after an update reached the exchange, the exchange had long
+# applied it. From Tokyo the read arrives within milliseconds, and a live run
+# already caught a read sent after the stream's update answering with the
+# position from before it -- which the liquidation guard then read as a close.
+# So anything the stream said within this long before a read was sent is
+# treated as possibly newer than the answer.
+READ_LAG_S = 1.0
+
 
 @dataclass
 class _Overlay:
@@ -98,6 +109,11 @@ class PositionBook:
     # from BEFORE that fill -- once the overlay expired, the book fell back
     # to it. See `apply_read`.
     _position_at: dict[Key, float] = field(default_factory=dict)
+    # When the STREAM last wrote each key. Kept apart from `_position_at`,
+    # which reads write too: a read that finished a moment ago says nothing
+    # about whether the next one lags, while a stream update a moment ago is
+    # exactly what a lagging answer would write over. See `READ_LAG_S`.
+    _streamed_at: dict[Key, float] = field(default_factory=dict)
     # Keys whose last read could not be applied because a fill had arrived
     # after it was sent. See `apply_read`.
     _awaiting_read: set[Key] = field(default_factory=set)
@@ -114,7 +130,9 @@ class PositionBook:
         key = (account, symbol)
         self._authoritative[key] = float(size)
         self._overlays.pop(key, None)
-        self._position_at[key] = time.monotonic()
+        now = time.monotonic()
+        self._position_at[key] = now
+        self._streamed_at[key] = now
         self._awaiting_read.discard(key)
 
     def apply_snapshot(self, account: str, positions: Iterable) -> None:
@@ -173,6 +191,12 @@ class PositionBook:
         caller forces it for such a socket, and keeps hedges waiting on reads
         until the socket catches up.
 
+        "After `requested_at`" is widened by `READ_LAG_S` for what the stream
+        said: the answer can trail the stream, so an update or fill from just
+        before the read was sent may still be missing from it. Reads are not
+        widened -- one read finishing just before the next says nothing about
+        either lagging.
+
         Returns the symbols that were skipped, for the log.
         """
         fresh = {(account, p.symbol): float(p.size) for p in positions}
@@ -180,15 +204,14 @@ class PositionBook:
             fresh.setdefault(key, 0.0)
         skipped = []
         now = time.monotonic()
+        stream_cutoff = requested_at - READ_LAG_S
         for key, size in fresh.items():
-            if force:
-                pass
-            elif self._position_at.get(key, 0.0) > requested_at:
-                skipped.append(key[1])
-                self._awaiting_read.discard(key)
-                continue
+            # Fills first. A stream position update drops every overlay, so
+            # one still here arrived after the stream last spoke and is newer
+            # than it too -- skipping on the stream alone would leave it to
+            # lapse on its ordinary clock, back to the position before it.
             later = [] if force else [
-                o for o in self._overlays.get(key, ()) if o.added_at > requested_at
+                o for o in self._overlays.get(key, ()) if o.added_at > stream_cutoff
             ]
             if later:
                 skipped.append(key[1])
@@ -199,6 +222,13 @@ class PositionBook:
                 for overlay in later:
                     overlay.expires_at = max(overlay.expires_at, hold_until)
                 self._awaiting_read.add(key)
+                continue
+            if not force and (
+                self._position_at.get(key, 0.0) > requested_at
+                or self._streamed_at.get(key, 0.0) > stream_cutoff
+            ):
+                skipped.append(key[1])
+                self._awaiting_read.discard(key)
                 continue
             self._authoritative[key] = size
             self._position_at[key] = now

@@ -12,7 +12,7 @@ import pytest
 from bulkdn.feed import MarketFeed
 from bulkdn.hedger import LegRoles
 from bulkdn.marketdata import MarketSpec, epoch_seconds, min_order_size
-from bulkdn.positions import PositionBook
+from bulkdn.positions import READ_LAG_S, PositionBook
 from bulkdn.risk import RiskMonitor
 from bulkdn.config import RiskConfig
 from bulkdn.strategy import Strategy
@@ -257,6 +257,7 @@ async def test_a_close_that_raises_still_halts():
     obj._deferred_to_our_own_orders = no
     obj._settled_by_a_fresh_read = no
     obj._liquidation_confirmed = no
+    obj._settled_after_waiting = no
 
     import bulkdn.strategy as strategy_module
 
@@ -302,11 +303,51 @@ def test_the_confirming_read_settles_it_without_counting_twice():
     book.apply_fill("m", BTC, is_buy=False, size=0.5)
     book.apply_read("m", [P(BTC, 0.5)], requested_at=sent)
 
-    book.apply_read("m", [P(BTC, 0.0)], requested_at=time.monotonic())
+    # Sent once the exchange's answer can no longer be trailing the fill.
+    book.apply_read("m", [P(BTC, 0.0)], requested_at=time.monotonic() + READ_LAG_S)
 
     assert book.effective("m", BTC) == pytest.approx(0.0)
     assert book.authoritative("m", BTC) == pytest.approx(0.0)
     assert not book.awaiting_read()
+
+
+# -- an answer that trails the stream ------------------------------------------
+#
+# From far away a read took ~320ms to reach the exchange, so one sent after a
+# stream update arrived long after the exchange had applied it. From Tokyo it
+# arrives in milliseconds and can be served from state from before the update:
+# a live run caught a read sent after the stream's update answering with the
+# older position, and the liquidation guard read that as a close.
+
+
+def test_a_read_sent_just_after_a_stream_update_does_not_undo_it():
+    book = PositionBook()
+    book.set_authoritative("m", BTC, 0.016505)          # the stream, after our hedge
+    sent = time.monotonic()                              # a read, a moment later
+    book.apply_read("m", [P(BTC, 0.015712)], requested_at=sent)  # served from before it
+
+    assert book.authoritative("m", BTC) == pytest.approx(0.016505), (
+        "a trailing answer wrote the older position over the stream's"
+    )
+
+
+def test_a_read_sent_just_after_a_fill_holds_it_for_confirmation():
+    book = PositionBook(overlay_ttl_ms=20)
+    book.set_authoritative("m", BTC, 0.5)
+    book.apply_fill("m", BTC, is_buy=False, size=0.5)
+    sent = time.monotonic()                              # after the fill, not by much
+    book.apply_read("m", [P(BTC, 0.5)], requested_at=sent)
+    time.sleep(0.05)                                     # past its ordinary ttl
+
+    assert book.effective("m", BTC) == pytest.approx(0.0), "the fill lapsed"
+    assert book.awaiting_read(), "nothing asked for a read to confirm it"
+
+
+def test_a_read_sent_well_after_the_stream_is_applied():
+    book = PositionBook()
+    book.set_authoritative("m", BTC, 0.2)
+    book.apply_read("m", [P(BTC, 0.3)], requested_at=time.monotonic() + READ_LAG_S + 0.01)
+    assert book.authoritative("m", BTC) == pytest.approx(0.3)
 
 
 def test_a_read_sent_after_every_fill_is_simply_applied():

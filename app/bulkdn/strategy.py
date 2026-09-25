@@ -86,6 +86,12 @@ STREAM_LAG_HOLD_S = 30.0
 MAX_DOUBT_DEFERRALS = 3
 DEFERRAL_WINDOW_S = 900.0
 
+# Pauses before the further reads of a shrink the exchange does not call a
+# liquidation, each after the one before. The first read is sent at once and,
+# close to the exchange, can still be served from before our own fill; one
+# sent a READ_LAG_S later cannot. See `_settled_after_waiting`.
+SHRINK_RECHECK_DELAYS_S = (1.0, 2.0)
+
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
 
@@ -602,6 +608,8 @@ class Strategy:
             return False
 
         confirmed = await self._liquidation_confirmed()
+        if not confirmed and await self._settled_after_waiting(events):
+            return False
         label = "liquidation" if confirmed else "position closed externally"
         for event in events:
             log.critical("%s: %s", label.upper(), event.describe())
@@ -1414,6 +1422,26 @@ class Strategy:
             ", ".join(sorted({e.account_name for e in events})),
         )
         return True
+
+    async def _settled_after_waiting(self, events) -> bool:
+        """Read again, later, before closing on a shrink the exchange denies.
+
+        `_settled_by_a_fresh_read` asks at once, and close to the exchange
+        "at once" is milliseconds after our own fill -- soon enough to be
+        served from before it and to confirm the stale shrink it was meant to
+        refute. The exchange has just said it liquidated nothing, so the shrink
+        is either a manual close or a reading of ours; a few more seconds of a
+        possibly lone leg is a small price next to closing every account at
+        market over a reading.
+
+        Only on that denial. When the exchange confirms a liquidation, or
+        cannot be asked, the survivor is closed without waiting.
+        """
+        for delay in SHRINK_RECHECK_DELAYS_S:
+            await asyncio.sleep(delay)
+            if await self._settled_by_a_fresh_read(events):
+                return True
+        return False
 
     async def _liquidation_confirmed(self) -> bool:
         """Did the exchange actually liquidate something? True if it cannot say.
