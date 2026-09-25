@@ -285,10 +285,10 @@ def test_without_a_side_the_draw_still_flips_a_coin():
 #
 # Live symptom, two draws in a row on a six-account pool:
 #
-#     === group 3 drawn: BTC-USD HVvToE..JS9z SELL -> ... at 1.65bps ===
-#     === group 4 drawn: BTC-USD CVjYFS..2Zxo SELL -> ... at 1.67bps ===
-#     ... CVjYFS..2Zxo: LimitOrder(SELL 0.003407 @ 86315.009999999995 ...)
-#     ... HVvToE..JS9z: LimitOrder(SELL 0.003407 @ 86315.009999999995 ...)
+#     === group 3 drawn: BTC-USD CCCCCC..CCC3 SELL -> ... at 1.65bps ===
+#     === group 4 drawn: BTC-USD DDDDDD..DDD4 SELL -> ... at 1.67bps ===
+#     ... DDDDDD..DDD4: LimitOrder(SELL 0.003407 @ 86315.009999999995 ...)
+#     ... CCCCCC..CCC3: LimitOrder(SELL 0.003407 @ 86315.009999999995 ...)
 #
 # Two makers, one side, one price, to the cent.
 
@@ -345,8 +345,8 @@ def test_two_groups_drawn_in_one_pass_do_not_take_the_same_side():
 
     A live run opened exactly this way:
 
-        === group 1 drawn: BTC-USD 79Dg5R..DCa4 BUY ... at 2.20bps ===
-        === group 2 drawn: BTC-USD 8rr5CY..YSLm BUY ... at 2.19bps ===
+        === group 1 drawn: BTC-USD AAAAAA..AAA1 BUY ... at 2.20bps ===
+        === group 2 drawn: BTC-USD BBBBBB..BBB2 BUY ... at 2.19bps ===
     """
     obj = strategy()
     obj._groups = {}  # nothing has run yet, which is the whole point

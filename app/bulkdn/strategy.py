@@ -1008,8 +1008,8 @@ class Strategy:
         straight back round to draw again without yielding, so the second draw
         still saw an empty map. A live run opened with both groups on the bid:
 
-            === group 1 drawn: BTC-USD 79Dg5R..DCa4 BUY ... at 2.20bps ===
-            === group 2 drawn: BTC-USD 8rr5CY..YSLm BUY ... at 2.19bps ===
+            === group 1 drawn: BTC-USD AAAAAA..AAA1 BUY ... at 2.20bps ===
+            === group 2 drawn: BTC-USD BBBBBB..BBB2 BUY ... at 2.19bps ===
 
         `Pairing.draw` registers in `active` before it returns, so by the time
         the dispatcher asks about the next group, the last one is there.
