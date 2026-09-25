@@ -11,10 +11,38 @@ rem desynchronises the parser -- it does not merely render wrong, it splits
 rem commands apart and the install fails. So the guide is described here
 rem rather than named, because its name is Cyrillic.
 
+rem Which Python builds the virtualenv, when there is none yet. The one on
+rem PATH if it is new enough; otherwise the newest 3.12+ the py launcher knows
+rem of. PATH is often someone else's to decide -- other software pinned to an
+rem older Python, which a global change would break -- and python.org installs
+rem the launcher either way, so a 3.14 installed WITHOUT "Add to PATH" is
+rem enough. Only the first build asks: once app\.venv exists, every script
+rem here runs the Python inside it, whatever PATH says later.
+rem
+rem Kept as a command rather than resolved to a path: "py -3.14" has no
+rem quotes to get wrong, and an install path under Program Files would.
+set "PY_NEW=python"
+if not exist "app\.venv\Scripts\python.exe" (
+    call :suitable python
+    if errorlevel 1 (
+        for %%X in (3.14 3.13 3.12) do (
+            if "!PY_NEW!"=="python" (
+                call :suitable py -%%X
+                if not errorlevel 1 set "PY_NEW=py -%%X"
+            )
+        )
+    )
+)
+
 rem Both prerequisites are checked before anything is downloaded. Finding out
 rem git is missing halfway through a 200MB install is a poor way to learn it.
-where python >nul 2>&1
-if errorlevel 1 (
+rem PATH need not have a python when the launcher found one above.
+set "PY_ON_PATH=1"
+if "!PY_NEW!"=="python" (
+    where python >nul 2>&1
+    if errorlevel 1 set "PY_ON_PATH="
+)
+if not defined PY_ON_PATH (
     echo.
     echo   Python is not installed, or was installed without "Add to PATH".
     echo.
@@ -53,15 +81,16 @@ rem Checked here because the failure otherwise comes from inside pip, as a
 rem wall of build errors for numpy or llvmlite, and the message after it said
 rem to check the internet. Checked against the interpreter that will run the
 rem bot: the existing virtualenv if there is one, since a re-run keeps it.
-set "PY_CHECK=python"
+set "PY_CHECK=!PY_NEW!"
 if exist "app\.venv\Scripts\python.exe" set "PY_CHECK=app\.venv\Scripts\python.exe"
 set "PY_FOUND="
-rem Unquoted inside the for /f on purpose: both values above are space-free,
-rem relative to this folder, and a leading quote there makes cmd strip the
-rem wrong pair of quotes from the command.
+rem Unquoted, here and below, on purpose: every value above is space-free
+rem apart from the one between "py" and its version, which has to split. A
+rem leading quote in the for /f makes cmd strip the wrong pair of quotes, and
+rem quoting "py -3.14" would ask for a program by that whole name.
 for /f "delims=" %%V in ('!PY_CHECK! -c "import platform; print(platform.python_version(), platform.architecture()[0])" 2^>nul') do set "PY_FOUND=%%V"
 if not defined PY_FOUND set "PY_FOUND=nothing -- it did not run"
-"!PY_CHECK!" -c "import sys, struct; sys.exit(0 if sys.version_info >= (3, 12) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
+call !PY_CHECK! -c "import sys, struct; sys.exit(0 if sys.version_info >= (3, 12) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo   This needs 64-bit Python 3.12 or newer. Found: !PY_FOUND!
@@ -76,6 +105,10 @@ if errorlevel 1 (
         echo   "Add python.exe to PATH" at the bottom of the installer. If it
         echo   says it did not run, the python on PATH is usually the Microsoft
         echo   Store placeholder, which the real install replaces.
+        echo.
+        echo   If other software needs the older Python on PATH, leave that box
+        echo   UNTICKED instead: this finds a 3.12+ through the py launcher,
+        echo   and uses it for this folder only.
     )
     echo.
     echo   Full walkthrough: the step-by-step guide in this folder
@@ -83,7 +116,7 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-"!PY_CHECK!" -c "import sys; sys.exit(1 if sys.version_info[:2] > (3, 14) else 0)" >nul 2>&1
+call !PY_CHECK! -c "import sys; sys.exit(1 if sys.version_info[:2] > (3, 14) else 0)" >nul 2>&1
 if errorlevel 1 (
     echo.
     echo   Note: Python !PY_FOUND! is newer than anything this has been tested
@@ -94,7 +127,8 @@ if errorlevel 1 (
 if not exist "app\.venv\Scripts\python.exe" (
     echo.
     echo   Creating the virtualenv...
-    python -m venv app\.venv
+    echo   ^(with !PY_NEW!^)
+    call !PY_NEW! -m venv app\.venv
     if errorlevel 1 (
         echo   Could not create app\.venv -- see the error above.
         pause
@@ -333,3 +367,14 @@ pause
 rem Explicit, because update.bat calls this and reads the exit code to decide
 rem whether to say "Up to date".
 exit /b 0
+
+
+rem Whether the command given runs a 64-bit Python 3.12 or newer. Called
+rem with the command split into words -- "python", or "py -3.14".
+rem
+rem `call` here and at every other run of a Python below: a python that is
+rem a .bat -- pyenv-win's shims are -- would otherwise end this script
+rem there, since cmd does not come back from a batch file run without it.
+:suitable
+call %* -c "import sys, struct; sys.exit(0 if sys.version_info >= (3, 12) and struct.calcsize('P') == 8 else 1)" >nul 2>&1
+exit /b %errorlevel%
