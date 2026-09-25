@@ -533,3 +533,116 @@ async def test_a_switch_confirmed_after_a_run_started_does_nothing():
     assert "mode unchanged" in reply.text and h.c.dry_run is True
     h.release.set()
     await h.settle()
+
+
+# -- account management ------------------------------------------------------------------
+
+
+class MarginDesk:
+    """Fake planners and sender, standing in for menu.plan_* and submit_plan."""
+
+    def __init__(self, moves):
+        self.moves = moves
+        self.planned = []
+        self.sent = []
+
+    def planner(self, kind):
+        def plan(config):
+            self.planned.append(kind)
+            return types.SimpleNamespace(
+                lines=["\n  master 1 6r...", "  sub 1    100.00"], moves=list(self.moves),
+            )
+        return plan
+
+    def submit(self, config, moves):
+        self.sent.append(moves)
+        return [f"    {src} -> {dst} {amount:,.2f}: ok" for _t, src, dst, amount in moves]
+
+
+def with_margin(h, moves):
+    desk = MarginDesk(moves)
+    h.c.margin = {"balance": desk.planner("balance"), "collect": desk.planner("collect")}
+    h.c.submit_transfers = desk.submit
+    return desk
+
+
+MOVES = [(None, "SUB1PUBKEY11111", "MASTERPUBKEY111", 120.5),
+         (None, "SUB2PUBKEY22222", "MASTERPUBKEY111", 80.0)]
+
+
+async def test_accounts_offers_balance_and_collect():
+    h = Harness()
+    reply = await h.say("💰 Accounts")
+    assert button(reply, "⚖️") == "margin:balance"
+    assert button(reply, "⬆️") == "margin:collect"
+
+
+async def test_collect_sends_exactly_the_plan_it_showed():
+    h = Harness()
+    desk = with_margin(h, MOVES)
+    plan = await h.c.press("margin:collect")
+    assert "2 transfer(s), 200.50 in all" in plan.text
+    assert desk.sent == [], "it moved margin before it was confirmed"
+
+    reply = await h.c.press(button(plan, "✅"))
+    assert "Sending 2" in reply.text
+    await h.settle()
+    await asyncio.sleep(0.05)
+    assert desk.sent == [MOVES]
+    assert any("ok" in text for text in h.sent), "the outcome was never reported"
+
+
+async def test_no_margin_moves_during_a_run():
+    """Collecting mid-run takes the free margin an open position leans on."""
+    h = Harness()
+    desk = with_margin(h, MOVES)
+    await h.start_run()
+    reply = await h.c.press("margin:collect")
+    assert "in progress" in reply.text and not reply.buttons
+    assert desk.planned == []
+    h.release.set()
+    await h.settle()
+
+
+async def test_dry_run_shows_the_plan_and_sends_nothing():
+    h = Harness(dry_run=True)
+    desk = with_margin(h, MOVES)
+    plan = await h.c.press("margin:balance")
+    assert "DRY-RUN" in plan.text and not plan.buttons
+    assert desk.sent == []
+
+
+async def test_a_stale_transfer_button_does_nothing():
+    h = Harness()
+    desk = with_margin(h, MOVES)
+    plan = await h.c.press("margin:collect")
+    h.now += tc.CONFIRM_TTL_S + 1
+    assert "expired" in (await h.c.press(button(plan, "✅"))).text
+    assert desk.sent == []
+
+
+async def test_nothing_to_move_says_so():
+    h = Harness()
+    with_margin(h, [])
+    reply = await h.c.press("margin:collect")
+    assert "Nothing to collect" in reply.text and not reply.buttons
+
+
+async def test_no_run_starts_while_transfers_are_going():
+    h = Harness()
+    desk = with_margin(h, MOVES)
+    gate = __import__("threading").Event()
+    real = desk.submit
+
+    def slow(config, moves):
+        gate.wait(2)
+        return real(config, moves)
+
+    h.c.submit_transfers = slow
+    plan = await h.c.press("margin:collect")
+    await h.c.press(button(plan, "✅"))
+    assert "already in progress" in (await h.say("▶️ Run")).text
+    assert "Sending margin transfers" in (await h.say("📊 Status")).text
+    gate.set()
+    await asyncio.sleep(0.2)
+    assert desk.sent == [MOVES]

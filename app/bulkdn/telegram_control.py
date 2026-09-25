@@ -41,6 +41,7 @@ import io
 import logging
 import re
 import secrets
+import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -76,10 +77,12 @@ KEYBOARD = {
     "⏹ Stop": "/stop",
     "🛑 Close all": "/close",
     "📜 Log": "/log",
+    "💰 Accounts": "/accounts",
     "🔁 Live / Dry run": "/mode",
 }
 _KEYBOARD_ROWS = [
-    ["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"], ["📜 Log", "🔁 Live / Dry run"],
+    ["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"],
+    ["📜 Log", "💰 Accounts"], ["🔁 Live / Dry run"],
 ]
 
 # Spelled out down to the lines to paste: install.bat creates settings.yaml
@@ -107,6 +110,7 @@ HELP = (
     "⏹ Stop -- stop the run and cancel its orders; positions stay\n"
     "🛑 Close all -- close every position at market (stops a run first)\n"
     "📜 Log -- the last lines of logs.txt\n"
+    "💰 Accounts -- balance margin across sub-accounts, or collect it to the master\n"
     "🔁 Live / Dry run -- switch whether runs and closes trade real funds\n\n"
     "<b>Typed</b>\n"
     "/run 250k -- a run with this volume target\n"
@@ -155,6 +159,8 @@ class Pending:
     code: str
     expires_at: float
     volume: float | None = None
+    # For a margin plan: the transfers it will send, as planned when asked.
+    moves: list | None = None
 
 
 class BotApi:
@@ -271,6 +277,8 @@ class Controller:
         clock: Callable[[], float] = time.monotonic,
         make_code: Callable[[], str] | None = None,
         alerts: AlertHandler | None = None,
+        margin: dict[str, Callable] | None = None,
+        submit_transfers: Callable | None = None,
     ):
         self.config = config
         self.dry_run = dry_run
@@ -282,6 +290,10 @@ class Controller:
         self.clock = clock
         self.make_code = make_code or (lambda: secrets.token_hex(4))
         self.alerts = alerts
+        # "balance" and "collect", each config -> MarginPlan; and the sender.
+        # The same functions the menu uses, so both make the same plan.
+        self.margin = margin or {}
+        self.submit_transfers = submit_transfers
         self.pending: Pending | None = None
         self.work: asyncio.Task | None = None
         self.work_kind = ""
@@ -329,6 +341,8 @@ class Controller:
             return self._ask_close()
         if command == "/mode":
             return self._ask_mode()
+        if command == "/accounts":
+            return self._accounts_menu()
         if command == "/yes":
             return self._confirm(args)
         return Reply(f"Unknown command {html.escape(command)}.", keyboard=True)
@@ -338,6 +352,9 @@ class Controller:
         action, _, code = (data or "").partition(":")
         if action == "refresh":
             return await self._status() if code == "status" else self._log([])
+        if action == "margin":
+            # Only reads: the plan it shows is confirmed separately.
+            return await self._plan_margin(code)
         pending = self.pending
         if pending is None or code != pending.code or self.clock() > pending.expires_at:
             # Not cleared: a stale button on an old message must not cancel
@@ -356,6 +373,8 @@ class Controller:
         refresh = [[("🔄 Refresh", "refresh:status")]]
         if self.busy and self.work_kind == "close":
             return Reply("Closing positions...", refresh)
+        if self.busy and self.work_kind == "transfer":
+            return Reply("Sending margin transfers...", refresh)
         if self.busy:
             minutes = (self.clock() - self.work_started) / 60
             if self.strategy is None:
@@ -399,8 +418,8 @@ class Controller:
     def _stop(self) -> Reply:
         if not self.busy:
             return Reply("Nothing is running.")
-        if self.work_kind == "close":
-            return Reply("A close is in progress -- it cannot be stopped halfway.")
+        if self.work_kind in ("close", "transfer"):
+            return Reply(f"A {self.work_kind} is in progress -- it cannot be stopped halfway.")
         if self.strategy is None:
             return Reply("The run is still starting -- press Stop again in a few seconds.")
         self.strategy.request_stop("telegram")
@@ -440,6 +459,8 @@ class Controller:
     def _ask_close(self) -> Reply:
         if self.busy and self.work_kind == "close":
             return Reply("A close is already in progress.")
+        if self.busy and self.work_kind == "transfer":
+            return Reply("Margin transfers are being sent -- ask again when they are done.")
         code = self._new_pending("close")
         first = "Stop the current run, then close" if self.busy else "Close"
         return Reply(
@@ -474,6 +495,75 @@ class Controller:
             [[("🧪 Switch to DRY-RUN", f"dry:{code}"), ("❌ Cancel", f"cancel:{code}")]],
         )
 
+    def _accounts_menu(self) -> Reply:
+        return Reply(
+            "<b>Account management</b>\n"
+            "⚖️ Balance -- even out free margin across each master's accounts\n"
+            "⬆️ Collect -- move every sub-account's free margin up to its master\n\n"
+            "Only free (transferable) margin moves, and only inside one master's "
+            "accounts: the exchange cannot move margin between masters. "
+            "Each shows the plan first; nothing is sent until you confirm it.",
+            [[("⚖️ Balance margin", "margin:balance"), ("⬆️ Collect to master", "margin:collect")]],
+        )
+
+    async def _plan_margin(self, kind: str) -> Reply:
+        """Read the balances and show what would move. Sends nothing.
+
+        Refused while a run or a close is going: collecting to the master
+        mid-run takes the free margin a sub-account with an open position is
+        leaning on, which is how a hedged pair becomes a liquidated one.
+        """
+        planner = self.margin.get(kind)
+        if planner is None:
+            return Reply("Account management is not available here.")
+        if self.busy:
+            return Reply(
+                f"A {self.work_kind} is in progress. Move margin between runs, "
+                "not during one -- an open position may be using it."
+            )
+        try:
+            # Blocking HTTP, paced by ratelimit -- off the loop, which is
+            # still answering Telegram and must not freeze for it.
+            plan = await asyncio.to_thread(planner, copy.deepcopy(self.config))
+        except Exception as exc:  # noqa: BLE001 - reported, nothing sent
+            return Reply(f"Could not read the balances: {html.escape(describe(exc))}")
+
+        report = "\n".join(line.lstrip("\n") for line in plan.lines)
+        title = "⚖️ Balance margin" if kind == "balance" else "⬆️ Collect to master"
+        if not plan.moves:
+            nothing = "Already balanced." if kind == "balance" else "Nothing to collect."
+            return Reply(f"<b>{title}</b>\n<pre>{html.escape(report[-_MAX_TEXT:])}</pre>\n{nothing}")
+
+        moves = "\n".join(
+            f"{_short(src)} -> {_short(dst)}  {amount:,.2f}" for _tree, src, dst, amount in plan.moves
+        )
+        total = sum(amount for *_, amount in plan.moves)
+        body = (
+            f"<b>{title}</b> ({self.mode_word})\n"
+            f"<pre>{html.escape(report[-(_MAX_TEXT // 2):])}</pre>\n"
+            f"<b>{len(plan.moves)} transfer(s), {total:,.2f} in all:</b>\n"
+            f"<pre>{html.escape(moves[-(_MAX_TEXT // 2):])}</pre>"
+        )
+        if self.dry_run:
+            return Reply(body + "\nDRY-RUN: nothing will be sent. Switch to LIVE to move margin.")
+        code = self._new_pending("transfer")
+        self.pending.moves = list(plan.moves)
+        return Reply(
+            body,
+            [[(f"✅ Send {len(plan.moves)} transfer(s)", f"transfer:{code}"),
+              ("❌ Cancel", f"cancel:{code}")]],
+        )
+
+    async def _do_transfers(self, moves: list) -> None:
+        try:
+            lines = await asyncio.to_thread(self.submit_transfers, copy.deepcopy(self.config), moves)
+        except Exception as exc:  # noqa: BLE001 - reported
+            log.exception("transfers started from telegram failed")
+            await self.send(f"⚠️ Transfers failed: {html.escape(describe(exc))} -- check 💰 Accounts.")
+            return
+        report = "\n".join(line.lstrip("\n") for line in lines)
+        await self.send(f"💸 Transfers\n<pre>{html.escape(report[-_MAX_TEXT:])}</pre>")
+
     def _new_pending(self, action: str, volume: float | None = None) -> str:
         code = self.make_code()
         self.pending = Pending(action, code, self.clock() + CONFIRM_TTL_S, volume)
@@ -505,6 +595,13 @@ class Controller:
             previous = self.work if self.busy else None
             self._start("close", self._do_close(previous))
             return Reply("🛑 Closing every position at market -- I will report when done.")
+        if pending.action == "transfer":
+            if self.busy:
+                return Reply(f"A {self.work_kind} started meanwhile -- nothing was sent.")
+            if self.dry_run:
+                return Reply("DRY-RUN: nothing was sent. Switch to LIVE to move margin.")
+            self._start("transfer", self._do_transfers(pending.moves or []))
+            return Reply(f"💸 Sending {len(pending.moves or [])} transfer(s)... I will report each one.")
         if pending.action in ("live", "dry"):
             if self.busy:
                 return Reply(f"A {self.work_kind} started meanwhile -- mode unchanged.")
@@ -573,6 +670,10 @@ class Controller:
             self.strategy.request_stop("control loop exiting")
         with contextlib.suppress(Exception):
             await asyncio.wait_for(asyncio.shield(self.work), timeout_s)
+
+
+def _short(pubkey: str) -> str:
+    return f"{pubkey[:6]}..{pubkey[-4:]}" if len(pubkey) > 12 else pubkey
 
 
 def _parse_amount(text: str) -> float | None:
@@ -669,10 +770,14 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
 
     notifier = Notifier(telegram)
     allowed = set(telegram.user_ids)
+    from .menu import plan_balance, plan_collect, submit_plan
+
     controller = Controller(
         config, dry_run,
         run_fn=cmd_run, flatten_fn=cmd_flatten, status_fn=capture_status,
         send=notifier.send, log_path=log_path, alerts=AlertHandler(notifier),
+        margin={"balance": plan_balance, "collect": plan_collect},
+        submit_transfers=submit_plan,
     )
     poller = TelegramPoller(telegram.bot_token)
     strangers: set[int] = set()
@@ -691,7 +796,9 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
             log.info("telegram control is on (%s) for user id(s) %s",
                      controller.mode_word, ", ".join(map(str, sorted(allowed))))
             print(f"\n  Telegram control is on ({controller.mode_word}). Use the buttons in the chat.")
-            print("  Ctrl+C here stops listening; a run in progress is stopped first.\n")
+            if sys.stdin is not None and sys.stdin.isatty():
+                # Not under systemd, where there is no Ctrl+C to press.
+                print("  Ctrl+C here stops listening; a run in progress is stopped first.\n")
             hello = Reply(f"✅ Control is on (<b>{controller.mode_word}</b>). Use the buttons below.",
                           keyboard=True)
             for user_id in sorted(allowed):

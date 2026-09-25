@@ -546,7 +546,20 @@ def _settle(balances: list[tuple[str, str, float]]) -> list[tuple[str, str, floa
     return moves
 
 
-def _balance_subaccounts(config: Config) -> None:
+@dataclass
+class MarginPlan:
+    """What Balance or Collect would do, worked out before anything is sent.
+
+    Kept apart from asking and sending so the menu and Telegram make the same
+    plan from the same code. `lines` is the report as the menu prints it;
+    `moves` are the transfers, each with the tree whose key signs it.
+    """
+
+    lines: list[str]
+    moves: list[tuple[Tree, str, str, float]]
+
+
+def plan_balance(config: Config) -> MarginPlan:
     """Even out transferable margin inside each master's own tree.
 
     Inside each tree, not across all of them. A margin transfer is signed by
@@ -558,13 +571,14 @@ def _balance_subaccounts(config: Config) -> None:
     """
     trees = _trees(config)
     alone = len(trees) == 1
+    lines: list[str] = []
     plan: list[tuple[Tree, str, str, float]] = []
 
     for tree in trees:
         accounts = tree.labelled(alone)
         if len(accounts) < 2:
-            print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)} "
-                  "owns no sub-accounts yet")
+            lines.append(f"\n  {tree.title(alone)} {short_pubkey(tree.master)} "
+                         "owns no sub-accounts yet")
             continue
 
         read = [(label, pk, _transferable(config, pk)) for label, pk in accounts]
@@ -574,50 +588,62 @@ def _balance_subaccounts(config: Config) -> None:
         unread = [(label, pk) for label, pk, bal in read if bal is None]
         balances = [(label, pk, bal) for label, pk, bal in read if bal is not None]
         for label, pk in unread:
-            print(f"\n  !! could not read {label} {short_pubkey(pk)} -- left out "
-                  "of the plan. Try again in a minute.")
+            lines.append(f"\n  !! could not read {label} {short_pubkey(pk)} -- left out "
+                         "of the plan. Try again in a minute.")
         if len(balances) < 2:
-            print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)}: fewer than "
-                  "two balances could be read, so nothing is planned for it")
+            lines.append(f"\n  {tree.title(alone)} {short_pubkey(tree.master)}: fewer than "
+                         "two balances could be read, so nothing is planned for it")
             continue
         total = sum(bal for _, _, bal in balances)
         target = total / len(balances)
 
-        print(f"\n  {'account':<22} {'transferable':>14} {'delta':>12}")
+        lines.append(f"\n  {'account':<22} {'transferable':>14} {'delta':>12}")
         for label, pk, bal in balances:
-            print(
+            lines.append(
                 f"  {label + ' ' + short_pubkey(pk):<22} "
                 f"{bal:>14.2f} {bal - target:>12.2f}"
             )
-        print(
+        lines.append(
             f"\n  total {total:,.2f} across {len(balances)} accounts "
             f"-> {target:,.2f} each"
         )
 
         moves = _settle(balances)
         if not moves:
-            print("  already balanced")
+            lines.append("  already balanced")
             continue
         plan.extend((tree, src, dst, amount) for src, dst, amount in moves)
 
-    if not plan:
+    return MarginPlan(lines, plan)
+
+
+def _balance_subaccounts(config: Config) -> None:
+    plan = plan_balance(config)
+    for line in plan.lines:
+        print(line)
+    if not plan.moves:
         _pause()
         return
 
     print("\n  planned transfers:")
-    for _, src, dst, amount in plan:
+    for _, src, dst, amount in plan.moves:
         print(f"    {short_pubkey(src)} -> {short_pubkey(dst)}  {amount:,.2f}")
 
-    if not _confirm(f"Submit {len(plan)} transfer(s)."):
+    if not _confirm(f"Submit {len(plan.moves)} transfer(s)."):
         print("  aborted")
         _pause()
         return
 
-    _submit_plan(config, plan)
+    _submit_plan(config, plan.moves)
     _pause()
 
 
 def _submit_plan(config: Config, plan: list[tuple[Tree, str, str, float]]) -> None:
+    for line in submit_plan(config, plan):
+        print(line)
+
+
+def submit_plan(config: Config, plan: list[tuple[Tree, str, str, float]]) -> list[str]:
     """Send a list of transfers, one at a time, and say what became of each.
 
     A failure used to end the loop with a traceback halfway down the list --
@@ -636,6 +662,7 @@ def _submit_plan(config: Config, plan: list[tuple[Tree, str, str, float]]) -> No
     from .subaccounts import submit_transfer
     from bulk_api.common import SignatureDomain
 
+    report: list[str] = []
     done: list[str] = []
     refused: list[str] = []
     unknown: list[str] = []
@@ -659,14 +686,14 @@ def _submit_plan(config: Config, plan: list[tuple[Tree, str, str, float]]) -> No
             outcome, detail = "error", describe(exc)
         if outcome == ACCEPTED:
             done.append(line)
-            print(f"    {line}: ok")
+            report.append(f"    {line}: ok")
         elif outcome in (UNKNOWN, UNSENT):
             if outcome == UNKNOWN:
                 unknown.append(line)
-                print(f"    {line}: UNKNOWN ({detail})")
+                report.append(f"    {line}: UNKNOWN ({detail})")
             else:
                 refused.append(line)
-                print(f"    {line}: exchange unreachable, not sent ({detail})")
+                report.append(f"    {line}: exchange unreachable, not sent ({detail})")
             skipped = [
                 f"{short_pubkey(s)} -> {short_pubkey(d)} {a:,.2f}"
                 for _t, s, d, a in plan[index + 1:]
@@ -674,19 +701,20 @@ def _submit_plan(config: Config, plan: list[tuple[Tree, str, str, float]]) -> No
             break
         else:
             refused.append(line)
-            print(f"    {line}: refused ({detail})")
+            report.append(f"    {line}: refused ({detail})")
     else:
         skipped = []
 
-    print(f"\n  {len(done)} done, {len(refused)} refused, {len(unknown)} unknown, "
-          f"{len(skipped)} not sent")
+    report.append(f"\n  {len(done)} done, {len(refused)} refused, {len(unknown)} unknown, "
+                  f"{len(skipped)} not sent")
     for line in skipped:
-        print(f"    not sent: {line}")
+        report.append(f"    not sent: {line}")
     if unknown:
-        print(f"\n  {UNKNOWN_ADVICE}")
+        report.append(f"\n  {UNKNOWN_ADVICE}")
+    return report
 
 
-def _collect_to_master(config: Config) -> None:
+def plan_collect(config: Config) -> MarginPlan:
     """Sweep every sub-account's transferable margin up to its own master.
 
     Each tree into its own master, for the same reason Balance stays inside
@@ -695,49 +723,57 @@ def _collect_to_master(config: Config) -> None:
     """
     trees = _trees(config)
     alone = len(trees) == 1
-    plan: list[tuple[Tree, str, float]] = []
+    lines: list[str] = []
+    plan: list[tuple[Tree, str, str, float]] = []
 
     for tree in trees:
         if not tree.subs:
-            print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)} "
-                  "owns no sub-accounts yet")
+            lines.append(f"\n  {tree.title(alone)} {short_pubkey(tree.master)} "
+                         "owns no sub-accounts yet")
             continue
 
-        print(f"\n  {tree.title(alone)} {short_pubkey(tree.master)}")
-        print(f"  {'sub-account':<22} {'transferable':>14}")
+        lines.append(f"\n  {tree.title(alone)} {short_pubkey(tree.master)}")
+        lines.append(f"  {'sub-account':<22} {'transferable':>14}")
         for label, pk in tree.labelled(alone)[1:]:
             bal = _transferable(config, pk)
             if bal is None:
                 # Unknown is not zero, and it is not "everything" either:
                 # nothing is planned for an account that could not be read.
-                print(f"  {label + ' ' + short_pubkey(pk):<22} {'unreadable':>14}"
-                      "  -- left out")
+                lines.append(f"  {label + ' ' + short_pubkey(pk):<22} {'unreadable':>14}"
+                             "  -- left out")
                 continue
-            print(f"  {label + ' ' + short_pubkey(pk):<22} {bal:>14.2f}")
+            lines.append(f"  {label + ' ' + short_pubkey(pk):<22} {bal:>14.2f}")
             # Floored, not rounded: rounding 10.005 up asks for a cent the
             # account does not have, and the whole transfer is refused for it.
             amount = int(bal * 100) / 100
             if amount > 0.01:
-                plan.append((tree, pk, amount))
+                plan.append((tree, pk, tree.master, amount))
 
-    if not plan:
+    return MarginPlan(lines, plan)
+
+
+def _collect_to_master(config: Config) -> None:
+    plan = plan_collect(config)
+    for line in plan.lines:
+        print(line)
+    if not plan.moves:
         print("\n  nothing to collect")
         _pause()
         return
 
     print("\n  planned transfers:")
-    for tree, src, amount in plan:
-        print(f"    {short_pubkey(src)} -> {short_pubkey(tree.master)}  {amount:,.2f}")
-    print(f"\n  total {sum(a for _, _, a in plan):,.2f}")
+    for _tree, src, dst, amount in plan.moves:
+        print(f"    {short_pubkey(src)} -> {short_pubkey(dst)}  {amount:,.2f}")
+    print(f"\n  total {sum(a for *_, a in plan.moves):,.2f}")
     print("  Margin backing an open position stays where it is -- only the")
     print("  transferable balance moves.")
 
-    if not _confirm(f"Submit {len(plan)} transfer(s) to the master account."):
+    if not _confirm(f"Submit {len(plan.moves)} transfer(s) to the master account."):
         print("  aborted")
         _pause()
         return
 
-    _submit_plan(config, [(tree, src, tree.master, amount) for tree, src, amount in plan])
+    _submit_plan(config, plan.moves)
     _pause()
 
 
