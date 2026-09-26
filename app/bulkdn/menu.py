@@ -1374,6 +1374,10 @@ def _append_market(
         f"max_distance_bps: {_render_number(template.max_distance_bps)}",
         f"chase_patience_s: {_render_number(template.chase_patience_s)}",
         f"improve_ticks: {template.improve_ticks}",
+        # Only when it is on: absent is off, and a new market should not grow
+        # a line the template never had.
+        f"join_depth_usd: {_render_number(template.join_depth_usd)}"
+        if template.join_depth_usd > 0 else None,
         # Omitted rather than written as 0 when there is no dollar cap to copy:
         # absent means "the whole leg", which is what a coin cap copied into a
         # different coin could not honestly mean anyway.

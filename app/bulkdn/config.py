@@ -132,6 +132,15 @@ class LegConfig:
     # rather than with a taker fee. Clamped to stay one tick short of the other
     # side, so a one-tick spread leaves the order on the touch.
     improve_ticks: int = 1
+    # Once on the touch, rest only at a price where at least this many dollars
+    # of OTHER people's orders already rest, instead of stepping ahead of the
+    # book. 0 (the default) keeps `improve_ticks`.
+    #
+    # From live fills: when our order was the only thing at its price, the
+    # hedge met a touch ~1.6bps worse, because taking us emptied the level;
+    # with more than 1 BTC resting beside us it met our own price. Queueing
+    # behind others is slower to fill, which is the price of it.
+    join_depth_usd: float = 0.0
     # The per-order cap, in whichever unit suits; it defaults to the whole leg.
     max_order_size: float = 0.0
     max_order_notional_usd: float = 0.0
@@ -190,6 +199,10 @@ class LegConfig:
             raise ConfigError(
                 f"legs.{name}.improve_ticks must be >= 0 (0 joins the touch "
                 "instead of beating it)"
+            )
+        if self.join_depth_usd < 0:
+            raise ConfigError(
+                f"legs.{name}.join_depth_usd must be >= 0 (0 switches it off)"
             )
         if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
             raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
@@ -764,7 +777,7 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
 
 _LEG_KEYS = frozenset({
     "symbol", "size", "notional_usd", "offset_bps", "max_distance_bps",
-    "chase_patience_s", "improve_ticks", "max_order_size",
+    "chase_patience_s", "improve_ticks", "join_depth_usd", "max_order_size",
     "max_order_notional_usd", "leverage", "enabled",
 })
 _TOP_KEYS = frozenset({
@@ -894,6 +907,7 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
                 if raw.get("improve_ticks") is not None
                 else 1
             ),
+            join_depth_usd=number("join_depth_usd", 0.0),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(

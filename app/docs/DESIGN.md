@@ -600,6 +600,7 @@ parameters that shape execution:
 | `legs.*.max_distance_bps` | Drift that triggers a cancel+replace |
 | `legs.*.chase_patience_s` | Unfilled for this long: give up the offset and rest on the touch. Still passive |
 | `legs.*.improve_ticks` | Ticks to post PAST the touch once tightened, clamped inside the spread. 1 = best bid/ask outright; 0 = join the queue |
+| `legs.*.join_depth_usd` | Once tightened, rest at the best level (within 1bps of the touch) where others hold at least this many dollars, our own orders not counted; keep a level while it holds half that; move when it thins. Overrides `improve_ticks`. 0 = off |
 | `legs.*.max_order_notional_usd` | Cap on any single resting order, in dollars |
 | `legs.*.max_order_size` | The same cap, as a base quantity |
 | `hold_minutes` | Time fully open before exiting; a number or a `low-high` range drawn per cycle |

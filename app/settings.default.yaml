@@ -175,6 +175,14 @@ legs:
                             # Still passive: inside the spread, never across
                             # it, so it is a maker fill and pays no taker fee.
                             # 0 = join the queue instead and wait behind it.
+    join_depth_usd: 0       # instead of improve_ticks: rest only at a price
+                            # where at least this many dollars of OTHER
+                            # people's orders already rest (within 1bps of the
+                            # best price), and move when they leave. Standing
+                            # alone at a price is what makes the hedge dear:
+                            # taking us empties the level and the hedge meets
+                            # the next one, ~1.6bps worse on live fills. Fills
+                            # are slower in a queue. 0 = off; try 2000.
     max_order_notional_usd: 100  # cap on any single resting order, in dollars.
                             # 0 = no cap, the whole leg in one order.
                             #

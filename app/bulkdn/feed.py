@@ -192,6 +192,18 @@ class MarketFeed:
             ask_size=ask_size,
         )
 
+    def levels(self, symbol: str, is_buy: bool, n: int) -> list[tuple[float, float]]:
+        """The first `n` price levels on one side, best first, as (price, size).
+
+        Empty when there is no book. Only for a caller that has already had a
+        usable touch from `quote`: this does not repeat its frozen-book check.
+        """
+        book = self.session.client.get_book(symbol)
+        if book is None:
+            return []
+        side = book.get_bids(n) if is_buy else book.get_asks(n)
+        return [(level.price, level.size) for level in side if level.price and level.size]
+
     def reference_price(self, symbol: str) -> float | None:
         return self.quote(symbol).reference_price
 

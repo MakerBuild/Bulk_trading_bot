@@ -56,6 +56,18 @@ log = logging.getLogger(__name__)
 # the orderUpdate arriving.
 ACK_GRACE_S = 3.0
 
+# `join_depth_usd`: how far behind the touch a level may be and still be
+# joined. Further back is the deliberate resting offset under another name,
+# and resting 1bps back measured +27% on the non-fee cost -- so past this the
+# order joins the touch, whatever rests there.
+JOIN_MAX_BPS = 1.0
+# How many levels to look through for one deep enough.
+JOIN_SCAN_LEVELS = 20
+# A level we already rest at is kept while others there hold this share of
+# `join_depth_usd`. Without it an order would hop every time the queue around
+# it crossed the line, and each hop goes to the back of the new queue.
+JOIN_KEEP_FRACTION = 0.5
+
 
 @dataclass
 class ChaseParams:
@@ -64,6 +76,7 @@ class ChaseParams:
     max_order_size: float
     chase_patience_s: float = 0.0
     improve_ticks: int = 1
+    join_depth_usd: float = 0.0
 
 
 def effective_offset_bps(
@@ -210,6 +223,12 @@ class Chaser:
         if target is None:
             return ChaseOutcome(symbol, "skipped", "no reference price")
 
+        joining = params.join_depth_usd > 0 and offset <= 0
+        if joining:
+            joined = self._join_target(roles, leg, quote, params.join_depth_usd)
+            if joined is not None:
+                target = joined
+
         # The best price on our side may be another of our own groups. Stepping
         # past it -- which `chase_price` does to any best price -- starts a
         # walk: that group sees a stranger ahead, steps past this one, and the
@@ -300,7 +319,11 @@ class Chaser:
         # moved the target rounds to the same tick and nothing is sent, so a
         # transaction costs only when the book actually changed.
         if was_tightened:
-            if resting.price != target and not at_the_touch:
+            # A joining order never steps past anyone, itself included -- its
+            # target is a level others already hold -- so it moves whenever
+            # that level does. That includes leaving the touch once everyone
+            # else there has gone, which is the point of it.
+            if resting.price != target and (joining or not at_the_touch):
                 return await self._place(
                     session, roles, leg, target, desired, replace_oid=leg.oid,
                     reason=f"following the touch {resting.price:g} -> {target:g}",
@@ -464,6 +487,50 @@ class Chaser:
         now = time.monotonic()
         self._placed_at[oid] = now
         self._chasing_since.setdefault(self._chase_key(roles), now)
+
+    def _join_target(self, roles: LegRoles, leg: LegState, quote, depth_usd: float):
+        """The best price on our side where others already rest `depth_usd`.
+
+        Our own orders at a level are taken off its size: joining ourselves is
+        standing alone with extra steps. The level this leg already rests at
+        is kept while others there hold `JOIN_KEEP_FRACTION` of it and nothing
+        better has filled up. Nothing deep enough within `JOIN_MAX_BPS` of the
+        touch: join the touch itself rather than step ahead of it.
+
+        None without a book, which leaves the ordinary target in place.
+        """
+        symbol = roles.symbol
+        is_buy = roles.maker_is_buy
+        touch = quote.best_bid if is_buy else quote.best_ask
+        if not touch or not quote.best_bid or not quote.best_ask:
+            return None
+        levels = self.feed.levels(symbol, is_buy, JOIN_SCAN_LEVELS)
+        if not levels:
+            return None
+        resting_at = leg.price if leg.oid else None
+        # Best first, so reaching our own level means nothing ahead of it has
+        # filled up -- and then it is kept on the lower bar.
+        for price, size in levels:
+            if distance_bps(price, touch) > JOIN_MAX_BPS:
+                break
+            others = (size - self._our_size_at(symbol, is_buy, price)) * price
+            if others >= depth_usd:
+                return price
+            if price == resting_at and others >= depth_usd * JOIN_KEEP_FRACTION:
+                return price
+        return touch
+
+    def _our_size_at(self, symbol: str, is_buy: bool, price: float) -> float:
+        """How much of ours rests at `price` on this side, every leg together."""
+        total = 0.0
+        for oid, (sym, buy, maker) in list(self._ours.items()):
+            if sym != symbol or buy != is_buy:
+                continue
+            session = self.sessions.get(maker)
+            order = session.client.get_order_map().get(oid) if session else None
+            if order is not None and order.price == price:
+                total += order.size
+        return total
 
     def _ours_at(
         self, symbol: str, is_buy: bool, price: float, except_oid: str | None

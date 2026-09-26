@@ -3415,6 +3415,7 @@ def build_chase_params(config: Config) -> dict[str, ChaseParams]:
             max_order_size=leg.max_order_size,
             chase_patience_s=leg.chase_patience_s,
             improve_ticks=leg.improve_ticks,
+            join_depth_usd=leg.join_depth_usd,
         )
         for leg in config.active_legs
     }
