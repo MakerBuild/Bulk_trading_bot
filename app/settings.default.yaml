@@ -1,150 +1,6 @@
-# ===========================================================================
-#  BULK delta-neutral bot -- settings
-#
-#  Everything you normally change is in the first half of this file.
-#  The second half is plumbing you can usually leave alone.
-#
-#  Your private key does NOT go here. Put it on one line in
-#  `private_key.local`, then encrypt it from the menu (Accounts Management).
-#
-#  MAINNET ONLY. `run --live` trades real funds. There is no test network.
-# ===========================================================================
-
-
-# ---------------------------------------------------------------------------
-#  WHAT TO TRADE
-#
-#  Each market below is one leg: an account opens a position in it, and one
-#  or more other accounts take the opposite side, so the pair nets out to
-#  roughly zero. Every market switched on runs at the same time.
-#
-#  WHICH accounts do that is not set here -- see `mode` below. They are drawn
-#  from the pool per cycle, so the two block names are only names.
-#
-#  Any market the exchange lists works. Add one from the menu rather than by
-#  hand and it arrives with the numbers of a market already set up.
-#
-#  HOW MUCH: write it in dollars.
-#
-#    notional_usd: 100     $100 of whatever `symbol` names, per cycle
-#
-#  Dollars do not change meaning when you change `symbol`, which is the whole
-#  point: the bot converts to a quantity at the current price when it starts.
-#
-#  Either dollar setting may be written as a RANGE instead of one number,
-#  the same way hold_minutes is:
-#
-#    notional_usd: 4000             exactly that, every cycle
-#    notional_usd: 2000-6000        drawn fresh at the start of each cycle
-#    notional_usd: [2000, 6000]     the same thing, spelled as a list
-#
-#  A fixed size repeats exactly, and an exact repeat is a shape in the fill
-#  history: the same notional, cycle after cycle, between the same two
-#  accounts. A range removes that for nothing.
-#
-#  Margin is planned from the HIGH end at startup, so every later draw fits
-#  inside a budget that was already checked -- and a draw is clamped to what
-#  the plan allowed, which may be less than the range asks for when the
-#  accounts are thin.
-#
-#  The old way still works, one leg at a time, if you want an exact quantity:
-#
-#    size: 0.001           0.001 of the base coin, per cycle
-#
-#  But `size` is tied to one coin's price. `size: 2.0` is $200 of SOL and
-#  $5,200 of ETH -- change the symbol and leave the number, and the cycle is
-#  twenty-six times larger without a word of warning. Set one or the other per
-#  leg, never both.
-#
-#  Keep the two legs close in dollar terms. They are scaled together when
-#  margin is short, so a lopsided pair starves the smaller leg first.
-#
-#  If the sizes below need more margin than the accounts hold, every leg is
-#  scaled down together to fit -- see max_margin_fraction near the bottom.
-#
-#  WHICH MARKETS: every block below with `enabled: true`.
-#
-#  Add, remove and switch them from the menu -- Configuration -> Markets &
-#  Accounts -> Markets. `enabled: false` keeps a market's numbers in the file
-#  while it is not trading, so turning it back on next week restores them.
-#
-#  There may be more than two. The two names below are historical: they used
-#  to say which account opened which leg, and accounts are no longer chosen
-#  that way -- they are drawn per cycle from the pool. What is left is a set
-#  of markets, and nothing requires that set to be exactly two.
-#
-#  The markets are not equally cheap. Over a two-hour live run, hedging cost
-#  1.24 bps on BTC-USD against 3.59 on ETH-USD. Switching the dearer one off
-#  is worth roughly a fifth to two fifths of the spread bill, and costs half
-#  as many pairs earning volume at a time.
-#
-#  Two enabled markets may not name the same symbol: a leg is held per
-#  symbol, so one would overwrite the other and stop trading.
-#
-#  WHICH ACCOUNTS: `mode`.
-#
-#    single   one master and its own sub-accounts. `single_master` says
-#             which one, by its line number in private_key.local.
-#    multi    every master and every sub-account, in one pool.
-#
-#  This is not about markets -- both modes trade every market switched on.
-#  It is about who is on the other side of a trade, and that shows.
-#
-#  A trade between two accounts under one master is a self-trade: the
-#  exchange sees one owner on both sides, and its own fee documentation
-#  excludes those from qualifying volume. A trade between accounts under two
-#  DIFFERENT masters is not a self-trade to anybody, because nothing on the
-#  exchange links one master to another. That is the whole of the
-#  difference, and with one key in the file the two modes are identical.
-#
-#  You are responsible for complying with the exchange's terms, including
-#  its rules on self-trading and wash trading, whichever mode you choose.
 mode: multi
 single_master: 1
 
-# ---------------------------------------------------------------------------
-#  HOW MANY AT ONCE
-#
-#  Whichever accounts the mode put in play, they form one pool, and groups
-#  are drawn from it per cycle: one account opens, one or more cover it, and
-#  they disband when the cycle ends. The next cycle draws different accounts,
-#  a different market and a different size.
-#
-#  The point is that a fixed pairing is the clearest signal a series of
-#  trades can give about itself -- the same two pubkeys, the same size, the
-#  same market, over and over. Splitting the hedge removes the rest of it:
-#  $4,000 answered by one account of $4,000 is a line anyone can draw, and
-#  the same $4,000 answered by $1,800, $1,400 and $800 is not.
-#
-#    max_groups   how many groups may trade at once. A hundred accounts allow
-#                 fifty, which is fifty resting orders being chased and fifty
-#                 hedges chasing them -- against an exchange that answers 429
-#                 to two accounts polling every five seconds. Raise it slowly
-#                 and watch the log for rejections.
-#
-#    max_takers   how many accounts may share one hedge. 1 means no split.
-#                 A share under the market's minimum order cannot be sent at
-#                 all, so the split is floored: asking for more pieces than
-#                 the size can carry yields FEWER pieces, not rejected ones.
-#
-#  Both settings are capped by the accounts themselves, and they compete for
-#  them. A group is one opener plus its takers, and an account is in at most
-#  one group, so six accounts give three groups of two, or two groups of
-#  three, or one group of six. Raising max_takers lowers how many groups fit.
-#
-#  Splitting has a size floor worth knowing before you set it. No share is
-#  ever smaller than 15% of the cycle, so a split needs
-#
-#      cycle size x 0.15  >=  the market's minimum order
-#
-#  BTC-USD accepts $1, so $7 a cycle is enough. ETH-USD accepts $50, so
-#  splitting it needs $333 a cycle. Under that the split simply does not
-#  happen -- the hedge goes to one account whole.
-#
-#  An account is only ever in one group at a time. That is arithmetic, not
-#  tidiness: the hedge is derived from positions, so an account in two groups
-#  has one position serving two sums and both are wrong.
-# ---------------------------------------------------------------------------
 pool:
   max_groups: 5
   max_takers: 1
@@ -152,266 +8,52 @@ pool:
 legs:
   master_account:
     symbol: BTC-USD
-    notional_usd: 100       # total per cycle, in dollars
-    leverage: 10            # 1-50, capped by the market's own maximum
-    offset_bps: 2.0         # rest this far inside the best price (2 = 0.02%).
-                            # May be written as a range -- 1.5-2.5 -- and is
-                            # then drawn per cycle like the dollar settings.
-                            #
-                            # Worth doing as soon as more than one group runs
-                            # at a time. The resting price is worked out from
-                            # the book and this number and nothing else, so two
-                            # groups on one market sharing one offset land on
-                            # the same tick and queue behind each other. The
-                            # accounts rotate; the price does not follow unless
-                            # this does.
-    max_distance_bps: 5.0   # re-price the order once it drifts this far
-    chase_patience_s: 3     # unfilled this long? stop waiting and go get it.
-                            # Lower = fills sooner, and gives up the 2bps edge
-                            # sooner. 0 keeps waiting forever.
-    improve_ticks: 1        # then post ONE TICK better than the best price,
-                            # which makes this order the best bid or ask and
-                            # fills it ahead of everyone queued at the old one.
-                            # Still passive: inside the spread, never across
-                            # it, so it is a maker fill and pays no taker fee.
-                            # 0 = join the queue instead and wait behind it.
-    join_depth_usd: 0       # instead of improve_ticks: rest only at a price
-                            # where at least this many dollars of OTHER
-                            # people's orders already rest (within 1bps of the
-                            # best price), and move when they leave. Standing
-                            # alone at a price is what makes the hedge dear:
-                            # taking us empties the level and the hedge meets
-                            # the next one, ~1.6bps worse on live fills. Fills
-                            # are slower in a queue. 0 = off; try 2000.
-    max_order_notional_usd: 100  # cap on any single resting order, in dollars.
-                            # 0 = no cap, the whole leg in one order.
-                            #
-                            # THIS NUMBER AND risk.max_net_exposure_usd ARE A
-                            # PAIR. A resting order that fills all at once
-                            # leaves the pair one-sided by that much until the
-                            # hedge lands a moment later, so the exposure limit
-                            # has to sit ABOVE this, with room to spare. Raise
-                            # one without the other and the first clean fill
-                            # trips the kill switch: every order cancelled,
-                            # every account closed at market, bot stopped.
-                            # Twice this value is a sane floor.
+    notional_usd: 100
+    leverage: 10
+    offset_bps: 2.0
+    max_distance_bps: 5.0
+    chase_patience_s: 3
+    improve_ticks: 1
+    join_depth_usd: 0
+    max_order_notional_usd: 100
 
   sub_account:
     symbol: ETH-USD
-    notional_usd: 100       # matching the leg above, so the pair is balanced
-    leverage: 10            # ETH-USD allows up to 25
+    notional_usd: 100
+    leverage: 10
     offset_bps: 3.0
     max_distance_bps: 8.0
     chase_patience_s: 3
     improve_ticks: 1
-    max_order_notional_usd: 100  # see the note on the leg above
+    max_order_notional_usd: 100
 
-
-# ---------------------------------------------------------------------------
-#  HOW LONG TO HOLD
-#
-#  Time fully open before the exit phase starts. Either a fixed number of
-#  minutes, or a range the bot draws from at the start of every cycle:
-#
-#    hold_minutes: 0.5       exactly 30 seconds, every cycle
-#    hold_minutes: 0.5-1.5     somewhere between 30 and 60 seconds
-#
-#  A range is worth preferring: a fixed hold makes every cycle the same
-#  length, which is a pattern in the fill history. The draw is made once per
-#  cycle and then held as a deadline, so a restart mid-hold finishes the hold
-#  it was already serving.
-# ---------------------------------------------------------------------------
 hold_minutes: 0.5-1.5
 
-
-# ---------------------------------------------------------------------------
-#  WHEN TO STOP
-#
-#  Whichever limit is hit first ends the run. 0 disables that limit. Groups
-#  already open finish their cycle; no new ones are drawn.
-#
-#  `cycles` counts groups started in this run, a resumed group included --
-#  each group lives for exactly one open/hold/exit cycle.
-#
-#  Spend and volume are read from the exchange's own fill records, so they
-#  match what you were actually charged rather than a local guess.
-#
-#  MEASURED FROM THE START OF EACH RUN, not from the life of the account. So
-#  `burn_usd: 3` means "$3 this run": finish one, press Start again, and the
-#  count begins at zero. What you burned last week does not end today's run
-#  before it places an order.
-#
-#  An interrupted run keeps its count when you restart it -- progress you have
-#  already paid for is not handed back. `flatten` clears it, which is the way
-#  to start the goal over deliberately.
-# ---------------------------------------------------------------------------
 execution_target:
-  cycles: 0                 # number of groups to start; 0 = unlimited
-  burn_usd: 3               # stop once $3 of fees has been spent this run
-  volume_usd: 0             # stop once this much qualifying volume is done
+  cycles: 0
+  burn_usd: 3
+  volume_usd: 0
 
-
-# ---------------------------------------------------------------------------
-#  SAFETY LIMITS
-#
-#  Breaching any of these cancels every order, closes every account, and
-#  stops the bot. They are hard stops, not warnings.
-#
-#  Note on minimum order size: every market sets a floor -- $1 on BTC-USD, $50
-#  on ETH-USD and SOL-USD. A hedge smaller than the floor cannot be sent at
-#  all, so the pair can carry up to that much one-sided exposure that no hedge
-#  can remove. Keep max_net_exposure_usd comfortably above the larger floor.
-# ---------------------------------------------------------------------------
 risk:
-  max_net_exposure_usd: 500.0   # one-sided exposure allowed, checked per
-                                # market over every account AND per group.
-                                # A market with no price is valued at its
-                                # last known price, not at zero.
-                                # Must stay above legs.*.max_order_notional_usd
-                                # -- see the note there. 500 against the 100
-                                # above leaves 5x, which is why the shipped
-                                # pair is safe; change either and redo the sum.
-  max_position_usd: 5000.0      # per account, per symbol
-  max_reject_streak: 5          # consecutive rejected orders before stopping
-  max_hedge_impact_bps: 0       # refuse a hedge whose slippage exceeds this;
-                                # 0 = off, and off is also what happens for a
-                                # market with no impact curve published
-  ws_stale_timeout_s: 30.0      # no market data for this long => stop
-  price_stale_timeout_s: 15.0   # refuse to re-price on a stale quote
+  max_net_exposure_usd: 500.0
+  max_position_usd: 5000.0
+  max_reject_streak: 5
+  max_hedge_impact_bps: 0
+  ws_stale_timeout_s: 30.0
+  price_stale_timeout_s: 15.0
 
-# How long the open or exit phase may run before the cycle is called stuck.
-# HOLD is exempt -- it ends on its own clock.
-#
-# Not a speed setting. A phase usually takes 3-15 minutes and now and then
-# over 20 in a quiet market; this is for the one that is not going to finish.
-# In multi mode only that group is cut short and the run carries on: an open
-# keeps what it has filled, an exit closes the rest at market (taker fee on
-# what was left). If that does not finish within 5 more minutes, or in a
-# single-pair run, it cancels, closes every account and stops.
-# 0 disables it.
 max_phase_minutes: 30
 
-
-
-# ===========================================================================
-#  Below here is plumbing. You can usually leave it alone.
-# ===========================================================================
-
-
-# ---------------------------------------------------------------------------
-#  Access control
-#
-#  This build runs only for accounts that signed up through its owner. There is
-#  no list of admitted wallets anywhere -- not here and not in the source. At
-#  startup the bot asks BULK's public index who referred the account it is
-#  about to trade from, and runs only if the answer is the owner.
-#
-#  So nothing has to be released when someone new signs up: sign up through the
-#  owner's link and it works on the next start. And an account that did not is
-#  refused no matter what this file says.
-#
-#  That the list is gone is deliberate. Every field this block used to have was
-#  a way around the check -- adding a wallet, replacing one, granting an
-#  unconditional pass, turning the requirement off, or allowing everything when
-#  the index is unreachable. A gate its own config file can open is not a gate.
-#
-#  One consequence worth knowing: while the index is unreachable, nothing runs.
-#  The check is at startup only, so it can never interrupt a cycle already
-#  under way or leave a position open.
-#
-#  Nothing to configure here. If you forked this for your own use, empty
-#  SEALED_WALLETS in app/bulkdn/referral.py and this block works again:
-#
-#    access:
-#      require_referral: true
-#      wallets: ["<your referrer wallet>"]
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-#  Execution timing
-# ---------------------------------------------------------------------------
-chase_interval_s: 1.0       # how often resting orders are re-evaluated
-reconcile_interval_s: 5.0   # how often the hedge rule is re-run. Local
-                            # arithmetic, so this costs nothing.
+chase_interval_s: 1.0
+reconcile_interval_s: 5.0
 position_sync_interval_s: 60.0
-                            # how often positions are re-read from the
-                            # exchange with nothing looking wrong. The read
-                            # exists to catch a socket that goes quiet
-                            # without disconnecting, and that is measured
-                            # directly -- a session quiet for half of
-                            # ws_stale_timeout_s triggers a read at once.
-                            # This is only the backstop under it, for a
-                            # socket that talks and is still wrong.
-hedge_tolerance_lots: 1.0   # imbalance tolerated before hedging, in lots
-overlay_ttl_ms: 2000        # how long an unconfirmed fill is trusted
+hedge_tolerance_lots: 1.0
+overlay_ttl_ms: 2000
 
-# Sizes are weighed against the THINNEST account in the pool, since any account
-# can be drawn to open. A cycle whose margin fits within 80% of that account's
-# available margin is used exactly as written; the other 20% is what stands
-# between a one-sided account and liquidation while its hedge is in flight, and
-# what pays the fees. A cycle that needs more is scaled down -- every leg
-# together -- until it fits inside THIS share of that margin. So this is a
-# fallback, not a permanent cap.
 max_margin_fraction: 0.25
 
-
-# ---------------------------------------------------------------------------
-#  Telegram
-#
-#  Optional. The bot runs unattended, and a halt that only reaches the console
-#  reaches nobody -- with this set, starts, finished cycles, halts and the end
-#  of a run are sent to Telegram as well. Nothing is sent until BOTH are set.
-#
-#    bot_token   from @BotFather when you create the bot
-#    user_ids    who receives the messages: numeric Telegram user ids (ask
-#                @userinfobot for yours). Each person must press Start in a
-#                chat with the bot once, or Telegram refuses to deliver.
-#
-#  A failed message never affects trading. If proxy.local holds an http(s)
-#  proxy, messages go through it too; a SOCKS proxy is not applied to them.
-#
-#  The same bot can also take COMMANDS: menu item "Telegram Control", or
-#  `run.bat telegram --live`. Leave that window open, and the chat gets
-#  buttons: Status, Run, Stop, Close all, Log (/run 250k for another volume
-#  target). Run and Close all are confirmed with a button that works once, for
-#  a minute. Only the user_ids above are
-#  answered, and the key password is asked once when the window is started --
-#  after a server reboot it has to be started again by hand.
-#
-#  Sub-accounts are not configured anywhere: the bot finds every one of them
-#  from its master at startup. (Older files had a `sub1_pubkey` line here; it
-#  is no longer read and can be deleted.)
-# ---------------------------------------------------------------------------
-# telegram:
-#   bot_token: "123456789:AAE-your-token-here"
-#   user_ids: [123456789]
-
-
-# ---------------------------------------------------------------------------
-#  Connection
-#
-#  TLS is verified on every connection, against the certificate bundle the bot
-#  ships with. An earlier version of this note said the WebSocket served an
-#  expired certificate; it never did. What had expired was a root certificate
-#  in the WINDOWS store, which the bot no longer relies on.
-#
-#  So both switches below are off, and should stay off. `ws_ssl_auto_bypass`
-#  retries once WITHOUT verification if the certificate is rejected -- for a
-#  network that genuinely cannot connect any other way. Turning it on means the
-#  fills and positions every hedge is computed from may come from an endpoint
-#  nothing has authenticated.
-# ---------------------------------------------------------------------------
 ws_ssl_auto_bypass: false
-ws_insecure_ssl: false      # skip verification outright; never use this
+ws_insecure_ssl: false
 
-# Endpoint overrides, for when the published hosts change.
-# http_url: "https://mainnet-api1.bulk.trade/api/v1"
-# ws_url: "wss://mainnet-ws1.bulk.trade"
-
-
-# ---------------------------------------------------------------------------
-#  Housekeeping
-# ---------------------------------------------------------------------------
 state_file: "./app/state/strategy_state.json"
-log_level: INFO             # INFO, or DEBUG when diagnosing something
+log_level: INFO
