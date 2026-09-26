@@ -371,6 +371,51 @@ def test_a_group_that_has_turned_around_counts_on_the_side_it_is_now_resting():
     assert obj._least_crowded_side(BTC) is True
 
 
+# -- about to turn around ----------------------------------------------------
+#
+# The live case: g23 opening SELL, g24 drawn BUY, g25 drawn on the tie BUY, and
+# then g23 turned to its exit -- three makers on the bid, sharing the sellers,
+# and one of them ran out its thirty minutes at 66%.
+
+
+def opening(obj, key, maker, *, maker_is_buy, target, held, oid):
+    from bulkdn.positions import PositionBook
+
+    if not hasattr(obj, "book"):
+        obj.book = PositionBook()
+    register(obj, key, maker, maker_is_buy=maker_is_buy, oid=oid)
+    obj.state.leg(key).target_size = target
+    obj.book.set_authoritative(maker, BTC, held if maker_is_buy else -held)
+
+
+def test_a_group_well_into_its_open_counts_on_the_side_it_will_exit_on():
+    obj = strategy()
+    opening(obj, "g23:" + BTC, "maker-a", maker_is_buy=False,
+            target=0.04, held=0.03, oid="oid-23")
+    opening(obj, "g24:" + BTC, "maker-b", maker_is_buy=True,
+            target=0.04, held=0.0, oid="oid-24")
+
+    # g23 is about to buy back what it sold: two buyers, so g25 sells.
+    assert obj._least_crowded_side(BTC) is False
+
+
+def test_a_group_early_in_its_open_still_counts_where_it_is():
+    obj = strategy()
+    opening(obj, "g23:" + BTC, "maker-a", maker_is_buy=False,
+            target=0.04, held=0.01, oid="oid-23")
+    opening(obj, "g24:" + BTC, "maker-b", maker_is_buy=True,
+            target=0.04, held=0.0, oid="oid-24")
+
+    assert {obj._least_crowded_side(BTC) for _ in range(40)} == {True, False}
+
+
+def test_a_group_in_hold_counts_on_its_exit_side():
+    obj = strategy()
+    register(obj, "g1:" + BTC, "maker-a", maker_is_buy=False, phase=Phase.HOLD)
+    # Sold, holding, about to buy back: the next group sells.
+    assert obj._least_crowded_side(BTC) is False
+
+
 # -- not waiting on a cancel that has nothing to cancel ----------------------
 #
 # A live run put the first hedge ~730ms behind its maker fill, and the hedge's

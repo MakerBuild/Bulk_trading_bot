@@ -274,11 +274,12 @@ risk:
 # How long the open or exit phase may run before the cycle is called stuck.
 # HOLD is exempt -- it ends on its own clock.
 #
-# Not a speed setting: a normal phase takes under a minute, so this only fires
-# when a resting order is never going to fill. It matters most on the way out,
-# where the sweep that closes anything left over runs only once the phase ends
-# -- so without this, an exit that cannot fill leaves positions open with the
-# bot still looking busy. Hitting it cancels, closes every account and stops.
+# Not a speed setting. A phase usually takes 3-15 minutes and now and then
+# over 20 in a quiet market; this is for the one that is not going to finish.
+# In multi mode only that group is cut short and the run carries on: an open
+# keeps what it has filled, an exit closes the rest at market (taker fee on
+# what was left). If that does not finish within 5 more minutes, or in a
+# single-pair run, it cancels, closes every account and stops.
 # 0 disables it.
 max_phase_minutes: 30
 

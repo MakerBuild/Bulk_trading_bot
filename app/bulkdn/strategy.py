@@ -155,6 +155,24 @@ TARGET_RETRY_S = 10.0
 # a test suite that failed only on a freshly booted Linux VM.
 NEVER = float("-inf")
 
+# A pool group whose OPEN or EXIT outruns `max_phase_minutes` is cut short
+# rather than halting the run: an open keeps what it has filled, an exit closes
+# the rest at market. Two live runs ended early on exactly this -- a quiet
+# market, three groups resting on one side and sharing the same
+# sellers, one of them 66% of the way to its target at thirty minutes. Nothing
+# was wrong; the halt then closed every group at market anyway.
+#
+# The cut itself gets this long. Past it, something really is stuck, and that
+# is still a halt.
+CUT_SHORT_GRACE_S = 300.0
+# Between market closes of one cut-short exit. Reduce-only, so a second close
+# can take the position to flat but not past it; this only stops one close per
+# chase tick while the first is still on its way back.
+CUT_SHORT_RETRY_S = 5.0
+# An OPEN this far to its target counts as about to turn round when the next
+# group's side is chosen. See `_resting_side`.
+TURNING_FRACTION = 0.5
+
 
 def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
     """How long a phase may run, in seconds. 0 means no limit.
@@ -1032,18 +1050,45 @@ class Strategy:
         The phase still comes from the leg, because that is what says whether a
         group has turned around: a leg with no state yet has not, which is the
         right answer for one that was drawn a moment ago.
+
+        And each group is counted on the side it is ABOUT to rest on, which is
+        not always the one it rests on now -- see `_resting_side`.
         """
         resting = [0, 0]
         active = self.pairing.active if self.pairing is not None else {}
         for group_id, group in active.items():
             if group.symbol != symbol:
                 continue
-            leg = self.state.legs.get(self.group_key(group_id, group.symbol))
-            exiting = leg is not None and leg.phase == Phase.EXIT
-            resting[group.maker_is_buy != exiting] += 1
+            resting[self._resting_side(group_id, group)] += 1
         if resting[True] == resting[False]:
             return self._rng.random() < 0.5
         return resting[True] < resting[False]
+
+    def _resting_side(self, group_id: int, group: Group) -> bool:
+        """The side a group's maker will be resting on for most of what is ahead.
+
+        A group in HOLD, or well into its OPEN, is about to turn round: what it
+        bought it must sell. Counted on the side it has now, it was invisible
+        to the draw that mattered. A live run halted like this:
+
+            g23 SELL, opening      g24 drawn BUY  (1 sell : 0 buys)
+            g25 drawn on a tie     BUY
+            g23 turns to its exit  BUY  -- three makers on the bid
+
+        Three of our orders at one price split the same sellers three ways,
+        each group filled at a third of the pace, and one ran out its thirty
+        minutes at 66%. Counting g23 as the buyer it was about to become makes
+        g25 a seller.
+        """
+        leg = self.state.legs.get(self.group_key(group_id, group.symbol))
+        turning = False
+        if leg is not None:
+            if leg.phase in (Phase.HOLD, Phase.EXIT):
+                turning = True
+            elif leg.phase == Phase.OPEN and leg.target_size > 0:
+                held = abs(self.book.effective(group.maker, group.symbol))
+                turning = held >= TURNING_FRACTION * leg.target_size
+        return group.maker_is_buy != turning
 
     async def _hedge_leg(self, roles: LegRoles) -> HedgeResult:
         """Hedge one leg: the one way every hedge in a run goes out.
@@ -1893,16 +1938,36 @@ class Strategy:
         symbol = leg.symbol
         started = time.monotonic()
         budget = phase_budget_s(leg.phase, self.config.max_phase_minutes)
+        cut_at: float | None = None
+        closed_at = NEVER
 
         while not self._stop.is_set():
-            if budget and time.monotonic() - started > budget:
+            if budget and cut_at is None and time.monotonic() - started > budget:
+                limit = f"{symbol} {label} did not finish within " \
+                        f"{self.config.max_phase_minutes:g} minutes"
+                # Only a drawn group. A configured leg is the whole run, and
+                # there is no other group to carry on beside it.
+                if not leg.group_id:
+                    self._trigger_halt(limit)
+                    return
+                cut_at = time.monotonic()
+                await self._cut_short(key, leg, limit)
+            elif cut_at is not None and time.monotonic() - cut_at > CUT_SHORT_GRACE_S:
                 self._trigger_halt(
                     f"{symbol} {label} did not finish within "
-                    f"{self.config.max_phase_minutes:g} minutes"
+                    f"{self.config.max_phase_minutes:g} minutes, nor "
+                    f"{CUT_SHORT_GRACE_S / 60:g} more after it was cut short"
                 )
                 return
 
-            if leg.phase != Phase.HOLD and not leg.complete:
+            if cut_at is not None and leg.phase == Phase.EXIT and not leg.complete:
+                roles = self._roles_for_key(key)
+                if roles is None:
+                    return
+                ready = time.monotonic() - closed_at >= CUT_SHORT_RETRY_S
+                if await self._close_rest_at_market(roles, leg, send=ready):
+                    closed_at = time.monotonic()
+            elif leg.phase != Phase.HOLD and not leg.complete:
                 roles = self._roles_for_key(key)
                 if roles is None:
                     return
@@ -1931,6 +1996,61 @@ class Strategy:
                 return
 
             await asyncio.sleep(self.config.chase_interval_s)
+
+    async def _cut_short(self, key: str, leg, limit: str) -> None:
+        """End one group's overlong phase without ending the run.
+
+        An OPEN keeps whatever it has filled: its target becomes what is held,
+        so the next chase step finds nothing left and the group moves on to
+        HOLD and a normal exit. It is already hedged; nothing trades.
+
+        An EXIT pulls its resting order and `_drive_leg` closes the maker's
+        remainder at market from then on. The close lands as a maker fill,
+        which the hedger answers the way it answers any exit fill -- reduce-only
+        on the takers -- so the pair stays neutral while it unwinds, and the
+        sweep in `_leg_exit` takes any residual after.
+        """
+        roles = self._roles_for_key(key)
+        if roles is None:
+            return
+        if leg.oid:
+            await self.chaser.cancel_leg(roles, leg)
+        held = abs(self.book.effective(roles.maker, roles.symbol))
+        if leg.phase == Phase.OPEN:
+            leg.target_size = held
+            what = f"keeping the {held:g} it has filled and moving on"
+        else:
+            what = f"closing the remaining {held:g} at market"
+        self._persist()
+        log.warning("%s: %s -- %s", key, limit, what)
+        self.notifier.send_soon(self.notifier.error(f"{limit}\n{key}: {what}"))
+
+    async def _close_rest_at_market(self, roles: LegRoles, leg, *, send: bool) -> bool:
+        """Send a reduce-only market close for what the maker still holds.
+
+        True when one went out. Below a lot or the minimum notional there is
+        nothing that can be sent, and the leg is marked complete exactly as the
+        chaser would have marked it. That is checked every tick; `send` only
+        says whether another close may go out yet.
+        """
+        spec = self.feed.specs[roles.symbol]
+        held = self.book.effective(roles.maker, roles.symbol)
+        size = round_size(abs(held), spec)
+        price = self.feed.reference_price(roles.symbol)
+        if size < spec.lot_size or (price and size * price < spec.min_notional):
+            leg.complete = True
+            return False
+        if not send:
+            return False
+        try:
+            await self.sessions[roles.maker].close_market(roles.symbol, held < 0, size)
+        except Exception as exc:  # noqa: BLE001 - retried after CUT_SHORT_RETRY_S
+            log.error("%s: market close of a cut-short exit failed: %s",
+                      roles.key, describe(exc))
+            return False
+        log.info("%s: sent a market close of %g on %s",
+                 roles.key, size, self.sessions[roles.maker].name)
+        return True
 
     def _leg_is_neutral(self, key: str) -> bool:
         """Whether this leg has no hedge left that could actually be placed.

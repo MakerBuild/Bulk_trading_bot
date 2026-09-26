@@ -603,7 +603,7 @@ parameters that shape execution:
 | `legs.*.max_order_notional_usd` | Cap on any single resting order, in dollars |
 | `legs.*.max_order_size` | The same cap, as a base quantity |
 | `hold_minutes` | Time fully open before exiting; a number or a `low-high` range drawn per cycle |
-| `max_phase_minutes` | Cap on OPEN or EXIT; hitting it halts, which cancels and flattens. HOLD is exempt |
+| `max_phase_minutes` | Cap on OPEN or EXIT. A pool group that hits it is cut short (an open keeps what it filled, an exit closes the rest at market) and the run goes on; a configured leg, or a cut that does not finish within 5 minutes, halts, which cancels and flattens. HOLD is exempt |
 | `chase_interval_s` | How often resting orders are re-evaluated |
 | `reconcile_interval_s` | How often the reconciler re-runs the hedge rule |
 | `position_sync_interval_s` | Backstop HTTP position read; a quiet socket triggers one sooner |
