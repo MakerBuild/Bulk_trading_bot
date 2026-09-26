@@ -687,24 +687,29 @@ class Strategy:
                         "close it by hand now", symbol,
                     )
                     continue
-                for session in self.all_sessions:
-                    size = self.book.authoritative(session.pubkey, symbol)
-                    rounded = round_size(abs(size), spec)
-                    if rounded < spec.lot_size:
-                        continue
-                    try:
-                        # size > 0 is long, so closing it is a sell.
-                        await session.close_market(symbol, size < 0, rounded)
-                        log.critical(
-                            "closed %s %.8f on %s after %s",
-                            symbol, rounded, session.name, label,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - the next close still goes
-                        log.critical(
-                            "COULD NOT CLOSE %s on %s after %s: %s -- "
-                            "close it by hand now",
-                            symbol, session.name, label, describe(exc),
-                        )
+                # Both sides held as swept for as long as the closes take.
+                # `cancel_all_orders` cleared the book, but a chaser whose
+                # order it cancelled re-places on its next tick unless told
+                # not to, and a later close in this loop would fill it.
+                async with self._sweep(symbol, True), self._sweep(symbol, False):
+                    for session in self.all_sessions:
+                        size = self.book.authoritative(session.pubkey, symbol)
+                        rounded = round_size(abs(size), spec)
+                        if rounded < spec.lot_size:
+                            continue
+                        try:
+                            # size > 0 is long, so closing it is a sell.
+                            await session.close_market(symbol, size < 0, rounded)
+                            log.critical(
+                                "closed %s %.8f on %s after %s",
+                                symbol, rounded, session.name, label,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - the next close still goes
+                            log.critical(
+                                "COULD NOT CLOSE %s on %s after %s: %s -- "
+                                "close it by hand now",
+                                symbol, session.name, label, describe(exc),
+                            )
         finally:
             # `_trigger_halt` sends the notification itself; sending it here too
             # delivered every liquidation halt twice.
@@ -1158,6 +1163,25 @@ class Strategy:
         sweeping = getattr(self, "_sweeping", {})
         return bool(sweeping.get((roles.symbol, roles.maker_is_buy)))
 
+    @contextlib.asynccontextmanager
+    async def _sweep(self, symbol: str, resting_is_buy: bool):
+        """Mark one side of `symbol` as being swept by a taking order.
+
+        The mark `_hedge_leg` sets around a hedge, for the other taking
+        orders: while it is held, `_drive_leg` places nothing on that side.
+        `resting_is_buy` is the side the order sweeps -- the bid for a market
+        sell, the ask for a market buy.
+        """
+        side = (symbol, resting_is_buy)
+        sweeping = self.__dict__.setdefault("_sweeping", {})
+        sweeping[side] = sweeping.get(side, 0) + 1
+        try:
+            yield
+        finally:
+            sweeping[side] -= 1
+            if not sweeping[side]:
+                del sweeping[side]
+
     async def _clear_hedge_path(self, roles: LegRoles) -> None:
         """Pull our own resting orders off the side this hedge will sweep.
 
@@ -1188,7 +1212,16 @@ class Strategy:
             # because a cancel costs a request against an exchange that has
             # answered 429 to two accounts polling every five seconds.
             return
+        await self._clear_own_orders(roles.symbol, roles.maker_is_buy)
 
+    async def _clear_own_orders(self, symbol: str, resting_is_buy: bool) -> None:
+        """Pull every live group's resting order off one side of `symbol`.
+
+        `resting_is_buy` is the side a taking order is about to sweep: the
+        bid for a market sell, the ask for a market buy. For a hedge that is
+        the hedging maker's own side (`_clear_hedge_path`); for a cut-short
+        close, which trades the same way as its maker, it is the other one.
+        """
         # Live groups, for the reason spelled out in `_least_crowded_side`:
         # a released leg no longer has a group to take its side from, and
         # has no order of ours on the book either.
@@ -1202,10 +1235,10 @@ class Strategy:
         in_path = []
         for key, group in list(self._groups.items()):
             leg = self.state.legs.get(key)
-            if group.symbol != roles.symbol or leg is None or not leg.oid:
+            if group.symbol != symbol or leg is None or not leg.oid:
                 continue
             other = self._roles_for_key(key)
-            if other is None or other.maker_is_buy != roles.maker_is_buy:
+            if other is None or other.maker_is_buy != resting_is_buy:
                 continue
             session = self.sessions.get(other.maker)
             if session is None:
@@ -1222,12 +1255,12 @@ class Strategy:
             # leg past its size.
             oid = leg.oid
             try:
-                await session.cancel(roles.symbol, oid)
-            except Exception as exc:  # noqa: BLE001 - the hedge still goes
+                await session.cancel(symbol, oid)
+            except Exception as exc:  # noqa: BLE001 - the taking order still goes
                 log.warning(
-                    "%s: could not pull its %s order out of the hedge's path "
-                    "(%s) -- hedging anyway, which may trade against it",
-                    session.name, roles.symbol, describe(exc),
+                    "%s: could not pull its %s order out of the path "
+                    "(%s) -- sending anyway, which may trade against it",
+                    session.name, symbol, describe(exc),
                 )
                 return
             if leg.oid == oid:
@@ -2032,6 +2065,13 @@ class Strategy:
         nothing that can be sent, and the leg is marked complete exactly as the
         chaser would have marked it. That is checked every tick; `send` only
         says whether another close may go out yet.
+
+        Like a hedge, the close is a market order that sweeps a side our own
+        orders may rest on -- and with the groups kept on opposite sides,
+        another group's maker usually does. So that side is cleared first
+        and marked as swept while the close is on its way, the way
+        `_hedge_leg` does it. Not the same side as for a hedge: a hedge
+        trades against its maker, this close trades with it.
         """
         spec = self.feed.specs[roles.symbol]
         held = self.book.effective(roles.maker, roles.symbol)
@@ -2042,8 +2082,12 @@ class Strategy:
             return False
         if not send:
             return False
+        # A long closes with a sell, which sweeps the bid: our buys.
+        swept_is_buy = held > 0
+        await self._clear_own_orders(roles.symbol, swept_is_buy)
         try:
-            await self.sessions[roles.maker].close_market(roles.symbol, held < 0, size)
+            async with self._sweep(roles.symbol, swept_is_buy):
+                await self.sessions[roles.maker].close_market(roles.symbol, held < 0, size)
         except Exception as exc:  # noqa: BLE001 - retried after CUT_SHORT_RETRY_S
             log.error("%s: market close of a cut-short exit failed: %s",
                       roles.key, describe(exc))

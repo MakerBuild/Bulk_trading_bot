@@ -221,6 +221,8 @@ class Bot:
         self._settled_after_waiting = (
             Strategy._settled_after_waiting.__get__(self)
         )
+        # The guard holds both sides as swept while its closes go out.
+        self._sweep = Strategy._sweep.__get__(self)
 
     # the pieces the guard leans on
     async def _sync_positions(self, max_age_s=0.0):

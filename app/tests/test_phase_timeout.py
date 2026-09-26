@@ -168,11 +168,14 @@ class FakeSession:
         self.pubkey = pubkey
         self.refuses = refuses
         self.closes = []
+        self.probe = None
 
     async def close_market(self, symbol, is_buy, size):
         if self.refuses:
             self.refuses -= 1
             raise RuntimeError("no answer from the exchange")
+        if self.probe is not None:
+            self.probe()
         self.closes.append((symbol, is_buy, size))
         self.book.set_authoritative(self.pubkey, symbol, 0.0)
 
@@ -185,6 +188,9 @@ class FakeChaser:
     async def cancel_leg(self, roles, leg):
         self.cancelled += 1
         leg.oid = None
+
+    def may_be_resting(self, session, oid):
+        return bool(oid)
 
     async def step(self, roles, leg):
         # What the real chaser does with nothing left to trade.
@@ -210,6 +216,7 @@ def build_group(phase, *, held, target=0.04, refuses=0):
     leg.oid = "resting"
     leg.target_size = target
     s.book = PositionBook()
+    s._groups = {}
     s.book.set_authoritative("maker", SYMBOL, held)
     roles = type("R", (), {"maker": "maker", "symbol": SYMBOL, "key": SYMBOL,
                            "_book": s.book})()
@@ -328,3 +335,89 @@ async def test_a_configured_leg_still_halts(group_clock):
 
     assert s._stop.is_set()
     assert s.sessions["maker"].closes == []
+
+
+# -- a cut-short close must not trade against our own orders -----------------
+#
+# The close is a market order, like a hedge, and with the groups kept on
+# opposite sides another group's maker is usually resting on the side it
+# sweeps. Two ALO orders of ours can never match -- the exchange rejects the
+# one that would cross -- so a taking order of ours is the only way the bot
+# self-trades, and this was the one taking order that did not clear its path.
+
+
+class OtherSession:
+    def __init__(self, name):
+        self.name = name
+        self.pubkey = name
+        self.cancelled = []
+
+    async def cancel(self, symbol, oid):
+        self.cancelled.append(oid)
+
+
+def with_another_group(s, *, maker_is_buy, oid="other-oid"):
+    """A second live group whose maker rests on the bid or on the ask."""
+    from bulkdn.pairing import Group
+
+    key = "g99:" + SYMBOL
+    s._groups[key] = Group(
+        SYMBOL, maker="other", takers=("t-other",), shares=(1.0,),
+        maker_is_buy=maker_is_buy,
+    )
+    leg = s.state.leg(key, SYMBOL)
+    leg.phase = Phase.OPEN
+    leg.oid = oid
+    roles = type("R", (), {
+        "maker": "other", "symbol": SYMBOL, "key": key, "maker_is_buy": maker_is_buy,
+    })()
+    own = s._roles_for_key(SYMBOL)
+    s._roles_for_key = lambda k, _own=own, _r=roles: _r if k == key else _own
+    s.sessions["other"] = OtherSession("other")
+    return leg
+
+
+async def test_a_cut_short_close_pulls_the_other_groups_order_off_the_side_it_sweeps(group_clock):
+    group_clock.now = 40 * 60
+    s, leg = build_group(Phase.EXIT, held=0.01)   # long: closes with a SELL
+    other = with_another_group(s, maker_is_buy=True)  # resting on the bid
+
+    await Strategy._drive_leg(s, SYMBOL, lambda: leg.complete, "exit")
+
+    assert s.sessions["other"].cancelled == ["other-oid"]
+    assert other.oid is None, "the chaser must re-place it, not track a cancelled id"
+    assert s.sessions["maker"].closes == [(SYMBOL, False, pytest.approx(0.01))]
+
+
+async def test_an_order_on_the_other_side_is_left_alone(group_clock):
+    group_clock.now = 40 * 60
+    s, leg = build_group(Phase.EXIT, held=0.01)
+    other = with_another_group(s, maker_is_buy=False)  # resting on the ask
+
+    await Strategy._drive_leg(s, SYMBOL, lambda: leg.complete, "exit")
+
+    assert s.sessions["other"].cancelled == []
+    assert other.oid == "other-oid"
+
+
+async def test_a_short_is_closed_with_a_buy_which_sweeps_the_ask(group_clock):
+    group_clock.now = 40 * 60
+    s, leg = build_group(Phase.EXIT, held=-0.01)
+    with_another_group(s, maker_is_buy=False)
+
+    await Strategy._drive_leg(s, SYMBOL, lambda: leg.complete, "exit")
+
+    assert s.sessions["other"].cancelled == ["other-oid"]
+
+
+async def test_the_swept_side_is_marked_while_the_close_is_on_its_way(group_clock):
+    """So no chaser re-places onto it in between, the way `_hedge_leg` does."""
+    group_clock.now = 40 * 60
+    s, leg = build_group(Phase.EXIT, held=0.01)
+    seen = []
+    s.sessions["maker"].probe = lambda: seen.append(dict(getattr(s, "_sweeping", {})))
+
+    await Strategy._drive_leg(s, SYMBOL, lambda: leg.complete, "exit")
+
+    assert seen == [{(SYMBOL, True): 1}], "the bid was not marked while the sell went out"
+    assert not getattr(s, "_sweeping", {}), "the mark must come off afterwards"
