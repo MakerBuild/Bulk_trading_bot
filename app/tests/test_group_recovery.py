@@ -28,6 +28,7 @@ def strategy(tmp_path, accounts=("opener", "t1", "t2", "spare")):
     obj._groups = {}
     obj._group_ids = {}
     obj.state = StrategyState()
+    obj.symbols = [BTC]
     obj.store = StateStore(str(tmp_path / "state.json"))
     obj.sessions = {pubkey: object() for pubkey in accounts}
     obj.pairing = Pairing(pool=list(accounts), max_groups=5, rng=random.Random(2))
@@ -421,3 +422,15 @@ async def test_the_dispatcher_counts_from_the_state_file(tmp_path):
     await asyncio.wait_for(obj._dispatch_groups({BTC: 0.1}), 2)
 
     assert drawn == [], "a resumed run drew past its cycles"
+
+
+def test_a_cycle_on_a_switched_off_market_refuses_by_name(tmp_path):
+    """A live run: ETH-USD switched off mid-exit, and the restart died on
+    `KeyError: 'ETH-USD'` in the hedger. The operator needs to be told which
+    cycle is stranded and what closes it, not handed a missing dict key."""
+    obj = strategy(tmp_path)
+    eth = Group("ETH-USD", maker="opener", takers=("t1",), shares=(1.0,))
+    remember(obj, phase=Phase.EXIT, group=eth, group_id=1)
+
+    with pytest.raises(RuntimeError, match=r"g1:ETH-USD \(mid-EXIT\).*Close All Positions"):
+        obj.restore_groups()

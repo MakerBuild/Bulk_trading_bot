@@ -172,6 +172,37 @@ CUT_SHORT_RETRY_S = 5.0
 # An OPEN this far to its target counts as about to turn round when the next
 # group's side is chosen. See `_resting_side`.
 TURNING_FRACTION = 0.5
+# How often a leg still waiting on a fill says so. The chaser logs only when it
+# moves the order, and an order sitting on the touch in a quiet market can go
+# minutes without moving: a live operator read that silence as a hung bot and
+# stopped it three times in five minutes, restarting the exit each time.
+WAITING_LOG_S = 60.0
+
+
+def waiting_line(
+    key: str,
+    label: str,
+    *,
+    left: float,
+    price: float | None,
+    waited_s: float,
+    budget_s: float,
+    group: bool,
+) -> str:
+    """The periodic "still waiting" line for one leg, and what ends the wait."""
+    resting = f"order resting at {price:g}" if price else "no order resting yet"
+    if not budget_s:
+        then = "no time limit is set"
+    elif not group:
+        then = f"at {budget_s / 60:g} min the run halts"
+    elif label == "exit":
+        then = f"at {budget_s / 60:g} min the rest closes at market"
+    else:
+        then = f"at {budget_s / 60:g} min it keeps what has filled and moves on"
+    return (
+        f"{key} {label}: waiting for a fill -- {left:g} left, {resting}, "
+        f"{waited_s / 60:.1f} min in; {then}"
+    )
 
 
 def phase_budget_s(phase: Phase, max_phase_minutes: float) -> float:
@@ -1973,6 +2004,7 @@ class Strategy:
         budget = phase_budget_s(leg.phase, self.config.max_phase_minutes)
         cut_at: float | None = None
         closed_at = NEVER
+        said_at = started
 
         while not self._stop.is_set():
             if budget and cut_at is None and time.monotonic() - started > budget:
@@ -2021,6 +2053,17 @@ class Strategy:
                         maker = self.sessions.get(roles.maker)
                         if maker is not None:
                             self._note_stream_lag(maker, "an order got no answer")
+                now = time.monotonic()
+                if not leg.complete and now - said_at >= WAITING_LOG_S:
+                    said_at = now
+                    log.info("%s", waiting_line(
+                        key, label,
+                        left=self.chaser.remaining_size(roles, leg),
+                        price=leg.price,
+                        waited_s=now - started,
+                        budget_s=budget,
+                        group=bool(leg.group_id),
+                    ))
 
             self._persist()
 
@@ -2320,10 +2363,18 @@ class Strategy:
         and resuming it would open a cycle nobody asked for.
         """
         resumed: list[tuple[int, Group, str]] = []
+        switched_off: list[str] = []
         for key, leg in self.state.legs.items():
             if not leg.group_id or not leg.maker or not leg.takers:
                 continue
             if leg.phase in (Phase.IDLE, Phase.COMPLETE):
+                continue
+            if leg.symbol not in self.symbols:
+                # A market switched off with a cycle still open on it. This run
+                # has no spec, no feed and no chase settings for it, so resuming
+                # the group got as far as the first hedge and died on a
+                # KeyError naming the market -- which told the operator nothing.
+                switched_off.append(f"{key} (mid-{leg.phase.value})")
                 continue
             group = Group(
                 symbol=leg.symbol,
@@ -2350,6 +2401,14 @@ class Strategy:
                 self.pairing.reserve(leg.group_id, group)
             resumed.append((leg.group_id, group, key))
             log.warning("resuming group %d mid-%s: %s", leg.group_id, leg.phase.value, group)
+        if switched_off:
+            raise RuntimeError(
+                "a cycle is still open on a market switched off in settings.yaml: "
+                + ", ".join(switched_off)
+                + ". This run cannot finish it. Close it with `6. Close All "
+                "Positions` -- that covers switched-off markets too -- then "
+                "start again."
+            )
         return resumed
 
     def group_key(self, group_id: int, symbol: str) -> str:
@@ -3341,8 +3400,8 @@ class Strategy:
             # `_live_roles` names -- and with the groups not yet back it named
             # the configured pair, m1 and m1s1, and traded one against the
             # other. The dispatcher starts these rather than restoring again.
-            self._restored = self.restore_groups()
             try:
+                self._restored = self.restore_groups()
                 self._refuse_unowned_positions()
             except RuntimeError:
                 # Refusing to trade is right; leaving the last process's orders
