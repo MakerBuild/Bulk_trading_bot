@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
 import logging
 import logging.handlers
 import os
@@ -38,6 +39,7 @@ from .impact import ImpactBook
 from .hedger import Hedger
 from .pairing import Pairing
 from .positions import PositionBook
+from . import lock
 from . import proxy
 from . import ratelimit
 from . import screen as screen_mod
@@ -68,6 +70,15 @@ LOG_FILE = "logs.txt"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 2
 
+# The commands that trade, close or read the accounts, which hold bulkdn.lock
+# for as long as they run -- so the menu and the Telegram service cannot work
+# the same accounts at once, and an update cannot reinstall under either.
+LOCKED_COMMANDS = ("run", "flatten", "status", "telegram")
+# Exit code when another copy holds the lock. Not 1: the Telegram service is
+# told not to restart on 1 (a setup error), and this one clears by itself once
+# the other copy stops, so the service should keep trying.
+EXIT_ALREADY_RUNNING = 4
+
 
 # Loggers whose INFO output is bookkeeping rather than news: position reads,
 # exposure sums, every order placed and every fill. About ninety lines per five
@@ -91,6 +102,11 @@ class _ConsoleFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # For a line the screen already shows in a form of its own -- a
+        # startup error printed as a sentence, a settings problem drawn in a
+        # box -- and that is logged only so logs.txt has it too.
+        if getattr(record, "console", True) is False:
+            return False
         if record.levelno >= logging.WARNING:
             return True
         if record.name in _QUIET_ON_SCREEN:
@@ -112,6 +128,11 @@ class _StatusHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+def set_log_level(level: str) -> None:
+    """The level everything is logged at, from the settings or the flag."""
+    logging.getLogger().setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
 def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     """Log to the console, and to `log_file` alongside it.
 
@@ -119,19 +140,33 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     screen the date is obvious, in a file read days later it is the point.
 
     The console also gets far less of it -- see `_ConsoleFilter`.
+
+    Called first thing, before the settings are read, so that whatever stops
+    a start is in the file too. The level is set again once the settings say
+    what it should be. Calling it twice replaces its handlers rather than
+    doubling every line.
     """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    set_log_level(level)
 
     # basicConfig's own handler prints straight to the stream, which would
-    # scroll through the status block. Replaced rather than added to.
+    # scroll through the status block. Replaced rather than added to -- and
+    # so are this function's own, from an earlier call.
     root = logging.getLogger()
+    wanted = os.path.abspath(log_file) if log_file else None
     for handler in list(root.handlers):
-        if type(handler) is logging.StreamHandler:
+        ours = isinstance(handler, _StatusHandler) or (
+            isinstance(handler, logging.handlers.RotatingFileHandler)
+            and handler.baseFilename == wanted
+        )
+        if type(handler) is logging.StreamHandler or ours:
             root.removeHandler(handler)
+            if ours:
+                handler.close()
     console = _StatusHandler(screen_mod.SCREEN)
     console.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
@@ -170,11 +205,30 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
 
 
 class Runtime:
-    """Wires the components together and owns their lifecycle."""
+    """Wires the components together and owns their lifecycle.
+
+    `trading=False` is for the commands that only look or close -- status,
+    check, flatten. They act on EVERY key in the file, whatever the mode, and
+    need no second account: closing one master's positions does not need
+    anything to pair with, and a mode is a choice about what to OPEN.
+    """
 
     def __init__(
-        self, config: Config, dry_run: bool, symbols: list[str] | None = None
+        self,
+        config: Config,
+        dry_run: bool,
+        symbols: list[str] | None = None,
+        *,
+        trading: bool = True,
     ):
+        # A private copy, which is this run's plan. The sizing below replaces
+        # each leg's size with what the thinnest account can carry, and a leg
+        # written as a range redraws its size every cycle; the chaser, the
+        # hedge ceilings and the exit sizes all read those resolved numbers
+        # from here. Doing it to the caller's Config meant the caller had to
+        # copy defensively before every run -- the menu did, Telegram did --
+        # and a caller that forgot ran its next run on the last one's sizes.
+        config = copy.deepcopy(config)
         self.config = config
         self.dry_run = dry_run
         # The markets this runtime subscribes to and acts on. A trading run
@@ -199,7 +253,7 @@ class Runtime:
         # `multi` hands over every key, so a group can span two masters. The
         # drawing, the trading and the accounting are the same code either
         # way -- which is why there is no second path to keep in step.
-        keys = self._keys_in_play(config)
+        keys = self._keys_in_play(config) if trading else list(config.private_keys)
         # Every account under every key in play, on one socket per key.
         # Discovery is an HTTP call per key rather than something the operator
         # copies by hand: a sub-account is a fact about its master, and a list
@@ -212,15 +266,25 @@ class Runtime:
             symbols=self.symbols,
             dry_run=dry_run,
         )
-        if len(self.pool) < 2:
+        # Only a run that opens positions needs two accounts. Status, check
+        # and flatten used to refuse here too, so a master whose only
+        # sub-account had not been created yet could not even be closed.
+        if trading and len(self.pool) < 2:
             raise ConfigError(
                 f"{config.mode} mode needs at least two accounts to pair, and "
                 f"the key(s) it uses produced {len(self.pool)}. Create a "
                 "sub-account from Accounts Management."
             )
+        if not self.pool:
+            raise ConfigError(
+                "the keys in the key file produced no accounts at all. A BULK "
+                "account is created by a deposit -- make one first."
+            )
         # The first two keep their old names for the commands that act on
-        # one account -- status, transfer, the market feed's socket.
-        self.master, self.sub1 = self.pool[0], self.pool[1]
+        # one account -- status, transfer, the market feed's socket. A closing
+        # runtime may have only the one.
+        self.master = self.pool[0]
+        self.sub1 = self.pool[1] if len(self.pool) > 1 else None
         log.info(
             "%s: %d accounts under %d key(s) on %d socket(s)",
             config.mode,
@@ -314,11 +378,17 @@ class Runtime:
             "mainnet mode=%s master=%s sub1=%s legs=%s (%s)",
             "DRY-RUN" if self.dry_run else "LIVE",
             self.master.pubkey,
-            self.sub1.pubkey,
+            self.sub1.pubkey if self.sub1 is not None else "-",
             ",".join(self.symbols),
             self.config.mode,
         )
-        self.load_specs(strict=trading)
+        # Every step below that reads the exchange over HTTP is synchronous
+        # `requests`, and runs in a worker thread rather than on the event
+        # loop. On the loop it froze everything else for its whole length --
+        # the referral check alone retries for up to a minute -- and in a
+        # Telegram session that is the loop answering /stop. test_no_kludges
+        # holds every async function in this file to it.
+        await asyncio.to_thread(self.load_specs, strict=trading)
 
         # Orders left resting by a run that died come off first, before any
         # check below can stop this start. Recovery cancels them too, but only
@@ -329,15 +399,15 @@ class Runtime:
         # failure is logged rather than raised: it must not become the thing
         # that stops the start either.
         if trading and not self.dry_run:
-            await cancel_all_orders(self.pool, self.symbols)
+            _report_cancel_failures(await cancel_all_orders(self.pool, self.symbols))
 
         # Before anything is placed. A gate that tripped later would abandon
         # open positions and leave the pair directional.
         if trading:
-            self.check_access()
+            await asyncio.to_thread(self.check_access)
 
-        if verify and self._same_tree(self.master, self.sub1):
-            verify_sub_account(self.master, self.sub1)
+        if verify and self.sub1 is not None and self._same_tree(self.master, self.sub1):
+            await asyncio.to_thread(verify_sub_account, self.master, self.sub1)
 
         if not trading:
             await self._connect_all()
@@ -357,10 +427,10 @@ class Runtime:
                     ", ".join(missing),
                 )
 
-        self.apply_sizing()
+        await asyncio.to_thread(self.apply_sizing)
 
         if not self.dry_run:
-            self.apply_leverage()
+            await asyncio.to_thread(self.apply_leverage)
 
         await self._connect_all()
         await self.feed.subscribe()
@@ -441,10 +511,11 @@ class Runtime:
         Runs in dry-run too, so a rehearsal shows the sizes a live run would
         really use rather than the ones written in the file.
 
-        The legs are mutated in place because everything downstream -- the
+        The legs are resized in place because everything downstream -- the
         chaser's targets, the hedge ceilings, the exit sizes -- reads them from
         the config, and a second source of truth for size is how the two end up
-        disagreeing.
+        disagreeing. It is this runtime's own copy that changes (see
+        `__init__`), never the Config the caller handed in.
         """
         legs = list(self.config.active_legs)
         # Priced over HTTP, not from the feed: this runs before the WebSocket
@@ -670,7 +741,8 @@ async def cmd_run(config: Config, dry_run: bool, *, on_strategy=None) -> int:
     has to reach into a run it did not start by hand -- the Telegram control
     loop, which answers /status and /stop from it.
     """
-    runtime = Runtime(config, dry_run)
+    # Built in a worker thread: finding the accounts is an HTTP call per key.
+    runtime = await asyncio.to_thread(Runtime, config, dry_run)
     # For the whole run, startup included: the lines that need a person --
     # a crash, a close that failed -- reach Telegram and not only the log.
     alerts = AlertHandler(runtime.notifier)
@@ -729,7 +801,7 @@ async def _run(runtime: Runtime, config: Config, dry_run: bool, on_strategy=None
     except Exception:
         # Logged rather than only raised, so the traceback reaches the log file
         # and not just the console window that is about to close.
-        log.exception("run failed")
+        log.exception("run failed", extra={"alert": True})
         raise
     finally:
         stopper.cancel()
@@ -745,6 +817,22 @@ async def _run(runtime: Runtime, config: Config, dry_run: bool, on_strategy=None
             # that failed to close used to skip this, and the halt alert that
             # explained the failure was cancelled unsent.
             await runtime.notifier.drain()
+
+
+def _report_cancel_failures(failures) -> bool:
+    """Say, loudly, which accounts' cancel-all failed. True when any did.
+
+    `cancel_all_orders` returns its failures as (session, exception) pairs;
+    an older build returned None, which is read as "none failed". CRITICAL
+    and marked as an alert, because a resting order nobody cancelled is an
+    unhedged fill waiting to happen.
+    """
+    for session, exc in failures or ():
+        log.critical(
+            "%s: could not cancel its orders: %s", session.name, describe(exc),
+            extra={"alert": True},
+        )
+    return bool(failures)
 
 
 async def cmd_flatten(
@@ -766,7 +854,13 @@ async def cmd_flatten(
     # ones only and then reset the state, so a market turned off with a
     # position still open was left on the exchange and forgotten.
     every_market = list(dict.fromkeys(market.symbol for market in config.markets))
-    runtime = Runtime(config, dry_run, symbols=every_market)
+    # Every key, whatever the mode. In single mode the trading runtime holds
+    # one master's accounts only, and closing through it left every other
+    # master's positions open -- and then reset the state to IDLE as if they
+    # were not there.
+    runtime = await asyncio.to_thread(
+        Runtime, config, dry_run, symbols=every_market, trading=False
+    )
     await runtime.start(verify=False, trading=False)
     closed = True
     try:
@@ -774,7 +868,9 @@ async def cmd_flatten(
         # pool mode those two are two of however many the keys produced --
         # leaving a resting order on the rest is leaving an unhedged fill
         # waiting to happen on an account nobody is watching any more.
-        await cancel_all_orders(runtime.pool, runtime.symbols)
+        cancel_failed = _report_cancel_failures(
+            await cancel_all_orders(runtime.pool, runtime.symbols)
+        )
         if limit:
             # From the first market switched on. `markets[0]` is whatever
             # happens to be first in the file, and it may be one switched off
@@ -810,6 +906,16 @@ async def cmd_flatten(
             for line in sorted(elsewhere):
                 print(f"    {line}")
             print("  Close these on the exchange by hand. The state is kept.")
+            return 1
+        if cancel_failed:
+            # An order that could not be cancelled may still be resting, and
+            # can fill after the close with nothing hedging it. Reporting flat
+            # -- and resetting the state that remembers the run -- would tell
+            # the operator to stop looking at exactly the account to look at.
+            print("")
+            print("  Some orders could NOT be cancelled -- see the lines above.")
+            print("  They may still be resting. Run Close All again, or cancel")
+            print("  them on the exchange by hand. The state is kept.")
             return 1
 
         state = runtime.store.load()
@@ -864,15 +970,19 @@ async def cmd_status(config: Config) -> int:
     # exactly what someone reading `status` needs to see, and it was the one
     # thing this left out.
     every_market = list(dict.fromkeys(market.symbol for market in config.markets))
-    runtime = Runtime(config, dry_run=True, symbols=every_market)
+    # Every key too, for the same reason as `flatten`: a status that answers
+    # for one master in single mode says nothing about the others.
+    runtime = await asyncio.to_thread(
+        Runtime, config, dry_run=True, symbols=every_market, trading=False
+    )
     # Not strict: one delisted or misspelled market must not hide the rest.
-    runtime.load_specs(strict=False)
+    await asyncio.to_thread(runtime.load_specs, strict=False)
     switched_off = {m.symbol for m in config.markets if not m.enabled}
 
     # Every account, not the named pair. `status` is what an operator reads
     # to decide whether anything is open, and answering for two accounts out
     # of six is answering the wrong question confidently.
-    sync_positions_http(runtime.pool, runtime.book)
+    await asyncio.to_thread(sync_positions_http, runtime.pool, runtime.book)
     state = runtime.store.load()
 
     print(f"endpoint     : {config.http_url}")
@@ -911,7 +1021,7 @@ async def cmd_status(config: Config) -> int:
     print("\nopen orders:")
     for session in runtime.pool:
         try:
-            orders = session.open_orders()
+            orders = await asyncio.to_thread(session.open_orders)
         except Exception as exc:
             print(f"  {session.name}: query failed ({exc})")
             continue
@@ -929,16 +1039,22 @@ async def cmd_status(config: Config) -> int:
 
 async def cmd_check(config: Config) -> int:
     """Validate configuration and account wiring without connecting to trade."""
-    runtime = Runtime(config, dry_run=True)
-    runtime.feed.load_specs()
+    runtime = await asyncio.to_thread(Runtime, config, dry_run=True, trading=False)
+    await asyncio.to_thread(runtime.feed.load_specs)
     print("market specs OK")
+    if runtime.sub1 is None:
+        print(
+            "only one account: a run needs two to pair. Create a sub-account "
+            "from Accounts Management -> Create New Subaccount."
+        )
+        return 1
     if not Runtime._same_tree(runtime.master, runtime.sub1):
         # Nothing is wrong: in multi mode the pool's first two accounts can be
         # two different masters, and neither is the other's child.
         print("sub-account relationship: n/a -- these two are separate masters")
         return 0
     try:
-        verify_sub_account(runtime.master, runtime.sub1)
+        await asyncio.to_thread(verify_sub_account, runtime.master, runtime.sub1)
         print("sub-account relationship OK")
     except Exception as exc:
         print(f"sub-account check FAILED: {exc}")
@@ -1065,7 +1181,7 @@ async def cmd_transfer(
     # the key owning BOTH ends, so one inside the second master's tree signed
     # by the first master's key is simply refused -- and refused after the
     # operator has been told it was submitted.
-    tree = _tree_holding(config, source)
+    tree = await asyncio.to_thread(_tree_holding, config, source)
     if tree is None:
         print(f"\nno key in the file owns {source}. Nothing was submitted.")
         return 1
@@ -1087,7 +1203,8 @@ async def cmd_transfer(
         f"  via  {config.http_url}\n"
     )
 
-    result, outcome, detail = submit_signed(
+    result, outcome, detail = await asyncio.to_thread(
+        submit_signed,
         submit_transfer,
         http_url=config.http_url,
         private_key=key,
@@ -1197,7 +1314,8 @@ async def cmd_create_subaccount(
         f"mainnet, domain byte {SignatureDomain[config.signature_domain_name].value}\n"
     )
 
-    result, outcome, detail = submit_signed(
+    result, outcome, detail = await asyncio.to_thread(
+        submit_signed,
         build_and_submit,
         http_url=config.http_url,
         private_key=private_key or config.private_key,
@@ -1332,9 +1450,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _startup_error(what: str, exc: Exception) -> None:
+    """A reason the command cannot start: on screen as a sentence, and in the file.
+
+    It used to be a bare print, before logging existed -- so it was nowhere
+    once the window closed, which on Windows it did at once.
+    """
+    print(f"\n{what}: {exc}", file=sys.stderr)
+    log.error("%s: %s", what, exc, extra={"console": False})
+
+
+def _ready(config: Config, log_level: str | None) -> None:
+    """What every command needs once the settings have been read."""
+    set_log_level(log_level or config.log_level)
+    # Before anything reads an account. See ratelimit for why every path
+    # through the transport, the SDK's included, has to share one pace.
+    ratelimit.install(config.http_url)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # First, so that anything below that stops the start is in logs.txt as
+    # well as on a screen that may be about to close. The settings' own
+    # level is applied once they have been read.
+    configure_logging(args.log_level or "INFO")
+
+    if args.command in (None, "menu"):
+        # Imported here, not at the top. `menu` is a front end over these
+        # commands and calls back into them, so importing it at module
+        # scope made the two mutually dependent -- and paid for with eight
+        # `from .cli import ...` lines hidden inside menu's functions. One
+        # deferred import in the one place that needs it costs less and
+        # says which direction the dependency actually runs.
+        from .menu import Settings, run_menu
+
+        # The menu opens whatever state the settings are in. A setting it
+        # cannot read is shown there, with a way to fix it -- refusing to
+        # open was what sent people to a command prompt to find out why the
+        # window closed.
+        return run_menu(
+            Settings(
+                args.config,
+                mode=args.mode,
+                on_load=lambda config: _ready(config, args.log_level),
+            )
+        )
 
     try:
         config = load_config(
@@ -1343,10 +1505,8 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
         )
     except ConfigError as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
+        _startup_error("configuration error", exc)
         return 1
-
-    configure_logging(args.log_level or config.log_level)
 
     # Before anything opens a socket, and after logging so the choice is on the
     # record. A bad proxy line stops the bot here rather than being ignored:
@@ -1355,12 +1515,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         proxy.configure()
     except proxy.ProxyError as exc:
-        print(f"proxy error: {exc}", file=sys.stderr)
+        _startup_error("proxy error", exc)
         return 1
 
-    # Before anything reads an account. See ratelimit for why every path
-    # through the transport, the SDK's included, has to share one pace.
-    ratelimit.install(config.http_url)
+    _ready(config, args.log_level)
 
     dry_run = not getattr(args, "live", False)
     if not dry_run:
@@ -1368,17 +1526,15 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("LIVE TRADING ON MAINNET -- real funds are at risk")
         log.warning("=" * 70)
 
-    try:
-        if args.command in (None, "menu"):
-            # Imported here, not at the top. `menu` is a front end over these
-            # commands and calls back into them, so importing it at module
-            # scope made the two mutually dependent -- and paid for with eight
-            # `from .cli import ...` lines hidden inside menu's functions. One
-            # deferred import in the one place that needs it costs less and
-            # says which direction the dependency actually runs.
-            from .menu import run_menu
+    locked = args.command in LOCKED_COMMANDS
+    if locked:
+        try:
+            lock.acquire(args.command)
+        except lock.Held as exc:
+            _startup_error("already running", exc)
+            return EXIT_ALREADY_RUNNING
 
-            return run_menu(config, args.config)
+    try:
         if args.command == "run":
             return asyncio.run(cmd_run(config, dry_run))
         if args.command == "flatten":
@@ -1411,7 +1567,7 @@ def main(argv: list[str] | None = None) -> int:
     except AccessDenied as exc:
         # A refusal is an expected outcome, not a crash -- say so plainly
         # rather than unwinding a traceback over it.
-        print(f"\naccess denied: {exc}", file=sys.stderr)
+        _startup_error("access denied", exc)
         print(
             "This build runs only for accounts signed up under the owner's "
             "referral code.",
@@ -1423,11 +1579,14 @@ def main(argv: list[str] | None = None) -> int:
         # exchange -- fewer than two accounts to pair, a single_master past the
         # last key, a leverage above the market's ceiling. The same plain
         # sentence as a bad file, not a traceback through asyncio.run.
-        print(f"\nconfiguration error: {exc}", file=sys.stderr)
+        _startup_error("configuration error", exc)
         return 1
     except KeyboardInterrupt:
         log.warning("interrupted")
         return 130
+    finally:
+        if locked:
+            lock.release()
 
     parser.error(f"unknown command {args.command}")
     return 1

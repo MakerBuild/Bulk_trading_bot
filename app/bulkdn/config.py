@@ -8,11 +8,13 @@ signing authority.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import logging
 import math
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -21,7 +23,7 @@ import yaml
 from . import keystore
 from .notify import TelegramConfig
 from .pause import PauseConfig, Window
-from .referral import AccessConfig
+from .referral import AccessConfig, is_sealed
 
 log = logging.getLogger(__name__)
 
@@ -74,6 +76,14 @@ MAINNET_WS_URL = "wss://mainnet-ws1.bulk.trade"
 
 # Domain byte 1. Trusted client configuration, never a JSON field or header.
 SIGNATURE_DOMAIN_NAME = "MAINNET"
+
+# The `updateUserSettings` action's own bound on leverage, from the API
+# reference. Here rather than beside the request that sends it, because the
+# settings file is checked against it long before any request is built --
+# and the two copies there used to be are two numbers free to disagree.
+# bulkdn.settings enforces the same pair on the way out.
+MIN_LEVERAGE = 1.0
+MAX_LEVERAGE = 50.0
 
 
 class ConfigError(Exception):
@@ -162,51 +172,54 @@ class LegConfig:
 
     def validate(self, name: str) -> None:
         if not self.symbol:
-            raise ConfigError(f"legs.{name}.symbol is required")
+            raise ConfigError(f"{name}.symbol is required")
 
         if self.size < 0 or self.notional_usd < 0:
-            raise ConfigError(f"legs.{name}: size and notional_usd must be >= 0")
+            raise ConfigError(f"{name}: size and notional_usd must be >= 0")
         if self.size > 0 and self.notional_usd > 0:
             raise ConfigError(
-                f"legs.{name} sets both `size` and `notional_usd` -- use one. "
+                f"{name} sets both `size` and `notional_usd` -- use one. "
                 f"`notional_usd` is in dollars and keeps its meaning when you "
                 f"change `symbol`; `size` is in the base coin and does not."
             )
         if self.size <= 0 and self.notional_usd <= 0:
             raise ConfigError(
-                f"legs.{name} has no size: set `notional_usd: 100` for $100 of "
+                f"{name} has no size: set `notional_usd: 100` for $100 of "
                 f"{self.symbol}, or `size` for an amount of the base coin."
             )
 
         if self.max_order_size < 0 or self.max_order_notional_usd < 0:
-            raise ConfigError(f"legs.{name}: the max_order_* caps must be >= 0")
+            raise ConfigError(f"{name}: the max_order_* caps must be >= 0")
         if self.max_order_size > 0 and self.max_order_notional_usd > 0:
             raise ConfigError(
-                f"legs.{name} sets both `max_order_size` and "
+                f"{name} sets both `max_order_size` and "
                 f"`max_order_notional_usd` -- use one."
             )
         # Both may be zero: the cap then defaults to the whole leg, which is
         # applied once the leg has a size.
         if self.notional_usd <= 0 and self.max_order_notional_usd <= 0 and self.max_order_size <= 0:
-            raise ConfigError(f"legs.{name}.max_order_size must be > 0")
+            raise ConfigError(f"{name}.max_order_size must be > 0")
 
         if self.offset_bps < 0:
-            raise ConfigError(f"legs.{name}.offset_bps must be >= 0")
+            raise ConfigError(f"{name}.offset_bps must be >= 0")
         if self.max_distance_bps <= 0:
-            raise ConfigError(f"legs.{name}.max_distance_bps must be > 0")
+            raise ConfigError(f"{name}.max_distance_bps must be > 0")
         if self.chase_patience_s < 0:
-            raise ConfigError(f"legs.{name}.chase_patience_s must be >= 0 (0 disables it)")
+            raise ConfigError(f"{name}.chase_patience_s must be >= 0 (0 disables it)")
         if self.improve_ticks < 0:
             raise ConfigError(
-                f"legs.{name}.improve_ticks must be >= 0 (0 joins the touch "
+                f"{name}.improve_ticks must be >= 0 (0 joins the touch "
                 "instead of beating it)"
             )
         if self.join_depth_usd < 0:
             raise ConfigError(
-                f"legs.{name}.join_depth_usd must be >= 0 (0 switches it off)"
+                f"{name}.join_depth_usd must be >= 0 (0 switches it off)"
             )
-        if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
-            raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
+        if self.leverage is not None and not MIN_LEVERAGE <= self.leverage <= MAX_LEVERAGE:
+            raise ConfigError(
+                f"{name}.leverage must be between {MIN_LEVERAGE:g} and "
+                f"{MAX_LEVERAGE:g}"
+            )
 
 
 @dataclass
@@ -252,14 +265,21 @@ class ExecutionTarget:
     `volume_usd` counts qualifying volume only. Fills that crossed between the
     master and its own sub-account are real spend but earn no tier credit, so
     counting them would overstate progress toward a volume goal.
+
+    The defaults are what app/settings.default.yaml ships, because that file is
+    what every installed copy started from -- test_defaults keeps the two equal.
+    `cycles` used to default to 1 here and to 0 in the loader, and `burn_usd`
+    to 0 here and to 3 in the shipped file: three answers to "what happens when
+    the line is missing", depending on who asked.
     """
 
-    cycles: int = 1
+    # Groups to start in this run; 0 = no limit.
+    cycles: int = 0
     # How much fee activity to accumulate before stopping, as a plain amount.
     # A maker-heavy pair earns more than it pays and so runs a negative total;
     # the sign is not something to configure, so this counts the distance from
     # zero either way. 0 disables it.
-    burn_usd: float = 0.0
+    burn_usd: float = 3.0
     volume_usd: float = 0.0
 
     def validate(self) -> None:
@@ -323,12 +343,24 @@ class Span:
 
         if isinstance(value, str):
             text = value.strip()
+            # A plain number first. `-5` and `1e-3` both hold a `-`, and
+            # splitting on it called the first "not a number" -- when what
+            # was wrong was the sign -- and refused the second outright.
+            try:
+                number = float(text)
+            except ValueError:
+                pass
+            else:
+                return cls._checked(number, number, value, name)
             # YAML reads `0.5-1` as a string, which is the spelling the
-            # settings file documents, so it is the one that must work.
-            low, sep, high = text.partition("-")
+            # guide documents, so it is the one that must work. The
+            # first character is skipped when looking for the dash, so a
+            # negative low end (`-5-10`) splits after its sign and is then
+            # refused for being negative, which is what it is.
+            low, sep, high = text[1:].partition("-")
             if not sep:
                 return cls._checked(text, text, value, name)
-            return cls._checked(low, high, value, name)
+            return cls._checked(text[:1] + low, high, value, name)
 
         raise ConfigError(f"{name} must be a number or a range, got {value!r}")
 
@@ -340,6 +372,10 @@ class Span:
             raise ConfigError(
                 f"{name} must be a number or a range like 2000-6000, got {original!r}"
             ) from exc
+        # `nan` passes every comparison below by failing it, and `inf` is a
+        # size or a hold no draw can honour.
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise ConfigError(f"{name} must be a finite number, got {original!r}")
         if lo < 0:
             raise ConfigError(f"{name} must be >= 0, got {original!r}")
         if hi < lo:
@@ -422,7 +458,10 @@ class Config:
     # rejections means finding out during a cycle rather than before one.
     max_groups: int = 5
     max_takers: int = 1
-    hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(5.0, 5.0))
+    # Drawn fresh for every hold; see HoldTime. The shipped file's range, for
+    # the same reason as ExecutionTarget's defaults: it used to be a fixed five
+    # minutes here, which no installed copy has ever run.
+    hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(0.5, 1.5))
     # How long OPEN or EXIT may run before the cycle is called stuck.
     # HOLD is exempt: it ends on a clock it sets itself.
     #
@@ -446,7 +485,6 @@ class Config:
     # already enough to draw a 429 from the exchange; the pool this is
     # being prepared for has a hundred.
     position_sync_interval_s: float = 60.0
-    cycles: int = 1
     hedge_tolerance_lots: float = 1.0
     overlay_ttl_ms: int = 2000
     # Fallback when the configured sizes need more margin than the accounts
@@ -481,6 +519,16 @@ class Config:
         return [market for market in self.markets if market.enabled]
 
     @property
+    def cycles(self) -> int:
+        """The cycle limit, which is `target.cycles` under its older name.
+
+        It was a field of its own that duplicated `target.cycles`, and the menu
+        had to remember to set both. Read-only, so there is one place to write
+        it and the strategy's `config.cycles` still reads the same number.
+        """
+        return self.target.cycles
+
+    @property
     def master_account(self) -> LegConfig:
         """The first market. Kept for the callers that only need any market.
 
@@ -497,7 +545,10 @@ class Config:
     # See bulkdn/pause.py. Off unless asked for.
     pause: PauseConfig = field(default_factory=PauseConfig)
 
-    # Optional endpoint overrides, for when the derived host is wrong.
+    # Optional endpoint overrides. Nothing is derived: the hosts are the
+    # MAINNET_* constants above, and these replace them outright when set --
+    # which also replaces what the signature domain was pinned beside, so
+    # they are for a host the exchange itself publishes, not for a guess.
     http_url_override: str = ""
     ws_url_override: str = ""
 
@@ -635,8 +686,6 @@ class Config:
             raise ConfigError("reconcile_interval_s must be > 0")
         if self.position_sync_interval_s <= 0:
             raise ConfigError("position_sync_interval_s must be > 0")
-        if self.cycles < 0:
-            raise ConfigError("cycles must be >= 0 (0 means run forever)")
         # Below one lot the exchange cannot express the correction, so a
         # sub-lot tolerance would make the hedger spin on an uncorrectable
         # residual.
@@ -666,7 +715,7 @@ class Config:
             if market.max_order_span is not None:
                 cap = max(cap, market.max_order_span.high)
             if cap > 0 and limit <= cap:
-                log.warning(
+                _warn(
                     "risk.max_net_exposure_usd ($%s) is not above %s's per-order "
                     "cap ($%s): one resting order filling in full would trip "
                     "the exposure halt before the hedge lands. Twice the cap is "
@@ -739,7 +788,15 @@ def _as_int(value: Any, name: str) -> int:
     Truncating would quietly run a different setting from the one written --
     `max_groups: 2.5` is either a typo or a misunderstanding, and in both
     cases the operator should hear about it. `3.0` is accepted, since it is 3.
+
+    A whole number written as one is taken as it is rather than through a
+    float, which is exact only up to 2**53 -- a Telegram id is a count of
+    nothing but it is still a number that has to arrive unchanged.
     """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
     number = _as_float(value, name)
     if not number.is_integer():
         raise ConfigError(f"{name} must be a whole number, got {value!r}")
@@ -760,6 +817,62 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"{name} must be a mapping")
     return value
+
+
+# -- warnings, said once ----------------------------------------------------
+#
+# The menu reads the file again for every action, so that what it shows and
+# what a run trades are what the file says now. A warning logged on every read
+# would then repeat on every keypress, and the one that matters would scroll
+# away under copies of the rest. So everything the loader warns about is
+# collected while it reads, and said once for each version of the file: the
+# same file read twice says nothing new, and an edit gets its own say.
+
+_collecting: list[list[tuple[str, tuple[Any, ...]]]] = []
+_last_said: dict[str, tuple[int, int] | None] = {}
+
+
+def _warn(message: str, *args: Any) -> None:
+    """A warning about the settings, held back until the read is over."""
+    if _collecting:
+        _collecting[-1].append((message, args))
+    else:
+        log.warning(message, *args)
+
+
+def _version(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+@contextlib.contextmanager
+def _warnings_for(path: str, say: bool):
+    """Collect the warnings of one read, and say them unless already said."""
+    pending: list[tuple[str, tuple[Any, ...]]] = []
+    _collecting.append(pending)
+    try:
+        yield
+    finally:
+        _collecting.pop()
+        if say:
+            key = os.path.abspath(path)
+            version = _version(path)
+            if _last_said.get(key, ()) != version:
+                _last_said[key] = version
+                for message, args in pending:
+                    log.warning(message, *args)
+
+
+def _renamed(old: str, new: str) -> None:
+    """An older spelling, still read, and what it is called now."""
+    _warn(
+        "%s still works, but it is the older spelling: the current one is %s. "
+        "Renaming it is optional and changes nothing about how the bot runs.",
+        old, new,
+    )
 
 
 # -- spotting typos ----------------------------------------------------------
@@ -828,16 +941,16 @@ def _warn_unknown(raw: dict[str, Any], known: frozenset[str], where: str) -> Non
     for key in raw:
         path = f"{where}.{key}" if where else str(key)
         if not isinstance(key, str):
-            log.warning("%s is not a setting this bot reads, so it has no effect", path)
+            _warn("%s is not a setting this bot reads, so it has no effect", path)
             continue
         if key in known:
             continue
         if key in _RETIRED:
-            log.warning("%s is %s", path, _RETIRED[key])
+            _warn("%s is %s", path, _RETIRED[key])
             continue
         near = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.6)
         hint = f" -- did you mean `{near[0]}`?" if near else ""
-        log.warning(
+        _warn(
             "%s is not a setting this bot reads, so it has no effect%s", path, hint
         )
 
@@ -853,23 +966,27 @@ def _span_from_raw(raw: dict[str, Any], key: str, name: str) -> Span | None:
     """
     if key not in raw or raw[key] is None:
         return None
-    return Span.parse(raw[key], f"legs.{name}.{key}")
+    return Span.parse(raw[key], f"{name}.{key}")
 
 
 def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if not isinstance(raw, dict):
-        raise ConfigError(f"legs.{name} must be a mapping")
+        raise ConfigError(f"{name} must be a mapping")
     # Retired and misspelled settings alike. Unknown keys used to be ignored
     # in silence, which let someone tune a number that was never read and
     # conclude the bot ignores its own config.
     _warn_unknown(raw, _LEG_KEYS, name)
 
-    def number(key: str, default: float) -> float:
-        value = raw.get(key)
-        return default if value is None else _as_float(value, f"{name}.{key}")
+    # Defaults are read off the dataclass, not written out again here: a
+    # second copy is a second number to forget when the first one changes.
+    default = LegConfig(symbol="")
 
-    size = number("size", 0.0)
-    cap_size = number("max_order_size", 0.0)
+    def number(key: str) -> float:
+        value = raw.get(key)
+        return getattr(default, key) if value is None else _as_float(value, f"{name}.{key}")
+
+    size = number("size")
+    cap_size = number("max_order_size")
 
     # Both dollar settings may be written as a range. The value carried
     # forward is the HIGH end, because the margin plan at startup is built
@@ -908,14 +1025,14 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             max_order_span=cap_span,
             offset_bps=offset_span.low if offset_span else 0.0,
             offset_span=offset_span,
-            max_distance_bps=number("max_distance_bps", 5.0),
-            chase_patience_s=number("chase_patience_s", 3.0),
+            max_distance_bps=number("max_distance_bps"),
+            chase_patience_s=number("chase_patience_s"),
             improve_ticks=(
                 _as_int(raw["improve_ticks"], f"{name}.improve_ticks")
                 if raw.get("improve_ticks") is not None
-                else 1
+                else default.improve_ticks
             ),
-            join_depth_usd=number("join_depth_usd", 0.0),
+            join_depth_usd=number("join_depth_usd"),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(
@@ -923,10 +1040,13 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
                 if raw.get("leverage") is not None
                 else None
             ),
-            enabled=_as_bool(raw.get("enabled", True), f"{name}.enabled"),
+            enabled=_as_bool(
+                raw["enabled"] if raw.get("enabled") is not None else default.enabled,
+                f"{name}.enabled",
+            ),
         )
     except KeyError as exc:
-        raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
+        raise ConfigError(f"{name} is missing required key {exc}") from exc
 
 
 def _mode_from_raw(value: Any) -> str:
@@ -939,6 +1059,7 @@ def _mode_from_raw(value: Any) -> str:
     """
     mode = str(value).strip().lower()
     if mode == "pool":
+        _renamed("mode: pool", "mode: multi")
         return "multi"
     return mode
 
@@ -955,6 +1076,15 @@ def _markets_from_raw(
     operator reading a complaint about `legs.sub_account` can find that line.
     """
     raw_markets = raw.get("markets")
+    if raw_markets is not None and legs:
+        # One of the two used to be ignored without a word -- `legs:` -- so an
+        # operator editing that block was editing nothing.
+        raise ConfigError(
+            "the settings file has both `markets:` and `legs:`, and only one "
+            "of them can say what to trade. Keep one: `markets:` is the current "
+            "spelling. Move any market from `legs:` into it, then delete the "
+            "`legs:` block."
+        )
     if raw_markets is not None:
         if not isinstance(raw_markets, list) or not raw_markets:
             raise ConfigError("markets must be a non-empty list")
@@ -980,11 +1110,16 @@ def _markets_from_raw(
     # plainly say. Refusing them had become a trap of its own -- a market
     # added from the menu was named after its coin, and a `sol:` block was
     # turned away by a message about a rename from two versions ago.
+    _renamed(
+        "`legs:`",
+        "a `markets:` list, one `- symbol: ...` entry per market -- "
+        "app/settings.default.yaml shows the shape",
+    )
     names = [f"legs.{name}" for name in legs]
     return [_leg_from_dict(legs[name], f"legs.{name}") for name in legs], names
 
 
-def _load_private_keys(required: bool) -> list[str]:
+def load_private_keys(required: bool = True) -> list[str]:
     """Every signing key, from the environment or the key file, in order.
 
     The environment wins so an unattended run needs no password prompt, and it
@@ -1015,13 +1150,19 @@ def _telegram_from_dict(raw: Any) -> TelegramConfig:
         raise ConfigError("telegram must be a mapping")
     _warn_unknown(raw, _TELEGRAM_KEYS, "telegram")
 
+    if "user_id" in raw:
+        if "user_ids" in raw:
+            _warn("telegram.user_id is ignored because telegram.user_ids is set -- delete it")
+        else:
+            _renamed("telegram.user_id", "telegram.user_ids")
     user_ids = raw.get("user_ids", raw.get("user_id", []))
-    if isinstance(user_ids, (int, str)):
+    if user_ids is None:
+        user_ids = []
+    if not isinstance(user_ids, list):
         user_ids = [user_ids]
-    try:
-        parsed_ids = [int(uid) for uid in user_ids]
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"telegram.user_ids must be integers: {exc}") from exc
+    # Through `_as_int`, not a bare int(): that read `12.7` as user 12 and
+    # `true` as user 1, and sent the bot's reports to whoever those are.
+    parsed_ids = [_as_int(uid, "telegram.user_ids") for uid in user_ids]
 
     token = str(raw.get("bot_token", "") or "")
     if token and not parsed_ids:
@@ -1047,16 +1188,36 @@ def _pause_from_dict(raw: Any) -> PauseConfig:
     except ValueError as exc:
         raise ConfigError(f"pause.schedule: {exc}") from exc
 
-    def number(key: str, default: float) -> float:
+    default = PauseConfig()
+
+    def number(key: str) -> float:
         value = raw.get(key)
-        return default if value is None else _as_float(value, f"pause.{key}")
+        return getattr(default, key) if value is None else _as_float(value, f"pause.{key}")
 
     return PauseConfig(
-        max_move_bps=number("max_move_bps", 0.0),
-        window_minutes=number("window_minutes", 15.0),
-        calm_minutes=number("calm_minutes", 10.0),
+        max_move_bps=number("max_move_bps"),
+        window_minutes=number("window_minutes"),
+        calm_minutes=number("calm_minutes"),
         schedule=windows,
     )
+
+
+def _access_from_raw(raw: Any) -> AccessConfig:
+    """The `access:` block -- or, in a sealed build, nothing at all.
+
+    A sealed build carries its owner compiled in and ignores this block
+    entirely (see bulkdn/referral.py), yet it was still parsed and validated
+    here, so a stray word in a block nothing reads could stop the bot
+    starting. It is now skipped, and the operator is told it does nothing.
+    """
+    if is_sealed():
+        if raw:
+            _warn(
+                "access: is ignored in this build -- who may run it is built in. "
+                "The block can be deleted."
+            )
+        return AccessConfig()
+    return _access_from_dict(raw or {})
 
 
 def _access_from_dict(raw: Any) -> AccessConfig:
@@ -1064,6 +1225,13 @@ def _access_from_dict(raw: Any) -> AccessConfig:
     if not isinstance(raw, dict):
         raise ConfigError("access must be a mapping")
     _warn_unknown(raw, _ACCESS_KEYS, "access")
+
+    for old, new in (("code", "codes"), ("wallet", "wallets")):
+        if old in raw:
+            if new in raw:
+                _warn("access.%s is ignored because access.%s is set -- delete it", old, new)
+            else:
+                _renamed(f"access.{old}", f"access.{new}")
 
     def as_list(value) -> list[str]:
         if value is None:
@@ -1091,6 +1259,43 @@ def _access_from_dict(raw: Any) -> AccessConfig:
     return access
 
 
+class _DuplicateKey(Exception):
+    """A key that appears twice in one block, with both line numbers."""
+
+    def __init__(self, key: Any, first: int, second: int):
+        super().__init__(key, first, second)
+        self.key, self.first, self.second = key, first, second
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader, except that a key given twice in one block is refused.
+
+    YAML says a mapping's keys are unique, and PyYAML quietly keeps the LAST of
+    two. That is how a menu edit went missing: the target writer did not
+    recognise `execution_target:  # note`, appended a second block below it,
+    and every later edit landed in the first block -- which the loader then
+    threw away in favour of the second. Nothing failed; the edits just did not
+    take. Two of the same key is now a sentence naming both lines.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            seen: dict[Any, int] = {}
+            for key_node, _value in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    first = seen.get(key)
+                except TypeError:
+                    continue  # unhashable: SafeLoader refuses it with its own message
+                line = key_node.start_mark.line + 1
+                if first is not None:
+                    raise _DuplicateKey(key, first, line)
+                seen[key] = line
+        return super().construct_mapping(node, deep=deep)
+
+
 def _read_yaml(path: str) -> dict[str, Any]:
     """The settings file as a mapping, or a ConfigError that says what to do.
 
@@ -1104,10 +1309,12 @@ def _read_yaml(path: str) -> dict[str, Any]:
       passing on, since it points straight at the line.
     * A file that is a list or a bare word at the top parses fine and then
       failed with AttributeError on the first `.get`.
+    * A key written twice in one block -- see _StrictLoader.
     """
     try:
         with open(path, encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle)
+            # A SafeLoader subclass: nothing in the file can construct an object.
+            raw = yaml.load(handle, Loader=_StrictLoader)
     except FileNotFoundError as exc:
         raise ConfigError(f"config file not found: {path}") from exc
     except UnicodeDecodeError as exc:
@@ -1119,6 +1326,12 @@ def _read_yaml(path: str) -> dict[str, Any]:
         ) from exc
     except yaml.YAMLError as exc:
         raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
+    except _DuplicateKey as exc:
+        raise ConfigError(
+            f"{path} sets `{exc.key}` twice in the same block, on lines "
+            f"{exc.first} and {exc.second}. Only one of them can count, so the "
+            "bot will not guess which you meant: delete the one you do not want."
+        ) from exc
 
     if raw is None:
         return {}
@@ -1138,7 +1351,7 @@ def _log_level(value: Any) -> str:
     """
     level = _as_str(value, "log_level")
     if not isinstance(logging.getLevelName(level.upper()), int):
-        log.warning(
+        _warn(
             "log_level %r is not a level this understands -- logging at INFO. "
             "Use INFO, or DEBUG when diagnosing something.",
             level,
@@ -1150,6 +1363,9 @@ def load_config(
     path: str,
     require_credentials: bool = True,
     mode: str | None = None,
+    *,
+    private_keys: list[str] | None = None,
+    warn: bool = True,
 ) -> Config:
     """Load, merge, and validate configuration.
 
@@ -1158,9 +1374,34 @@ def load_config(
     line that asks for something contradictory is refused by the same rules as
     a settings file that does -- rather than running with a config nothing ever
     checked.
+
+    `private_keys` hands in keys already read, so a caller that re-reads the
+    file -- the menu does, before every action -- asks for the key password
+    once rather than every time. `warn=False` reads without saying anything,
+    for a check of a file that is about to be written.
     """
+    with _warnings_for(path, say=warn):
+        return _load_config(path, require_credentials, mode, private_keys)
+
+
+def _load_config(
+    path: str,
+    require_credentials: bool,
+    mode: str | None,
+    private_keys: list[str] | None,
+) -> Config:
     raw = _read_yaml(path)
     _warn_unknown(raw, _TOP_KEYS, "")
+
+    # Every default below is read off the dataclasses rather than written out
+    # again. They used to be written three times -- the dataclass, this
+    # function, and the shipped settings file -- and had drifted: `cycles` was
+    # 1 in one and 0 in another, `hold_minutes` five minutes against the
+    # file's 0.5-1.5. The dataclasses are the one copy now, and test_defaults
+    # holds the shipped file to them.
+    defaults = Config(markets=[])
+    risk_default = RiskConfig()
+    target_default = ExecutionTarget()
 
     def number(block: dict[str, Any], key: str, default: float, where: str = "") -> float:
         value = block.get(key)
@@ -1171,6 +1412,12 @@ def load_config(
         value = block.get(key)
         name = f"{where}.{key}" if where else key
         return default if value is None else _as_int(value, name)
+
+    def top(key: str) -> float:
+        return number(raw, key, getattr(defaults, key))
+
+    def risk(key: str) -> float:
+        return number(risk_raw, key, getattr(risk_default, key), "risk")
 
     pool_raw = _mapping(raw.get("pool"), "pool")
     _warn_unknown(pool_raw, _POOL_KEYS, "pool")
@@ -1189,60 +1436,74 @@ def load_config(
     _warn_unknown(target_raw, _TARGET_KEYS, "execution_target")
     # `cycles` was a top-level key before execution targets existed; the
     # top-level spelling still works and the nested one wins.
-    #
-    # Absent means unlimited, as the shipped file says. It meant 1 in the code,
-    # which a pool run never honoured -- so settings written before cycles were
-    # counted per group would suddenly have run one group and stopped.
     if target_raw.get("cycles") is not None:
-        cycles = whole(target_raw, "cycles", 0, "execution_target")
+        if raw.get("cycles") is not None:
+            _warn("cycles at the top level is ignored because execution_target.cycles "
+                  "is set -- delete the top-level one")
+        cycles = whole(target_raw, "cycles", target_default.cycles, "execution_target")
     else:
-        cycles = whole(raw, "cycles", 0)
+        if raw.get("cycles") is not None:
+            _renamed("`cycles:` at the top level", "`cycles:` under `execution_target:`")
+        cycles = whole(raw, "cycles", target_default.cycles)
     target = ExecutionTarget(
         cycles=cycles,
-        burn_usd=number(target_raw, "burn_usd", 0.0, "execution_target"),
-        volume_usd=number(target_raw, "volume_usd", 0.0, "execution_target"),
+        burn_usd=number(target_raw, "burn_usd", target_default.burn_usd, "execution_target"),
+        volume_usd=number(
+            target_raw, "volume_usd", target_default.volume_usd, "execution_target"
+        ),
     )
 
     if raw.get("single_master") is not None:
-        single_master = whole(raw, "single_master", 1)
+        if pool_raw.get("single_master") is not None:
+            _warn("pool.single_master is ignored because single_master is set at the "
+                  "top level -- delete the one under pool:")
+        single_master = whole(raw, "single_master", defaults.single_master)
     else:
-        single_master = whole(pool_raw, "single_master", 1, "pool")
+        if pool_raw.get("single_master") is not None:
+            _renamed("pool.single_master", "`single_master:` at the top level")
+        single_master = whole(pool_raw, "single_master", defaults.single_master, "pool")
 
     config = Config(
         markets=markets,
         market_names=market_names,
-        mode=_mode_from_raw(mode if mode is not None else raw.get("mode", "multi")),
+        mode=_mode_from_raw(mode if mode is not None else raw.get("mode") or defaults.mode),
         single_master=single_master,
-        max_groups=whole(pool_raw, "max_groups", 5, "pool"),
-        max_takers=whole(pool_raw, "max_takers", 1, "pool"),
-        hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
-        max_phase_minutes=number(raw, "max_phase_minutes", 30.0),
-        chase_interval_s=number(raw, "chase_interval_s", 1.0),
-        reconcile_interval_s=number(raw, "reconcile_interval_s", 5.0),
-        position_sync_interval_s=number(raw, "position_sync_interval_s", 60.0),
-        cycles=target.cycles,
+        max_groups=whole(pool_raw, "max_groups", defaults.max_groups, "pool"),
+        max_takers=whole(pool_raw, "max_takers", defaults.max_takers, "pool"),
+        hold_minutes=(
+            HoldTime.parse(raw["hold_minutes"])
+            if raw.get("hold_minutes") is not None
+            else defaults.hold_minutes
+        ),
+        max_phase_minutes=top("max_phase_minutes"),
+        chase_interval_s=top("chase_interval_s"),
+        reconcile_interval_s=top("reconcile_interval_s"),
+        position_sync_interval_s=top("position_sync_interval_s"),
         target=target,
-        hedge_tolerance_lots=number(raw, "hedge_tolerance_lots", 1.0),
-        overlay_ttl_ms=whole(raw, "overlay_ttl_ms", 2000),
-        max_margin_fraction=number(raw, "max_margin_fraction", 0.25),
+        hedge_tolerance_lots=top("hedge_tolerance_lots"),
+        overlay_ttl_ms=whole(raw, "overlay_ttl_ms", defaults.overlay_ttl_ms),
+        max_margin_fraction=top("max_margin_fraction"),
         risk=RiskConfig(
-            max_net_exposure_usd=number(risk_raw, "max_net_exposure_usd", 500.0, "risk"),
-            max_position_usd=number(risk_raw, "max_position_usd", 5000.0, "risk"),
-            max_reject_streak=whole(risk_raw, "max_reject_streak", 5, "risk"),
-            max_hedge_impact_bps=number(risk_raw, "max_hedge_impact_bps", 0.0, "risk"),
-            ws_stale_timeout_s=number(risk_raw, "ws_stale_timeout_s", 30.0, "risk"),
-            price_stale_timeout_s=number(risk_raw, "price_stale_timeout_s", 15.0, "risk"),
+            max_net_exposure_usd=risk("max_net_exposure_usd"),
+            max_position_usd=risk("max_position_usd"),
+            max_reject_streak=whole(
+                risk_raw, "max_reject_streak", risk_default.max_reject_streak, "risk"
+            ),
+            max_hedge_impact_bps=risk("max_hedge_impact_bps"),
+            ws_stale_timeout_s=risk("ws_stale_timeout_s"),
+            price_stale_timeout_s=risk("price_stale_timeout_s"),
         ),
-        state_file=_as_str(
-            raw.get("state_file", "./app/state/strategy_state.json"), "state_file"
-        ),
-        log_level=_log_level(raw.get("log_level", "INFO")),
+        state_file=_as_str(raw.get("state_file") or defaults.state_file, "state_file"),
+        log_level=_log_level(raw.get("log_level") or defaults.log_level),
         http_url_override=_as_str(raw.get("http_url") or "", "http_url"),
         ws_url_override=_as_str(raw.get("ws_url") or "", "ws_url"),
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
-        access=_access_from_dict(raw.get("access") or {}),
+        access=_access_from_raw(raw.get("access")),
         pause=_pause_from_dict(raw.get("pause") or {}),
-        private_keys=_load_private_keys(require_credentials),
+        private_keys=(
+            list(private_keys) if private_keys is not None
+            else load_private_keys(require_credentials)
+        ),
     )
     config.validate(require_credentials=require_credentials)
     return config

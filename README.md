@@ -23,9 +23,12 @@ on in `settings.yaml`; the defaults are BTC-USD and ETH-USD.
    install no longer waits on GitHub to answer.
 3. **Get the code.** Unzip the archive you were sent, or
    `git clone https://github.com/MakerBuild/Bulk_trading_bot.git` — they come to
-   the same thing, because the zip is a clone. `update.bat` works either way.
+   the same thing, because the zip is a clone. `update.bat` works either way: a
+   folder unzipped without git's history is turned into a clone on its first
+   update, with your settings, key and state copied to `update-backup` first.
 4. **Double-click `install.bat`.** It builds a local environment, installs
-   everything, and checks that transaction signing works. Safe to re-run.
+   everything, and signs and verifies a test transaction to prove signing works.
+   Safe to re-run; it refuses while the bot is running from the folder.
 
 Never done this before? **[ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md](ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md)** walks through it
 step by step, in Russian, including what to do when something fails.
@@ -57,8 +60,14 @@ from the master at startup. Nothing about sub-accounts goes in the settings.
 
 Open `settings.yaml`. Everything you normally change is in the first half:
 which markets, which accounts (`mode`), how many groups at once, how much per
-cycle, leverage, how long to hold, when to stop, and the safety limits. Each
-option says what it does.
+cycle, leverage, how long to hold, when to stop, and the safety limits. The
+guide's settings table says what each one does. A line left out means the value
+in `app/settings.default.yaml`, which is what the code defaults to as well.
+
+Markets are a `markets:` list, one `- symbol: ...` entry each. An older file
+with a `legs:` block still works; the log says once that it is the older
+spelling. The menu reads `settings.yaml` again before every action, so an edit
+made while it is open counts from the next Start -- no restart.
 
 Sizes are in dollars -- `notional_usd: 100` is $100 of whatever `symbol` names,
 converted to a quantity at the current price when the bot starts. The size and
@@ -88,7 +97,8 @@ multi    every master and every sub-account, in one pool     (the default)
 ```
 
 Both modes trade every market switched on; they differ only in who can be on
-the other side of a trade. With more than one master in play, a group's maker
+the other side of a trade. Closing and status always cover every key in the
+file, whichever mode is set. With more than one master in play, a group's maker
 comes from one master's tree and its hedgers from another's. With one key in
 the file the two modes are the same thing.
 Switch it from **Configuration → Markets & Accounts → Accounts**.

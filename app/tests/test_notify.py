@@ -222,7 +222,7 @@ def test_token_without_recipients_is_an_error():
 
 
 def test_non_numeric_id_is_an_error():
-    with pytest.raises(ConfigError, match="must be integers"):
+    with pytest.raises(ConfigError, match="telegram.user_ids must be"):
         _telegram_from_dict({"bot_token": "t", "user_ids": ["not-a-number"]})
 
 

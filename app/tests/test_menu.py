@@ -33,6 +33,21 @@ class StubConfig:
     active_legs = [master_account, sub_account]
 
 
+class Loaded:
+    """A Settings that reads the same Config every time."""
+
+    path = "config.yaml"
+
+    def __init__(self, config):
+        self.config = config
+
+    def load(self):
+        return self.config
+
+    def forget_keys(self):
+        pass
+
+
 def feed(monkeypatch, answers):
     """Drive the menu from a scripted list of keystrokes."""
     it = iter(answers)
@@ -66,12 +81,12 @@ def test_confirm_treats_eof_as_refusal(monkeypatch):
 
 def test_exit_returns_immediately(monkeypatch):
     feed(monkeypatch, ["0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_unknown_choice_reprompts_then_exits(monkeypatch):
     feed(monkeypatch, ["99", "", "0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_menu_survives_an_action_that_raises(monkeypatch):
@@ -81,7 +96,7 @@ def test_menu_survives_an_action_that_raises(monkeypatch):
 
     monkeypatch.setattr(menu, "_active_strategy", boom)
     feed(monkeypatch, ["2", "", "0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_no_account_tree_is_reported_as_guidance(monkeypatch):
@@ -90,7 +105,7 @@ def test_no_account_tree_is_reported_as_guidance(monkeypatch):
 
     monkeypatch.setattr(menu, "_history", missing)
     feed(monkeypatch, ["3", "", "0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_start_declined_does_not_run_the_strategy(monkeypatch):
@@ -127,8 +142,10 @@ SETTINGS_WITH_COMMENTS = """\
 legs:
   master_account:
     symbol: BTC-USD      # keep this comment
+    notional_usd: 100
   sub_account:
     symbol: ETH-USD
+    notional_usd: 100
 """
 
 
@@ -161,7 +178,11 @@ def test_a_nested_mode_key_is_not_mistaken_for_the_top_level_one(tmp_path):
     """`legs` could gain a key ending in the same word. Only a line starting
     at column zero is this setting."""
     path = tmp_path / "settings.yaml"
-    path.write_text("legs:\n  master_account:\n    mode: whatever\n", encoding="utf-8")
+    path.write_text(
+        "legs:\n  master_account:\n    symbol: BTC-USD\n    notional_usd: 100\n"
+        "    mode: whatever\n",
+        encoding="utf-8",
+    )
 
     menu._write_mode(str(path), "single")
 

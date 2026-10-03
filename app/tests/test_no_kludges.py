@@ -1,4 +1,4 @@
-"""Four things that were wrong, pinned so they cannot come back.
+"""Six things that were wrong, pinned so they cannot come back.
 
 Each of these passed review once by looking reasonable. What they have in
 common is that nothing failed when they were introduced -- so the fix is only
@@ -283,3 +283,49 @@ async def test_a_locked_state_file_does_not_stop_a_leg(tmp_path):
         state = StrategyState()
 
     Fake()._persist()  # must not raise
+
+
+# -- 6. nor anywhere else the CLI awaits ---------------------------------------
+#
+# The same fault, in cli.py: building the Runtime discovers accounts with one
+# HTTP request per key, the referral check retries for up to a minute, sizing
+# and leverage read every account in turn, and status reads positions and
+# orders -- all synchronous `requests`, all called straight from coroutines. In
+# a Telegram session that loop is also the one answering /stop.
+
+BLOCKING_IN_CLI = {
+    "Runtime", "build_pool", "discover_accounts", "check_access",
+    "check_referral_access", "verify_sub_account", "apply_sizing", "apply_leverage",
+    "full_account", "sync_positions_http", "open_orders", "load_specs",
+    "_tree_holding", "submit_signed", "http_price",
+}
+
+
+def _direct_calls(function: ast.AsyncFunctionDef):
+    """Calls made by this coroutine itself, not by functions defined inside it."""
+    stack = list(function.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        if isinstance(node, ast.Call):
+            yield node
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def test_the_cli_awaits_nothing_that_blocks():
+    """A blocking call handed to asyncio.to_thread is passed, not called, so
+    only a direct call shows up here."""
+    tree = ast.parse(SOURCES["cli"])
+    direct = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncFunctionDef):
+            continue
+        for call in _direct_calls(node):
+            name = getattr(call.func, "id", None) or getattr(call.func, "attr", None)
+            if name in BLOCKING_IN_CLI:
+                direct.append(f"{node.name}:{call.lineno} {name}()")
+    assert not direct, (
+        f"cli.py calls synchronous network code on the event loop: {direct}. "
+        "Route it through asyncio.to_thread."
+    )

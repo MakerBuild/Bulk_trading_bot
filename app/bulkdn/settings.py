@@ -24,13 +24,15 @@ from dataclasses import dataclass
 
 from bulk_api.common.signer import SignatureDomain, TransactionSigner
 
+from .config import MAX_LEVERAGE, MIN_LEVERAGE
 from .tx import accepted, sign_and_submit
 
 UPDATE_USER_SETTINGS_ORDINAL = 18
 
-# The action's own bound, from the API reference.
-MIN_LEVERAGE = 1.0
-MAX_LEVERAGE = 50.0
+# MIN_LEVERAGE and MAX_LEVERAGE are the action's own bound, from the API
+# reference. They live in config, which checks the settings file against them
+# before anything is sent; they are imported here, not written out a second
+# time, so the check and the request cannot disagree.
 
 
 def serialize_leverage(symbol: str, leverage: float) -> bytes:

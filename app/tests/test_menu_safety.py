@@ -36,6 +36,19 @@ def feed(monkeypatch, answers):
     monkeypatch.setattr(builtins, "input", answer)
 
 
+class Loaded:
+    """A Settings that reads the same Config every time."""
+
+    def __init__(self, config, path="settings.yaml"):
+        self.config, self.path = config, path
+
+    def load(self):
+        return self.config
+
+    def forget_keys(self):
+        pass
+
+
 def real_config(**overrides):
     values = {
         "markets": [
@@ -81,14 +94,14 @@ def test_the_menu_reports_a_cancel_and_carries_on(monkeypatch, tmp_path, capsys)
     # Configuration -> burn target -> Ctrl+C, then exit.
     feed(monkeypatch, ["5", "2", KeyboardInterrupt(), "0"])
 
-    assert menu.run_menu(config, str(path)) == 0
+    assert menu.run_menu(Loaded(config, str(path))) == 0
     assert "nothing was changed" in capsys.readouterr().out
     assert path.read_text(encoding="utf-8") == TARGET_FILE
 
 
 def test_end_of_input_at_the_top_menu_exits_rather_than_spinning(monkeypatch):
     feed(monkeypatch, [EOFError()])
-    assert menu.run_menu(real_config(), "settings.yaml") == 0
+    assert menu.run_menu(Loaded(real_config())) == 0
 
 
 @pytest.mark.parametrize("value", ["inf", "nan", "-inf", "1e400"])
@@ -318,57 +331,6 @@ def test_never_reaching_the_exchange_is_not_unknown():
     assert outcome == cli.UNSENT
 
 
-# -- one run's sizes do not leak into the next ------------------------------
-
-
-def test_a_dry_run_cannot_resize_the_live_run_after_it(monkeypatch):
-    config = real_config()
-    seen = []
-
-    async def fake_run(run_config, dry_run):
-        seen.append((dry_run, run_config.markets[0].size, run_config))
-        # What apply_sizing and the per-cycle redraw do to the config.
-        for leg in run_config.markets:
-            leg.size = 0.00001
-            leg.max_order_size = 0.00001
-            leg.notional_usd = 1.0
-        return 0
-
-    monkeypatch.setattr(menu, "cmd_run", fake_run)
-    monkeypatch.setattr(menu, "_pause", lambda: None)
-
-    feed(monkeypatch, ["1"])
-    menu._start(config)
-    feed(monkeypatch, ["2", "yes"])
-    menu._start(config)
-
-    (dry, _, first), (live, size_seen_by_live, second) = seen
-    assert dry is True and live is False
-    assert first is not config and second is not config and first is not second
-    assert size_seen_by_live == 0.0, "the live run inherited the dry run's sizes"
-    assert config.markets[0].notional_usd == 100.0, "the menu's own config was changed"
-
-
-def test_status_and_flatten_get_their_own_copy_too(monkeypatch):
-    config = real_config()
-    given = []
-
-    async def record(run_config, *a, **k):
-        given.append(run_config)
-        return 0
-
-    monkeypatch.setattr(menu, "cmd_status", record)
-    monkeypatch.setattr(menu, "cmd_flatten", record)
-    monkeypatch.setattr(menu, "_pause", lambda: None)
-
-    menu._active_strategy(config)
-    feed(monkeypatch, ["1"])
-    menu._close_all(config)
-
-    assert len(given) == 2
-    assert all(run_config is not config for run_config in given)
-
-
 # -- the words on the screen ------------------------------------------------
 
 
@@ -387,7 +349,7 @@ def test_the_live_confirmation_names_the_real_stop_conditions(monkeypatch):
 
 
 def test_no_limit_at_all_is_said_plainly():
-    config = real_config(target=ExecutionTarget(cycles=0))
+    config = real_config(target=ExecutionTarget(cycles=0, burn_usd=0.0))
     assert "runs until you press S" in menu._stop_conditions(config)
 
 
@@ -472,7 +434,7 @@ def test_status_covers_switched_off_markets(monkeypatch, capsys):
             return []
 
     class Status:
-        def __init__(self, cfg, dry_run, symbols=None):
+        def __init__(self, cfg, dry_run, symbols=None, trading=True):
             made.append(symbols)
             self.symbols = symbols
             self.pool = [Session()]

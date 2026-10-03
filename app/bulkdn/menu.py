@@ -12,13 +12,16 @@ a menu entry that silently does nothing is worse than one that admits it.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import contextlib
-import copy
 import logging
 import math
+import os
 import pathlib
 import re
 import shutil
+import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -42,7 +45,7 @@ from .cli import (
 from .config import Config, ConfigError, LegConfig
 from .retry import describe
 from .scripts import script, venv_folder
-from . import proxy
+from . import lock, proxy
 
 log = logging.getLogger(__name__)
 
@@ -109,21 +112,6 @@ def _pause() -> None:
     # Ctrl+C here means "get me out", which is where this goes anyway.
     with contextlib.suppress(Cancelled):
         _ask("\n  [enter] to return to the menu ")
-
-
-def _fresh(config: Config) -> Config:
-    """A private copy of the settings for one run.
-
-    A run writes into the config it is given: the sizing plan replaces each
-    leg's size with what the thinnest account can carry, and a leg written as
-    a range redraws its size every cycle. That is by design inside a run --
-    but the menu held ONE config for its whole life, so a dry run's sizes
-    became the next live run's sizes, capped by whatever margin the rehearsal
-    happened to see. Each run now gets its own copy, and nothing it does
-    outlives it. The menu's own edits -- targets, markets, mode -- still land
-    on the original, which is what every later copy is taken from.
-    """
-    return copy.deepcopy(config)
 
 
 # -- helpers ----------------------------------------------------------------
@@ -301,13 +289,13 @@ def _start(config: Config) -> None:
     print("  need a second window, and you do not need to close this one.")
     choice = _ask("\n  > ")
     if choice == "1":
-        asyncio.run(cmd_run(_fresh(config), dry_run=True))
+        asyncio.run(cmd_run(config, dry_run=True))
     elif choice == "2":
         if _confirm(f"Start LIVE trading, {config.mode} mode, on "
                     f"{', '.join(leg.symbol for leg in config.active_legs)}: "
                     f"{_stop_conditions(config)}; "
                     f"{config.hold_minutes} min hold per cycle."):
-            asyncio.run(cmd_run(_fresh(config), dry_run=False))
+            asyncio.run(cmd_run(config, dry_run=False))
         else:
             print("  aborted")
     _pause()
@@ -337,14 +325,14 @@ def _telegram(config: Config) -> None:
         _pause()
         return
     try:
-        asyncio.run(serve(_fresh(config), dry_run=not live))
+        asyncio.run(serve(config, dry_run=not live))
     except KeyboardInterrupt:
         print("\n  Telegram control stopped.")
     _pause()
 
 
 def _active_strategy(config: Config) -> None:
-    asyncio.run(cmd_status(_fresh(config)))
+    asyncio.run(cmd_status(config))
     _pause()
 
 
@@ -1080,7 +1068,9 @@ def _key_state(path: str) -> str:
     return "default password"
 
 
-def _accounts_menu(config: Config, config_path: str) -> None:
+def _accounts_menu(
+    config: Config, config_path: str, settings: Settings | None = None
+) -> None:
     from .config import PRIVATE_KEY_FILE
 
     state = _key_state(PRIVATE_KEY_FILE)
@@ -1112,6 +1102,10 @@ def _accounts_menu(config: Config, config_path: str) -> None:
         elif choice == "5":
             _erase_data(config, config_path)
             state = _key_state(PRIVATE_KEY_FILE)
+            # The key may be gone: the next action reads the file again
+            # rather than trading on a copy held from before the erase.
+            if settings is not None:
+                settings.forget_keys()
         elif choice in ("6", "0"):
             return
 
@@ -1135,53 +1129,236 @@ TARGET_BLOCK_COMMENT = (
 )
 
 
+# -- writing the settings file ------------------------------------------------
+#
+# Every edit the menu makes goes through `_save_settings`, and every line it
+# looks for is found by `_key_on`. There used to be four writers, each with its
+# own idea of what a `key:` line looks like, and they disagreed in ways that
+# mattered:
+#
+#   * `execution_target:  # note` was not recognised as the block, so the
+#     target writer appended a second one. PyYAML keeps the LAST of two keys,
+#     so every later edit landed in the first block and was thrown away -- the
+#     menu said "set", and nothing changed.
+#   * the market finder took the first `symbol:` anywhere in the file;
+#   * each wrote the file in place with open(path, "w"): a crash or a full disk
+#     mid-write left it truncated, and two of them wrote LF into a file that
+#     Notepad had saved with CRLF.
+#
+# Line-walking rather than loading and dumping the YAML, still: the operator's
+# comments are their notes, and a round trip through a YAML library deletes
+# every one of them. What changed is that the result is now checked by the same
+# loader the bot starts with before it replaces the file, so an edit that would
+# leave the file unreadable -- or a file that already was -- is refused with the
+# reason, and the file on disk is the one that was there before.
+
+_KEY_LINE = re.compile(
+    r"^(?P<indent>[ ]*)(?P<dash>-[ ]+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ ]*:(?=\s|$)(?P<rest>.*)$"
+)
+
+
+@dataclass(frozen=True)
+class _KeyLine:
+    """One `key: value` line, as far as the menu's edits need to know."""
+
+    column: int  # where the key itself starts, past any `- `
+    key: str
+    dash: bool  # the line opens a list item
+    prefix: str  # everything before the key: indentation and any `- `
+    rest: str  # everything after the colon
+
+
+def _key_on(line: str) -> _KeyLine | None:
+    """The key a line sets, however it is spaced or commented, or None.
+
+    `execution_target:`, `execution_target:   # note`, `  - symbol: BTC-USD`
+    and `  cycles:   3  # groups` all read as the key they set. Comments,
+    blank lines and continuation lines read as None.
+    """
+    match = _KEY_LINE.match(line)
+    if match is None:
+        return None
+    prefix = match["indent"] + (match["dash"] or "")
+    return _KeyLine(len(prefix), match["key"], bool(match["dash"]), prefix, match["rest"])
+
+
+def _comment_of(rest: str) -> str:
+    """The trailing comment of a value, with the spacing before it, or ''.
+
+    YAML starts a comment at a `#` that follows whitespace; a `#` inside a
+    value (`ETH#1`) is part of it. The values the menu writes are numbers and
+    plain words, so quotes need no handling beyond that rule.
+    """
+    if rest.lstrip().startswith("#"):
+        return "  " + rest.lstrip()
+    match = re.search(r"\s#", rest)
+    return "  " + rest[match.start():].lstrip() if match else ""
+
+
+def _with_value(found: _KeyLine, value: str) -> str:
+    """The same line with a new value, its trailing comment kept."""
+    return f"{found.prefix}{found.key}: {value}{_comment_of(found.rest)}"
+
+
+def _is_content(line: str) -> bool:
+    """A line that is neither blank nor only a comment."""
+    text = line.strip()
+    return bool(text) and not text.startswith("#")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _top_level(lines: list[str], key: str) -> int | None:
+    """The line of top-level `key:`, or None. Refuses a file that has two."""
+    found = [
+        index for index, line in enumerate(lines)
+        if (hit := _key_on(line)) is not None
+        and hit.column == 0 and not hit.dash and hit.key == key
+    ]
+    if len(found) > 1:
+        raise ConfigError(
+            f"`{key}:` appears {len(found)} times in the settings file (lines "
+            f"{', '.join(str(i + 1) for i in found)}). Only one can count: delete "
+            "the others, then try again."
+        )
+    return found[0] if found else None
+
+
+def _block_end(lines: list[str], header: int) -> int:
+    """Where a top-level block ends: the next line that starts at column 0.
+
+    Comments do not end it, wherever they sit -- a `# note` at the left margin
+    between two markets is still between two markets.
+    """
+    for index in range(header + 1, len(lines)):
+        if _is_content(lines[index]) and _indent(lines[index]) == 0:
+            return index
+    return len(lines)
+
+
+def _end_of_block(lines: list[str], header: int) -> int:
+    """Where to add to a top-level block, skipping the comments that trail it.
+
+    The trailing comments belong to whatever comes NEXT -- they are the
+    header of the following section -- so a market inserted after them would
+    appear underneath somebody else's heading.
+    """
+    end = _block_end(lines, header)
+    while end > header + 1 and not _is_content(lines[end - 1]):
+        end -= 1
+    return end
+
+
+def _set_in_block(lines: list[str], header: int, key: str, value: str) -> list[str]:
+    """Set `key` among the direct children of the block opened at `header`."""
+    opened = _key_on(lines[header])
+    if opened is not None and _is_content(opened.rest):
+        raise ConfigError(
+            f"`{opened.key}:` is written on one line. Write it as a block, one "
+            "setting per line, to change it from the menu."
+        )
+    end = _block_end(lines, header)
+    children = [i for i in range(header + 1, end) if _is_content(lines[i])]
+    column = _indent(lines[children[0]]) if children else 2
+    for index in children:
+        found = _key_on(lines[index])
+        if found is not None and found.column == column and found.key == key:
+            lines[index] = _with_value(found, value)
+            return lines
+    lines.insert(header + 1, f"{' ' * column}{key}: {value}")
+    return lines
+
+
+def _save_settings(config_path: str, edit: Callable[[list[str]], list[str]]) -> None:
+    """Apply one edit to the settings file, safely or not at all.
+
+    The edited text goes to a temporary file beside the real one, is loaded by
+    the same `load_config` the bot starts with, and only then replaces the
+    file -- atomically, retried like the key store and the state file while Windows
+    briefly has the destination locked. Line endings and a leading byte-order mark are
+    kept as the file had them: Notepad saves CRLF, and a file that is half one
+    and half the other is a file the next editor "fixes" in a diff of every
+    line.
+    """
+    from .config import load_config
+
+    path = pathlib.Path(config_path)
+    data = path.read_bytes()
+    bom = data.startswith(codecs.BOM_UTF8)
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{config_path} is not saved as UTF-8, so it cannot be edited safely "
+            "from here. Open it in Notepad, choose File -> Save As, set Encoding "
+            "to UTF-8, and save it again."
+        ) from exc
+    crlf = text.count("\r\n") * 2 >= text.count("\n") > 0
+    lines = edit(text.splitlines())
+    newline = "\r\n" if crlf else "\n"
+    body = newline.join(lines).rstrip("\r\n") + newline
+
+    handle, temp = tempfile.mkstemp(
+        dir=str(path.parent) or ".", prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write((codecs.BOM_UTF8 if bom else b"") + body.encode("utf-8"))
+            out.flush()
+            os.fsync(out.fileno())
+        try:
+            load_config(temp, require_credentials=False, warn=False)
+        except ConfigError as exc:
+            raise ConfigError(
+                f"not saved -- {config_path} would not load afterwards: "
+                f"{str(exc).replace(temp, config_path)}"
+            ) from exc
+        _replace_with_retry(temp, str(path))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(temp)
+
+
+def _replace_with_retry(temp: str, path: str) -> None:
+    """`os.replace`, retried while Windows has the destination locked.
+
+    Notepad, OneDrive or a virus scanner holding settings.yaml for a moment
+    turns the rename into a sharing violation that is gone milliseconds
+    later. The key store and the state file retry the same way, on the one
+    schedule they share, so there is one number to tune.
+    """
+    from .state import REPLACE_ATTEMPTS, REPLACE_RETRY_DELAY_S
+
+    delay = REPLACE_RETRY_DELAY_S
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def _write_target(config_path: str, key: str, value: float, defaults) -> None:
     """Set one key under `execution_target`, keeping the file's comments.
 
-    Walks lines rather than matching a pattern: the block is two levels deep
-    and YAML numbers come in several shapes, both of which a regex handles
-    badly. Writes the whole block when the file predates execution targets.
+    Writes the whole block when the file predates execution targets.
     """
-    with open(config_path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
-
-    header = next(
-        (i for i, line in enumerate(lines) if line.strip() == "execution_target:"), None
-    )
-
-    if header is None:
+    def edit(lines: list[str]) -> list[str]:
+        header = _top_level(lines, "execution_target")
+        if header is not None:
+            return _set_in_block(lines, header, key, _render_number(value))
         block = [TARGET_BLOCK_COMMENT, "execution_target:"]
         for name in ("cycles", "burn_usd", "volume_usd"):
             chosen = value if name == key else getattr(defaults, name)
             block.append(f"  {name}: {_render_number(chosen)}")
-        lines = [*lines, "", *block]
-    else:
-        end = next(
-            (
-                i
-                for i in range(header + 1, len(lines))
-                if lines[i].strip() and not lines[i].startswith((" ", "\t"))
-            ),
-            len(lines),
-        )
-        at = next(
-            (
-                i
-                for i in range(header + 1, end)
-                if lines[i].strip().startswith(f"{key}:")
-            ),
-            None,
-        )
-        if at is None:
-            lines.insert(header + 1, f"  {key}: {_render_number(value)}")
-        else:
-            line = lines[at]
-            indent = line[: len(line) - len(line.lstrip())]
-            trailing = "  " + line[line.index("#") :] if "#" in line else ""
-            lines[at] = f"{indent}{key}: {_render_number(value)}{trailing}"
+        return [*lines, "", *block]
 
-    with open(config_path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(lines).rstrip("\n") + "\n")
+    _save_settings(config_path, edit)
 
 
 def _edit_target(config: Config, config_path: str, key: str, label: str) -> None:
@@ -1209,8 +1386,6 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
 
     _write_target(config_path, key, value, config.target)
     setattr(config.target, key, int(value) if key == "cycles" else value)
-    if key == "cycles":
-        config.cycles = int(value)
     print(f"  {label} set to {_render_number(value)} in {config_path}")
 
 
@@ -1218,33 +1393,24 @@ def _write_scalar(config_path: str, key: str, value: str) -> None:
     """Set a top-level key, keeping the rest of the file as it is.
 
     Inserted above the markets block when absent rather than appended,
-    because that is where it is documented and where someone reading the file
-    will look for it. Line-walking rather than a regex for the same reason
-    the execution target uses one: the file is full of comments that must
-    survive.
+    because that is where the shipped file has it and where someone reading
+    the file will look for it.
     """
-    with open(config_path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
-
-    at = next(
-        (i for i, line in enumerate(lines) if line.strip().startswith(f"{key}:")
-         and not line.startswith((" ", "\t"))),
-        None,
-    )
-    if at is not None:
-        lines[at] = f"{key}: {value}"
-    else:
-        anchor = next(
-            (i for i, line in enumerate(lines) if line.rstrip() in ("markets:", "legs:")),
-            None,
-        )
+    def edit(lines: list[str]) -> list[str]:
+        at = _top_level(lines, key)
+        if at is not None:
+            found = _key_on(lines[at])
+            lines[at] = _with_value(found, value)
+            return lines
+        anchor = _top_level(lines, "markets")
+        if anchor is None:
+            anchor = _top_level(lines, "legs")
         block = [f"{key}: {value}", ""]
-        lines = [*lines, "", *block] if anchor is None else [
-            *lines[:anchor], *block, *lines[anchor:]
-        ]
+        if anchor is None:
+            return [*lines, "", *block]
+        return [*lines[:anchor], *block, *lines[anchor:]]
 
-    with open(config_path, "w", encoding="utf-8", newline="") as handle:
-        handle.write("\n".join(lines) + "\n")
+    _save_settings(config_path, edit)
 
 
 def _write_mode(config_path: str, mode: str) -> None:
@@ -1267,65 +1433,83 @@ def _symbol_on(line: str) -> str | None:
     return match.group(2) if match else None
 
 
-def _block_at(lines: list[str], symbol: str) -> tuple[int, int] | None:
-    """The line range of the market block naming `symbol`, or None.
+def _market_item(lines: list[str], symbol: str) -> tuple[int, int, int] | None:
+    """The market naming `symbol`: (first line, end, column of its fields).
 
-    Found by the symbol rather than by the block's name, because the file has
-    two spellings and the symbol is the one thing both of them carry. A
-    `markets:` list writes `- symbol: BTC-USD`; a `legs:` mapping writes
-    `symbol: BTC-USD` under a named block. Either way that line is the block,
-    and the block runs until a line at or above its own indentation.
+    Looked for inside the `markets:` or `legs:` block only. It used to take the
+    first `symbol:` anywhere in the file, which is a different setting the day
+    any other block grows one.
+
+    The item is found by its symbol line and widened to the whole entry: a
+    `markets:` entry starts at its `- ` line, which need not be the symbol's
+    (`- notional_usd: 100` then `symbol: ...` is the same market), and a
+    `legs:` entry at its name. Starting at the symbol line instead missed an
+    `enabled:` written above it, and the writer then added a second one.
     """
-    for index, line in enumerate(lines):
-        if _symbol_on(line) != symbol:
+    for block in ("markets", "legs"):
+        header = _top_level(lines, block)
+        if header is None:
             continue
-        indent = len(line) - len(line.lstrip())
-        if line.lstrip().startswith("- "):
-            # The dash sits at the block's own indentation; its fields are
-            # indented past it.
-            indent += 2
-        end = len(lines)
-        for after in range(index + 1, len(lines)):
-            body = lines[after]
-            if not body.strip() or body.lstrip().startswith("#"):
+        end = _block_end(lines, header)
+        for index in range(header + 1, end):
+            if _symbol_on(lines[index]) != symbol:
                 continue
-            if len(body) - len(body.lstrip()) < indent:
-                end = after
-                break
-        return index, end
+            found = _key_on(lines[index])
+            column = found.column if found is not None else _indent(lines[index])
+            start = index
+            if found is None or not found.dash:
+                # Back to the line that opens this entry: the nearest one
+                # above that sits further left than the fields do.
+                for above in range(index - 1, header, -1):
+                    if not _is_content(lines[above]):
+                        continue
+                    opener = _key_on(lines[above])
+                    if opener is not None and opener.dash and opener.column == column:
+                        start = above
+                        break
+                    if _indent(lines[above]) < column:
+                        start = above
+                        break
+            stop = end
+            for after in range(index + 1, end):
+                if _is_content(lines[after]) and _indent(lines[after]) < column:
+                    stop = after
+                    break
+            return start, stop, column
     return None
+
+
+def _block_at(lines: list[str], symbol: str) -> tuple[int, int] | None:
+    """The line range of the market naming `symbol`, or None."""
+    found = _market_item(lines, symbol)
+    return None if found is None else found[:2]
 
 
 def _write_market_enabled(config_path: str, symbol: str, enabled: bool) -> None:
     """Turn one market on or off, leaving the rest of the file alone.
 
-    Line-walking rather than loading and re-dumping the YAML, for the reason
-    every other writer here does it: the file is mostly comments, and a
-    round trip through a YAML library throws all of them away. Someone who
-    turns ETH off for a week should find their notes about it when they turn
-    it back on.
+    Someone who turns ETH off for a week should find their notes about it
+    when they turn it back on, which is why this edits one line rather than
+    rewriting the file from what was loaded.
     """
-    with open(config_path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
+    def edit(lines: list[str]) -> list[str]:
+        found = _market_item(lines, symbol)
+        if found is None:
+            raise ConfigError(f"{symbol} is not in {config_path}")
+        start, stop, column = found
+        value = "true" if enabled else "false"
+        for index in range(start, stop):
+            hit = _key_on(lines[index])
+            if hit is not None and hit.column == column and hit.key == "enabled":
+                lines[index] = _with_value(hit, value)
+                return lines
+        # Right under the symbol, where the old writer put it and where
+        # someone scanning for this market's switch will look.
+        named = next(i for i in range(start, stop) if _symbol_on(lines[i]) == symbol)
+        lines.insert(named + 1, f"{' ' * column}enabled: {value}")
+        return lines
 
-    found = _block_at(lines, symbol)
-    if found is None:
-        raise ConfigError(f"{symbol} is not in {config_path}")
-    at, block_end = found
-    value = "true" if enabled else "false"
-    indent = " " * (len(lines[at]) - len(lines[at].lstrip()))
-    if lines[at].lstrip().startswith("- "):
-        indent += "  "
-
-    for index in range(at, block_end):
-        if lines[index].strip().startswith("enabled:"):
-            lines[index] = f"{indent}enabled: {value}"
-            break
-    else:
-        lines.insert(at + 1, f"{indent}enabled: {value}")
-
-    with open(config_path, "w", encoding="utf-8", newline="") as handle:
-        handle.write("\n".join(lines) + "\n")
+    _save_settings(config_path, edit)
 
 
 def _append_market(
@@ -1336,6 +1520,7 @@ def _append_market(
     notional: str | None = None,
     cap: str | None = None,
     leverage: float | None = None,
+    enabled: bool = True,
 ) -> None:
     """Add a market to the file, copying its numbers from an existing one.
 
@@ -1349,17 +1534,9 @@ def _append_market(
     NEW market -- the template's dollar size (or a stand-in when it has none),
     and its leverage clamped to the new market's ceiling. Left as None they
     fall back to the template's own, for callers that have nothing to adjust.
+    `enabled` is written in the same edit, so a market that must arrive
+    switched off is never on the disk switched on.
     """
-    with open(config_path, encoding="utf-8") as handle:
-        lines = handle.read().splitlines()
-
-    listed = next(
-        (i for i, line in enumerate(lines) if line.rstrip() == "markets:"), None
-    )
-    mapped = next((i for i, line in enumerate(lines) if line.rstrip() == "legs:"), None)
-    if listed is None and mapped is None:
-        raise ConfigError(f"{config_path} has neither a markets: nor a legs: block")
-
     if notional is None:
         notional = _render_span(template.notional_span, template.notional_usd)
     if cap is None and template.max_order_notional_usd > 0:
@@ -1382,51 +1559,35 @@ def _append_market(
         # absent means "the whole leg", which is what a coin cap copied into a
         # different coin could not honestly mean anyway.
         f"max_order_notional_usd: {cap}" if cap else None,
-        "enabled: true",
+        f"enabled: {'true' if enabled else 'false'}",
     ]
     fields = [field for field in fields if field]
 
-    if listed is not None:
-        at = _end_of_block(lines, listed)
-        block = [f"  - symbol: {symbol}"] + [f"    {field}" for field in fields]
-    else:
-        at = _end_of_block(lines, mapped)
-        # A name of its own, because the mapping spelling needs one and the
-        # two it ships with are named after accounts that no longer pick
-        # anything. The whole symbol, not the coin: `sol` was the spelling
-        # this file used two versions ago, and naming a block that walked
-        # straight into the check that refuses it.
-        name = symbol.lower().replace("-", "_")
-        # The symbol is a field here rather than part of the header: the
-        # mapping spelling names a block and puts the market inside it.
-        block = [f"  {name}:"] + [
-            f"    {field}" for field in [f"symbol: {symbol}", *fields]
-        ]
+    def edit(lines: list[str]) -> list[str]:
+        listed = _top_level(lines, "markets")
+        mapped = _top_level(lines, "legs")
+        if listed is None and mapped is None:
+            raise ConfigError(f"{config_path} has neither a markets: nor a legs: block")
+        if listed is not None:
+            at = _end_of_block(lines, listed)
+            block = [f"  - symbol: {symbol}"] + [f"    {field}" for field in fields]
+        else:
+            at = _end_of_block(lines, mapped)
+            # A name of its own, because the mapping spelling needs one and the
+            # two it shipped with are named after accounts that no longer pick
+            # anything. The whole symbol, not the coin: `sol` was the spelling
+            # this file used two versions ago, and naming a block that walked
+            # straight into the check that refuses it.
+            name = symbol.lower().replace("-", "_")
+            # The symbol is a field here rather than part of the header: the
+            # mapping spelling names a block and puts the market inside it.
+            block = [f"  {name}:"] + [
+                f"    {field}" for field in [f"symbol: {symbol}", *fields]
+            ]
+        lines[at:at] = [f"  # added from the menu, copied from {template.symbol}", *block]
+        return lines
 
-    lines[at:at] = [f"  # added from the menu, copied from {template.symbol}", *block]
-
-    with open(config_path, "w", encoding="utf-8", newline="") as handle:
-        handle.write("\n".join(lines) + "\n")
-
-
-def _end_of_block(lines: list[str], header: int) -> int:
-    """Where a top-level block ends, skipping the comments that trail it.
-
-    The trailing comments belong to whatever comes NEXT -- they are the
-    header of the following section -- so a market inserted after them would
-    appear underneath somebody else's heading.
-    """
-    end = len(lines)
-    for index in range(header + 1, len(lines)):
-        line = lines[index]
-        if line.strip() and not line.startswith((" ", "\t")):
-            end = index
-            break
-    while end > header + 1 and (
-        not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")
-    ):
-        end -= 1
-    return end
+    _save_settings(config_path, edit)
 
 
 def _render_span(span, fallback: float) -> str:
@@ -1562,13 +1723,15 @@ def _add_market(config: Config, config_path: str) -> None:
 
     _append_market(
         config_path, symbol, template,
-        notional=notional, cap=cap, leverage=leverage,
+        notional=notional, cap=cap, leverage=leverage, enabled=not switch_off,
     )
-    if switch_off:
-        _write_market_enabled(config_path, symbol, False)
     print(f"\n  {symbol} added to {config_path}, copied from {template.symbol}")
-    # There is no restart item in the menu; the file is read once, at start.
-    print("  It is read when the bot starts: exit (0) and run it again to trade it.")
+    # The menu reads the file again before every action, so the next Start
+    # trades it. This screen's own list is refreshed here.
+    from .config import load_config
+
+    config.markets[:] = load_config(config_path, require_credentials=False, warn=False).markets
+    print("  The next Start trades it" + (" once it is switched on." if switch_off else "."))
 
 
 def _markets_screen(config: Config, config_path: str) -> None:
@@ -1892,10 +2055,10 @@ def _close_all(config: Config) -> None:
 
     choice = _ask("\n  > ")
     if choice == "1":
-        asyncio.run(cmd_flatten(_fresh(config), dry_run=True))
+        asyncio.run(cmd_flatten(config, dry_run=True))
     elif choice == "2":
         if _confirm("Close all positions at market."):
-            asyncio.run(cmd_flatten(_fresh(config), dry_run=False))
+            asyncio.run(cmd_flatten(config, dry_run=False))
         else:
             print("  aborted")
     elif choice == "3":
@@ -1907,7 +2070,7 @@ def _close_all(config: Config) -> None:
             print("  so it can take a while -- Ctrl+C cancels the orders and stops.")
             asyncio.run(
                 cmd_flatten(
-                    _fresh(config), dry_run=False, limit=True,
+                    config, dry_run=False, limit=True,
                     timeout_s=LIMIT_CLOSE_TIMEOUT_S,
                 )
             )
@@ -1941,17 +2104,212 @@ def main_item(label: str) -> str:
     return f"{MAIN_ITEMS.index(label) + 1}. {label}"
 
 
-def run_menu(config: Config, config_path: str) -> int:
+class Settings:
+    """settings.yaml, read again for every action, and the keys read once.
+
+    The menu used to read the file once, when it opened, and hand that one
+    Config to everything for the rest of its life. An edit made in Notepad
+    while it was open did nothing until a restart -- the add-market screen had
+    to say "exit and run again" -- and a run's sizes, written into that one
+    Config, became the next run's unless every caller remembered to copy it
+    first. Now every action gets the file as it is at that moment.
+
+    The keys are the exception. Reading them can mean typing a password, and
+    asking for it before every action would be a reason to stop encrypting the
+    key file. They are read once and kept until the key file is erased.
+    `forget_keys` drops them.
+
+    `on_load` runs after every successful read: the CLI applies the log level
+    and the request pacing there, from whatever the file now says.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        mode: str | None = None,
+        on_load: Callable[[Config], None] | None = None,
+    ):
+        self.path = path
+        self.mode = mode
+        self.on_load = on_load
+        self.keys: list[str] | None = None
+        self._proxy_version: object = None
+
+    def load(self) -> Config:
+        """The settings as they are now. Raises ConfigError or ProxyError."""
+        from .config import load_config, load_private_keys
+
+        self._apply_proxy()
+        if self.keys is None:
+            # The file first: a typo in it should be found before anyone is
+            # asked for a password it was never going to get past.
+            load_config(self.path, require_credentials=False, mode=self.mode)
+            # Kept only when there is something to keep. An empty key file is
+            # the usual first-run state, and the key pasted into it a minute
+            # later has to be read then, not after a restart.
+            self.keys = load_private_keys(required=True) or None
+        config = load_config(
+            self.path, require_credentials=True, mode=self.mode,
+            private_keys=self.keys or [],
+        )
+        if self.on_load is not None:
+            self.on_load(config)
+        return config
+
+    def forget_keys(self) -> None:
+        self.keys = None
+
+    def _apply_proxy(self) -> None:
+        """Route through proxy.local as it is now -- re-read when it changes.
+
+        Applied again only when the file changes, so an edit takes effect at
+        the next action and an unchanged file does not log the same line
+        before every one.
+        """
+        path = pathlib.Path(proxy.PROXY_FILE)
+        try:
+            stat = path.stat()
+            version: object = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            version = "absent"
+        if version != self._proxy_version:
+            proxy.configure()
+            self._proxy_version = version
+
+
+def _open_in_editor(path: str) -> None:
+    """Open a file in the editor this machine has, and wait until it is closed.
+
+    Notepad on Windows; $EDITOR, then nano, on Linux. With neither, the path
+    is printed instead -- the server case, where whoever is at the keyboard
+    already has their own way of editing a file.
+    """
+    import subprocess
+
+    if os.name == "nt":
+        command = ["notepad", path]
+    else:
+        editor = os.environ.get("EDITOR") or shutil.which("nano") or shutil.which("vi")
+        if not editor:
+            print(f"\n  No editor found. Edit this file, then choose Try again:\n    {path}")
+            return
+        command = [*editor.split(), path]
+    print(f"\n  Opening {path} -- close the editor when you have saved it.")
+    try:
+        subprocess.run(command, check=False)
+    except OSError as exc:
+        print(f"  could not open an editor ({exc}). Edit the file by hand:\n    {path}")
+
+
+def _reset_settings(config_path: str) -> None:
+    """Replace the settings with the shipped ones, keeping a copy of the old.
+
+    The copy is named `settings.yaml.bak-<time>`, beside it, so nothing the
+    operator tuned is lost -- and git ignores it.
+    """
+    import datetime
+
+    from .config import SETTINGS_TEMPLATE
+
+    template = pathlib.Path(SETTINGS_TEMPLATE)
+    if not template.exists():
+        print(f"\n  {_shown(template)} is missing, so there is nothing to reset to -- "
+              f"run {script('update')}.")
+        return
+    target = pathlib.Path(config_path)
+    if target.exists():
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = target.with_name(f"{target.name}.bak-{stamp}")
+        shutil.copyfile(target, backup)
+        print(f"\n  Your old settings are kept as {_shown(backup)}")
+    shutil.copyfile(template, target)
+    print(f"  {_shown(target)} is now the shipped defaults. Check the sizes before Start.")
+
+
+def _settings_problem(settings: Settings, problem: Exception) -> bool:
+    """Show why the settings cannot be used, and offer the ways out.
+
+    Returns False when the operator chose to leave. Every way of fixing it
+    ends back at a fresh read, so the menu opens the moment it is fixed --
+    with no restart, and no command prompt to find the message in.
+    """
+    from .config import PRIVATE_KEY_FILE, load_config
+
+    # Logged so logs.txt has it as well; drawn below, so not on screen twice.
+    log.error("cannot use the settings: %s", problem, extra={"console": False})
+
+    # Which file to send them to. The settings file loading on its own means
+    # the fault is in the key file -- or the proxy, which says so itself.
+    is_proxy = isinstance(problem, proxy.ProxyError)
+    file_ok = False
+    if not is_proxy:
+        try:
+            load_config(settings.path, require_credentials=False, warn=False)
+            file_ok = True
+        except Exception:  # noqa: BLE001 - any failure means the file is the fault
+            file_ok = False
+    culprit = proxy.PROXY_FILE if is_proxy else (PRIVATE_KEY_FILE if file_ok else settings.path)
+
+    print("\n" + _box("THE BOT CANNOT START YET", [
+        f"Something in {culprit} needs fixing.",
+        "Nothing has been sent to the exchange.",
+    ]))
+    for line in str(problem).splitlines() or [""]:
+        print(f"  {line}")
+    print(f"\n  The same message is in {LOG_FILE}.")
+    print("\n  1. Try again           -- once you have fixed it")
+    print(f"  2. Open {culprit} to fix it")
+    if culprit == settings.path:
+        print("  3. Reset to the shipped settings  -- your copy is kept")
+    print("  0. Exit")
+    try:
+        choice = _ask("\n  > ")
+    except Cancelled:
+        return False
+    if choice == "0":
+        return False
+    if choice == "2":
+        _open_in_editor(str(pathlib.Path(culprit).resolve()))
+    elif choice == "3" and culprit == settings.path:
+        _reset_settings(settings.path)
+    return True
+
+
+def _locked(what: str, action: Callable[[Config], None]) -> Callable[[Config], None]:
+    """`action`, holding the one-copy lock while it runs. See bulkdn/lock.py.
+
+    For the items that trade, close or read the accounts. Held per item rather
+    than for the menu's whole life: an open menu on a desk must not stop the
+    Telegram service on the same machine from working while nobody uses it.
+    """
+    def run(config: Config) -> None:
+        try:
+            lock.acquire(what)
+        except lock.Held as exc:
+            print(f"\n  {exc}")
+            _pause()
+            return
+        try:
+            action(config)
+        finally:
+            lock.release()
+
+    return run
+
+
+def run_menu(settings: Settings) -> int:
     items = [main_item(label) for label in MAIN_ITEMS] + ["0. Exit"]
-    handlers: dict[str, Callable[[], None]] = {
-        "Start": lambda: _start(config),
-        "Active Strategy": lambda: _active_strategy(config),
-        "History": lambda: _history(config),
-        "Accounts Management": lambda: _accounts_menu(config, config_path),
-        "Configuration": lambda: _configuration(config, config_path),
-        CLOSE_ALL_LABEL: lambda: _close_all(config),
-        "Logs": _logs,
-        "Telegram Control": lambda: _telegram(config),
+    # Each is handed the Config read for that choice.
+    handlers: dict[str, Callable[[Config], None]] = {
+        "Start": _locked("menu: start", _start),
+        "Active Strategy": _locked("menu: status", _active_strategy),
+        "History": _history,
+        "Accounts Management": lambda config: _accounts_menu(config, settings.path, settings),
+        "Configuration": lambda config: _configuration(config, settings.path),
+        CLOSE_ALL_LABEL: _locked("menu: close all", _close_all),
+        "Logs": lambda _config: _logs(),
+        "Telegram Control": _locked("menu: telegram control", _telegram),
     }
     actions = {
         str(number): handlers[label]
@@ -1959,6 +2317,19 @@ def run_menu(config: Config, config_path: str) -> int:
     }
 
     while True:
+        # Read again before every choice: what is shown and what an action
+        # does are what the file says now. See Settings.
+        try:
+            config = settings.load()
+        except (ConfigError, proxy.ProxyError) as exc:
+            if not _settings_problem(settings, exc):
+                return 1
+            continue
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at the password prompt.
+            print()
+            return 130
+
         print("\n" + _box("DELTA-NEUTRAL BOT", items))
         print(f"  mainnet  {config.http_url}")
         try:
@@ -1974,7 +2345,7 @@ def run_menu(config: Config, config_path: str) -> int:
             print("  no such option")
             continue
         try:
-            action()
+            action(config)
         except Cancelled:
             # Whatever the prompt was about to write or send, it did not.
             print("  cancelled -- nothing was changed")
@@ -1983,9 +2354,13 @@ def run_menu(config: Config, config_path: str) -> int:
             _pause()
         except ConfigError as exc:
             print(f"\n  configuration error: {exc}")
+            log.error("configuration error: %s", exc, extra={"console": False})
             _pause()
         except KeyboardInterrupt:
             print("\n  interrupted")
         except Exception as exc:  # noqa: BLE001 - the menu must survive anything
             print(f"\n  {type(exc).__name__}: {exc}")
+            # The screen gets one line; the file gets the traceback, which is
+            # what anyone asked to help will need.
+            log.error("menu item %s failed", choice, exc_info=True, extra={"console": False})
             _pause()

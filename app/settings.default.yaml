@@ -5,9 +5,8 @@ pool:
   max_groups: 5
   max_takers: 1
 
-legs:
-  master_account:
-    symbol: BTC-USD
+markets:
+  - symbol: BTC-USD
     notional_usd: 100
     leverage: 10
     offset_bps: 2.0
@@ -16,9 +15,9 @@ legs:
     improve_ticks: 1
     join_depth_usd: 0
     max_order_notional_usd: 100
+    enabled: true
 
-  sub_account:
-    symbol: ETH-USD
+  - symbol: ETH-USD
     notional_usd: 100
     leverage: 10
     offset_bps: 3.0
@@ -26,6 +25,7 @@ legs:
     chase_patience_s: 3
     improve_ticks: 1
     max_order_notional_usd: 100
+    enabled: true
 
 hold_minutes: 0.5-1.5
 
