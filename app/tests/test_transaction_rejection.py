@@ -626,3 +626,38 @@ async def test_submit_sends_exactly_what_signed_transaction_signs():
 
     sent = client.ws.sent[0]["request"]["payload"]
     assert sent == client.signed_transaction([FakeAction()], MASTER, nonce=42)
+
+
+@pytest.mark.parametrize("silence", [
+    asyncio.TimeoutError(), SubmissionInDoubt("unreadable answer"), asyncio.CancelledError(),
+])
+async def test_an_order_with_no_answer_still_carries_its_id(silence):
+    """It may be resting. Its id is a hash of fields stamped before sending,
+    but it travelled only on a rejection -- so a placement that timed out left
+    a possibly-live order the chaser could neither track nor cancel."""
+    class Silent:
+        async def submit(self, actions, **kwargs):
+            stamped(actions)
+            raise silence
+
+    s = AccountSession(name="m1", pubkey=MASTER, client=Silent(), http=None)
+    with pytest.raises(type(silence)) as caught:
+        await s.place_limit(BTC, True, 100.0, 0.001, cancel_oid="old")
+
+    assert caught.value.order_id
+    assert caught.value.order_id != "old"
+    assert caught.value.placed is None, "nobody knows whether it was placed"
+    assert s.symbols_in_doubt(60.0) == {BTC}
+
+
+async def test_an_order_that_never_left_carries_no_id():
+    from bulkdn.accounts import NotSent
+
+    class Unsigned:
+        async def submit(self, actions, **kwargs):
+            raise NotSent("signer not configured")
+
+    s = AccountSession(name="m1", pubkey=MASTER, client=Unsigned(), http=None)
+    with pytest.raises(NotSent) as caught:
+        await s.place_limit(BTC, True, 100.0, 0.001)
+    assert not hasattr(caught.value, "order_id")

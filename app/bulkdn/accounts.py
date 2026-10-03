@@ -1005,6 +1005,20 @@ class AccountSession:
             exc.order_id = _safe_order_id(order)
             exc.placed = _order_accepted(order, actions, exc.responses)
             raise
+        except NotSent:
+            # Nothing left this process: there is no order anywhere to track.
+            raise
+        except (Exception, asyncio.CancelledError) as exc:
+            # No answer -- a timeout, a reply that could not be read, a socket
+            # that closed, a caller that stopped waiting. The order may be
+            # resting right now, and its id was lost with the answer: it was
+            # attached only to a rejection. It does not need the answer, being
+            # a hash of the fields stamped on before signing, so it travels on
+            # this exception too and the chaser can track or cancel an order
+            # it would otherwise never hear of. `placed` is None: not known.
+            exc.order_id = _safe_order_id(order)
+            exc.placed = None
+            raise
         # order_id() is a deterministic hash of the signed fields, so it is
         # known once seqno/nonce/pubkey have been stamped on by submit().
         return order.order_id(), responses
