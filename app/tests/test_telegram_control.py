@@ -646,3 +646,24 @@ async def test_no_run_starts_while_transfers_are_going():
     gate.set()
     await asyncio.sleep(0.2)
     assert desk.sent == [MOVES]
+
+
+async def test_the_idle_status_is_read_off_the_control_loop(monkeypatch):
+    """`cmd_status` blocks on HTTP for every account. Awaited on the control
+    loop, nothing else -- no button, no poll -- was answered until it ended."""
+    import threading
+
+    from bulkdn import cli
+
+    seen = {}
+
+    async def cmd_status(config):
+        seen["thread"] = threading.get_ident()
+        print("positions: all flat")
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_status", cmd_status)
+    text = await tc.capture_status(object())
+
+    assert "all flat" in text
+    assert seen["thread"] != threading.get_ident(), "it ran on the control loop"

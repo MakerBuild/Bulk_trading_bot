@@ -48,6 +48,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from . import ratelimit
 from .notify import AlertHandler, Notifier, telegram_proxy
 from .retry import describe
 
@@ -726,12 +727,28 @@ def authorised_press(update: dict, allowed: set[int], strangers: set[int]) -> di
 
 
 async def capture_status(config) -> str:
-    """`cmd_status`'s printout, as text."""
+    """`cmd_status`'s printout, as text, read in a worker thread.
+
+    `cmd_status` is a coroutine in name only: it discovers every account and
+    reads every position and open order with blocking HTTP, paced by
+    ratelimit. Awaited here it ran on this loop, which then answered no button
+    and polled no update until the last read came back. In a thread, on a loop
+    of its own that serves nothing else, the wait is that thread's alone.
+
+    `redirect_stdout` swaps `sys.stdout` for the whole process while it runs,
+    so anything this loop printed meanwhile would land in the status too.
+    Nothing here prints after startup; the log handlers hold their own
+    streams.
+    """
+    return await asyncio.to_thread(_status_text, config)
+
+
+def _status_text(config) -> str:
     from .cli import cmd_status
 
     buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        await cmd_status(config)
+    with ratelimit.private_loop(), contextlib.redirect_stdout(buffer):
+        asyncio.run(cmd_status(config))
     return buffer.getvalue()
 
 
