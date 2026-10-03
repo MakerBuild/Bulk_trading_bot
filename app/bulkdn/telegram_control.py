@@ -60,9 +60,9 @@ _BOT_LOG = logging.getLogger("bulkdn")
 CONFIRM_TTL_S = 60.0
 # Seconds Telegram holds a getUpdates open waiting for a message.
 POLL_TIMEOUT_S = 25
-# Telegram refuses a message past 4096 characters, and the notifier splits
-# longer ones -- through a <pre> if need be, leaving each half with an unclosed
-# tag, which Telegram refuses outright. So bodies are kept well inside one.
+# A reply is one message -- and on a refresh, one EDITED message -- so it cannot
+# be split the way the notifier splits what it sends. Its free text is cut to
+# its tail instead, measured before escaping, well inside Telegram's 4096.
 _MAX_TEXT = 1700
 LOG_LINES_DEFAULT = 15
 LOG_LINES_MAX = 30
@@ -562,8 +562,10 @@ class Controller:
             log.exception("transfers started from telegram failed")
             await self.send(f"⚠️ Transfers failed: {html.escape(describe(exc))} -- check 💰 Accounts.")
             return
+        # Whole, not cut to its tail: the notifier splits a long report into
+        # messages that each parse, and every transfer's outcome matters.
         report = "\n".join(line.lstrip("\n") for line in lines)
-        await self.send(f"💸 Transfers\n<pre>{html.escape(report[-_MAX_TEXT:])}</pre>")
+        await self.send("💸 Transfers", plain=report, pre=True)
 
     def _new_pending(self, action: str, volume: float | None = None) -> str:
         code = self.make_code()

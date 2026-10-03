@@ -18,8 +18,8 @@ def sent(monkeypatch):
     monkeypatch.setattr(notify, "_ALERT_BATCH_S", 0.05)
     messages = []
 
-    async def send(self, text, *, prefix=""):
-        messages.append(text)
+    async def send(self, text="", *, prefix="", plain="", pre=False):
+        messages.append(text + plain)
 
     monkeypatch.setattr(Notifier, "send", send)
     return messages
@@ -38,11 +38,16 @@ async def settle(notifier):
     await notifier.drain()
 
 
+ALERT = {"alert": True}
+
+
 async def test_lines_that_need_a_person_arrive_as_one_message(sent):
     notifier, logger, handler = wired()
     try:
-        logger.critical("COULD NOT CLOSE BTC-USD on m1s4 -- close it by hand now")
-        logger.error("flatten did not fully close -- MANUAL ACTION REQUIRED: m2 BTC-USD")
+        logger.critical("COULD NOT CLOSE BTC-USD on m1s4 -- close it by hand now", extra=ALERT)
+        logger.error(
+            "flatten did not fully close -- MANUAL ACTION REQUIRED: m2 BTC-USD", extra=ALERT
+        )
         await settle(notifier)
     finally:
         handler.detach(logger)
@@ -58,7 +63,7 @@ async def test_a_crash_says_what_it_was(sent):
         try:
             raise ConnectionResetError("socket gone")
         except ConnectionResetError:
-            logger.exception("run failed")
+            logger.exception("run failed", extra=ALERT)
         await settle(notifier)
     finally:
         handler.detach(logger)
@@ -73,8 +78,10 @@ async def test_routine_lines_and_the_halt_are_not_forwarded(sent):
         logger.info("fill on m1: BUY")
         logger.warning("throttled by the exchange")
         logger.error("hedge for g1 failed: timeout")
-        logger.critical("HALT: hedge limit exceeded")
-        logger.critical("halted: hedge limit exceeded")
+        # Flagged, as strategy.py flags it -- and still not forwarded: the
+        # halt sends `Notifier.halted` itself, and forwarding it sent it twice.
+        logger.critical("HALT: hedge limit exceeded", extra=ALERT)
+        logger.critical("halted: hedge limit exceeded", extra=ALERT)
         await settle(notifier)
     finally:
         handler.detach(logger)
@@ -82,11 +89,29 @@ async def test_routine_lines_and_the_halt_are_not_forwarded(sent):
     assert sent == []
 
 
+async def test_what_is_forwarded_is_decided_by_the_flag_not_the_wording(sent):
+    """It used to be read from the text: any CRITICAL line, anything saying
+    MANUAL ACTION REQUIRED, a message of exactly "run failed". Rewording a
+    line changed what reached the phone."""
+    notifier, logger, handler = wired()
+    try:
+        logger.critical("a critical line nobody marked")
+        logger.error("MANUAL ACTION REQUIRED, but not marked")
+        logger.warning("a warning that needs a person", extra=ALERT)
+        await settle(notifier)
+    finally:
+        handler.detach(logger)
+
+    assert sent == ["a warning that needs a person"]
+
+
 async def test_a_line_logged_from_a_worker_thread_arrives(sent):
     """Position reads run in threads and log from there."""
     notifier, logger, handler = wired()
     try:
-        await asyncio.to_thread(logger.critical, "COULD NOT CANCEL resting orders")
+        await asyncio.to_thread(
+            lambda: logger.critical("COULD NOT CANCEL resting orders", extra=ALERT)
+        )
         await settle(notifier)
     finally:
         handler.detach(logger)
@@ -99,7 +124,7 @@ async def test_an_alert_still_gathering_is_sent_at_shutdown(sent, monkeypatch):
     monkeypatch.setattr(notify, "_ALERT_BATCH_S", 60.0)
     notifier, logger, handler = wired()
     try:
-        logger.critical("COULD NOT CLOSE BTC-USD")
+        logger.critical("COULD NOT CLOSE BTC-USD", extra=ALERT)
         await asyncio.sleep(0)          # handed to the loop
         await notifier.drain()
     finally:
@@ -112,7 +137,7 @@ async def test_a_flood_is_capped(sent):
     notifier, logger, handler = wired()
     try:
         for i in range(40):
-            logger.critical("COULD NOT CLOSE %d", i)
+            logger.critical("COULD NOT CLOSE %d", i, extra=ALERT)
         await settle(notifier)
     finally:
         handler.detach(logger)
@@ -125,7 +150,7 @@ async def test_a_flood_is_capped(sent):
 async def test_nothing_is_sent_without_telegram(sent):
     notifier, logger, handler = wired(enabled=False)
     try:
-        logger.critical("COULD NOT CLOSE BTC-USD")
+        logger.critical("COULD NOT CLOSE BTC-USD", extra=ALERT)
         await settle(notifier)
     finally:
         handler.detach(logger)

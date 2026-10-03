@@ -21,7 +21,7 @@ async def test_a_cycle_report_does_not_wait_for_telegram(monkeypatch):
     release = asyncio.Event()
     sent = []
 
-    async def slow_send(text, *, prefix=""):
+    async def slow_send(text, *, prefix="", plain=""):
         await release.wait()
         sent.append(text)
 

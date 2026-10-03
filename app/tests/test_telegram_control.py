@@ -75,8 +75,8 @@ class Harness:
     async def status(self, config):
         return self.status_text
 
-    async def send(self, text):
-        self.sent.append(text)
+    async def send(self, text, *, plain="", pre=False):
+        self.sent.append(text + plain)
 
     async def say(self, text) -> Reply:
         return await self.c.handle(text)

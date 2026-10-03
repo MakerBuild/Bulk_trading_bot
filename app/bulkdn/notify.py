@@ -18,6 +18,7 @@ import contextlib
 import html
 import logging
 import os
+import re
 import urllib.parse
 from dataclasses import dataclass, field
 
@@ -26,9 +27,13 @@ from .retry import describe
 
 log = logging.getLogger(__name__)
 
-# Telegram rejects messages past ~4096 characters. Splitting well below that
-# leaves room for the header without needing to measure it.
+# Telegram rejects messages past ~4096 characters. Each message is kept to
+# this many characters of HTML as SENT -- escaped, tags included -- which is
+# never fewer than Telegram counts, so it holds with room to spare.
 _CHUNK = 1900
+# A message whose caller-composed part leaves less room than this for the free
+# text gets the free text in messages of its own instead.
+_MIN_ROOM = 200
 _TIMEOUT_S = 15
 
 # Where `proxy.apply` puts the configured proxy. Read back from here rather
@@ -146,22 +151,37 @@ class Notifier:
         self._alerts, self._alerts_dropped = [], 0
         self.send_soon(self.error(text))
 
-    async def send(self, text: str, *, prefix: str = "") -> None:
-        """Deliver one message. Silent no-op when Telegram is not configured."""
+    async def send(
+        self, text: str = "", *, prefix: str = "", plain: str = "", pre: bool = False
+    ) -> None:
+        """Deliver a message -- several, if it is long. No-op when unconfigured.
+
+        `text` is HTML the caller composed, and short. `plain` is free text of
+        any length -- a halt reason, a batch of alert lines, a report -- and
+        follows it. Long free text is split BEFORE it is escaped, and each
+        piece is escaped and, with `pre`, wrapped in `<pre>` on its own.
+
+        It used to be the other way round: the finished HTML was cut every
+        1900 characters, through the middle of a `<pre>` or an `&amp;`, and
+        Telegram refused each such piece ("can't parse entities") -- so the
+        long messages, which are the halts and the MANUAL ACTION alerts, were
+        the ones that vanished.
+        """
         if not self.enabled:
             return
 
-        body = f"<b>{html.escape(self.label)}</b>"
+        lead = f"<b>{html.escape(self.label)}</b>"
         if prefix:
-            body += f" {html.escape(prefix)}"
-        body += f"\n\n{text}"
+            lead += f" {html.escape(prefix)}"
+        if text:
+            lead += f"\n\n{text}"
 
         try:
             async with aiohttp.ClientSession() as session:
                 proxy = telegram_proxy()
-                for chunk in _split(body):
+                for message in _compose(lead, plain, pre=pre):
                     for user_id in self.config.user_ids:
-                        await self._send_one(session, user_id, chunk, proxy=proxy)
+                        await self._send_one(session, user_id, message, proxy=proxy)
         except Exception as exc:  # noqa: BLE001 - reporting must never break trading
             log.warning("telegram notification failed: %s", self._redacted(describe(exc)))
 
@@ -184,28 +204,53 @@ class Notifier:
         *,
         proxy: str | None = None,
     ) -> None:
+        """Send one message to one recipient, as plain text if its HTML is refused.
+
+        A message Telegram cannot parse used to be logged and dropped. Its
+        words matter more than its bold, so it is sent again without
+        formatting: tags stripped, entities turned back into characters.
+        """
         try:
-            async with session.post(
-                f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage",
-                json={
-                    "chat_id": user_id,
-                    "text": text,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True,
-                },
-                timeout=aiohttp.ClientTimeout(total=_TIMEOUT_S),
-                proxy=proxy,
-            ) as response:
-                payload = await response.json()
-                if not payload.get("ok"):
-                    log.warning(
-                        "telegram rejected message to %s: %s",
-                        user_id, self._redacted(str(payload)),
-                    )
+            payload = await self._post(session, user_id, text, html_mode=True, proxy=proxy)
+            if not payload.get("ok") and _parse_refused(payload):
+                log.warning(
+                    "telegram could not parse a message to %s (%s) -- sending it "
+                    "as plain text",
+                    user_id, self._redacted(str(payload.get("description"))),
+                )
+                payload = await self._post(
+                    session, user_id, _as_plain(text), html_mode=False, proxy=proxy
+                )
+            if not payload.get("ok"):
+                log.warning(
+                    "telegram rejected message to %s: %s",
+                    user_id, self._redacted(str(payload)),
+                )
         except Exception as exc:  # noqa: BLE001 - one bad recipient must not stop the rest
             log.warning(
                 "telegram send to %s failed: %s", user_id, self._redacted(describe(exc))
             )
+
+    async def _post(
+        self,
+        session: aiohttp.ClientSession,
+        user_id: int,
+        text: str,
+        *,
+        html_mode: bool,
+        proxy: str | None,
+    ) -> dict:
+        body = {"chat_id": user_id, "text": text, "disable_web_page_preview": True}
+        if html_mode:
+            body["parse_mode"] = "HTML"
+        async with session.post(
+            f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage",
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=_TIMEOUT_S),
+            proxy=proxy,
+        ) as response:
+            payload = await response.json()
+        return payload if isinstance(payload, dict) else {"ok": False, "result": payload}
 
     # -- event helpers -----------------------------------------------------
     #
@@ -234,25 +279,21 @@ class Notifier:
         """
         target = f"/{of}" if of else ""
         text = f"cycle <b>{cycle}{target}</b> complete"
-        if detail:
-            text += f"\n{detail}"
-        self.send_soon(self.send(text, prefix="✅"))
+        self.send_soon(self.send(text, prefix="✅", plain=detail))
 
     async def halted(self, reason: str) -> None:
         await self.send(
-            f"<b>trading stopped</b>\n{html.escape(reason)}\n\n"
-            "Orders cancelled and positions flattened.",
+            "<b>trading stopped</b>",
             prefix="🛑 HALT",
+            plain=f"{reason}\n\nOrders cancelled and positions flattened.",
         )
 
     async def run_finished(self, *, cycles: int, detail: str = "") -> None:
         text = f"run finished after <b>{cycles}</b> cycle(s)"
-        if detail:
-            text += f"\n{detail}"
-        await self.send(text, prefix="🏁")
+        await self.send(text, prefix="🏁", plain=detail)
 
     async def error(self, message: str) -> None:
-        await self.send(f"<pre>{html.escape(message)}</pre>", prefix="⚠️ error")
+        await self.send(prefix="⚠️ error", plain=message, pre=True)
 
     def send_soon(self, coro) -> None:
         """Fire a notification without making the caller wait for it.
@@ -302,6 +343,10 @@ class Notifier:
                 task.cancel()
 
 
+# The halt's own log lines. See `AlertHandler.emit`.
+_HALT_LINES = ("HALT:", "halted:")
+
+
 class AlertHandler(logging.Handler):
     """Forwards the log lines that need a person to Telegram.
 
@@ -310,31 +355,37 @@ class AlertHandler(logging.Handler):
     hand" and "MANUAL ACTION REQUIRED" went to the log alone -- the lines that
     most need someone, in a file nobody reads until later.
 
-    Forwarded: every CRITICAL line except the halt's own (it has a message of
-    its own already), a crash, and a flatten that could not finish.
+    Forwarded: exactly the records logged with `extra={"alert": True}`. The
+    line that needs a person says so where it is written. This used to be
+    decided here by reading the text -- every CRITICAL line not starting
+    "HALT:", anything containing "MANUAL ACTION REQUIRED", a record whose
+    message was exactly "run failed" -- so rewording a log line silently
+    changed what reached the phone, and nothing at the call site said so.
+
+    A forwarded record that carries an exception has it appended, so a crash
+    says what it was. The one flagged line NOT forwarded is the halt's own
+    ("HALT: ..."/"halted: ..."), which has a message of its own already.
     """
 
     def __init__(self, notifier: Notifier):
-        super().__init__(level=logging.ERROR)
+        super().__init__(level=logging.NOTSET)
         self.notifier = notifier
 
     def emit(self, record: logging.LogRecord) -> None:
         # A failed send logs a warning from here, and must not come back.
-        if record.name == __name__:
+        if record.name == __name__ or not getattr(record, "alert", False):
             return
         try:
             message = record.getMessage()
         except Exception:  # noqa: BLE001 - a bad format string is not our problem here
             return
-        if record.levelno >= logging.CRITICAL:
-            if message.startswith(("HALT:", "halted:")):
-                return
-        elif "MANUAL ACTION REQUIRED" in message:
-            pass
-        elif message == "run failed" and record.exc_info and record.exc_info[1]:
-            message = f"run failed: {describe(record.exc_info[1])}"
-        else:
+        if message.startswith(_HALT_LINES):
+            # The halt is flagged like any line that needs a person, but it
+            # already has a message of its own: `Strategy._trigger_halt`
+            # sends `Notifier.halted`. Forwarded as well, it arrived twice.
             return
+        if record.exc_info and record.exc_info[1]:
+            message = f"{message}: {describe(record.exc_info[1])}"
         self.notifier.alert(message)
 
     def attach(self, logger: logging.Logger) -> None:
@@ -346,5 +397,75 @@ class AlertHandler(logging.Handler):
         logger.removeHandler(self)
 
 
-def _split(text: str) -> list[str]:
-    return [text[i : i + _CHUNK] for i in range(0, len(text), _CHUNK)] or [text]
+def _compose(lead: str, plain: str, *, pre: bool = False) -> list[str]:
+    """The messages for HTML `lead` followed by free text `plain`.
+
+    `plain` is split first and escaped piece by piece, so no tag and no entity
+    is ever cut. A `lead` too long for one message -- it is the caller's HTML,
+    and a caller is meant to keep it short -- is sent as free text too rather
+    than cut.
+    """
+    wrap = (lambda piece: f"<pre>{html.escape(piece)}</pre>") if pre else html.escape
+    overhead = len("<pre></pre>") if pre else 0
+    if len(lead) > _CHUNK:
+        plain = _as_plain(lead) + (f"\n\n{plain}" if plain else "")
+        lead, pre, wrap, overhead = "", False, html.escape, 0
+    if not plain:
+        return [lead]
+    room = _CHUNK - len(lead) - 1 - overhead
+    if not lead or room < _MIN_ROOM:
+        messages = [lead] if lead else []
+        return messages + [wrap(piece) for piece in _pieces(plain, _CHUNK - overhead)]
+    pieces = _pieces(plain, _CHUNK - overhead, first=room)
+    return [f"{lead}\n{wrap(pieces[0])}"] + [wrap(piece) for piece in pieces[1:]]
+
+
+def _pieces(text: str, limit: int, *, first: int | None = None) -> list[str]:
+    """Split plain text so each piece, once escaped, is at most `limit` long.
+
+    At line breaks where it can, so a log line stays whole; a single line
+    longer than a piece is cut between characters, which is safe because
+    nothing has been escaped yet. `first` is the room in the first piece, when
+    it shares a message with something else.
+    """
+    pieces: list[str] = []
+    current, used = "", 0
+    budget = first if first is not None else limit
+
+    def flush() -> None:
+        nonlocal current, used, budget
+        pieces.append(current)
+        current, used, budget = "", 0, limit
+
+    for line in text.splitlines(keepends=True):
+        cost = len(html.escape(line))
+        if used + cost <= budget:
+            current, used = current + line, used + cost
+            continue
+        if current:
+            flush()
+        if cost <= budget:
+            current, used = line, cost
+            continue
+        for char in line:
+            step = len(html.escape(char))
+            if used + step > budget:
+                flush()
+            current, used = current + char, used + step
+    if current or not pieces:
+        pieces.append(current)
+    return pieces
+
+
+def _parse_refused(payload: dict) -> bool:
+    """Whether Telegram refused a message for its HTML, not for anything else."""
+    description = str(payload.get("description") or "").lower()
+    return payload.get("error_code") == 400 and "parse entities" in description
+
+
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _as_plain(text: str) -> str:
+    """HTML as the plain text it displays: tags dropped, entities decoded."""
+    return html.unescape(_TAG.sub("", text))
