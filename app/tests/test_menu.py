@@ -127,8 +127,10 @@ SETTINGS_WITH_COMMENTS = """\
 legs:
   master_account:
     symbol: BTC-USD      # keep this comment
+    notional_usd: 100
   sub_account:
     symbol: ETH-USD
+    notional_usd: 100
 """
 
 
@@ -161,7 +163,11 @@ def test_a_nested_mode_key_is_not_mistaken_for_the_top_level_one(tmp_path):
     """`legs` could gain a key ending in the same word. Only a line starting
     at column zero is this setting."""
     path = tmp_path / "settings.yaml"
-    path.write_text("legs:\n  master_account:\n    mode: whatever\n", encoding="utf-8")
+    path.write_text(
+        "legs:\n  master_account:\n    symbol: BTC-USD\n    notional_usd: 100\n"
+        "    mode: whatever\n",
+        encoding="utf-8",
+    )
 
     menu._write_mode(str(path), "single")
 

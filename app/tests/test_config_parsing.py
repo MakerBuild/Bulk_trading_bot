@@ -104,3 +104,24 @@ def test_the_leverage_bounds_are_written_once():
 def test_a_leverage_outside_the_bounds_is_refused_by_the_loader(value):
     with pytest.raises(ConfigError, match="leverage"):
         LegConfig(symbol="BTC-USD", notional_usd=100, leverage=value).validate("m")
+
+
+# -- a key written twice ----------------------------------------------------
+
+
+def test_a_key_written_twice_is_refused_with_both_lines(tmp_path):
+    """PyYAML keeps the last of two and says nothing, so an edit to the first
+    did nothing at all."""
+    top = "execution_target:\n  burn_usd: 3\nexecution_target:\n  burn_usd: 5"
+    with pytest.raises(ConfigError, match=r"`execution_target` twice.*lines 4 and 6"):
+        load(tmp_path, top)
+
+
+def test_a_key_written_twice_inside_a_market_is_refused_too(tmp_path):
+    path = tmp_path / "settings.yaml"
+    path.write_text(
+        "markets:\n  - symbol: BTC-USD\n    notional_usd: 100\n    notional_usd: 50\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="notional_usd"):
+        load_config(str(path), require_credentials=False)

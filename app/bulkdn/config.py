@@ -172,52 +172,52 @@ class LegConfig:
 
     def validate(self, name: str) -> None:
         if not self.symbol:
-            raise ConfigError(f"legs.{name}.symbol is required")
+            raise ConfigError(f"{name}.symbol is required")
 
         if self.size < 0 or self.notional_usd < 0:
-            raise ConfigError(f"legs.{name}: size and notional_usd must be >= 0")
+            raise ConfigError(f"{name}: size and notional_usd must be >= 0")
         if self.size > 0 and self.notional_usd > 0:
             raise ConfigError(
-                f"legs.{name} sets both `size` and `notional_usd` -- use one. "
+                f"{name} sets both `size` and `notional_usd` -- use one. "
                 f"`notional_usd` is in dollars and keeps its meaning when you "
                 f"change `symbol`; `size` is in the base coin and does not."
             )
         if self.size <= 0 and self.notional_usd <= 0:
             raise ConfigError(
-                f"legs.{name} has no size: set `notional_usd: 100` for $100 of "
+                f"{name} has no size: set `notional_usd: 100` for $100 of "
                 f"{self.symbol}, or `size` for an amount of the base coin."
             )
 
         if self.max_order_size < 0 or self.max_order_notional_usd < 0:
-            raise ConfigError(f"legs.{name}: the max_order_* caps must be >= 0")
+            raise ConfigError(f"{name}: the max_order_* caps must be >= 0")
         if self.max_order_size > 0 and self.max_order_notional_usd > 0:
             raise ConfigError(
-                f"legs.{name} sets both `max_order_size` and "
+                f"{name} sets both `max_order_size` and "
                 f"`max_order_notional_usd` -- use one."
             )
         # Both may be zero: the cap then defaults to the whole leg, which is
         # applied once the leg has a size.
         if self.notional_usd <= 0 and self.max_order_notional_usd <= 0 and self.max_order_size <= 0:
-            raise ConfigError(f"legs.{name}.max_order_size must be > 0")
+            raise ConfigError(f"{name}.max_order_size must be > 0")
 
         if self.offset_bps < 0:
-            raise ConfigError(f"legs.{name}.offset_bps must be >= 0")
+            raise ConfigError(f"{name}.offset_bps must be >= 0")
         if self.max_distance_bps <= 0:
-            raise ConfigError(f"legs.{name}.max_distance_bps must be > 0")
+            raise ConfigError(f"{name}.max_distance_bps must be > 0")
         if self.chase_patience_s < 0:
-            raise ConfigError(f"legs.{name}.chase_patience_s must be >= 0 (0 disables it)")
+            raise ConfigError(f"{name}.chase_patience_s must be >= 0 (0 disables it)")
         if self.improve_ticks < 0:
             raise ConfigError(
-                f"legs.{name}.improve_ticks must be >= 0 (0 joins the touch "
+                f"{name}.improve_ticks must be >= 0 (0 joins the touch "
                 "instead of beating it)"
             )
         if self.join_depth_usd < 0:
             raise ConfigError(
-                f"legs.{name}.join_depth_usd must be >= 0 (0 switches it off)"
+                f"{name}.join_depth_usd must be >= 0 (0 switches it off)"
             )
         if self.leverage is not None and not MIN_LEVERAGE <= self.leverage <= MAX_LEVERAGE:
             raise ConfigError(
-                f"legs.{name}.leverage must be between {MIN_LEVERAGE:g} and "
+                f"{name}.leverage must be between {MIN_LEVERAGE:g} and "
                 f"{MAX_LEVERAGE:g}"
             )
 
@@ -967,12 +967,12 @@ def _span_from_raw(raw: dict[str, Any], key: str, name: str) -> Span | None:
     """
     if key not in raw or raw[key] is None:
         return None
-    return Span.parse(raw[key], f"legs.{name}.{key}")
+    return Span.parse(raw[key], f"{name}.{key}")
 
 
 def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     if not isinstance(raw, dict):
-        raise ConfigError(f"legs.{name} must be a mapping")
+        raise ConfigError(f"{name} must be a mapping")
     # Retired and misspelled settings alike. Unknown keys used to be ignored
     # in silence, which let someone tune a number that was never read and
     # conclude the bot ignores its own config.
@@ -1047,7 +1047,7 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             ),
         )
     except KeyError as exc:
-        raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
+        raise ConfigError(f"{name} is missing required key {exc}") from exc
 
 
 def _mode_from_raw(value: Any) -> str:
@@ -1260,6 +1260,43 @@ def _access_from_dict(raw: Any) -> AccessConfig:
     return access
 
 
+class _DuplicateKey(Exception):
+    """A key that appears twice in one block, with both line numbers."""
+
+    def __init__(self, key: Any, first: int, second: int):
+        super().__init__(key, first, second)
+        self.key, self.first, self.second = key, first, second
+
+
+class _StrictLoader(yaml.SafeLoader):
+    """SafeLoader, except that a key given twice in one block is refused.
+
+    YAML says a mapping's keys are unique, and PyYAML quietly keeps the LAST of
+    two. That is how a menu edit went missing: the target writer did not
+    recognise `execution_target:  # note`, appended a second block below it,
+    and every later edit landed in the first block -- which the loader then
+    threw away in favour of the second. Nothing failed; the edits just did not
+    take. Two of the same key is now a sentence naming both lines.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        if isinstance(node, yaml.MappingNode):
+            seen: dict[Any, int] = {}
+            for key_node, _value in node.value:
+                if key_node.tag == "tag:yaml.org,2002:merge":
+                    continue
+                key = self.construct_object(key_node, deep=deep)
+                try:
+                    first = seen.get(key)
+                except TypeError:
+                    continue  # unhashable: SafeLoader refuses it with its own message
+                line = key_node.start_mark.line + 1
+                if first is not None:
+                    raise _DuplicateKey(key, first, line)
+                seen[key] = line
+        return super().construct_mapping(node, deep=deep)
+
+
 def _read_yaml(path: str) -> dict[str, Any]:
     """The settings file as a mapping, or a ConfigError that says what to do.
 
@@ -1273,10 +1310,12 @@ def _read_yaml(path: str) -> dict[str, Any]:
       passing on, since it points straight at the line.
     * A file that is a list or a bare word at the top parses fine and then
       failed with AttributeError on the first `.get`.
+    * A key written twice in one block -- see _StrictLoader.
     """
     try:
         with open(path, encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle)
+            # A SafeLoader subclass: nothing in the file can construct an object.
+            raw = yaml.load(handle, Loader=_StrictLoader)
     except FileNotFoundError as exc:
         raise ConfigError(f"config file not found: {path}") from exc
     except UnicodeDecodeError as exc:
@@ -1288,6 +1327,12 @@ def _read_yaml(path: str) -> dict[str, Any]:
         ) from exc
     except yaml.YAMLError as exc:
         raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
+    except _DuplicateKey as exc:
+        raise ConfigError(
+            f"{path} sets `{exc.key}` twice in the same block, on lines "
+            f"{exc.first} and {exc.second}. Only one of them can count, so the "
+            "bot will not guess which you meant: delete the one you do not want."
+        ) from exc
 
     if raw is None:
         return {}
