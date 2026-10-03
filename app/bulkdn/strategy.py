@@ -3128,15 +3128,19 @@ class Strategy:
         so it is confirmed against the exchange before being acted on.
 
         Only this leg's accounts are read. It read the whole pool, one account
-        at a time and under the shared sync lock, to confirm one group of
-        three -- over a pool of a hundred, half a minute, with every other
-        caller of the lock waiting behind it.
+        at a time, to confirm one group of three -- over a pool of a hundred,
+        half a minute, with every other caller of the lock waiting behind it.
+
+        Through `_sync_positions` all the same. Read around it, the read did
+        not count: a leg waiting on a read of these accounts kept waiting, and
+        the hedge slices it had just accounted for stayed reserved.
         """
         roles = self._roles_for_key(key) if key else None
         try:
             if roles is not None and self._groups:
-                sessions = [self.sessions[p] for p in roles.accounts if p in self.sessions]
-                await sync_positions(sessions, self.book)
+                await self._sync_positions(
+                    sessions=[self.sessions[p] for p in roles.accounts if p in self.sessions],
+                )
             else:
                 await self._sync_positions()
         except Exception as exc:
@@ -3817,7 +3821,7 @@ class Strategy:
         """
         # Off the loop, like every other read: the hedge worker and the
         # supervisor are already running, and the sockets are live.
-        await sync_positions(self.all_sessions, self.book)
+        await self._sync_positions(max_age_s=0.0)
 
         if self.state.phase == Phase.HALTED:
             # Deliberately not cleared automatically, even though the per-leg

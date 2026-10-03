@@ -107,3 +107,39 @@ async def test_a_failed_read_is_not_recorded_as_fresh(strategy):
 
     await strategy._sync_positions()
     assert strategy.recorder.calls == 1, "the failure left a fresh timestamp"
+
+
+# -- a leg confirming its phase reads through the same door ------------------
+#
+# `_confirm_done` read the leg's own accounts by calling the exchange read
+# directly, around the lock. That read neither cleared doubt about the
+# accounts it had just read nor settled the unanswered hedge slices it had
+# just accounted for, so a leg waiting on a read kept waiting after one.
+
+
+async def test_a_phase_confirmation_counts_as_a_read_of_its_accounts(strategy):
+    import types
+
+    from bulkdn.pairing import Group
+
+    maker = types.SimpleNamespace(name="m", pubkey="M", client=object(), stream_lagging_until=0.0)
+    taker = types.SimpleNamespace(name="t", pubkey="T", client=object(), stream_lagging_until=0.0)
+    elsewhere = types.SimpleNamespace(name="x", pubkey="X", client=object(), stream_lagging_until=0.0)
+    strategy.sessions = {s.pubkey: s for s in (maker, taker, elsewhere)}
+    strategy._groups = {
+        "g1:BTC-USD": Group("BTC-USD", maker="M", takers=("T",), shares=(1.0,)),
+    }
+    settled = []
+    strategy.hedger = types.SimpleNamespace(
+        in_flight=types.SimpleNamespace(
+            settle_doubtful=lambda started, keys=None: settled.append(keys)
+        ),
+    )
+    strategy._mark_unread(maker)
+    strategy._mark_unread(elsewhere)
+
+    assert await strategy._confirm_done(lambda: True, "g1 open", "g1:BTC-USD")
+
+    assert not strategy._waiting_for("M"), "the read of its accounts did not count"
+    assert strategy._waiting_for("X"), "an account it did not read was cleared"
+    assert settled[-1] == ["g1:BTC-USD"]

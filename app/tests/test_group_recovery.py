@@ -258,7 +258,9 @@ async def test_recovery_reconciles_the_restored_groups_not_the_pair(tmp_path, mo
     monkeypatch.setattr(strategy_mod, "sync_positions", no_read)
     monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
     monkeypatch.setattr(strategy_mod, "reconcile_net", reconcile_net)
-    obj.hedger = object()
+    obj.hedger = types.SimpleNamespace(
+        in_flight=types.SimpleNamespace(settle_doubtful=lambda *a, **k: None),
+    )
 
     await obj._recover()
 
