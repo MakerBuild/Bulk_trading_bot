@@ -351,7 +351,13 @@ class Runtime:
             ",".join(self.symbols),
             self.config.mode,
         )
-        self.load_specs(strict=trading)
+        # Every step below that reads the exchange over HTTP is synchronous
+        # `requests`, and runs in a worker thread rather than on the event
+        # loop. On the loop it froze everything else for its whole length --
+        # the referral check alone retries for up to a minute -- and in a
+        # Telegram session that is the loop answering /stop. test_no_kludges
+        # holds every async function in this file to it.
+        await asyncio.to_thread(self.load_specs, strict=trading)
 
         # Orders left resting by a run that died come off first, before any
         # check below can stop this start. Recovery cancels them too, but only
@@ -367,10 +373,10 @@ class Runtime:
         # Before anything is placed. A gate that tripped later would abandon
         # open positions and leave the pair directional.
         if trading:
-            self.check_access()
+            await asyncio.to_thread(self.check_access)
 
         if verify and self.sub1 is not None and self._same_tree(self.master, self.sub1):
-            verify_sub_account(self.master, self.sub1)
+            await asyncio.to_thread(verify_sub_account, self.master, self.sub1)
 
         if not trading:
             await self._connect_all()
@@ -390,10 +396,10 @@ class Runtime:
                     ", ".join(missing),
                 )
 
-        self.apply_sizing()
+        await asyncio.to_thread(self.apply_sizing)
 
         if not self.dry_run:
-            self.apply_leverage()
+            await asyncio.to_thread(self.apply_leverage)
 
         await self._connect_all()
         await self.feed.subscribe()
@@ -704,7 +710,8 @@ async def cmd_run(config: Config, dry_run: bool, *, on_strategy=None) -> int:
     has to reach into a run it did not start by hand -- the Telegram control
     loop, which answers /status and /stop from it.
     """
-    runtime = Runtime(config, dry_run)
+    # Built in a worker thread: finding the accounts is an HTTP call per key.
+    runtime = await asyncio.to_thread(Runtime, config, dry_run)
     # For the whole run, startup included: the lines that need a person --
     # a crash, a close that failed -- reach Telegram and not only the log.
     alerts = AlertHandler(runtime.notifier)
@@ -804,7 +811,9 @@ async def cmd_flatten(
     # one master's accounts only, and closing through it left every other
     # master's positions open -- and then reset the state to IDLE as if they
     # were not there.
-    runtime = Runtime(config, dry_run, symbols=every_market, trading=False)
+    runtime = await asyncio.to_thread(
+        Runtime, config, dry_run, symbols=every_market, trading=False
+    )
     await runtime.start(verify=False, trading=False)
     closed = True
     try:
@@ -904,15 +913,17 @@ async def cmd_status(config: Config) -> int:
     every_market = list(dict.fromkeys(market.symbol for market in config.markets))
     # Every key too, for the same reason as `flatten`: a status that answers
     # for one master in single mode says nothing about the others.
-    runtime = Runtime(config, dry_run=True, symbols=every_market, trading=False)
+    runtime = await asyncio.to_thread(
+        Runtime, config, dry_run=True, symbols=every_market, trading=False
+    )
     # Not strict: one delisted or misspelled market must not hide the rest.
-    runtime.load_specs(strict=False)
+    await asyncio.to_thread(runtime.load_specs, strict=False)
     switched_off = {m.symbol for m in config.markets if not m.enabled}
 
     # Every account, not the named pair. `status` is what an operator reads
     # to decide whether anything is open, and answering for two accounts out
     # of six is answering the wrong question confidently.
-    sync_positions_http(runtime.pool, runtime.book)
+    await asyncio.to_thread(sync_positions_http, runtime.pool, runtime.book)
     state = runtime.store.load()
 
     print(f"endpoint     : {config.http_url}")
@@ -951,7 +962,7 @@ async def cmd_status(config: Config) -> int:
     print("\nopen orders:")
     for session in runtime.pool:
         try:
-            orders = session.open_orders()
+            orders = await asyncio.to_thread(session.open_orders)
         except Exception as exc:
             print(f"  {session.name}: query failed ({exc})")
             continue
@@ -969,8 +980,8 @@ async def cmd_status(config: Config) -> int:
 
 async def cmd_check(config: Config) -> int:
     """Validate configuration and account wiring without connecting to trade."""
-    runtime = Runtime(config, dry_run=True, trading=False)
-    runtime.feed.load_specs()
+    runtime = await asyncio.to_thread(Runtime, config, dry_run=True, trading=False)
+    await asyncio.to_thread(runtime.feed.load_specs)
     print("market specs OK")
     if runtime.sub1 is None:
         print(
@@ -984,7 +995,7 @@ async def cmd_check(config: Config) -> int:
         print("sub-account relationship: n/a -- these two are separate masters")
         return 0
     try:
-        verify_sub_account(runtime.master, runtime.sub1)
+        await asyncio.to_thread(verify_sub_account, runtime.master, runtime.sub1)
         print("sub-account relationship OK")
     except Exception as exc:
         print(f"sub-account check FAILED: {exc}")
@@ -1111,7 +1122,7 @@ async def cmd_transfer(
     # the key owning BOTH ends, so one inside the second master's tree signed
     # by the first master's key is simply refused -- and refused after the
     # operator has been told it was submitted.
-    tree = _tree_holding(config, source)
+    tree = await asyncio.to_thread(_tree_holding, config, source)
     if tree is None:
         print(f"\nno key in the file owns {source}. Nothing was submitted.")
         return 1
@@ -1133,7 +1144,8 @@ async def cmd_transfer(
         f"  via  {config.http_url}\n"
     )
 
-    result, outcome, detail = submit_signed(
+    result, outcome, detail = await asyncio.to_thread(
+        submit_signed,
         submit_transfer,
         http_url=config.http_url,
         private_key=key,
@@ -1243,7 +1255,8 @@ async def cmd_create_subaccount(
         f"mainnet, domain byte {SignatureDomain[config.signature_domain_name].value}\n"
     )
 
-    result, outcome, detail = submit_signed(
+    result, outcome, detail = await asyncio.to_thread(
+        submit_signed,
         build_and_submit,
         http_url=config.http_url,
         private_key=private_key or config.private_key,

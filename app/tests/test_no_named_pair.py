@@ -52,10 +52,10 @@ ALLOWED = {
     # Parent-child is a claim about two specific accounts, and it is guarded
     # by `_same_tree` so it is only made inside one tree.
     ("cli.py", "if verify and self.sub1 is not None and self._same_tree(self.master, self.sub1):"),
-    ("cli.py", "verify_sub_account(self.master, self.sub1)"),
+    ("cli.py", "await asyncio.to_thread(verify_sub_account, self.master, self.sub1)"),
     ("cli.py", "if runtime.sub1 is None:"),
     ("cli.py", "if not Runtime._same_tree(runtime.master, runtime.sub1):"),
-    ("cli.py", "verify_sub_account(runtime.master, runtime.sub1)"),
+    ("cli.py", "await asyncio.to_thread(verify_sub_account, runtime.master, runtime.sub1)"),
     # Handed to the strategy, which keeps them for the same reasons.
     ("cli.py", "master=self.master,"),
     ("cli.py", "sub1=self.sub1,"),
