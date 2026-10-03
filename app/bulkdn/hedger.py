@@ -33,7 +33,9 @@ import time
 from dataclasses import dataclass
 
 from .accounts import AccountSession, NotSent, OrderRejected, short_pubkey
-from .marketdata import MarketSpec, min_order_size, round_notional, round_size, touch_text
+from .marketdata import (
+    MarketSpec, is_tradeable, round_notional, round_size, touch_text, tradeable_size,
+)
 from .impact import ImpactBook
 from .positions import PositionBook
 from .retry import describe
@@ -363,22 +365,6 @@ class Hedger:
         """Retire an in-flight reservation once its hedge fill lands."""
         self.in_flight.consume(key, signed_size)
 
-    def _floor(self, spec, price: float | None) -> float:
-        """The smallest order this market accepts, in base units.
-
-        Two floors, and the notional one is usually the binding one. BTC-USD
-        admits a lot of 0.000001 and a notional of $1; ETH-USD admits a lot of
-        0.0001 -- about forty cents -- and a notional of $50. Measuring a
-        slice against the lot alone therefore passes pieces the exchange
-        refuses, and it refuses them one order at a time until the reject
-        streak halts the run.
-
-        Without a price the notional floor cannot be expressed in base units,
-        so the lot stands alone. That is the old behaviour, and it is only
-        reached when the feed has no reference price at all.
-        """
-        return min_order_size(spec, price)
-
     def _destination(self, slices: list[tuple[str, float]]) -> str:
         """Where a hedge is going, named so the fills under it can be matched.
 
@@ -409,7 +395,9 @@ class Hedger:
 
         A slice below what the market accepts is dropped and its weight handed
         on: an order the exchange will not take is not a smaller hedge, it is
-        a missing one. Asking for more pieces than the size can carry
+        a missing one. The notional floor is usually the one that binds:
+        ETH-USD admits a lot of 0.0001 -- about forty cents -- and refuses
+        any order under $50. Asking for more pieces than the size can carry
         therefore yields fewer pieces, not rejected ones -- which is what the
         settings file has always promised `max_takers` does.
 
@@ -422,18 +410,17 @@ class Hedger:
         if len(hedgers) == 1:
             return [(hedgers[0], size)]
 
-        floor = self._floor(spec, price)
         pieces: list[tuple[str, float]] = []
         placed = 0.0
         for pubkey, weight in zip(hedgers[:-1], weights[:-1], strict=False):
-            piece = round_size(size * weight, spec)
-            if piece < floor:
+            piece = tradeable_size(spec, size * weight, price)
+            if not piece:
                 continue
             pieces.append((pubkey, piece))
             placed += piece
 
         remainder = round_size(size - placed, spec)
-        if remainder >= floor:
+        if is_tradeable(spec, remainder, price):
             pieces.append((hedgers[-1], remainder))
         elif pieces:
             # Too small to send on its own: fold it into the last real slice
@@ -459,17 +446,9 @@ class Hedger:
 
         if abs(net) < self.tolerance(symbol):
             return 0.0
-        size = round_size(abs(net), spec)
-        if size < spec.lot_size:
-            return 0.0
-        # Deliberately not a shared "is this tradeable" helper. With no price
-        # the hedge still goes: refusing to correct a known imbalance because a
-        # ticker is missing leaves the pair directional, which is the worse of
-        # the two failures. A helper that folded the two checks together would
-        # have to pick one answer for both callers.
-        if mark_price and mark_price > 0 and size * mark_price < spec.min_notional:
-            return 0.0
-        return size
+        # With no price the hedge still goes, on the lot alone: see
+        # `tradeable_size`.
+        return tradeable_size(spec, abs(net), mark_price)
 
     def untradeable_residual(self, roles: LegRoles, mark_price: float | None = None) -> float:
         """Signed imbalance that exists but cannot be hedged. 0 when neutral."""
@@ -526,17 +505,17 @@ class Hedger:
 
             # net > 0 means the pair is net long, so the taker sells.
             is_buy = net < 0
-            size = round_size(abs(net), spec)
-
-            if size < spec.lot_size:
-                return HedgeResult(symbol, net, 0.0, is_buy, "below lot size")
-
             price = mark_price or 0.0
-            if price > 0 and size * price < spec.min_notional:
+            size = tradeable_size(spec, abs(net), price)
+            if not size:
                 # Too small to trade. The residual is left for the reconciler,
                 # which will clear it once it grows past the floor or the
                 # position is closed outright.
-                return HedgeResult(symbol, net, 0.0, is_buy, "below min notional")
+                below = (
+                    "lot size" if round_size(abs(net), spec) < spec.lot_size
+                    else "min notional"
+                )
+                return HedgeResult(symbol, net, 0.0, is_buy, f"below {below}")
 
             expected_bps = self._expected_impact_bps(symbol, size, is_buy)
             if (

@@ -1,16 +1,18 @@
 """Market data access, read off a single WS client.
 
-Both accounts share one price view -- prices are public and identical for both,
-so subscribing twice would only double the bandwidth. Market data is taken from
-the master session's client.
+Every account shares one price view -- prices are public and identical for all
+of them, so subscribing more than once would only multiply the bandwidth.
+Market data comes from a socket of its own; see `market_data_session`.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 
 import requests
+from bulk_api.common import Topic
 from dataclasses import dataclass
 from collections.abc import Sequence
 
@@ -25,6 +27,54 @@ log = logging.getLogger(__name__)
 # See `MarketFeed.quote`.
 _FROZEN_BOOK_BPS = 10.0
 _FROZEN_BOOK_AGE_S = 5.0
+# How far back `_Arrivals` looks for the shortest delay between the
+# exchange's stamp and our receipt. Long enough to hold through a lagging
+# spell, short enough that a clock correction is absorbed within minutes.
+_SKEW_WINDOW_S = 600.0
+
+
+class _Arrivals:
+    """When one stream's messages for a symbol arrived, and how far behind.
+
+    Age is measured on this machine's monotonic clock, from when the last
+    message ARRIVED. It used to be the wall clock minus the exchange's stamp,
+    which reads any difference between the two clocks as age: a few seconds
+    out and every price was stale, or none was.
+
+    Arrival alone cannot see a socket running behind, though -- messages keep
+    arriving, every one of them old, and a live market-data socket fell 7 to
+    32 seconds behind that way. So the stamps are still read, but only
+    against each other: the shortest stamp-to-arrival delay in the last
+    `_SKEW_WINDOW_S` is the clocks' difference plus the network's floor, and
+    anything a message took beyond it is how far behind the stream is running.
+    """
+
+    def __init__(self) -> None:
+        self.received_at: float | None = None
+        self._behind_s = 0.0
+        # (arrived, delay), with the delays increasing from the left: the
+        # window's minimum is always the first entry.
+        self._floor: deque[tuple[float, float]] = deque()
+
+    def heard(self, stamp) -> None:
+        now = time.monotonic()
+        self.received_at = now
+        if not stamp:
+            self._behind_s = 0.0
+            return
+        delay = time.time() - epoch_seconds(stamp)
+        while self._floor and self._floor[-1][1] >= delay:
+            self._floor.pop()
+        self._floor.append((now, delay))
+        while now - self._floor[0][0] > _SKEW_WINDOW_S:
+            self._floor.popleft()
+        self._behind_s = delay - self._floor[0][1]
+
+    def age_s(self) -> float:
+        """How old the last message's data is now. Never heard: infinitely."""
+        if self.received_at is None:
+            return float("inf")
+        return time.monotonic() - self.received_at + self._behind_s
 
 
 @dataclass(frozen=True)
@@ -64,6 +114,35 @@ class MarketFeed:
         self.symbols = list(symbols)
         self.specs: dict[str, MarketSpec] = {}
         self._frozen_warned: set[str] = set()
+        # When each symbol's ticker and book messages arrived. See `listen`.
+        self._tickers: dict[str, _Arrivals] = {}
+        self._books: dict[str, _Arrivals] = {}
+        self._listening = False
+
+    def listen(self) -> None:
+        """Start timing ticker and book messages as they arrive. Idempotent.
+
+        Until a symbol's first ticker is heard its price reads as stale, so
+        this goes in before anything trades on the feed -- `subscribe` does
+        it first thing. A ticker that arrived before it is only a second's
+        delay: the next one is timed.
+        """
+        if self._listening:
+            return
+        self._listening = True
+        self.session.on(Topic.TICKER, self._heard_ticker)
+        self.session.on(Topic.L2SNAPSHOT, self._heard_book)
+        self.session.on(Topic.L2DELTA, self._heard_book)
+
+    def _heard_ticker(self, ticker) -> None:
+        self._tickers.setdefault(ticker.symbol, _Arrivals()).heard(ticker.timestamp)
+
+    def _heard_book(self, update) -> None:
+        self._books.setdefault(update.symbol, _Arrivals()).heard(update.timestamp)
+
+    def _age_s(self, arrivals: dict[str, _Arrivals], symbol: str) -> float:
+        heard = arrivals.get(symbol)
+        return heard.age_s() if heard is not None else float("inf")
 
     def load_specs(self, strict: bool = True) -> dict[str, MarketSpec]:
         """Fetch tick size, lot size, and min notional over HTTP.
@@ -119,6 +198,7 @@ class MarketFeed:
         Tickers are already auto-subscribed on connect; the book is what the
         chaser needs, since resting inside the touch requires knowing the touch.
         """
+        self.listen()
         for symbol in self.symbols:
             try:
                 await self.session.client.subscribe_orderbook_snapshot(symbol)
@@ -152,9 +232,9 @@ class MarketFeed:
 
         ticker = client.get_ticker(symbol)
         mark_price = ticker.mark_price if ticker else None
-        age_s = 0.0
-        if ticker and ticker.timestamp:
-            age_s = max(0.0, time.time() - epoch_seconds(ticker.timestamp))
+        # A ticker never received is stale, not fresh. It read as zero
+        # seconds old, so a chaser with no ticker at all never skipped.
+        age_s = self._age_s(self._tickers, symbol)
 
         # A book that stopped updating -- its delta subscription failed, which
         # is tolerated, or the stream for it went quiet -- still answers with
@@ -165,17 +245,22 @@ class MarketFeed:
         # `_FROZEN_BOOK_BPS` is not describing this market. It is dropped, and
         # the price falls back to the mark, as with no book at all.
         if book is not None and mark_price and best_bid and best_ask:
-            updated = getattr(book, "last_update_time", None)
-            book_age = time.time() - epoch_seconds(updated) if updated else 0.0
+            # A book with no update heard is as old as can be. Read from the
+            # book's own stamp, a missing one read as zero seconds old and
+            # the book could never be found frozen.
+            book_age = self._age_s(self._books, symbol)
             band = _FROZEN_BOOK_BPS / 10_000
             outside = mark_price < best_bid * (1 - band) or mark_price > best_ask * (1 + band)
             if outside and book_age > _FROZEN_BOOK_AGE_S:
                 if symbol not in self._frozen_warned:
                     self._frozen_warned.add(symbol)
                     log.warning(
-                        "%s: book looks frozen (%.0fs old, touch %g/%g, mark %g) "
+                        "%s: book looks frozen (%s, touch %g/%g, mark %g) "
                         "-- pricing off the mark until it moves",
-                        symbol, book_age, best_bid, best_ask, mark_price,
+                        symbol,
+                        "no update heard" if book_age == float("inf")
+                        else f"{book_age:.0f}s since an update",
+                        best_bid, best_ask, mark_price,
                     )
                 best_bid = best_ask = bid_size = ask_size = None
             elif symbol in self._frozen_warned and not outside:

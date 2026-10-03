@@ -120,20 +120,35 @@ class PositionBook:
 
     # -- writes ------------------------------------------------------------
 
-    def set_authoritative(self, account: str, symbol: str, size: float) -> None:
-        """Record an exchange-reported position.
+    def set_authoritative(
+        self, account: str, symbol: str, size: float, as_of: float | None = None
+    ) -> None:
+        """Record an exchange-reported position, true as of `as_of`.
 
-        Any overlay for this key is dropped: the exchange has now spoken, and
-        keeping a guess on top of truth is how double-counting starts. A fill
-        that arrives after this update creates a fresh overlay.
+        Overlays from before `as_of` are dropped: the exchange has now spoken,
+        and keeping a guess on top of truth is how double-counting starts.
+        Overlays added after it are kept, as `apply_read` keeps the ones that
+        arrived after its request -- the position cannot include them, and
+        dropping one reads its fill as never having happened.
+
+        `as_of` is a `time.monotonic()` reading and defaults to now, which is
+        what a stream update is taken to be: it arrives on the socket behind
+        the fills it accounts for, so every overlay already here is one of
+        them. A fill that arrives after it creates a fresh overlay.
         """
         key = (account, symbol)
-        self._authoritative[key] = float(size)
-        self._overlays.pop(key, None)
         now = time.monotonic()
+        as_of = now if as_of is None else as_of
+        self._authoritative[key] = float(size)
+        later = [o for o in self._overlays.get(key, ()) if o.added_at > as_of]
         self._position_at[key] = now
         self._streamed_at[key] = now
-        self._awaiting_read.discard(key)
+        if later:
+            # Still unconfirmed, so a read that was waiting on them still is.
+            self._overlays[key] = later
+        else:
+            self._overlays.pop(key, None)
+            self._awaiting_read.discard(key)
 
     def apply_snapshot(self, account: str, positions: Iterable) -> None:
         """Replace all of an account's positions from a full snapshot.

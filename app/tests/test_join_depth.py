@@ -8,7 +8,7 @@ default `improve_ticks: 1` is what put us alone -- one tick ahead of the book.
 
 import pytest
 
-from bulkdn.chaser import ChaseParams, Chaser
+from bulkdn.chaser import _Placed, ChaseParams, Chaser
 from bulkdn.config import ConfigError, LegConfig, _leg_from_dict
 from bulkdn.feed import Quote
 from bulkdn.positions import PositionBook
@@ -83,7 +83,7 @@ async def test_our_own_orders_do_not_count_as_depth():
     chaser, master, _feed, leg = build([(BID, 0.05), (BID - 0.5, 0.05)])
     # Another group of ours holds the whole touch.
     master.client.order_map["other-group"] = FakeOrder(price=BID, size=0.05)
-    chaser._ours["other-group"] = (BTC, True, MASTER)
+    chaser._orders["other-group"] = _Placed(BTC, True, MASTER, placed_at=0.0)
 
     await chaser.step(OPEN_BTC, leg)
 

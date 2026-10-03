@@ -85,6 +85,9 @@ class FakeFeed:
     def quote(self, symbol):
         return self._quote
 
+    def reference_price(self, symbol):
+        return self._quote.mark_price
+
     def move(self, bid, ask):
         self._quote = FakeQuote(bid, ask)
 
@@ -182,6 +185,15 @@ def test_nothing_is_placed_when_already_flat():
 def test_dust_below_a_lot_is_left_alone():
     """Under one lot cannot be traded, so chasing it would never finish."""
     sessions, book, master, _sub1, feed = build(master_size=1e-7, sub_size=0.0)
+    assert close(sessions, book, feed, timeout_s=5) is True
+    assert master.placed == []
+
+
+def test_dust_under_the_minimum_notional_is_left_alone():
+    """Whole lots, but too small an order for the exchange to take: every
+    attempt would be refused until the close timed out."""
+    sessions, book, master, _sub1, feed = build(master_size=0.002, sub_size=0.0)
+    feed.specs[BTC] = MarketSpec(BTC, tick_size=0.5, lot_size=0.001, min_notional=500.0)
     assert close(sessions, book, feed, timeout_s=5) is True
     assert master.placed == []
 
@@ -575,3 +587,11 @@ def test_a_trading_start_cancels_before_the_gate_can_refuse(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(runtime.start(verify=False, trading=True))
     assert cancelled == [(["m1-session"], [BTC])], "the dead run's orders were left"
+
+
+def test_a_limit_close_that_gives_up_raises_an_alert(caplog):
+    sessions, book, _master, _sub1, feed = build()
+    with caplog.at_level("WARNING"):
+        assert close(sessions, book, feed, timeout_s=0.05) is False
+    alerts = [r for r in caplog.records if getattr(r, "alert", False)]
+    assert alerts and "gave up" in alerts[0].getMessage()
