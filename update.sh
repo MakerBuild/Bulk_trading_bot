@@ -2,11 +2,11 @@
 # Update the bot to the latest published version, then refresh its
 # dependencies. The Linux twin of update.bat.
 #
-# Works whether this folder was cloned or unzipped. A clone pulls; an unzipped
-# copy fetches a fresh one into a temp folder and copies it over. Your own
-# files -- settings.yaml, private_key.local, proxy.local, app/state, logs.txt --
-# are not part of the published code, so there is nothing to overwrite them
-# with.
+# Works whether this folder was cloned or unzipped. A clone fetches and
+# fast-forwards; an unzipped copy is first turned into a clone in place, then
+# is one. Your own files -- settings.yaml, private_key.local, proxy.local,
+# app/state, logs.txt -- are not part of the published code, so there is
+# nothing to overwrite them with.
 #
 # Wrapped in a function and run from the last line: this script may replace
 # itself as it updates, and bash reads a script as it goes -- a function is
@@ -23,9 +23,34 @@ main() {
     command -v git >/dev/null 2>&1 || fail \
         "git is not installed:" "" "    sudo apt update && sudo apt install -y git"
 
+    # The bot's own package answers the questions below; see bulkdn/scripts.py.
+    export PYTHONPATH="$PWD/app"
+    local tool_py=""
+    if [ -x app/.venv/bin/python ]; then
+        tool_py="app/.venv/bin/python"
+    elif command -v python3 >/dev/null 2>&1; then
+        tool_py="python3"
+    fi
+
+    # Not while the bot is running from this folder: an update replaces the
+    # code under it, and install.sh the libraries it has loaded. bulkdn/lock.py
+    # exits 3 when the bot holds its lock.
+    if [ -n "$tool_py" ]; then
+        "$tool_py" -m bulkdn.lock
+        if [ $? -eq 3 ]; then
+            fail "Stop the bot first, then run this again. Nothing was changed." \
+                 "If it runs as a service:  sudo ./service.sh stop   then update," \
+                 "then:  sudo ./service.sh start"
+        fi
+    fi
+
+    # proxy.local, read by the bot's own reader so git uses exactly the
+    # address the bot does. This took the FIRST usable line where install.bat
+    # took the last and the bot refused a file with two.
     local bot_proxy=""
-    if [ -f proxy.local ]; then
-        bot_proxy="$(grep -v '^[[:space:]]*#' proxy.local | grep -v '^[[:space:]]*$' | head -n 1 | tr -d '\r')"
+    if [ -f proxy.local ] && [ -n "$tool_py" ]; then
+        bot_proxy="$("$tool_py" -m bulkdn.scripts proxy)" || fail \
+            "proxy.local cannot be used -- the reason is above. Fix it, or empty it."
     fi
     if [ -n "$bot_proxy" ]; then
         say "Using the proxy from proxy.local."
@@ -80,34 +105,45 @@ main() {
             exit 1
         fi
     else
-        local tmpdir
-        tmpdir="$(mktemp -d)" || fail "Could not make a temporary folder."
+        # An unzipped copy becomes a clone in place -- see update.bat for why
+        # the old download-and-copy-over did not work. `checkout -f` writes the
+        # shipped files and leaves everything else alone; the operator's own
+        # files are copied to update-backup first all the same.
         echo
-        say "Downloading the latest version..."
-        local cloned=""
+        say "This copy was unzipped rather than cloned. Turning it into a clone," \
+            "so this and every later update works the same way..."
+        mkdir -p update-backup
+        for name in settings.yaml private_key.local proxy.local settings.default.yaml; do
+            [ -f "$name" ] && cp -p "$name" "update-backup/$name"
+        done
+        [ -d app/state ] && cp -rp app/state update-backup/
+        say "Your settings, key and state are also copied to update-backup."
+
+        git init --quiet || fail "git could not make this folder a clone."
+        git remote remove origin >/dev/null 2>&1
+        git remote add origin "$REPO"
+        echo "/update-backup/" >> .git/info/exclude
+        local fetched=""
         for attempt in 1 2 3; do
             if [ "$attempt" -gt 1 ]; then
                 say "No answer. Trying again ($attempt of 3)..."
                 sleep 2
-                rm -rf "$tmpdir" && mkdir -p "$tmpdir"
             fi
-            if git clone --depth 1 --quiet "$REPO" "$tmpdir"; then
-                cloned=1
+            if git fetch --quiet origin main; then
+                fetched=1
                 break
             fi
         done
-        if [ -z "$cloned" ]; then
-            rm -rf "$tmpdir"
-            fail "Could not reach the repository. Check the connection, then try again."
-        fi
-        say "Installing it..."
-        # Everything but git's own folder, over the top of this one. Files
-        # that are not in the published code are left where they are.
-        if ! (cd "$tmpdir" && tar --exclude=./.git -cf - .) | tar -xf -; then
-            rm -rf "$tmpdir"
-            fail "Copy failed."
-        fi
-        rm -rf "$tmpdir"
+        [ -n "$fetched" ] || fail \
+            "Could not reach GitHub after three tries. Your files were not changed."
+        git checkout --quiet -f -B main FETCH_HEAD || fail \
+            "Downloaded, but could not apply it -- see the message above." \
+            "Your settings, key and state are in update-backup."
+        git config branch.main.remote origin
+        git config branch.main.merge refs/heads/main
+        # Modules an unzipped copy kept after they were removed upstream.
+        git clean -fdq -- app/bulkdn app/tests app/dev
+        rm -f release.bat settings.default.yaml
     fi
 
     chmod +x install.sh run.sh update.sh service.sh 2>/dev/null

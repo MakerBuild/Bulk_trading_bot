@@ -18,6 +18,18 @@ main() {
     }
 
     local venv_py="app/.venv/bin/python"
+    # The bot's own package answers the questions below; see bulkdn/scripts.py.
+    export PYTHONPATH="$PWD/app"
+
+    # Not while the bot is running from this folder: the steps below reinstall
+    # the libraries it has loaded. bulkdn/lock.py exits 3 when it holds its lock.
+    if [ -x "$venv_py" ]; then
+        "$venv_py" -m bulkdn.lock
+        if [ $? -eq 3 ]; then
+            fail "Stop the bot first, then run this again. Nothing was changed." \
+                 "If it runs as a service:  sudo ./service.sh stop"
+        fi
+    fi
 
     # The Python that builds the virtualenv, when there is none yet. Once
     # app/.venv exists every script runs the one inside it.
@@ -58,22 +70,19 @@ main() {
         fi
     fi
 
-    # proxy.local: the first line that is neither blank nor a comment.
+    # proxy.local, read by the bot's own reader -- the same address the bot
+    # uses, in the form pip accepts for pip (see install.bat).
     local bot_proxy="" pip_proxy=""
     local -a pip_arg=()
     if [ -f proxy.local ]; then
-        bot_proxy="$(grep -v '^[[:space:]]*#' proxy.local | grep -v '^[[:space:]]*$' | head -n 1 | tr -d '\r')"
+        bot_proxy="$("$venv_py" -m bulkdn.scripts proxy)" || fail \
+            "proxy.local cannot be used -- the reason is above. Fix it, or empty it."
+        pip_proxy="$("$venv_py" -m bulkdn.scripts pip-proxy 2>/dev/null)"
     fi
     if [ -n "$bot_proxy" ]; then
         echo
         say "Using the proxy from proxy.local."
         export ALL_PROXY="$bot_proxy"
-        pip_proxy="$bot_proxy"
-        # pip cannot use a socks address (see install.bat); the same host and
-        # port as an http proxy works.
-        case "$pip_proxy" in
-            socks*) pip_proxy="http://${pip_proxy#*//}" ;;
-        esac
         pip_arg=(--proxy "$pip_proxy")
     fi
 
@@ -87,11 +96,19 @@ main() {
     local sdk_wheel="app/vendor/bulk_client-0.1.2-py3-none-any.whl"
     local sdk_ok=""
     if [ -f "$sdk_wheel" ]; then
-        say "Installing the BULK SDK..."
-        if "$venv_py" -m pip install "${pip_arg[@]}" --quiet --no-deps --force-reinstall "$sdk_wheel"; then
+        # Only when the wheel changed -- forcing it every time replaced the SDK
+        # under a running bot on every update. See install.bat.
+        if "$venv_py" -m bulkdn.scripts sdk-current "$sdk_wheel" >/dev/null 2>&1; then
+            say "The BULK SDK is up to date."
             sdk_ok=1
         else
-            say "The bundled copy would not install. Trying GitHub instead."
+            say "Installing the BULK SDK..."
+            if "$venv_py" -m pip install "${pip_arg[@]}" --quiet --no-deps --force-reinstall "$sdk_wheel"; then
+                sdk_ok=1
+                "$venv_py" -m bulkdn.scripts sdk-stamp "$sdk_wheel"
+            else
+                say "The bundled copy would not install. Trying GitHub instead."
+            fi
         fi
     fi
     if [ -z "$sdk_ok" ]; then
@@ -138,20 +155,8 @@ main() {
 
     # The two templates are written from the constants the bot itself uses,
     # rather than a second copy of their text here to drift out of step.
-    PYTHONPATH=app "$venv_py" - <<'PY' || fail "Could not write the key and proxy templates -- see the error above."
-import pathlib
-from bulkdn.config import PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE
-from bulkdn.proxy import PROXY_FILE, PROXY_TEMPLATE
-
-for name, text, note in (
-    (PRIVATE_KEY_FILE, PRIVATE_KEY_TEMPLATE, "for your key"),
-    (PROXY_FILE, PROXY_TEMPLATE, "(only needed if BULK is blocked where you are)"),
-):
-    path = pathlib.Path(name)
-    if not path.exists():
-        path.write_text(text, encoding="utf-8")
-        print(f"  Created {name} {note}.")
-PY
+    "$venv_py" -m bulkdn.scripts templates \
+        || fail "Could not write the key and proxy templates -- see the error above."
 
     # Owner-only. The key, the proxy's password and the Telegram token are in
     # these, and on a server other accounts may exist.
@@ -159,7 +164,9 @@ PY
     chmod +x run.sh update.sh service.sh 2>/dev/null
 
     echo
-    if ! "$venv_py" -c "from bulk_api.common import SignatureDomain; print('  Signing check: OK')" 2>/dev/null; then
+    # A real check: a test transaction signed, its domain byte checked, the
+    # signature verified. It used to import one name and call that OK.
+    if ! "$venv_py" -m bulkdn.scripts signing-check; then
         fail "WARNING: the SDK cannot sign. Do not trade with this install."
     fi
 

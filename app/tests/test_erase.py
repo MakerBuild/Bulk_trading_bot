@@ -209,26 +209,13 @@ def test_the_emptied_file_is_not_read_as_a_key():
     assert lines == []
 
 
-def test_install_bat_writes_the_same_template():
-    """Two copies of this text exist -- batch cannot read a Python constant --
-    so they are checked against each other rather than trusted to stay equal."""
-    from bulkdn.config import PRIVATE_KEY_TEMPLATE
-
-    # Found from this file, not the working directory: pytest can be started
-    # from the root or from app/, and only one of those has install.bat in it.
+def test_install_bat_writes_the_template_from_the_constant():
+    """There used to be a second copy of the text in install.bat, echoed line
+    by line and checked against this one. Now the batch asks Python."""
     root = pathlib.Path(__file__).resolve().parents[2]
     batch = (root / "install.bat").read_text(encoding="utf-8")
-    echoed = []
-    for line in batch.splitlines():
-        stripped = line.strip()
-        if "private_key.local echo" not in stripped:
-            continue
-        text = stripped.split("private_key.local echo", 1)[1]
-        # `echo.` is batch for a blank line, and `^>` escapes a redirect.
-        echoed.append("" if text.strip() == "." else text.strip().replace("^>", ">"))
-
-    expected = [line.strip() for line in PRIVATE_KEY_TEMPLATE.splitlines()]
-    assert echoed == expected, "install.bat and PRIVATE_KEY_TEMPLATE have drifted"
+    assert "-m bulkdn.scripts templates" in batch
+    assert "private_key.local echo" not in batch
 
 
 # -- what the menu says about the key ---------------------------------------
@@ -423,15 +410,27 @@ def test_the_retry_stops_once_it_works():
     assert 'set "FETCHED=1"' in fetch
 
 
-def test_the_download_is_retried_too():
-    """The unzipped copy clones instead of fetching, over the same network."""
+def test_an_unzipped_copy_is_turned_into_a_clone():
+    """It used to download a fresh copy and robocopy it over -- skipping this
+    file, so an unzipped copy never got a fix to its own updater, deleting
+    nothing, and deleting a settings file from a hand-kept list unbacked."""
     text = update_bat()
-    start = text.index("Downloading")
-    # The command, not the comment further up that mentions it by name.
-    section = text[start:text.index('robocopy "', start)]
+    start = text.index("unzipped rather than cloned")
+    section = text[start:text.index("Dependencies can move")]
+    assert "git init" in section
+    assert "checkout --quiet -f -B main FETCH_HEAD" in section
     assert "for /L" in section, "the download still gives up on the first try"
-    assert "git clone" in section
-    assert "CLONED" in section
+    assert "update-backup" in section, "the operator's files are not backed up first"
+    assert section.index("update-backup") < section.index("git init")
+    assert "robocopy \"!TMPDIR!\"" not in text and "/XF" not in text
+    assert "CHANGE-ME" not in text, "the dead repository check is back"
+
+
+def test_the_update_refuses_while_the_bot_runs():
+    """It replaced the code -- and install.bat the SDK -- under a running bot."""
+    for text in (update_bat(), install_bat()):
+        guard = text.index("-m bulkdn.lock")
+        assert "errorlevel 3" in text[guard:guard + 200]
 
 
 def test_a_failed_fetch_changes_nothing():
@@ -543,6 +542,35 @@ def test_delayed_expansion_is_on():
     assert "setlocal enabledelayedexpansion" in text
 
 
+def test_delayed_expansion_comes_on_only_after_the_cd():
+    """With it on, a ! in the folder's path is deleted from `cd /d "%~dp0"`."""
+    for text in (install_bat(), update_bat()):
+        assert text.index('cd /d "%~dp0"') < text.index("setlocal enabledelayedexpansion")
+        assert "%~dp0install.bat" not in text
+
+
+def test_a_half_built_virtualenv_is_removed():
+    """The next run would take it for a finished one and skip building it."""
+    text = install_bat()
+    failure = text.index("Could not create app\\.venv")
+    assert 'rd /s /q "app\\.venv"' in text[failure - 400:failure]
+
+
+def test_the_sdk_is_reinstalled_only_when_the_wheel_changed():
+    """--force-reinstall every time replaced it under a running bot."""
+    text = install_bat()
+    sdk = text[text.index('set "SDK_WHEEL='):text.index("Installing dependencies")]
+    assert "sdk-current" in sdk and "sdk-stamp" in sdk
+    assert sdk.index("sdk-current") < sdk.index("-m pip install")
+
+
+def test_the_signing_check_signs_something():
+    """It imported one name -- which the PyPI build passes too."""
+    text = install_bat()
+    assert "-m bulkdn.scripts signing-check" in text
+    assert "print('  Signing check: OK')" not in text
+
+
 # -- both scripts can go through the bot's own proxy -------------------------
 #
 # GitHub is unreachable from the networks proxy.local exists for: measured on
@@ -568,11 +596,19 @@ def test_the_proxy_line_is_never_echoed():
                 assert not re.search(r"![A-Z_]*PROXY[A-Z_]*!", line), line
 
 
-def test_comments_are_skipped_when_reading_it():
-    """The shipped file is all comments, and reading one as an address would
-    point every fetch at a sentence."""
+def test_the_line_comes_from_the_bots_own_reader():
+    """It was parsed five ways: the last line here, the first in the shell
+    scripts, trailing spaces kept, an indented note taken for an address."""
     for text in (update_bat(), install_bat()):
-        assert '"!LINE:~0,1!"=="#"' in text
+        assert "-m bulkdn.scripts proxy" in text
+        assert "!LINE:~0,1!" not in text, "the batch still parses the file itself"
+
+
+def test_the_line_is_read_with_delayed_expansion_off():
+    """With it on, every ! in a proxy password is deleted."""
+    for text in (update_bat(), install_bat()):
+        read = text.index("-m bulkdn.scripts proxy 2^>nul")
+        assert "DisableDelayedExpansion" in text[read - 400:read]
 
 
 def test_git_gets_the_address_as_written():
@@ -585,7 +621,7 @@ def test_pip_gets_an_http_address_instead():
     """Any socks address makes pip's vendored urllib3 raise PoolKey.__new__()
     got an unexpected keyword argument key_proxy_ssl_context."""
     text = install_bat()
-    assert 'if /I "!BOT_PROXY:~0,5!"=="socks" set "PIP_PROXY=http://!BOT_PROXY:*//=!"' in text
+    assert "-m bulkdn.scripts pip-proxy" in text
     assert "--proxy !PIP_PROXY!" in text
 
 

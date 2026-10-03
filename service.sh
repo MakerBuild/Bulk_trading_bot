@@ -6,7 +6,9 @@
 #   sudo ./service.sh uninstall   stop it and remove it
 #   ./service.sh status          is it running
 #   ./service.sh logs            follow its output (Ctrl+C to leave)
-#   sudo ./service.sh restart     restart it, e.g. after ./update.sh
+#   sudo ./service.sh stop        stop it, e.g. before ./update.sh
+#   sudo ./service.sh start       start it again
+#   sudo ./service.sh restart     restart it
 #
 # The service only LISTENS. It starts no run on its own: a run begins when
 # someone presses Run in Telegram, exactly as when control is started by hand.
@@ -78,7 +80,8 @@ User=${owner}
 WorkingDirectory=${dir}
 EnvironmentFile=${ENV_FILE}
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${dir}/run.sh telegram ${live}
+# Quoted: a folder with a space in its name split into two words here.
+ExecStart="${dir}/run.sh" telegram ${live}
 # A crash restarts the listener -- not a run. Exit status 1 is a setup
 # problem (Telegram not configured, a bad settings file, another copy
 # polling the token), which restarting every 30 seconds would not fix.
@@ -108,6 +111,17 @@ UNIT
             systemctl daemon-reload
             say "Removed, and the stored password deleted."
             ;;
+        stop)
+            need_root stop
+            systemctl stop "$UNIT_NAME"
+            say "Stopped. It starts again by itself after a reboot, or with:" \
+                "  sudo ./service.sh start"
+            ;;
+        start)
+            need_root start
+            systemctl start "$UNIT_NAME"
+            say "Started."
+            ;;
         restart)
             need_root restart
             systemctl restart "$UNIT_NAME"
@@ -125,7 +139,9 @@ UNIT
                 "  sudo ./service.sh uninstall   stop it and remove it" \
                 "  ./service.sh status          is it running" \
                 "  ./service.sh logs            follow its output" \
-                "  sudo ./service.sh restart     restart it, e.g. after ./update.sh"
+                "  sudo ./service.sh stop        stop it, e.g. before ./update.sh" \
+                "  sudo ./service.sh start       start it again" \
+                "  sudo ./service.sh restart     restart it"
             exit 1
             ;;
     esac

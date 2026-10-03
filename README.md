@@ -23,9 +23,12 @@ on in `settings.yaml`; the defaults are BTC-USD and ETH-USD.
    install no longer waits on GitHub to answer.
 3. **Get the code.** Unzip the archive you were sent, or
    `git clone https://github.com/MakerBuild/Bulk_trading_bot.git` — they come to
-   the same thing, because the zip is a clone. `update.bat` works either way.
+   the same thing, because the zip is a clone. `update.bat` works either way: a
+   folder unzipped without git's history is turned into a clone on its first
+   update, with your settings, key and state copied to `update-backup` first.
 4. **Double-click `install.bat`.** It builds a local environment, installs
-   everything, and checks that transaction signing works. Safe to re-run.
+   everything, and signs and verifies a test transaction to prove signing works.
+   Safe to re-run; it refuses while the bot is running from the folder.
 
 Never done this before? **[ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md](ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md)** walks through it
 step by step, in Russian, including what to do when something fails.

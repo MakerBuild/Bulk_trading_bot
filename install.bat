@@ -2,8 +2,13 @@
 rem First-time setup: builds the virtualenv and installs everything.
 rem Safe to re-run; it upgrades an existing install in place.
 
-setlocal enabledelayedexpansion
+rem The folder first, delayed expansion after. With it on, the `!` in a path
+rem like C:\Users\Me!\bot is read as a variable reference and deleted, so
+rem `cd` went to a folder that does not exist and every relative path after
+rem it missed.
+setlocal
 cd /d "%~dp0"
+setlocal enabledelayedexpansion
 
 rem This file stays pure ASCII. cmd reads a .bat through the console's
 rem codepage, and on a Russian Windows that is 866, where UTF-8 Cyrillic
@@ -124,12 +129,30 @@ if errorlevel 1 (
     echo   probably has no build for it yet -- Python 3.14 is known to work.
 )
 
+rem Refused while the bot is running from this folder: the steps below
+rem reinstall the libraries it has loaded. The check is bulkdn\lock.py, which
+rem needs nothing installed; a Python that cannot run it exits 1, not 3.
+if exist "app\.venv\Scripts\python.exe" (
+    set "PYTHONPATH=app"
+    app\.venv\Scripts\python.exe -m bulkdn.lock
+    if errorlevel 3 (
+        echo.
+        echo   Stop the bot first, then run this again. Nothing was changed.
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
 if not exist "app\.venv\Scripts\python.exe" (
     echo.
     echo   Creating the virtualenv...
     echo   ^(with !PY_NEW!^)
     call !PY_NEW! -m venv app\.venv
     if errorlevel 1 (
+        rem A failed attempt can leave a half-built folder, which the next
+        rem run would take for a finished one and skip this step.
+        if exist "app\.venv" rd /s /q "app\.venv"
         echo   Could not create app\.venv -- see the error above.
         pause
         exit /b 1
@@ -137,6 +160,10 @@ if not exist "app\.venv\Scripts\python.exe" (
 )
 
 set "VENV_PY=app\.venv\Scripts\python.exe"
+rem The bot's own package, for the questions below that this script asks it
+rem rather than answering itself: which proxy, whether the SDK is current,
+rem the key and proxy templates, the signing check.
+set "PYTHONPATH=app"
 
 echo.
 rem The bot already reads proxy.local, because BULK is unreachable from some
@@ -155,34 +182,37 @@ rem
 rem Both verified end to end against a network where github.com is blocked.
 rem The line is never echoed: it usually carries a password.
 rem
-rem It is read with delayed expansion OFF. With it on, `set "X=%%L"` treats
-rem every ! in the line as a variable reference and deletes it, so a password
-rem like pa!ss reached the proxy as pass and every request was refused. Each
-rem line is copied raw, tested in a short-lived scope where !LINE! is safe --
-rem expanding a variable never re-expands its value -- and the verdict leaves
-rem that scope through the for variable; the raw line is assigned only after
-rem the endlocal, back where ! means nothing. The scope around the loop is
-rem then left open under a fresh enabledelayedexpansion rather than closed,
-rem because closing it would throw BOT_PROXY away with it. From here on the
-rem value is only ever read as !BOT_PROXY!, which inserts it verbatim.
+rem The line comes from the bot's own reader, `python -m bulkdn.scripts
+rem proxy`, so git, pip and the bot all use the same address. This script used
+rem to parse the file itself and took the LAST usable line, where the shell
+rem scripts took the first and the bot refused a file with two. It is read
+rem with delayed expansion OFF: with it on, `set "X=%%L"` treats every ! in the
+rem line as a variable reference and deletes it, so a password like pa!ss
+rem reached the proxy as pass. The scope around the reads is then left open
+rem under a fresh enabledelayedexpansion rather than closed, because closing
+rem it would throw BOT_PROXY away with it. From here on the value is only ever
+rem read as !BOT_PROXY!, which inserts it verbatim.
 set "BOT_PROXY="
+set "PIP_PROXY="
 if exist "proxy.local" (
-    setlocal DisableDelayedExpansion
-    for /f "usebackq tokens=* delims=" %%L in ("proxy.local") do (
-        set "LINE=%%L"
-        setlocal EnableDelayedExpansion
-        set "KEEP="
-        if not "!LINE!"=="" if not "!LINE:~0,1!"=="#" set "KEEP=1"
-        for %%K in ("!KEEP!") do endlocal & if "%%~K"=="1" set "BOT_PROXY=%%L"
+    %VENV_PY% -m bulkdn.scripts proxy >nul
+    if errorlevel 1 (
+        echo.
+        echo   proxy.local cannot be used -- the reason is above. Fix it, or
+        echo   empty it, and run install.bat again.
+        echo.
+        pause
+        exit /b 1
     )
+    setlocal DisableDelayedExpansion
+    for /f "usebackq delims=" %%L in (`%VENV_PY% -m bulkdn.scripts proxy 2^>nul`) do set "BOT_PROXY=%%L"
+    for /f "usebackq delims=" %%L in (`%VENV_PY% -m bulkdn.scripts pip-proxy 2^>nul`) do set "PIP_PROXY=%%L"
     setlocal EnableDelayedExpansion
 )
 set "PIPARG="
 if defined BOT_PROXY (
     echo   Using the proxy from proxy.local.
     set "ALL_PROXY=!BOT_PROXY!"
-    set "PIP_PROXY=!BOT_PROXY!"
-    if /I "!BOT_PROXY:~0,5!"=="socks" set "PIP_PROXY=http://!BOT_PROXY:*//=!"
     set "PIPARG=--proxy !PIP_PROXY!"
 )
 
@@ -215,14 +245,25 @@ rem what has to move when the SDK does.
 set "SDK_WHEEL=app\vendor\bulk_client-0.1.2-py3-none-any.whl"
 set "SDK_OK="
 if exist "!SDK_WHEEL!" (
-    echo   Installing the BULK SDK...
-    rem --force-reinstall because the SDK's version string does not change
-    rem between commits: without it pip sees 0.1.2 installed already and keeps
-    rem whatever an earlier run left behind. The file is local, so repeating
-    rem this costs nothing.
-    "%VENV_PY%" -m pip install !PIPARG! --quiet --no-deps --force-reinstall "!SDK_WHEEL!"
-    if not errorlevel 1 set "SDK_OK=1"
-    if not defined SDK_OK echo   The bundled copy would not install. Trying GitHub instead.
+    rem Only when it changed. The SDK's version string does not change
+    rem between commits, so pip would keep whatever an earlier run left behind
+    rem -- hence --force-reinstall below -- but forcing it on every run also
+    rem replaced the SDK under a bot running from it, during every update. The
+    rem wheel's hash is recorded in app\.venv after a successful install and
+    rem compared here instead.
+    %VENV_PY% -m bulkdn.scripts sdk-current "!SDK_WHEEL!" >nul 2>&1
+    if not errorlevel 1 (
+        echo   The BULK SDK is up to date.
+        set "SDK_OK=1"
+    ) else (
+        echo   Installing the BULK SDK...
+        "%VENV_PY%" -m pip install !PIPARG! --quiet --no-deps --force-reinstall "!SDK_WHEEL!"
+        if not errorlevel 1 (
+            set "SDK_OK=1"
+            %VENV_PY% -m bulkdn.scripts sdk-stamp "!SDK_WHEEL!"
+        )
+        if not defined SDK_OK echo   The bundled copy would not install. Trying GitHub instead.
+    )
 )
 
 rem Fallback for a copy that predates the wheel, which has no app\vendor at
@@ -305,43 +346,17 @@ if not exist "settings.yaml" (
     echo   Created settings.yaml from the defaults -- edit that one.
 )
 
-rem Create the key file on first run, so there is one obvious place to put the
-rem key rather than a template to notice and rename.
-if not exist "private_key.local" (
-    > private_key.local echo # Paste your BULK master account's base58 private key on the line
-    >> private_key.local echo # below -- one line, no quotes, nothing else.
-    >> private_key.local echo #
-    >> private_key.local echo # This file never leaves your machine. Once the key is in, encrypt it
-    >> private_key.local echo # from the menu: Accounts Management -^> Encrypt Private Key.
-    >> private_key.local echo #
-    >> private_key.local echo # A sub-account has no key of its own -- it is created by, and signed
-    >> private_key.local echo # for by, its master. To trade several masters, put each key on a
-    >> private_key.local echo # line of its own; add them all before encrypting.
-    >> private_key.local echo.
-    echo   Created private_key.local for your key.
-)
-
-rem Optional, and left empty on purpose: most operators never touch it. It
-rem exists so that someone in a country where BULK is blocked has one obvious
-rem place to put a proxy, rather than a config setting to discover.
-rem Kept in step with proxy.PROXY_TEMPLATE, which test_proxy checks.
-if not exist "proxy.local" (
-    > proxy.local echo # Optional. Leave this file as it is unless BULK is blocked where you are.
-    >> proxy.local echo #
-    >> proxy.local echo # Put ONE proxy address on the line below -- no quotes, nothing else. Examples:
-    >> proxy.local echo #
-    >> proxy.local echo #     http://user:password@proxy.example.com:8080
-    >> proxy.local echo #     socks5h://user:password@proxy.example.com:1080
-    >> proxy.local echo #     socks5h://proxy.example.com:1080
-    >> proxy.local echo #
-    >> proxy.local echo # socks5h is the one to ask your provider for: the "h" means the proxy resolves
-    >> proxy.local echo # the hostname, so the lookup does not happen on your machine -- which is what
-    >> proxy.local echo # fails first where DNS is what does the blocking.
-    >> proxy.local echo #
-    >> proxy.local echo # Everything the bot does goes through it: orders, positions, prices and the
-    >> proxy.local echo # account stream. This file never leaves your machine, but it usually holds a
-    >> proxy.local echo # password, so treat it like the key file.
-    echo   Created proxy.local ^(only needed if BULK is blocked where you are^).
+rem The key file, on first run, so there is one obvious place to put the key
+rem rather than a template to notice and rename. And proxy.local, empty on
+rem purpose: most operators never touch it, but someone where BULK is blocked
+rem needs one obvious place to put a proxy. Both are written from the texts the
+rem bot itself uses -- this script used to echo its own copy of each, line by
+rem line, and a test had to check the two had not drifted.
+%VENV_PY% -m bulkdn.scripts templates
+if errorlevel 1 (
+    echo   Could not write the key and proxy templates -- see the error above.
+    pause
+    exit /b 1
 )
 
 rem Hide the repo's own bookkeeping, so the folder shows only the four files
@@ -350,7 +365,11 @@ rem same way it hides .git itself.
 if exist ".gitignore" attrib +h ".gitignore" >nul 2>&1
 
 echo.
-"%VENV_PY%" -c "from bulk_api.common import SignatureDomain; print('  Signing check: OK')" 2>nul
+rem A real check: a transaction for a throwaway key is signed by the SDK, its
+rem signature-domain byte checked -- the PyPI build leaves it off and the
+rem exchange refuses everything it signs -- and the signature verified. This
+rem used to import one name and call that OK.
+%VENV_PY% -m bulkdn.scripts signing-check
 if errorlevel 1 (
     echo   WARNING: the SDK cannot sign. Do not trade with this install.
     pause

@@ -155,22 +155,11 @@ def test_an_address_without_a_password_is_shown_whole():
 # -- the file is the operator's, and erasable --------------------------------
 
 
-def test_install_bat_writes_the_same_template():
-    """Two copies of this text exist -- batch cannot read a Python constant --
-    so they are checked against each other rather than trusted to stay equal."""
+def test_install_bat_writes_the_template_from_the_constant():
     root = pathlib.Path(__file__).resolve().parents[2]
     batch = (root / "install.bat").read_text(encoding="utf-8")
-
-    echoed = []
-    for line in batch.splitlines():
-        stripped = line.strip()
-        if "proxy.local echo" not in stripped:
-            continue
-        text = stripped.split("proxy.local echo", 1)[1]
-        echoed.append("" if text.strip() == "." else text.strip().replace("^", ""))
-
-    expected = [line.strip() for line in proxy.PROXY_TEMPLATE.splitlines()]
-    assert echoed == expected, "install.bat and PROXY_TEMPLATE have drifted"
+    assert "-m bulkdn.scripts templates" in batch
+    assert "proxy.local echo" not in batch
 
 
 def test_erasing_the_proxy_empties_it_rather_than_deleting(tmp_path, monkeypatch):

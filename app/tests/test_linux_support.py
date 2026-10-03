@@ -88,7 +88,28 @@ def test_both_installers_install_the_same_sdk():
 def test_the_installer_writes_the_bots_own_templates():
     """Rather than a second copy of their text, to drift out of step."""
     sh = (ROOT / "install.sh").read_text(encoding="utf-8")
-    assert "PRIVATE_KEY_TEMPLATE" in sh and "PROXY_TEMPLATE" in sh
+    assert "-m bulkdn.scripts templates" in sh
+
+
+@pytest.mark.parametrize("name", ["install.sh", "update.sh"])
+def test_the_shell_scripts_ask_the_bot_for_the_proxy(name):
+    """They took the first usable line where install.bat took the last."""
+    sh = (ROOT / name).read_text(encoding="utf-8")
+    assert "-m bulkdn.scripts proxy" in sh
+    assert "head -n 1" not in sh
+
+
+def test_the_service_path_is_quoted():
+    """A folder with a space in its name split ExecStart into two words."""
+    sh = (ROOT / "service.sh").read_text(encoding="utf-8")
+    assert re.search(r'^ExecStart="\$\{dir\}/run\.sh" telegram', sh, re.M)
+
+
+def test_the_service_can_be_stopped_for_an_update():
+    """update.sh refuses while the bot runs, and says to run this."""
+    sh = (ROOT / "service.sh").read_text(encoding="utf-8")
+    assert re.search(r"^\s+stop\)", sh, re.M) and re.search(r"^\s+start\)", sh, re.M)
+    assert "sudo ./service.sh stop" in (ROOT / "update.sh").read_text(encoding="utf-8")
 
 
 def test_the_service_only_listens():
