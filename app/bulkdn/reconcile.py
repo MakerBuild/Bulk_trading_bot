@@ -116,7 +116,7 @@ def _apply(session: AccountSession, parsed: list, requested_at: float, book: Pos
     # than it. Overwriting that fill is how the reconciler came to hedge the
     # same exposure twice.
     # A socket known to be running behind has nothing newer to protect.
-    lagging = time.monotonic() < getattr(session, "stream_lagging_until", 0.0)
+    lagging = time.monotonic() < session.stream_lagging_until
     skipped = book.apply_read(session.pubkey, parsed, requested_at, force=lagging)
     if parsed:
         summary = " ".join(f"{p.symbol}={p.size:+.8f}" for p in parsed)

@@ -104,6 +104,7 @@ class FakeSession:
         self.pubkey = f"{name}-KEY"
         self.fails = fails
         self.closes = []
+        self.stream_lagging_until = 0.0
 
     def full_account(self):
         if self.fails:
