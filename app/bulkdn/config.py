@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +75,14 @@ MAINNET_WS_URL = "wss://mainnet-ws1.bulk.trade"
 
 # Domain byte 1. Trusted client configuration, never a JSON field or header.
 SIGNATURE_DOMAIN_NAME = "MAINNET"
+
+# The `updateUserSettings` action's own bound on leverage, from the API
+# reference. Here rather than beside the request that sends it, because the
+# settings file is checked against it long before any request is built --
+# and the two copies there used to be are two numbers free to disagree.
+# bulkdn.settings enforces the same pair on the way out.
+MIN_LEVERAGE = 1.0
+MAX_LEVERAGE = 50.0
 
 
 class ConfigError(Exception):
@@ -205,8 +214,11 @@ class LegConfig:
             raise ConfigError(
                 f"legs.{name}.join_depth_usd must be >= 0 (0 switches it off)"
             )
-        if self.leverage is not None and not 1.0 <= self.leverage <= 50.0:
-            raise ConfigError(f"legs.{name}.leverage must be between 1 and 50")
+        if self.leverage is not None and not MIN_LEVERAGE <= self.leverage <= MAX_LEVERAGE:
+            raise ConfigError(
+                f"legs.{name}.leverage must be between {MIN_LEVERAGE:g} and "
+                f"{MAX_LEVERAGE:g}"
+            )
 
 
 @dataclass
@@ -323,12 +335,24 @@ class Span:
 
         if isinstance(value, str):
             text = value.strip()
+            # A plain number first. `-5` and `1e-3` both hold a `-`, and
+            # splitting on it called the first "not a number" -- when what
+            # was wrong was the sign -- and refused the second outright.
+            try:
+                number = float(text)
+            except ValueError:
+                pass
+            else:
+                return cls._checked(number, number, value, name)
             # YAML reads `0.5-1` as a string, which is the spelling the
-            # settings file documents, so it is the one that must work.
-            low, sep, high = text.partition("-")
+            # settings file documents, so it is the one that must work. The
+            # first character is skipped when looking for the dash, so a
+            # negative low end (`-5-10`) splits after its sign and is then
+            # refused for being negative, which is what it is.
+            low, sep, high = text[1:].partition("-")
             if not sep:
                 return cls._checked(text, text, value, name)
-            return cls._checked(low, high, value, name)
+            return cls._checked(text[:1] + low, high, value, name)
 
         raise ConfigError(f"{name} must be a number or a range, got {value!r}")
 
@@ -340,6 +364,10 @@ class Span:
             raise ConfigError(
                 f"{name} must be a number or a range like 2000-6000, got {original!r}"
             ) from exc
+        # `nan` passes every comparison below by failing it, and `inf` is a
+        # size or a hold no draw can honour.
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise ConfigError(f"{name} must be a finite number, got {original!r}")
         if lo < 0:
             raise ConfigError(f"{name} must be >= 0, got {original!r}")
         if hi < lo:
@@ -752,7 +780,15 @@ def _as_int(value: Any, name: str) -> int:
     Truncating would quietly run a different setting from the one written --
     `max_groups: 2.5` is either a typo or a misunderstanding, and in both
     cases the operator should hear about it. `3.0` is accepted, since it is 3.
+
+    A whole number written as one is taken as it is rather than through a
+    float, which is exact only up to 2**53 -- a Telegram id is a count of
+    nothing but it is still a number that has to arrive unchanged.
     """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
     number = _as_float(value, name)
     if not number.is_integer():
         raise ConfigError(f"{name} must be a whole number, got {value!r}")
@@ -1017,12 +1053,13 @@ def _telegram_from_dict(raw: Any) -> TelegramConfig:
     _warn_unknown(raw, _TELEGRAM_KEYS, "telegram")
 
     user_ids = raw.get("user_ids", raw.get("user_id", []))
-    if isinstance(user_ids, (int, str)):
+    if user_ids is None:
+        user_ids = []
+    if not isinstance(user_ids, list):
         user_ids = [user_ids]
-    try:
-        parsed_ids = [int(uid) for uid in user_ids]
-    except (TypeError, ValueError) as exc:
-        raise ConfigError(f"telegram.user_ids must be integers: {exc}") from exc
+    # Through `_as_int`, not a bare int(): that read `12.7` as user 12 and
+    # `true` as user 1, and sent the bot's reports to whoever those are.
+    parsed_ids = [_as_int(uid, "telegram.user_ids") for uid in user_ids]
 
     token = str(raw.get("bot_token", "") or "")
     if token and not parsed_ids:
@@ -1216,7 +1253,9 @@ def load_config(
         single_master=single_master,
         max_groups=whole(pool_raw, "max_groups", 5, "pool"),
         max_takers=whole(pool_raw, "max_takers", 1, "pool"),
-        hold_minutes=HoldTime.parse(raw.get("hold_minutes", 5.0)),
+        hold_minutes=HoldTime.parse(
+            raw["hold_minutes"] if raw.get("hold_minutes") is not None else 5.0
+        ),
         max_phase_minutes=number(raw, "max_phase_minutes", 30.0),
         chase_interval_s=number(raw, "chase_interval_s", 1.0),
         reconcile_interval_s=number(raw, "reconcile_interval_s", 5.0),
