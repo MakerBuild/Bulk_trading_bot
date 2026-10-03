@@ -16,8 +16,6 @@ import time
 import types
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 from test_strategy import BTC, MASTER, SUB1, build  # noqa: E402
