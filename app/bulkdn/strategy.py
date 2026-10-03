@@ -2540,10 +2540,11 @@ class Strategy:
     async def _run_group(self, group_id: int, group: Group, size: float) -> None:
         """One cycle for one drawn group, then give the accounts back.
 
-        The accounts are released in a `finally`: a group that ends by halting,
-        by the operator stopping, or by raising would otherwise hold its
-        accounts out of the pool for the rest of the run, and a pool that leaks
-        accounts quietly stops being able to draw.
+        The accounts are released in a `finally`, so a group that finishes its
+        cycle hands them back however it got there -- a pool that leaks
+        accounts quietly stops being able to draw. A group that ends mid-cycle
+        keeps them: it still holds positions, and only the run ending takes a
+        group out mid-cycle.
         """
         key = self.group_key(group_id, group.symbol)
         self._groups[key] = group
@@ -2572,19 +2573,22 @@ class Strategy:
             await self._run_leg(key, size, once=True)
         finally:
             leg_now = self.state.legs.get(key)
-            if (
-                self._stop.is_set()
-                and leg_now is not None
-                and leg_now.phase not in (Phase.IDLE, Phase.COMPLETE)
-            ):
-                # Stopped mid-cycle: the run is ending, so nobody will draw
-                # these accounts again, and the group is kept registered for
-                # the last hedge pass in `run`. Released here, its fills
-                # during the stop's cancel sweep had no roles to be hedged
+            if leg_now is not None and leg_now.phase not in (Phase.IDLE, Phase.COMPLETE):
+                # Ended mid-cycle -- stopped, halted, raised, or cancelled
+                # because another group raised. It still holds positions, so
+                # it stays registered: the liquidation guard and the
+                # reconciler see its accounts only through `_groups`, and so
+                # does the last hedge pass in `run`. Released, its fills
+                # during the closing cancel sweep had no roles to be hedged
                 # against, and the run exited holding them.
                 #
+                # Decided by the phase, not by the stop flag it used to be:
+                # a group cancelled because a sibling raised was cancelled
+                # before anything had set the stop, and dropped out of
+                # everything that watches positions while it still had some.
+                #
                 # Not a `return`: that would swallow whatever `_run_leg` raised.
-                log.info("=== group %d stopped mid-cycle ===", group_id)
+                log.info("=== group %d ended mid-cycle ===", group_id)
             else:
                 if self.pairing is not None:
                     self.pairing.release(group_id)
@@ -2718,6 +2722,11 @@ class Strategy:
                 log.info("waiting for %d group(s) to finish their cycle", len(running))
                 await asyncio.gather(*running)
         finally:
+            if any(not task.done() for task in running):
+                # Groups are cut off only when the run is ending -- one of them
+                # raised, or this was cancelled -- so it is said first, and
+                # everything they do on the way out reads it as the end.
+                self._stop.set()
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
@@ -3119,6 +3128,25 @@ class Strategy:
         except Exception as exc:  # noqa: BLE001 - cosmetic
             log.debug("could not redraw the final status block: %s", describe(exc))
 
+    async def _wind_down(self) -> None:
+        """End a run that is not halting: pull, hedge what filled, say what is left.
+
+        One routine for every such ending -- a stop, a failure, an interrupt --
+        because they leave the same thing behind: orders resting and fills
+        that landed while they were pulled. Only the stop used to hedge those;
+        a run that failed cancelled the same way and exited holding them.
+
+        The stop is set first, so the worker and the supervisor stand down and
+        this pass is the only hedging left. A halt ends through
+        `_emergency_stop` instead, which closes everything rather than
+        hedging it.
+        """
+        self._stop.set()
+        await self._cancel_resting(self.symbols)
+        await self._last_hedge_pass()
+        with contextlib.suppress(Exception):
+            self._log_open_positions()
+
     async def _last_hedge_pass(self) -> None:
         """Hedge whatever filled while a stop was pulling the orders.
 
@@ -3222,9 +3250,7 @@ class Strategy:
                 log.warning(
                     "stopped on %s -- cancelling resting orders", self._stop_requested
                 )
-                await self._cancel_resting(self.symbols)
-                await self._last_hedge_pass()
-                self._log_open_positions()
+                await self._wind_down()
 
             # Before the baseline is cleared: the totals are read from it.
             await self._final_cost_report()
@@ -3245,7 +3271,7 @@ class Strategy:
             raise
         except asyncio.CancelledError:
             log.warning("interrupted -- cancelling strategy orders")
-            await self._cancel_resting(self.symbols)
+            await self._wind_down()
             raise
         except Exception as exc:
             # Anything else used to leave straight through `finally`, which
@@ -3256,9 +3282,7 @@ class Strategy:
             log.critical(
                 "run failed (%s) -- cancelling every resting order", describe(exc)
             )
-            await self._cancel_resting(self.symbols)
-            with contextlib.suppress(Exception):
-                self._log_open_positions()
+            await self._wind_down()
             raise
         finally:
             self._stop.set()

@@ -283,3 +283,55 @@ def test_the_residual_sweep_touches_only_this_legs_accounts(tmp_path):
 
     assert set(swept) == {"opener", "t1", "t2", "t3"}
     assert "stranger-a" not in swept, "another group's account was swept"
+
+
+# -- but a group that ends mid-cycle keeps them ------------------------------
+#
+# Released, its positions drop out of everything that reads the groups: the
+# liquidation guard, the reconciler, and the last hedge pass of the run. That
+# used to be decided by the stop flag, and a group cancelled because a sibling
+# raised was cancelled before anything had set it.
+
+
+def ends_mid_cycle(tmp_path, ending):
+    obj = strategy(tmp_path)
+    group_id, group = obj.pairing.draw(BTC)
+
+    async def run_leg(key, size, once=False):
+        obj.state.legs[key].phase = Phase.HOLD
+        await ending()
+
+    obj._run_leg = run_leg
+    return obj, group_id, group
+
+
+def test_a_group_that_raises_mid_cycle_stays_registered(tmp_path):
+    async def boom():
+        raise RuntimeError("exchange said no")
+
+    obj, group_id, group = ends_mid_cycle(tmp_path, boom)
+    with pytest.raises(RuntimeError):
+        asyncio.run(obj._run_group(group_id, group, 1.0))
+
+    assert obj.group_key(group_id, BTC) in obj._groups, "its positions were let go"
+    assert not any(a in obj.pairing.free for a in group.accounts)
+
+
+def test_a_group_cancelled_mid_cycle_stays_registered_without_a_stop(tmp_path):
+    """The sibling of a group that raised: cancelled, and nothing had set the
+    stop yet."""
+    async def forever():
+        await asyncio.Event().wait()
+
+    obj, group_id, group = ends_mid_cycle(tmp_path, forever)
+
+    async def drive():
+        task = asyncio.create_task(obj._run_group(group_id, group, 1.0))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+    assert not obj._stop.is_set()
+    assert obj.group_key(group_id, BTC) in obj._groups
