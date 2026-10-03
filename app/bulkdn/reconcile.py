@@ -387,6 +387,7 @@ async def flatten(
             "flatten did not fully close after %d passes -- MANUAL ACTION REQUIRED: %s",
             max_passes,
             ", ".join(leftovers),
+            extra={"alert": True},
         )
 
 
@@ -540,5 +541,6 @@ async def flatten_limit(
         "limit close: gave up after %.0f minutes with %s still open. Orders are "
         "cancelled; close at market if you need it done now.",
         timeout_s / 60, ", ".join(leftovers) or "nothing",
+        extra={"alert": True},
     )
     return False

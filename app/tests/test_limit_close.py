@@ -587,3 +587,11 @@ def test_a_trading_start_cancels_before_the_gate_can_refuse(monkeypatch):
     with pytest.raises(RuntimeError):
         asyncio.run(runtime.start(verify=False, trading=True))
     assert cancelled == [(["m1-session"], [BTC])], "the dead run's orders were left"
+
+
+def test_a_limit_close_that_gives_up_raises_an_alert(caplog):
+    sessions, book, _master, _sub1, feed = build()
+    with caplog.at_level("WARNING"):
+        assert close(sessions, book, feed, timeout_s=0.05) is False
+    alerts = [r for r in caplog.records if getattr(r, "alert", False)]
+    assert alerts and "gave up" in alerts[0].getMessage()

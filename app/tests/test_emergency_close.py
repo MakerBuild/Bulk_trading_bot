@@ -189,3 +189,18 @@ async def test_a_close_that_never_shows_is_given_up_on_in_time(monkeypatch):
     )
 
     assert len(account.closes) == 2
+
+
+async def test_a_flatten_that_leaves_positions_open_raises_an_alert(monkeypatch, caplog):
+    """The operator has to act by hand, so the line is tagged for the
+    notifier rather than left to be found in the log."""
+    monkeypatch.setattr(reconcile, "FLATTEN_READ_INTERVAL_S", 0.01)
+    monkeypatch.setattr(reconcile, "FLATTEN_SETTLE_S", 0.02)
+    account = LaggingSession("m1s1", answers=[0.02])
+    feed = types.SimpleNamespace(specs={BTC: SPEC}, reference_price=lambda s: 50_000.0)
+
+    with caplog.at_level("ERROR"):
+        await reconcile.flatten({"a": account}, PositionBook(), feed, [BTC], max_passes=1)
+
+    alerts = [r for r in caplog.records if getattr(r, "alert", False)]
+    assert alerts and "MANUAL ACTION REQUIRED" in alerts[0].getMessage()
