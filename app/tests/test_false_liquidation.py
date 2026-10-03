@@ -183,6 +183,12 @@ class FakeSession:
         self.closed.append((symbol, is_buy, size, reduce_only))
         return []
 
+    async def hedge_market(self, symbol, is_buy, size, reduce_only=False):
+        # As the real one: through `market`, which tests replace. Never over
+        # HTTP here -- that path has its own tests.
+        await self.market(symbol, is_buy, size, reduce_only=reduce_only)
+        return False
+
     async def close_market(self, symbol, is_buy, size):
         # Through `market`, which tests replace to watch or refuse the close.
         return await self.market(symbol, is_buy, size, reduce_only=True)

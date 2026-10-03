@@ -34,6 +34,12 @@ class FakeSession:
         )
         return []
 
+    async def hedge_market(self, symbol, is_buy, size, reduce_only=False):
+        # As the real one: through `market`, which tests replace. Never over
+        # HTTP here -- that path has its own tests.
+        await self.market(symbol, is_buy, size, reduce_only=reduce_only)
+        return False
+
 
 def build(tolerance_lots=1.0, ceilings=None, ttl_ms=5000):
     book = PositionBook(overlay_ttl_ms=ttl_ms)

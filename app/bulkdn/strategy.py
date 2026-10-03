@@ -1355,11 +1355,24 @@ class Strategy:
                 # Hedges run concurrently now, so the check at the top of the
                 # caller is not the last word.
                 return HedgeResult(roles.symbol, 0.0, 0.0, False, "hedging suspended")
-            return await self.hedger.hedge(
+            result = await self.hedger.hedge(
                 roles,
                 mark_price=self.feed.reference_price(roles.symbol),
                 suspended=suspended,
             )
+            if result.settle_by_read:
+                # Sent over HTTP past a socket that is down: no fill will
+                # retire its reservation, so a read has to. Marked unread
+                # rather than only asked to settle: the reservation lapses in
+                # `doubt_ttl_s`, and with reads failing longer than that the
+                # leg would read as unhedged against a book that never saw the
+                # hedge, and be hedged again. Unread, it is not hedged at all
+                # until a read begun after this one succeeds.
+                for pubkey in roles.hedgers:
+                    session = self.sessions.get(pubkey)
+                    if session is not None and self._socket_down(session):
+                        self._mark_unread(session)
+            return result
         except HedgeInDoubt:
             # This leg only. Marking the whole book suspect stopped every
             # hedge in the pool until a full read finished -- seconds, half a
@@ -2042,6 +2055,13 @@ class Strategy:
                     "paused meanwhile",
                     session.name,
                 )
+            # Its accounts' fills stopped reaching the book when it went
+            # quiet, and their makers can fill until their orders come off.
+            # Their legs wait for a read over HTTP, which starts at once, and
+            # are hedged against that -- over HTTP too, if the socket is still
+            # down (`hedge_market`). Left to the read after the reconnect, a
+            # hedger's leg sat unhedged for as long as the reconnect took.
+            self._mark_unread(session)
             began = SharedReconnect.generation
             restored = await session.reconnect()
             if not restored and await self._network_came_back(client, began):

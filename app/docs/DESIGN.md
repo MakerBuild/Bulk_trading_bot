@@ -555,9 +555,12 @@ the liquidation guard and the reconciler keep running meanwhile. Every leg with 
 that socket is paused (`_paused_for_its_sockets`): its resting order is pulled over HTTP and
 nothing is placed until the socket is back and its accounts re-read. The run halts only when a
 heal gives up, or when sockets have dropped `MAX_RECONNECTS` times in `RECONNECT_WINDOW_S` —
-counted per incident, so two sockets dropping together are one. A leg whose hedger is on the
-dropped socket holds whatever filled before its order came off until that socket returns; the
-hedge then goes at once.
+counted per incident, so two sockets dropping together are one. The heal also marks the
+socket's accounts unread, so their legs are re-read over HTTP at once rather than after the
+reconnect. A hedge for a hedger on the dropped socket then goes **over HTTP**
+(`hedge_market`) — but only when the socket refused it as down before sending anything, and
+once, with no replay, so no second copy of it can exist. Its fill will not come back on the
+dead socket, so its reservation is held until a position read begun after it has seen it.
 
 ### Crash recovery
 

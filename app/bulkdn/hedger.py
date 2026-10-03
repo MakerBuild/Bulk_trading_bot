@@ -120,6 +120,10 @@ class HedgeResult:
     hedged_size: float
     is_buy: bool
     skipped_reason: str | None = None
+    # Some of it went over HTTP, its socket being down, so no fill will come
+    # back to retire its reservation -- only a position read will. The caller
+    # should start one rather than leave it to the next reconcile tick.
+    settle_by_read: bool = False
 
     @property
     def acted(self) -> bool:
@@ -576,12 +580,13 @@ class Hedger:
                     roles.key, piece if is_buy else -piece, awaiting_answer=True
                 )
             sent = 0.0
+            over_http = 0
             failures: list[BaseException] = []
             doubtful: list[BaseException] = []
             try:
                 results = await asyncio.gather(
                     *(
-                        self.sessions[pubkey].market(
+                        self.sessions[pubkey].hedge_market(
                             symbol, is_buy, piece, reduce_only=roles.reduce_only
                         )
                         for pubkey, piece in slices
@@ -590,7 +595,16 @@ class Hedger:
                 )
                 for (_pubkey, piece), result in zip(slices, results, strict=True):
                     signed = piece if is_buy else -piece
-                    if isinstance(result, (OrderRejected, NotSent)):
+                    if result is True:
+                        # Sent over HTTP: accepted, but its fill will not come
+                        # back on the socket that is down, so nothing would
+                        # retire the reservation except its clock -- and two
+                        # seconds later the leg would read as unhedged and be
+                        # hedged again. Held until a read begun after it.
+                        self.in_flight.hold_in_doubt(roles.key, signed)
+                        over_http += 1
+                        sent += piece
+                    elif isinstance(result, (OrderRejected, NotSent)):
                         # The exchange answered no, so this slice never traded
                         # and its exposure is still real. Releasing only its
                         # reservation lets the next trigger retry exactly the
@@ -623,6 +637,14 @@ class Hedger:
                         symbol, len(slices) - len(failures) - len(doubtful),
                         len(slices), len(failures), len(doubtful),
                     )
+                if over_http and not doubtful:
+                    # What went over HTTP is settled by a read whatever else
+                    # happened, and this is the outcome that starts one.
+                    raise HedgeInDoubt(
+                        f"{symbol}: {over_http} hedge slice(s) went over HTTP and "
+                        f"{len(failures)} failed ({describe(failures[0])}) -- held "
+                        "until positions are re-read"
+                    ) from failures[0]
                 if doubtful:
                     raise HedgeInDoubt(
                         f"{symbol}: {len(doubtful)} hedge slice(s) got no answer "
@@ -638,4 +660,4 @@ class Hedger:
                     round_notional(size * price),
                     f" impact~{expected_bps:.1f}bps" if expected_bps is not None else "",
                 )
-            return HedgeResult(symbol, net, size, is_buy)
+            return HedgeResult(symbol, net, size, is_buy, settle_by_read=over_http > 0)

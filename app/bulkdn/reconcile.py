@@ -115,9 +115,13 @@ def _apply(session: AccountSession, parsed: list, requested_at: float, book: Pos
     # it lands, and a fill that reached us over the stream meanwhile is newer
     # than it. Overwriting that fill is how the reconciler came to hedge the
     # same exposure twice.
-    # A socket known to be running behind has nothing newer to protect.
+    # A socket known to be running behind, or down, has nothing newer to
+    # protect -- and a read is all the book has for its accounts meanwhile.
     lagging = time.monotonic() < session.stream_lagging_until
-    skipped = book.apply_read(session.pubkey, parsed, requested_at, force=lagging)
+    down = not session.dry_run and not session.is_connected
+    skipped = book.apply_read(
+        session.pubkey, parsed, requested_at, force=lagging or down
+    )
     if parsed:
         summary = " ".join(f"{p.symbol}={p.size:+.8f}" for p in parsed)
         log.info("%s positions: %s", session.name, summary)

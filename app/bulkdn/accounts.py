@@ -1072,6 +1072,51 @@ class AccountSession:
             ]
         )
 
+    async def hedge_market(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        reduce_only: bool = False,
+    ) -> bool:
+        """A hedge's market order, over HTTP when the socket is already down.
+
+        Returns True when it went over HTTP. Its fill will not come back on a
+        socket that is down, so nothing retires its reservation but a position
+        read begun after it -- the caller holds it until one has.
+
+        Only when the socket refused it as down, which it does before anything
+        is sent: `NotConnected` means no copy of this order exists anywhere,
+        so sending it over HTTP sends it once. Never after a socket attempt
+        that went out and got no answer -- that one may have executed, and a
+        second copy is the double hedge `close_market` warns about. And once
+        over HTTP, with no replay: `post_signed` replays the same signed bytes
+        on a lost answer, which is only safe if the exchange refuses a seen
+        nonce, and nobody has confirmed that it does.
+
+        Hedges used to go over the socket alone. With a hedger's socket down,
+        whatever the maker filled before its order came off sat unhedged until
+        the reconnect finished -- minutes, on a slow one -- every attempt
+        refused as not connected.
+        """
+        try:
+            await self.market(symbol, is_buy, size, reduce_only=reduce_only)
+            return False
+        except NotConnected:
+            if self.dry_run:
+                raise
+        order = MarketOrder(
+            symbol=symbol,
+            side=Side.BUY if is_buy else Side.SELL,
+            size=size,
+            reduce_only=reduce_only,
+        )
+        log.warning(
+            "%s: %s hedge over HTTP -- the socket is down", self.name, symbol
+        )
+        await self._post_http([order], "hedge", attempts=1)
+        return True
+
     async def cancel(self, symbol: str, oid: str) -> list[OrderResponse]:
         # A cancel commonly loses a race with a fill; that is not a malfunction.
         return await self.submit(
@@ -1114,19 +1159,24 @@ class AccountSession:
         log.info("%s: cancelled all orders in %s over HTTP", self.name, ", ".join(symbols))
         return []
 
-    async def _post_http(self, actions: Sequence[Action], what: str) -> dict:
+    async def _post_http(
+        self, actions: Sequence[Action], what: str, *, attempts: int | None = None
+    ) -> dict:
         """Send the same signed transaction to `/order`, bypassing the socket.
 
         Only for actions that are harmless to send twice, because the socket
         attempt before this one may have executed without answering: a
-        cancel-all, or a reduce-only close.
+        cancel-all, or a reduce-only close -- or for a hedge the socket refused
+        before sending, with `attempts=1` so that it is not replayed either
+        (see `hedge_market`).
         """
         tx = self.client.signed_transaction(list(actions), self.pubkey)
         base_url = getattr(self.http, "base_url", None)
         if not base_url:
             raise NotSent(f"no HTTP endpoint to send the {what} to")
+        retry = {} if attempts is None else {"attempts": attempts}
         response, _uncertain = await asyncio.to_thread(
-            post_signed, f"{base_url}/order", json=tx, timeout=10
+            post_signed, f"{base_url}/order", json=tx, timeout=10, **retry
         )
         try:
             body = response.json()
@@ -1153,7 +1203,8 @@ class AccountSession:
         parsed per action.
 
         Not for hedges. A hedge opens exposure, and sending one twice is the
-        double hedge this bot has spent most of its history preventing.
+        double hedge this bot has spent most of its history preventing; a
+        hedge goes over HTTP only by the narrower rule in `hedge_market`.
         """
         def order() -> MarketOrder:
             return MarketOrder(

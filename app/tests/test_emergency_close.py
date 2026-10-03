@@ -105,6 +105,8 @@ class FakeSession:
         self.fails = fails
         self.closes = []
         self.stream_lagging_until = 0.0
+        self.dry_run = False
+        self.is_connected = True
 
     def full_account(self):
         if self.fails:
