@@ -140,3 +140,24 @@ def test_sell_fill_moves_position_down():
     book.set_authoritative(SUB1, BTC, 0.0)
     book.apply_fill(SUB1, BTC, is_buy=False, size=0.1)
     assert book.effective(SUB1, BTC) == -0.1
+
+
+def test_a_position_true_as_of_earlier_keeps_the_fills_since():
+    """The rule `apply_read` already follows: a position cannot include a
+    fill that arrived after the moment it describes, so that fill's overlay
+    stays. Dropping it read the fill as never having happened, and the
+    hedger covered it a second time."""
+    book = PositionBook(overlay_ttl_ms=5000)
+    as_of = time.monotonic()
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.1)
+
+    book.set_authoritative(MASTER, BTC, 0.5, as_of=as_of)
+    assert book.effective(MASTER, BTC) == 0.6
+
+
+def test_a_position_true_now_drops_every_fill_before_it():
+    book = PositionBook(overlay_ttl_ms=5000)
+    book.apply_fill(MASTER, BTC, is_buy=True, size=0.1)
+
+    book.set_authoritative(MASTER, BTC, 0.5)
+    assert book.effective(MASTER, BTC) == 0.5
