@@ -411,15 +411,9 @@ async def test_a_submission_that_never_left_counts_toward_the_streak():
 
     class Client:
         async def submit(self, actions, **kwargs):
-            raise NotSent("not connected to WebSocket")
+            raise NotSent("signer not configured")
 
-    session = object.__new__(AccountSession)
-    session.name = "m1s1"
-    session.pubkey = "m1s1-key"
-    session.client = Client()
-    session.reject_streak = 0
-    session.last_reject = ""
-    session.unconfirmed = {}
+    session = AccountSession(name="m1s1", pubkey="m1s1-key", client=Client(), http=None)
 
     class Action:
         symbol = "BTC-USD"
@@ -518,3 +512,80 @@ async def test_an_accepted_transaction_ends_the_throttling_count(monkeypatch):
 
     await throttle(client, master, 3, already=4)
     assert master.reject_streak == 0
+
+
+# -- a socket that drops ------------------------------------------------------
+
+
+class ClosingSocket:
+    """Delivers nothing, then closes the way websockets reports it."""
+
+    def __init__(self):
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        from websockets.exceptions import ConnectionClosed
+
+        raise ConnectionClosed(None, None)
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_the_sdk_does_not_reconnect_a_dropped_socket_behind_the_supervisor():
+    """Its receive loop called its own `_reconnect`, which slept and dialled
+    again while the supervisor's heal was doing the same."""
+    client = socket_client()
+    client.ws = ClosingSocket()
+    dialled = []
+
+    async def connect():
+        dialled.append(True)
+        return True
+
+    client.connect = connect
+    waiting = asyncio.get_running_loop().create_future()
+    client.pending_requests[7] = waiting
+
+    client.receive_task = asyncio.create_task(client._receive_loop())
+    await asyncio.wait_for(client.receive_task, timeout=1.0)
+
+    assert dialled == [], "the SDK reconnected on its own"
+    assert not client.is_connected, "the supervisor must see the socket as down"
+    assert client.dropped_at is not None
+    assert isinstance(waiting.exception(), SubmissionInDoubt), (
+        "a request on the dead socket was left to time out"
+    )
+
+
+async def test_orders_refused_while_the_socket_is_down_do_not_trip_the_kill_switch():
+    """A one-second drop with five re-prices in flight halted a run and closed
+    every account at market."""
+    from bulkdn.accounts import NotConnected, NotSent
+
+    client = socket_client()
+    client.state = ConnectionState.DISCONNECTED
+    master = session_on(client, "m1", MASTER)
+
+    for _ in range(10):
+        with pytest.raises(NotSent) as caught:
+            await master.submit([FakeAction()])
+        assert isinstance(caught.value, NotConnected)
+
+    assert master.reject_streak == 0
+    assert master.symbols_in_doubt(60.0) == set(), "nothing left, nothing in doubt"
+
+
+async def test_an_order_for_an_account_the_socket_does_not_carry_still_counts():
+    """Persistent faults on this side are what the streak is for."""
+    from bulkdn.accounts import NotSent
+
+    client = socket_client()
+    stranger = session_on(client, "x", "NOT-ON-THIS-SOCKET")
+
+    with pytest.raises(NotSent):
+        await stranger.submit([FakeAction()])
+    assert stranger.reject_streak == 1

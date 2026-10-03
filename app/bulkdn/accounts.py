@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 import requests
 from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
+from bulk_api.api.bulk_ws import ConnectionState
 from .retry import describe, post_signed
 from bulk_api.common import (
     OrderStatus,
@@ -131,6 +132,19 @@ class NotSent(RuntimeError):
     """
 
 
+class NotConnected(NotSent):
+    """Not sent because the socket is down.
+
+    A state the supervisor already knows about and is repairing -- the risk
+    layer reports the socket as disconnected and the heal reconnects it -- not
+    a fault in the key or the account. It is NOT counted toward the reject
+    streak. It used to be: a one-second drop with a few re-prices in flight
+    reached the streak limit of five, and the run halted and closed every
+    account at market over a blip the reconnect would have healed. A socket
+    that stays down halts the run through the disconnected check instead.
+    """
+
+
 class SubmissionInDoubt(RuntimeError):
     """A request was failed on the socket without an answer addressed to it.
 
@@ -186,6 +200,9 @@ class RoutedWsClient(BulkWebSocketClient):
         # When an update last named an account this socket does not carry.
         # See `_warn_unknown_owner`.
         self._unknown_owner_warned_at: float | None = None
+        # When the SDK's receive loop last saw this socket close. See
+        # `_reconnect`.
+        self.dropped_at: float | None = None
 
     # -- connection --------------------------------------------------------
 
@@ -243,6 +260,49 @@ class RoutedWsClient(BulkWebSocketClient):
             # that no longer existed, and the kill switch fired anyway.
             self.last_message_at = time.monotonic()
         return connected
+
+    async def _reconnect(self) -> None:
+        """Mark the socket down. Reconnecting is the supervisor's job, not the SDK's.
+
+        The SDK's receive loop calls this when its socket closes, and the
+        SDK's version slept and called `connect` itself. That made two owners
+        of one socket: the supervisor's heal (`reconnect_client`) saw the
+        socket down and ran its own disconnect/connect at the same time, each
+        tearing down what the other was building. And while the SDK sat in its
+        RECONNECTING state every submission was refused as not connected, and
+        each refusal counted toward the reject streak -- so a one-second drop
+        with a few re-prices in flight halted the run and closed everything at
+        market.
+
+        Now the socket is only marked down. The risk layer reads that as
+        "disconnected" on its next pass, and `reconnect_client` restores it
+        under the budget and sharing rules it already has. Requests still
+        waiting on the dead socket are failed as in doubt at once -- no answer
+        can arrive on it, and waiting out their timeouts would only stall the
+        callers -- and submissions meanwhile raise `NotConnected`, which is not
+        a rejection.
+        """
+        if self.receive_task is not None and asyncio.current_task() is not self.receive_task:
+            # A receive loop belonging to a socket that has since been
+            # replaced. The live one is not this one's to mark down.
+            return
+        self.state = ConnectionState.DISCONNECTED
+        self.dropped_at = time.monotonic()
+        log.warning(
+            "WebSocket closed (%d account(s) on it) -- marked down; the "
+            "supervisor reconnects it",
+            len(self.accounts),
+        )
+        if self.ws is not None:
+            with contextlib.suppress(Exception):
+                await self.ws.close()
+        pending = list(self.pending_requests.items())
+        self.pending_requests.clear()
+        for _request_id, waiting in pending:
+            if not waiting.done():
+                waiting.set_exception(
+                    SubmissionInDoubt("the socket closed before an answer arrived")
+                )
 
     async def _handle_message(self, data: dict) -> None:
         # Liveness is tracked off raw traffic so the risk layer can tell a quiet
@@ -541,7 +601,7 @@ class RoutedWsClient(BulkWebSocketClient):
             ]
 
         if not self.is_connected:
-            raise NotSent("not connected to WebSocket")
+            raise NotConnected("not connected to WebSocket")
 
         tx = signer.sign_transaction(tx, self.signature_domain)
 
@@ -774,9 +834,11 @@ class AccountSession:
             responses = await self.client.submit(actions, **kwargs)
         except NotSent as exc:
             # Nothing left this process, so nothing is in doubt -- and a fault
-            # that stops every order is exactly what the streak is for.
+            # that stops every order is exactly what the streak is for. A
+            # socket that is down is not such a fault: the supervisor knows
+            # and is healing it. See `NotConnected`.
             self._settle(actions)
-            if count_rejects:
+            if count_rejects and not isinstance(exc, NotConnected):
                 self.reject_streak += 1
                 self.last_reject = str(exc)
             raise
