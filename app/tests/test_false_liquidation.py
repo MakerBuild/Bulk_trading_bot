@@ -193,7 +193,7 @@ class Bot:
     @property
     def all_sessions(self):
         """Stands in for Strategy's own: every account the run trades."""
-        return [self.master, self.sub1]
+        return list(self.sessions.values())
 
     def __init__(self, *, in_doubt=False, sync_fails=False, liquidated=False,
                  confirm_fails=False):
@@ -201,6 +201,10 @@ class Bot:
 
         self.master = FakeSession("master")
         self.sub1 = FakeSession("sub1")
+        self.sessions = {s.pubkey: s for s in (self.master, self.sub1)}
+        # No groups: the configured pair, whose two accounts are the run.
+        self._groups = {}
+        self.pairing = None
         if in_doubt:
             self.master.unconfirmed[ETH] = time.monotonic()
         self._doubt_deferrals = {}
@@ -217,6 +221,8 @@ class Bot:
         )
         self._liquidation_confirmed = Strategy._liquidation_confirmed.__get__(self)
         self._exchange_liquidated = Strategy._exchange_liquidated.__get__(self)
+        self._key_for_account = Strategy._key_for_account.__get__(self)
+        self._leg_accounts = Strategy._leg_accounts.__get__(self)
         self._settled_by_a_fresh_read = (
             Strategy._settled_by_a_fresh_read.__get__(self)
         )
@@ -332,6 +338,53 @@ def test_an_unreachable_exchange_is_treated_as_a_liquidation(monkeypatch):
     bot = bot_with([liquidation_event()], in_doubt=False, confirm_fails=True)
     run_guard(monkeypatch, bot)
     assert bot.halted is not None and "liquidation" in bot.halted
+
+
+# -- a reprieve covers the group it was earned in -------------------------
+#
+# Deferring to our own unanswered order used to wipe the market for every
+# group trading it: every account's high-water mark in the symbol, and every
+# account's "in doubt" mark -- which is also what tells the orphan sweep that
+# an order of ours may be resting unaccounted for.
+
+
+def two_groups(bot):
+    """Put master+sub1 in one group on ETH, and two more accounts in another."""
+    from bulkdn.pairing import Group
+
+    for name in ("other", "other2"):
+        bot.sessions[f"{name}-KEY"] = FakeSession(name)
+    bot._groups = {
+        "g1:ETH-USD": Group(ETH, maker="master-KEY", takers=("sub1-KEY",), shares=(1.0,)),
+        "g2:ETH-USD": Group(ETH, maker="other-KEY", takers=("other2-KEY",), shares=(1.0,)),
+    }
+    bot.pairing = object()
+    resets = []
+    bot.guard.reset_symbol = lambda symbol, accounts=None: resets.append(
+        (symbol, None if accounts is None else set(accounts))
+    )
+    return resets
+
+
+def test_a_reprieve_leaves_other_groups_peaks_and_doubts_alone(monkeypatch):
+    bot = bot_with([liquidation_event()], in_doubt=True)
+    resets = two_groups(bot)
+    other = bot.sessions["other-KEY"]
+    other.unconfirmed[ETH] = time.monotonic()
+
+    assert run_guard(monkeypatch, bot) is False
+
+    assert resets == [(ETH, {"master-KEY"})], "other groups' peaks were wiped"
+    assert ETH in other.unconfirmed, "another group's order in doubt was forgotten"
+    assert ETH not in bot.master.unconfirmed
+
+
+def test_another_groups_unanswered_order_does_not_excuse_this_one(monkeypatch):
+    bot = bot_with([liquidation_event()], in_doubt=False)
+    two_groups(bot)
+    bot.sessions["other-KEY"].unconfirmed[ETH] = time.monotonic()
+
+    assert run_guard(monkeypatch, bot) is True, "a stranger's timeout excused it"
 
 
 # -- asking the exchange about the accounts that shrank, not the pool ------

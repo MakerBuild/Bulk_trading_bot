@@ -773,10 +773,17 @@ class Strategy:
         Only ever true once the exchange has answered with fresh positions. If
         that read fails the caller carries on to the halt, because at that
         point nothing is known -- not what happened, and not what is open.
+
+        Judged per leg. An unanswered order explains a shrink in the leg that
+        sent it -- its maker's or a hedger's -- and nothing else: another
+        group's timeout in the same market moved another group's accounts.
         """
-        in_doubt: set[str] = set()
-        for session in self.all_sessions:
-            in_doubt |= session.symbols_in_doubt(DOUBT_WINDOW_S)
+        def in_doubt(event) -> bool:
+            return any(
+                event.symbol in session.symbols_in_doubt(DOUBT_WINDOW_S)
+                for pubkey in self._leg_accounts(event.account, event.symbol)
+                if (session := self.sessions.get(pubkey)) is not None
+            )
 
         now = time.monotonic()
         for symbol, seen in self._doubt_deferrals.items():
@@ -786,7 +793,7 @@ class Strategy:
 
         explainable = [
             event for event in events
-            if event.symbol in in_doubt
+            if in_doubt(event)
             and len(self._doubt_deferrals.get(event.symbol, ())) < MAX_DOUBT_DEFERRALS
         ]
         if not explainable or len(explainable) != len(events):
@@ -813,17 +820,38 @@ class Strategy:
         for event in explainable:
             log.warning(
                 "%s -- but an order of ours in %s went unanswered, and a fresh "
-                "read of both accounts has now replaced the guess. Carrying on "
+                "read of its accounts has now replaced the guess. Carrying on "
                 "rather than calling it a liquidation (%d/%d in the last "
                 "%.0f minutes).",
                 event.describe(), event.symbol,
                 len(self._doubt_deferrals[event.symbol]), MAX_DOUBT_DEFERRALS,
                 DEFERRAL_WINDOW_S / 60,
             )
-            self.guard.reset_symbol(event.symbol)
-            for session in self.all_sessions:
-                session.settled(event.symbol)
+            # This leg's accounts only. Both used to be cleared for the whole
+            # market: every other group's high-water mark there -- so its next
+            # real shrink would go unseen -- and every other group's doubt,
+            # which is also what tells the orphan sweep that an unanswered
+            # order of theirs may still be resting.
+            self.guard.reset_symbol(event.symbol, accounts=(event.account,))
+            for pubkey in self._leg_accounts(event.account, event.symbol):
+                session = self.sessions.get(pubkey)
+                if session is not None:
+                    session.settled(event.symbol)
         return True
+
+    def _leg_accounts(self, pubkey: str, symbol: str) -> tuple[str, ...]:
+        """The accounts trading `symbol` alongside `pubkey`, itself included.
+
+        Its group's, in a pool. With no group drawn and no pool -- a configured
+        pair -- the run's accounts are the pair. An account between groups
+        stands alone.
+        """
+        key = self._key_for_account(pubkey, symbol)
+        if key is not None:
+            return tuple(self._groups[key].accounts)
+        if self.pairing is None and not self._groups:
+            return tuple(session.pubkey for session in self.all_sessions)
+        return (pubkey,)
 
     def _make_position_handler(self, session: AccountSession):
         def handler(update) -> None:
