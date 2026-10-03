@@ -161,6 +161,11 @@ class FakeSpec:
 class FakeFeed:
     specs = {SYMBOL: FakeSpec()}
 
+    def quote(self, symbol):
+        from bulkdn.feed import Quote
+
+        return Quote(symbol, 83_999.0, 84_001.0, 84_000.0, age_s=0.0)
+
     def reference_price(self, symbol):
         return 84_000.0
 
@@ -426,3 +431,21 @@ async def test_the_swept_side_is_marked_while_the_close_is_on_its_way(group_cloc
 
     assert seen == [{(SYMBOL, True): 1}], "the bid was not marked while the sell went out"
     assert not getattr(s, "_sweeping", {}), "the mark must come off afterwards"
+
+
+async def test_a_close_too_small_at_the_touch_it_takes_is_not_sent(group_clock):
+    """Measured at the mark, a sell that fills at the bid can clear the
+    minimum and still be refused -- and every refusal counts toward the
+    reject streak."""
+    from bulkdn.feed import Quote
+    from bulkdn.marketdata import MarketSpec
+
+    group_clock.now = 0.0
+    s, leg = build_group(Phase.EXIT, held=0.0002)        # $16.80 at the mark
+    s.feed.specs = {SYMBOL: MarketSpec(SYMBOL, 0.5, 0.000001, 10.0)}
+    s.feed.quote = lambda symbol: Quote(symbol, 40_000.0, 84_001.0, 84_000.0, age_s=0.0)
+
+    sent = await Strategy._close_rest_at_market(s, s._roles_for_key(SYMBOL), leg, send=True)
+
+    assert sent is False and leg.complete, "$8 at the bid was sent as a close"
+    assert s.sessions["maker"].closes == []

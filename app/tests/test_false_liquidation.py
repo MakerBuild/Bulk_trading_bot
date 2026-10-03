@@ -240,6 +240,8 @@ class Bot:
         )
         # The guard holds both sides as swept while its closes go out.
         self._sweep = Strategy._sweep.__get__(self)
+        # No book here: a close is sized by its lot alone.
+        self._taking_price = lambda symbol, buying: None
 
     # the pieces the guard leans on
     async def _sync_positions(self, max_age_s=0.0):

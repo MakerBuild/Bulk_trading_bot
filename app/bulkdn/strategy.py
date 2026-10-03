@@ -39,7 +39,13 @@ from .fees import burned_usd as _burned
 from .fees import realised_for_trees
 from .hedger import Hedger, HedgeInDoubt, HedgeLimitExceeded, HedgeResult, LegRoles
 from .liquidation import LiquidationGuard, recent_liquidations
-from .marketdata import epoch_seconds, round_notional, round_size, touch_text
+from .marketdata import (
+    epoch_seconds,
+    is_tradeable,
+    round_notional,
+    touch_text,
+    tradeable_size,
+)
 from .sizing import draw_sizes, resolve_notionals
 from .notify import Notifier
 from .accounts import short_pubkey
@@ -799,8 +805,13 @@ class Strategy:
                     continue
                 for session in hit:
                     size = self.book.authoritative(session.pubkey, symbol)
-                    rounded = round_size(abs(size), spec)
-                    if rounded < spec.lot_size:
+                    # Below the market's minimum the exchange refuses the
+                    # close, and the refusal counts toward the reject streak.
+                    # The lot alone used to decide here.
+                    rounded = tradeable_size(
+                        spec, abs(size), self._taking_price(symbol, buying=size < 0)
+                    )
+                    if not rounded:
                         continue
                     try:
                         # size > 0 is long, so closing it is a sell.
@@ -2494,9 +2505,13 @@ class Strategy:
         """
         spec = self.feed.specs[roles.symbol]
         held = self.book.effective(roles.maker, roles.symbol)
-        size = round_size(abs(held), spec)
-        price = self.feed.reference_price(roles.symbol)
-        if size < spec.lot_size or (price and size * price < spec.min_notional):
+        # Measured at the touch the close takes, not the mark: a sell fills at
+        # the bid, and a size that clears the minimum at the mark can fall
+        # short of it there and be refused.
+        size = tradeable_size(
+            spec, abs(held), self._taking_price(roles.symbol, buying=held < 0)
+        )
+        if not size:
             leg.complete = True
             return False
         if not send:
@@ -2514,6 +2529,17 @@ class Strategy:
         log.info("%s: sent a market close of %g on %s",
                  roles.key, size, self.sessions[roles.maker].name)
         return True
+
+    def _taking_price(self, symbol: str, *, buying: bool) -> float | None:
+        """The price a market order in `symbol` goes out at: the far touch.
+
+        A buy takes the ask and a sell the bid. Falls back to the reference
+        price when that side of the book is not there, which is what the
+        hedger measures against too.
+        """
+        quote = self.feed.quote(symbol)
+        touch = quote.best_ask if buying else quote.best_bid
+        return touch or self.feed.reference_price(symbol)
 
     def _leg_is_neutral(self, key: str) -> bool:
         """Whether this leg has no hedge left that could actually be placed.
@@ -3946,7 +3972,7 @@ class Strategy:
                 if session.pubkey in owned:
                     continue
                 size = abs(self.book.authoritative(session.pubkey, symbol))
-                if size < spec.lot_size or (price and size * price < spec.min_notional):
+                if not is_tradeable(spec, size, price):
                     continue
                 stray.append(f"{session.name} {symbol} {size:g}")
         if stray:
