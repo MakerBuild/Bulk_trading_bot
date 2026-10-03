@@ -84,6 +84,12 @@ CONFIRM_HOLD_S = 30.0
 # treated as possibly newer than the answer.
 READ_LAG_S = 1.0
 
+# How close a streamed position has to be to "what we had plus some of the
+# fills since" to count as that. Sizes come in eight decimals and the sums
+# here are of a handful of them, so float error is far below this and a lot
+# far above it.
+STREAM_MATCH_TOL = 1e-9
+
 
 @dataclass
 class _Overlay:
@@ -150,12 +156,71 @@ class PositionBook:
             self._overlays.pop(key, None)
             self._awaiting_read.discard(key)
 
-    def apply_snapshot(self, account: str, positions: Iterable) -> None:
+    def apply_stream_position(self, account: str, symbol: str, size: float) -> bool:
+        """Record a position the stream reported, if it agrees with our fills.
+
+        Returns False, and writes nothing, when it does not.
+
+        It used to be written outright, dropping every fill overlay as one it
+        must account for. A live run showed that it need not: a hedger holding
+        -0.000001 bought 0.002135, the fill arrived, and an update saying 0 --
+        the position partway through crossing zero, or one that left the fill
+        out -- landed after it. The book read the hedger as flat, the hedge
+        rule bought the same exposure again, sold the excess back, and the
+        liquidation guard took that for a position closed from outside.
+
+        So the update is matched against what we already know: the position
+        we had, plus the fills since, in the order they arrived. An update
+        equal to the position plus the first k of them is the ordinary case --
+        it accounts for those k, which are dropped, and later ones are kept
+        (k = 0 is an update from before every fill we hold). One that matches
+        no prefix contradicts fills the exchange did report, so neither can be
+        trusted over the other: the fills are kept, held past their ordinary
+        clock, and the key waits for a read sent after them to say what is
+        true -- the same confirming read `apply_read` asks for.
+
+        With no fill held there is nothing to contradict, and the update is
+        written as it always was: an unseen fill, a liquidation or a manual
+        close still reaches the book at once.
+        """
+        key = (account, symbol)
+        overlays = self._prune(key)
+        if not overlays:
+            self.set_authoritative(account, symbol, size)
+            return True
+        running = self._authoritative.get(key, 0.0)
+        matched = 0 if abs(size - running) <= STREAM_MATCH_TOL else None
+        for count, overlay in enumerate(overlays, start=1):
+            running += overlay.delta
+            if abs(size - running) <= STREAM_MATCH_TOL:
+                matched = count
+        now = time.monotonic()
+        if matched is None:
+            hold_until = now + max(self.overlay_ttl_ms / 1000.0, CONFIRM_HOLD_S)
+            for overlay in overlays:
+                overlay.expires_at = max(overlay.expires_at, hold_until)
+            self._awaiting_read.add(key)
+            return False
+        self._authoritative[key] = float(size)
+        self._position_at[key] = now
+        self._streamed_at[key] = now
+        rest = overlays[matched:]
+        if rest:
+            self._overlays[key] = rest
+        else:
+            self._overlays.pop(key, None)
+            self._awaiting_read.discard(key)
+        return True
+
+    def apply_snapshot(self, account: str, positions: Iterable) -> list[str]:
         """Replace all of an account's positions from a full snapshot.
 
         Symbols absent from the snapshot are zeroed -- the exchange omits
         positions it considers closed, and a stale non-zero entry here would
-        make the hedger chase a position that no longer exists.
+        make the hedger chase a position that no longer exists. Each is
+        written through `apply_stream_position`, so a snapshot that leaves out
+        fills we hold does not erase them. Returns the symbols it left
+        unwritten for that reason.
         """
         # Built first and written in one pass. It used to zero every position
         # of the account and then write the real ones, and anything reading
@@ -164,8 +229,10 @@ class PositionBook:
         fresh = {(account, p.symbol): float(p.size) for p in positions}
         for key in [key for key in self._authoritative if key[0] == account]:
             fresh.setdefault(key, 0.0)
-        for (acct, symbol), size in fresh.items():
-            self.set_authoritative(acct, symbol, size)
+        return [
+            symbol for (acct, symbol), size in fresh.items()
+            if not self.apply_stream_position(acct, symbol, size)
+        ]
 
     def apply_read(
         self, account: str, positions: Iterable, requested_at: float, force: bool = False

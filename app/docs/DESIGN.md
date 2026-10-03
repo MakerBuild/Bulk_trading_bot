@@ -161,6 +161,15 @@ in that window is newer than it; writing the read over it made the fill vanish a
 reconciler hedged it again. So a key the stream has touched since the request was sent is
 skipped.
 
+A **streamed position** is checked against the fills held for it too
+(`PositionBook.apply_stream_position`). It is written only when it equals the position we had
+plus the first k of those fills, in arrival order — the ordinary case, which retires those k.
+One that matches no prefix contradicts a fill the exchange itself reported (live: a hedger at
+-0.000001 bought 0.002135 and an update said 0), so the fills are kept past their usual clock
+and a read sent after them settles it. Written outright, that update erased the fill, the
+hedge went out twice, and the correction of the excess halted the run as a "liquidation".
+With no fill held, an update is written as before.
+
 ---
 
 ## Setup

@@ -329,6 +329,11 @@ class Strategy:
         # Counted rather than merely logged: if this is not zero at the end of
         # a run, the book was being rebuilt from HTTP rather than followed.
         self._unattributed_fills = 0
+        # How many streamed positions contradicted the fills held for them
+        # and were left for a read to settle. Counted for the same reason: how
+        # often the stream disagrees with itself is not known yet, and the
+        # end-of-run figure is how it will be.
+        self._contradicted_positions = 0
         # Per account: when something last happened there that the book did
         # not see -- an update that named no account, a socket that fell
         # behind or came back -- and when the last successful read of it
@@ -997,7 +1002,9 @@ class Strategy:
                 # read, and the hedger sold a position that was already hedged.
                 return
 
-            self.book.set_authoritative(session.pubkey, symbol, float(update.size or 0.0))
+            size = float(update.size or 0.0)
+            if not self.book.apply_stream_position(session.pubkey, symbol, size):
+                self._note_contradiction(session, symbol, size)
 
             # Cheap and synchronous -- no I/O, just arithmetic on the book.
             # Closing the survivor happens in the worker; a handler that
@@ -1043,9 +1050,27 @@ class Strategy:
                 p for p in (getattr(snapshot, "positions", None) or [])
                 if p.symbol in self.symbols
             ]
-            self.book.apply_snapshot(session.pubkey, positions)
+            listed = {p.symbol: float(p.size) for p in positions}
+            for symbol in self.book.apply_snapshot(session.pubkey, positions):
+                self._note_contradiction(session, symbol, listed.get(symbol, 0.0))
 
         return handler
+
+    def _note_contradiction(self, session: AccountSession, symbol: str, size: float) -> None:
+        """A streamed position disagreed with the fills held for it.
+
+        Nothing is decided here: the book kept the fills and asked for a
+        confirming read (`PositionBook.apply_stream_position`), which the
+        reconcile loop sends. This only says so -- every time, at INFO, since
+        how often it happens is exactly what is not known yet.
+        """
+        self._contradicted_positions += 1
+        log.info(
+            "%s: the stream says %s %+.8f, which none of the fills since the "
+            "last position adds up to -- keeping the fills (%+.8f) until a "
+            "read confirms",
+            session.name, symbol, size, self.book.effective(session.pubkey, symbol),
+        )
 
     # -- workers -----------------------------------------------------------
 
@@ -3441,6 +3466,11 @@ class Strategy:
         be the final figure -- not one taken minutes before the last group
         closed.
         """
+        if self._contradicted_positions:
+            log.info(
+                "%d streamed position(s) contradicted their fills this run and "
+                "were left to a read", self._contradicted_positions,
+            )
         if not self.config.target.measures_fills:
             return
         await self._refresh_totals()
