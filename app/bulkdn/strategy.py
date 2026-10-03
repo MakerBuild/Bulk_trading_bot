@@ -31,7 +31,7 @@ import time
 
 from bulk_api.common import Side, Topic
 
-from .accounts import AccountSession
+from .accounts import AccountSession, SharedReconnect
 from .chaser import ChaseParams, Chaser
 from .config import Config
 from .feed import MarketFeed
@@ -109,21 +109,26 @@ HEDGE_COALESCE_S = 0.1
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
 
-# How many times in a row the supervisor will try to heal before halting.
+# Drops that land while another socket is being repaired are one incident, and
+# only the first of them spends the budget above -- as does a socket dropping
+# AGAIN inside the incident, which is flapping.
 #
-# One pass was not enough, and a live log showed why: sub1's socket closed,
-# the heal began, and nine seconds into its reconnect the master's socket
-# closed too. The pass had already looked at the master and found it
-# healthy, so it finished, the re-check found the master down, and the run
-# halted on a drop that had never been offered a retry.
-#
-# That is not a rare shape. One flaky link carries both sockets, so the
-# second drop lands DURING the first repair more often than not.
-#
-# Bounded rather than a loop: a pass that restores nothing ends it, and the
-# reconnect budget over RECONNECT_WINDOW_S still governs a socket that
-# flaps. This only covers drops arriving inside one repair.
-MAX_HEAL_PASSES = 3
+# A live log showed why: sub1's socket closed, the heal began, and nine seconds
+# into its reconnect the master's socket closed too. One flaky link carries
+# both sockets, so the second drop lands during the first repair more often
+# than not, and charging it would turn one bad minute into two incidents. A
+# drop this soon after the last repair ended counts as part of it too: a
+# second socket noticed a tick after the first came back is the same outage.
+HEAL_INCIDENT_GRACE_S = 10.0
+
+# How often a leg paused for its socket tries again to pull an order the first
+# cancel could not. See `_paused_for_its_sockets`.
+PAUSED_CANCEL_RETRY_S = 5.0
+
+# The violations a reconnect can fix. Every other one -- exposure over the
+# cap, a position too large, a streak of rejections -- says the strategy itself
+# is misbehaving, and halts at once.
+SOCKET_FAULTS = ("disconnected", "stale_stream")
 
 # How long a position read stays good enough to share. Three callers now want
 # one -- the supervisor and each leg confirming a phase -- and a live run showed
@@ -298,6 +303,16 @@ class Strategy:
         # When each recent reconnect happened. Older entries fall out of the
         # window on their own, so a drop an hour ago says nothing about this one.
         self._reconnect_times: list[float] = []
+        # Reconnects under way, one per socket, by `id(client)`. See
+        # `_start_heals`.
+        self._heals: dict[int, asyncio.Task] = {}
+        # The sockets healed in the current incident, and when the last heal
+        # of it ended. See `_charge_reconnect`.
+        self._incident: set[int] = set()
+        self._incident_ended_at = NEVER
+        # Legs holding off for a socket, and when each last sent a cancel.
+        # See `_paused_for_its_sockets`.
+        self._paused_legs: dict[str, float] = {}
         self._sync_lock = asyncio.Lock()
         self._synced_at = NEVER
         # How many fills arrived that could not be attributed to an account.
@@ -1453,59 +1468,80 @@ class Strategy:
 
         await asyncio.gather(*(pull(session, leg) for session, leg in in_path))
 
-    async def _paused_for_a_lagging_socket(self, key: str, roles: LegRoles, leg) -> bool:
-        """Hold a leg with an account on a socket that has fallen behind.
+    def _socket_trouble(self, session: AccountSession) -> str:
+        """What is wrong with this session's socket, or "" for nothing."""
+        if self._socket_down(session):
+            return "down"
+        if self._stream_lagging(session):
+            return "behind"
+        return ""
+
+    async def _paused_for_its_sockets(self, key: str, roles: LegRoles, leg) -> bool:
+        """Hold a leg with an account on a socket that is down or behind.
 
         Its maker order cannot be managed -- every replace and cancel on a
-        stalled socket times out -- and its fills cannot be hedged on time:
-        on a live run the chaser kept placing on a stalled maker for two
-        minutes ("could not clear a possibly-resting order ... the leg may
-        open larger than its size") while that group's hedges timed out one
-        after another. Opening more of a position that cannot be managed is
-        the wrong trade at any price.
+        stalled socket times out, and a dropped one refuses them -- and its
+        fills cannot be hedged on time, or at all: on a live run the chaser
+        kept placing on a stalled maker for two minutes ("could not clear a
+        possibly-resting order ... the leg may open larger than its size")
+        while that group's hedges timed out one after another. A socket that
+        has dropped is worse again: nothing that fills on it is announced, and
+        it is found only by the next position read. Opening more of a position
+        that cannot be managed is the wrong trade at any price.
 
         So the leg's resting order is pulled -- cancel-all, which goes over
-        HTTP when the socket cannot carry it -- and nothing is placed until
-        the socket has kept up for `STREAM_LAG_HOLD_S`. Hedging is not paused:
-        what is already open still has to be covered. An order the cancel
-        could not pull stays tracked as the leg's own.
+        HTTP when the socket cannot carry it -- and nothing is placed until the
+        socket is back and, if it was behind, has kept up for
+        `STREAM_LAG_HOLD_S`. Hedging is not paused: what is already open still
+        has to be covered. An order the cancel could not pull stays tracked as
+        the leg's own, and the cancel is tried again every
+        `PAUSED_CANCEL_RETRY_S` for as long as the pause lasts.
         """
-        lagging = [
-            self.sessions[p] for p in roles.accounts
-            if p in self.sessions and self._stream_lagging(self.sessions[p])
+        troubled = [
+            (session, trouble)
+            for pubkey in roles.accounts
+            if (session := self.sessions.get(pubkey)) is not None
+            and (trouble := self._socket_trouble(session))
         ]
-        paused = self.__dict__.setdefault("_paused_legs", set())
-        if not lagging:
+        paused = self._paused_legs
+        if not troubled:
             if key in paused:
-                paused.discard(key)
-                log.info("%s: its sockets have caught up -- resuming", key)
+                del paused[key]
+                log.info("%s: its sockets are back and keeping up -- resuming", key)
             return False
-        if key not in paused:
-            paused.add(key)
+        now = time.monotonic()
+        last_cancel = paused.get(key)
+        if last_cancel is None:
+            session, trouble = troubled[0]
             log.warning(
-                "%s: pausing its orders while %s's socket is behind",
-                key, lagging[0].name,
+                "%s: pausing its orders while %s's socket is %s",
+                key, session.name, trouble,
             )
-            maker = self.sessions.get(roles.maker)
-            if maker is not None:
-                # Taken before the await, for the reason `_clear_own_orders`
-                # gives: a hedge clearing its path can change it meanwhile.
-                oid = leg.oid
-                try:
-                    await maker.cancel_all([roles.symbol])
-                except Exception as exc:  # noqa: BLE001 - the order stays tracked
-                    # Kept, not cleared. It was dropped on the claim that the
-                    # orphan sweep would retry, but that sweep runs only for a
-                    # symbol an unanswered submission left in doubt. Tracked,
-                    # the order is still pulled by a hedge sweeping its side,
-                    # and replaced or pulled by the chaser when the leg resumes.
-                    log.error(
-                        "%s: could not pull its order: %s -- still tracking it",
-                        key, describe(exc),
-                    )
-                else:
-                    if leg.oid == oid:
-                        leg.oid = None
+        elif not leg.oid or now - last_cancel < PAUSED_CANCEL_RETRY_S:
+            return True
+        paused[key] = now
+        maker = self.sessions.get(roles.maker)
+        if maker is not None:
+            # Taken before the await, for the reason `_clear_own_orders`
+            # gives: a hedge clearing its path can change it meanwhile.
+            oid = leg.oid
+            try:
+                await maker.cancel_all([roles.symbol])
+            except Exception as exc:  # noqa: BLE001 - the order stays tracked
+                # Kept, not cleared. It was dropped on the claim that the
+                # orphan sweep would retry, but that sweep runs only for a
+                # symbol an unanswered submission left in doubt. Tracked, the
+                # order is pulled again from here, by a hedge sweeping its
+                # side, and replaced or pulled by the chaser when the leg
+                # resumes.
+                log.error(
+                    "%s: could not pull its order: %s -- still tracking it, "
+                    "and trying again in %.0fs",
+                    key, describe(exc), PAUSED_CANCEL_RETRY_S,
+                )
+            else:
+                if leg.oid == oid:
+                    leg.oid = None
         return True
 
     def _note_fill_delay(self, session: AccountSession, fill) -> None:
@@ -1890,198 +1926,294 @@ class Strategy:
 
     # -- connection recovery -----------------------------------------------
 
-    async def _healed(self, violations, *, same_incident: bool = False) -> bool:
-        """Try to reconnect a dropped socket. True if anything was restored.
+    def _watched_sessions(self) -> list[AccountSession]:
+        """Every session whose socket must stay up: the accounts', and the
+        market data one, which carries no account but every price."""
+        return [*self.all_sessions, *getattr(self.risk, "watch", ())]
+
+    def _socket_down(self, session: AccountSession) -> bool:
+        """Whether this session's socket is down, or being reconnected.
+
+        Being reconnected counts: a heal begins by closing the socket, and a
+        socket that read as connected while delivering nothing -- the stale
+        case -- is no better while the heal is deciding that.
+        """
+        if session.dry_run:
+            return False
+        heal = self._heals.get(id(session.client))
+        return not session.is_connected or (heal is not None and not heal.done())
+
+    def _start_heals(self) -> None:
+        """Start reconnecting every socket that is down or silent, one task each.
 
         A dropped socket was treated as fatal, which made a cycle only as long
         as the exchange's least reliable minute -- two live runs ended this way
         mid-cycle, having done nothing wrong. It is a transient condition and
         deserves a retry before the kill switch.
 
-        `disconnected` and `stale_stream` are both retried; every other
-        violation -- exposure over the cap, a position too large, a streak of
-        rejections -- says the strategy itself is misbehaving, and reconnecting
-        would not address any of them.
+        Silence counts as well as a drop. A socket whose peer vanished without
+        a close frame still reads as connected, so the silence is all there is
+        to go on -- and the watchdog fires at `ws_stale_timeout_s` (30s by
+        default) while the library's own keepalive needs `ping_interval +
+        ping_timeout` (80s) to notice. That used to halt outright, killing runs
+        over a condition a reconnect fixes in two seconds.
 
-        `stale_stream` used to halt outright, and that was the more damaging of
-        the two. A socket whose peer vanished without a close frame still reads
-        as connected, so the silence is all there is to go on -- and the
-        watchdog fires at `ws_stale_timeout_s` (30s by default) while the
-        library's own keepalive needs `ping_interval + ping_timeout` (80s) to
-        notice. The stale check therefore always won, and a condition a
-        reconnect fixes in two seconds was killing runs instead.
+        In tasks of their own, not in the supervisor's loop. The supervisor
+        used to await the heal, and one reconnect can take minutes (see
+        `AccountSession.reconnect`): for all of that time the risk limits, the
+        liquidation guard and the reconciler stopped, while makers on the
+        dropped socket rested on and could fill with no fill event to say so.
+        Now the supervisor keeps ticking, the legs on a socket being healed are
+        paused and their orders pulled over HTTP (`_paused_for_its_sockets`),
+        and the run halts only when a heal gives up.
 
-        Halting is still the outcome when the retry fails: an unattended bot
-        that cannot see its fills must not keep resting orders on the book.
-
-        And it is the outcome for a socket that keeps flapping. Healing without
-        a limit would reconnect forever: no rejection is recorded, so the reject
-        streak never trips, and the cycle would never finish while the log
-        scrolled past unread. The pair stays hedged throughout -- the reconciler
-        works over HTTP -- so this is about not hiding a persistent fault, not
-        about exposure.
-
-        "Keeps flapping" is measured over `RECONNECT_WINDOW_S`, so a socket that
-        blips once an hour is forgiven each time and one that blips five times in
-        ten minutes is not.
-
-        `same_incident` is set by the supervisor when it calls again to catch a
-        socket that dropped DURING the previous repair. Those passes do not
-        spend the flap budget: they are one incident being repaired in stages,
-        and charging each stage would turn a single bad minute into five and
-        halt the run for flapping it never did.
+        One task per socket: every session on it shares one client, and
+        `reconnect_client` would make them share one set of attempts anyway.
         """
-        RECOVERABLE = ("disconnected", "stale_stream")
-        dropped = [v for v in violations if v.kind in RECOVERABLE]
-        if not dropped or len(dropped) != len(violations):
-            return False
-
-        now = time.monotonic()
-        self._reconnect_times = [
-            t for t in self._reconnect_times if now - t < RECONNECT_WINDOW_S
-        ]
-        if same_incident:
-            # Already charged for. The budget still governs: this pass only
-            # exists because the previous one was allowed.
-            pass
-        elif len(self._reconnect_times) >= MAX_RECONNECTS:
-            log.error(
-                "the socket has dropped %d times in the last %g minutes -- "
-                "not reconnecting again",
-                len(self._reconnect_times),
-                RECONNECT_WINDOW_S / 60,
-            )
-            return False
-        if not same_incident:
-            self._reconnect_times.append(now)
-
-        restored = False
-        failed = []
         stale_after = self.risk.config.ws_stale_timeout_s
-        # The market data socket too: it carries no account, but a book that
-        # has stopped arriving is a book every order is priced from.
-        watched = [*self.all_sessions, *getattr(self.risk, "watch", ())]
-        for session in watched:
+        for session in self._watched_sessions():
             if session.dry_run:
+                continue
+            socket = id(session.client)
+            heal = self._heals.get(socket)
+            if heal is not None and not heal.done():
                 continue
             # `is_connected` alone is not enough: a half-open socket reports
             # connected and delivers nothing, which is the case this exists for.
-            silent_for = session.last_message_age_s
-            if session.is_connected and silent_for <= stale_after:
+            if session.is_connected and session.last_message_age_s <= stale_after:
                 continue
+            # Charged here, as each task is created, and not inside it: two
+            # sockets found down in one pass both start before either task
+            # runs, and each would see the other under way and call itself the
+            # second drop of somebody else's incident.
+            refused = self._charge_reconnect(socket)
+            if refused:
+                log.error("%s: %s", session.name, refused)
+                self._trigger_halt(f"disconnected: {session.name} -- {refused}")
+                return
+            self._heals[socket] = asyncio.create_task(self._heal(session))
+
+    async def _heal(self, session: AccountSession) -> None:
+        """Reconnect one socket, or halt the run when that cannot be done.
+
+        Halting is still the outcome when the reconnect fails: an unattended
+        bot that cannot see its fills must not keep trading on the accounts it
+        cannot see. (A socket that keeps flapping halts before this starts --
+        see `_charge_reconnect`.)
+        """
+        client = session.client
+        restored = False
+        try:
             if session.is_connected:
                 log.warning(
                     "%s: WebSocket has delivered nothing for %.0fs but still "
-                    "reads as connected -- reconnecting",
-                    session.name, silent_for,
+                    "reads as connected -- reconnecting; its legs are paused "
+                    "meanwhile",
+                    session.name, session.last_message_age_s,
                 )
             else:
-                log.warning("%s: WebSocket dropped -- trying to reconnect", session.name)
-            if await session.reconnect():
-                restored = True
-            else:
-                failed.append(session)
-                log.error("%s: could not reconnect", session.name)
-
-        # The sessions are tried one after another, so an outage that ends
-        # midway leaves the earlier one having spent its attempts against a
-        # network that was still down. One socket coming back is proof the
-        # network did, so anything that failed before that gets another go --
-        # free, because the budget is charged per heal, not per attempt.
-        #
-        # This is what a DNS outage did: the master used its three attempts
-        # between 15:09:30 and 15:09:35 and lost all of them, sub1 succeeded at
-        # 15:09:42, and the halt fired a second later on a master that nobody
-        # had tried again.
-        if restored and failed:
-            for session in failed:
+                log.warning(
+                    "%s: WebSocket dropped -- trying to reconnect; its legs are "
+                    "paused meanwhile",
+                    session.name,
+                )
+            began = SharedReconnect.generation
+            restored = await session.reconnect()
+            if not restored and await self._network_came_back(client, began):
                 log.warning(
                     "%s: another socket is back, so the network is -- retrying",
                     session.name,
                 )
-                if await session.reconnect():
-                    restored = True
-
-        if restored:
-            # The socket missed whatever happened while it was down, so the
-            # next decision must be made on exchange truth rather than on a
-            # book that stopped being updated. Read over HTTP, which did not
-            # drop, rather than waiting for the stream to refill the book.
-            #
-            # Guarded, and off the event loop. This ran bare and synchronous
-            # inside the supervisor: one failed read -- a 429 or a 504, likely
-            # exactly when sockets are dropping -- raised out of `_supervise`
-            # and ended it, taking the exposure limits, the liquidation guard
-            # and the reconciler with it while the groups traded on. And on
-            # the loop it stalled every socket for a request per account.
-            try:
-                await self._sync_positions(max_age_s=0.0)
-            except Exception as exc:  # noqa: BLE001 - the book stays suspect
-                log.error(
-                    "could not re-read positions after reconnecting: %s -- "
-                    "holding hedges until a read succeeds",
-                    describe(exc),
+                restored = await session.reconnect()
+            if not restored:
+                log.error("%s: could not reconnect", session.name)
+                self._trigger_halt(
+                    f"disconnected: {session.name} WebSocket could not be reconnected"
                 )
-                self._mark_book_suspect()
-        return restored
+                return
+            await self._read_after_reconnect(session)
+        except Exception as exc:  # noqa: BLE001 - a task nobody awaits must say so
+            log.critical("the reconnect of %s failed: %s", session.name, describe(exc))
+            self._trigger_halt(f"the reconnect of {session.name} failed: {describe(exc)}")
+        finally:
+            self._incident_ended_at = time.monotonic()
+        if restored:
+            # Hedged against what the read found, at once rather than on the
+            # next reconcile tick: anything that filled before the paused
+            # makers' orders came off was booked by the read and nothing else.
+            for key, group in list(self._groups.items()):
+                if any(
+                    (other := self.sessions.get(p)) is not None and other.client is client
+                    for p in group.accounts
+                ):
+                    self._hedge_queue.put_nowait(key)
 
-    # -- phase driver ------------------------------------------------------
+    def _charge_reconnect(self, socket: int) -> str | None:
+        """Spend the reconnect budget on this heal, or say why it is refused.
+
+        Healing without a limit would reconnect forever: no rejection is
+        recorded, so the reject streak never trips, and the cycle would never
+        finish while the log scrolled past unread. "Keeps flapping" is measured
+        over `RECONNECT_WINDOW_S`, so a socket that blips once an hour is
+        forgiven each time and one that blips five times in ten minutes is not.
+
+        One incident is charged once (see `HEAL_INCIDENT_GRACE_S`): a second
+        socket dropping while the first is being repaired is the same outage
+        seen twice. The same socket dropping again inside it is not, and pays.
+        """
+        now = time.monotonic()
+        self._reconnect_times = [
+            t for t in self._reconnect_times if now - t < RECONNECT_WINDOW_S
+        ]
+        ongoing = now - self._incident_ended_at < HEAL_INCIDENT_GRACE_S or any(
+            not heal.done() for other, heal in self._heals.items() if other != socket
+        )
+        if not ongoing:
+            self._incident = set()
+        again = socket in self._incident
+        self._incident.add(socket)
+        if ongoing and not again:
+            return None
+        if len(self._reconnect_times) >= MAX_RECONNECTS:
+            return (
+                f"the sockets have dropped {len(self._reconnect_times)} times in "
+                f"the last {RECONNECT_WINDOW_S / 60:g} minutes -- not reconnecting again"
+            )
+        self._reconnect_times.append(now)
+        return None
+
+    async def _network_came_back(self, client, began: int) -> bool:
+        """After a failed reconnect: did any socket come back meanwhile?
+
+        Waits first for every other socket's attempts still under way. The
+        sockets are tried at the same time, so an outage that ends midway
+        leaves one having spent its attempts against a network that was still
+        down while another, timed differently, gets through. One socket coming
+        back is proof the network did, and the one that failed gets another go
+        -- free, because the budget is charged per heal, not per attempt.
+
+        This is what a DNS outage did: the master used its attempts between
+        15:09:30 and 15:09:35 and lost all of them, sub1 succeeded at 15:09:42,
+        and the halt fired a second later on a master that nobody had tried
+        again.
+
+        Waits on the attempts themselves, not on the other heals: a heal that
+        failed waits here too, and two of them waiting on each other would
+        wait for ever.
+        """
+        attempts = {
+            id(other.client): other.client.reconnect_share.task
+            for other in self._watched_sessions()
+            if other.client is not client
+            and other.client.reconnect_share.task is not None
+            and not other.client.reconnect_share.task.done()
+        }
+        if attempts:
+            await asyncio.wait(list(attempts.values()))
+        return SharedReconnect.generation != began
+
+    async def _read_after_reconnect(self, session: AccountSession) -> None:
+        """Re-read positions after a socket came back.
+
+        The socket missed whatever happened while it was down, so the next
+        decision must be made on exchange truth rather than on a book that
+        stopped being updated. Read over HTTP, which did not drop, rather than
+        waiting for the stream to refill the book.
+
+        Guarded, and off the event loop. This ran bare and synchronous inside
+        the supervisor once: one failed read -- a 429 or a 504, likely exactly
+        when sockets are dropping -- raised out of `_supervise` and ended it,
+        taking the exposure limits, the liquidation guard and the reconciler
+        with it while the groups traded on.
+        """
+        try:
+            await self._sync_positions(max_age_s=0.0)
+        except Exception as exc:  # noqa: BLE001 - the book stays suspect
+            log.error(
+                "%s: could not re-read positions after reconnecting: %s -- "
+                "holding hedges until a read succeeds",
+                session.name, describe(exc),
+            )
+            self._mark_book_suspect()
 
     # -- supervisor --------------------------------------------------------
 
     async def _supervise(self) -> None:
-        """Safety and reconciliation for the pair, while the legs run themselves.
+        """The run's safety checks, while the legs run themselves.
 
-        One loop, not one per leg: the risk limits are about the pair, the
-        position read is a single pair of HTTP calls, and running either twice
-        as often would buy nothing.
+        One loop, not one per leg: the risk limits are about the pool, and
+        checking them twice as often would buy nothing. It does only what is
+        cheap and must be prompt -- the limits, and noticing a socket that is
+        down -- every `chase_interval_s`. The position reads, the liquidation
+        guard and the reconciler, which wait on the exchange, run beside it in
+        `_reconcile_loop`; inline, a read of a large pool held up the next risk
+        check by as long as it took.
+
+        A violation a reconnect can fix starts a heal and does not halt; every
+        other one halts at once, mixed with a drop or not -- otherwise a
+        blinking socket would keep clearing a genuine violation.
         """
-        last_reconcile = NEVER
+        reconciler = asyncio.create_task(self._reconcile_loop())
+        try:
+            while not self._stop.is_set():
+                if reconciler.done():
+                    # Its exception, if it died, ends this task with it, and
+                    # `_until_legs_finish` reports it. Returning on its own is
+                    # only allowed once the run is stopping.
+                    reconciler.result()
+                    if not self._stop.is_set():
+                        raise RuntimeError("the reconciler stopped on its own")
+                    return
+                violations = self.risk.check()
+                if any(v.kind not in SOCKET_FAULTS for v in violations):
+                    self._trigger_halt("; ".join(str(v) for v in violations))
+                    return
+                if violations:
+                    self._start_heals()
+                await asyncio.sleep(self.config.chase_interval_s)
+        finally:
+            if not reconciler.done():
+                reconciler.cancel()
+            await asyncio.gather(reconciler, return_exceptions=True)
+
+    async def _reconcile_loop(self) -> None:
+        """Positions, the liquidation guard and the reconciler, on their own clock.
+
+        Over HTTP throughout, so it carries on while a socket is down: legs on
+        it are paused and their orders pulled, positions are read over HTTP,
+        and every leg is hedged against them -- a leg whose hedger is on the
+        dead socket once that socket is back.
+        """
         last_sync = NEVER
         while not self._stop.is_set():
-            violations = self.risk.check()
-            for pass_number in range(MAX_HEAL_PASSES):
-                if not violations:
-                    break
-                if not await self._healed(violations, same_incident=pass_number > 0):
-                    break
-                violations = self.risk.check()
-            if violations:
-                self._trigger_halt("; ".join(str(v) for v in violations))
+            now = time.monotonic()
+            # Re-read positions from the exchange before correcting against
+            # them. The in-memory book is fed by position updates, and the
+            # optimistic fill overlay expires -- so if those updates stall,
+            # the book decays toward zero and would otherwise make the bot
+            # believe it is flat while real positions are still open.
+            reason = self._sync_reason(now, last_sync)
+            if reason:
+                last_sync = now
+                try:
+                    await self._sync_positions()
+                except Exception as exc:  # noqa: BLE001 - retried next tick
+                    log.error("position sync failed: %s", describe(exc))
+
+            # Before hedging, not after. If a position was liquidated, the
+            # hedge rule's answer is to open a fresh one on the account that
+            # still holds something -- exactly the wrong response.
+            if await self._guard_liquidation(self._phases_by_account()):
+                return
+            if self._hedging_suspended:
                 return
 
-            now = time.monotonic()
-            if now - last_reconcile >= self.config.reconcile_interval_s:
-                last_reconcile = now
-                # Re-read positions from the exchange before correcting against
-                # them. The in-memory book is fed by position updates, and the
-                # optimistic fill overlay expires -- so if those updates stall,
-                # the book decays toward zero and would otherwise make the bot
-                # believe it is flat while real positions are still open.
-                reason = self._sync_reason(now, last_sync)
-                if reason:
-                    last_sync = now
-                    try:
-                        await self._sync_positions()
-                    except Exception as exc:  # noqa: BLE001 - retried next tick
-                        log.error("position sync failed: %s", describe(exc))
-
-                # Before hedging, not after. If a position was liquidated, the
-                # hedge rule's answer is to open a fresh one on the account that
-                # still holds something -- exactly the wrong response.
-                if await self._guard_liquidation(self._phases_by_account()):
-                    return
-                if self._hedging_suspended:
-                    return
-
-                # The same rule the worker keeps: no hedge off a book known to
-                # be behind. The reconciler ignored it, so after a failed
-                # re-read -- logged as "holding hedges" -- it went on hedging
-                # every five seconds off the very book that had just been
-                # declared stale.
-                if self._book_suspect and not await self._refreshed():
-                    continue
-
+            # The same rule the worker keeps: no hedge off a book known to
+            # be behind. The reconciler ignored it, so after a failed
+            # re-read -- logged as "holding hedges" -- it went on hedging
+            # every five seconds off the very book that had just been
+            # declared stale.
+            if not self._book_suspect or await self._refreshed():
                 try:
                     await self._reconcile_live_legs()
                 except HedgeLimitExceeded as exc:
@@ -2093,7 +2225,7 @@ class Strategy:
                 self.risk.log_exposure()
                 self._log_untradeable_residuals()
 
-            await asyncio.sleep(self.config.chase_interval_s)
+            await asyncio.sleep(self.config.reconcile_interval_s)
 
     async def _reconcile_live_legs(self) -> None:
         """Re-run the hedge rule on every live leg, as `reconcile_net` does.
@@ -2266,7 +2398,7 @@ class Strategy:
                     # here lands in its path; the next tick re-places it.
                     await asyncio.sleep(self.config.chase_interval_s)
                     continue
-                if await self._paused_for_a_lagging_socket(key, roles, leg):
+                if await self._paused_for_its_sockets(key, roles, leg):
                     await asyncio.sleep(self.config.chase_interval_s)
                     continue
                 try:
@@ -3400,6 +3532,10 @@ class Strategy:
             doubt_task = getattr(self, "_doubt_task", None)
             if doubt_task is not None:
                 doubt_task.cancel()
+            # A reconnect has nothing left to serve, and one that ran on would
+            # reopen a socket after the run ended.
+            for heal in self._heals.values():
+                heal.cancel()
             # The block stops being redrawn here, so whatever is under the
             # cursor is what the operator is left looking at.
             from .screen import SCREEN

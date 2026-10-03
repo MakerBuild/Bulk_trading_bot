@@ -14,7 +14,8 @@ import asyncio
 
 import pytest
 
-from bulkdn.strategy import NEVER, POSITION_FRESHNESS_S, Strategy
+from bulkdn.strategy import NEVER, POSITION_FRESHNESS_S
+from strategy_double import bare_strategy
 
 
 class Recorder:
@@ -39,7 +40,7 @@ async def strategy(monkeypatch):
     """
     from bulkdn import strategy as module
 
-    s = Strategy.__new__(Strategy)
+    s = bare_strategy()
     s.sessions = {}
     s.book = object()
     s._sync_lock = asyncio.Lock()

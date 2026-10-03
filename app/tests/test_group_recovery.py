@@ -17,14 +17,14 @@ from bulkdn.marketdata import MarketSpec
 from bulkdn.pairing import Group, Pairing
 from bulkdn.positions import PositionBook
 from bulkdn.state import Phase, StateStore, StrategyState
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 GROUP = Group(BTC, maker="opener", takers=("t1", "t2"), shares=(0.6, 0.4))
 
 
 def strategy(tmp_path, accounts=("opener", "t1", "t2", "spare")):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._groups = {}
     obj._group_ids = {}
     obj.state = StrategyState()

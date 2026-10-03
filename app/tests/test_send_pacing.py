@@ -14,7 +14,7 @@ import pytest
 
 from bulkdn import accounts
 from bulkdn.accounts import SendPacer
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 
 # -- a chase re-price yields to a busy socket --------------------------------
@@ -118,7 +118,7 @@ def hedging(monkeypatch):
     import bulkdn.strategy as module
 
     monkeypatch.setattr(module, "HEDGE_COALESCE_S", 0.3)
-    s = Strategy.__new__(Strategy)
+    s = bare_strategy()
     s._closing_out = False
     s._halt_reason = None
     s._book_suspect = False

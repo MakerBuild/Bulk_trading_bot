@@ -16,7 +16,7 @@ import asyncio
 from bulkdn.config import Config, RiskConfig, _leg_from_dict
 from bulkdn.pairing import Group
 from bulkdn.state import StrategyState
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 
@@ -26,7 +26,7 @@ def leg(raw):
 
 
 def strategy(offset):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj.config = Config(
         markets=[leg({"offset_bps": offset, "max_distance_bps": 5.0})],
         risk=RiskConfig(),

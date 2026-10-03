@@ -13,6 +13,7 @@ import requests
 from requests.adapters import BaseAdapter
 
 from bulkdn import ratelimit
+from strategy_double import bare_strategy
 
 API = "https://api.example/api/v1"
 
@@ -162,11 +163,11 @@ def test_installing_twice_does_not_stack(exchange):
 async def test_a_failed_target_read_waits_before_the_next(monkeypatch):
     from bulkdn import strategy as module
     from bulkdn.state import StrategyState
-    from bulkdn.strategy import NEVER, Strategy
+    from bulkdn.strategy import NEVER
 
     clock = [1000.0]
     monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
-    s = Strategy.__new__(Strategy)
+    s = bare_strategy()
     s.config = type("C", (), {"target": type("T", (), {
         "measures_fills": True, "burn_usd": 0.0, "volume_usd": 100_000.0,
     })()})()

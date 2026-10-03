@@ -13,11 +13,11 @@ import types
 import pytest
 
 from bulkdn import strategy as strategy_mod
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 
 def bare():
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._stop = asyncio.Event()
     return obj
 

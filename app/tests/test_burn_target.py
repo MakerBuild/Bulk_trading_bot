@@ -26,6 +26,7 @@ from bulkdn.config import ConfigError, ExecutionTarget
 from bulkdn.fees import burned_usd
 from bulkdn.state import StrategyState
 from bulkdn.strategy import NEVER, Strategy
+from strategy_double import bare_strategy
 
 
 class FakeTotals:
@@ -420,9 +421,8 @@ async def test_the_reading_that_reaches_the_target_is_the_one_shown(totals):
 
 def _refreshing_strategy(read):
     from bulkdn.state import StrategyState
-    from bulkdn.strategy import Strategy
 
-    s = Strategy.__new__(Strategy)
+    s = bare_strategy()
     s.state = StrategyState()
     s._progress = None
     s._spread_cost = lambda totals: 0.0

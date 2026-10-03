@@ -16,6 +16,7 @@ from bulkdn.positions import READ_LAG_S, PositionBook
 from bulkdn.risk import RiskMonitor
 from bulkdn.config import RiskConfig
 from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 SOL = "SOL-USD"
@@ -164,7 +165,7 @@ def test_a_quiet_book_the_mark_agrees_with_is_kept():
 
 
 def _worker_strategy(legs):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._stop = asyncio.Event()
     obj._liquidation_seen = asyncio.Event()
     obj._hedge_queue = asyncio.Queue()
@@ -236,7 +237,7 @@ async def test_one_leg_is_never_hedged_twice_at_once():
 
 async def test_a_close_that_raises_still_halts():
     """A market with no spec was a KeyError that skipped the halt."""
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._halt_reason = None
     obj._stop = asyncio.Event()
     obj._closing_out = False
@@ -368,10 +369,19 @@ def test_a_read_sent_after_every_fill_is_simply_applied():
 
 def _lag_strategy():
     client_a, client_b = object(), object()
-    a1 = types.SimpleNamespace(name="a1", pubkey="a1", client=client_a)
-    a2 = types.SimpleNamespace(name="a2", pubkey="a2", client=client_a)
-    b1 = types.SimpleNamespace(name="b1", pubkey="b1", client=client_b)
-    obj = object.__new__(Strategy)
+    a1 = types.SimpleNamespace(
+        name="a1", pubkey="a1", client=client_a, dry_run=False, is_connected=True,
+        stream_lagging_until=0.0,
+    )
+    a2 = types.SimpleNamespace(
+        name="a2", pubkey="a2", client=client_a, dry_run=False, is_connected=True,
+        stream_lagging_until=0.0,
+    )
+    b1 = types.SimpleNamespace(
+        name="b1", pubkey="b1", client=client_b, dry_run=False, is_connected=True,
+        stream_lagging_until=0.0,
+    )
+    obj = bare_strategy()
     obj.sessions = {s.pubkey: s for s in (a1, a2, b1)}
     obj._groups = {}
     obj._stop = asyncio.Event()
@@ -515,11 +525,11 @@ async def test_a_leg_on_a_lagging_socket_pulls_its_order_and_waits():
     roles = LegRoles(symbol=BTC, maker="a1", taker="b1", maker_is_buy=True, reduce_only=False)
     leg = types.SimpleNamespace(oid="resting")
 
-    assert await obj._paused_for_a_lagging_socket("g1", roles, leg) is False
+    assert await obj._paused_for_its_sockets("g1", roles, leg) is False
 
     obj._note_stream_lag(b1, "test")  # the HEDGER's socket fell behind
-    assert await obj._paused_for_a_lagging_socket("g1", roles, leg) is True
+    assert await obj._paused_for_its_sockets("g1", roles, leg) is True
     assert pulled == [[BTC]] and leg.oid is None
 
     b1.stream_lagging_until = 0.0
-    assert await obj._paused_for_a_lagging_socket("g1", roles, leg) is False
+    assert await obj._paused_for_its_sockets("g1", roles, leg) is False

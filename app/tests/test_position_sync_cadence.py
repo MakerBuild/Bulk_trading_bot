@@ -18,7 +18,7 @@ import pytest
 
 from bulkdn.config import Config, LegConfig, RiskConfig
 from bulkdn.positions import PositionBook
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 QUIET = 30.0  # ws_stale_timeout_s; the trigger is half of it
 
@@ -30,7 +30,7 @@ class FakeSession:
 
 
 def strategy(ages, sync_interval=60.0):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj.book = PositionBook()
     obj.config = Config(
         markets=[

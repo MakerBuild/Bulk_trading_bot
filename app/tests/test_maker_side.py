@@ -20,6 +20,7 @@ import random
 from bulkdn.pairing import Group, Pairing
 from bulkdn.state import Phase, StrategyState
 from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 POOL = [f"acct{n}" for n in range(12)]
@@ -27,7 +28,7 @@ POOL = [f"acct{n}" for n in range(12)]
 
 def roles_for(group, phase):
     """The roles the strategy derives for a group sitting in `phase`."""
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._groups = {}
     obj.state = StrategyState()
     key = "g1:" + group.symbol

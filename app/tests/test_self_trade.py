@@ -27,7 +27,7 @@ import pytest
 
 from bulkdn.pairing import Group, Pairing
 from bulkdn.state import Phase, StrategyState
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 
@@ -73,7 +73,7 @@ class FakeChaser:
 
 
 def strategy(*, actionable=1.0):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj.state = StrategyState()
     obj._groups = {}
     obj.sessions = {}

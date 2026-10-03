@@ -17,13 +17,13 @@ import pytest
 from bulkdn.config import Config, ExecutionTarget, LegConfig, RiskConfig
 from bulkdn.pairing import Pairing
 from bulkdn.state import StateStore, StrategyState
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 
 
 def strategy(tmp_path, pool_size=8, max_groups=3, cycles_each=None, cycles=0):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj.config = Config(
         markets=[
             LegConfig(symbol=BTC, size=1.0, offset_bps=1.0, max_distance_bps=5.0),

@@ -15,14 +15,14 @@ import pytest
 from bulkdn.config import Config, LegConfig, RiskConfig
 from bulkdn.pairing import Group, Pairing
 from bulkdn.state import Phase, StateStore, StrategyState
-from bulkdn.strategy import Strategy
+from strategy_double import bare_strategy
 
 BTC = "BTC-USD"
 
 
 def strategy(tmp_path):
     """A Strategy with only the parts the group runner touches."""
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._groups = {}
     obj._group_ids = {}
     obj._stop = asyncio.Event()

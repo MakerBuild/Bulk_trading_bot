@@ -772,10 +772,12 @@ class AccountSession:
         and the run halted on an outage it had barely waited out -- cancelling
         its orders and leaving the operator to restart it by hand.
 
-        Patience is nearly free here and impatience is not. The pair stays
-        hedged while the socket is down -- the reconciler works over HTTP -- so
-        a minute of trying costs a minute of not trading, while giving up costs
-        a halt.
+        Patience is nearly free here and impatience is not. While the socket is
+        down the supervisor keeps running beside the reconnect: the legs with an
+        account on it are paused and their resting orders pulled over HTTP, so
+        nothing more fills there, and positions are read and hedged over HTTP
+        reads as before. So a minute of trying costs a minute of not trading on
+        those accounts, while giving up costs a halt.
 
         **The budget belongs to the socket, not to the session.** Every account
         under a key shares one client, and each of their sessions used to spend
@@ -1169,10 +1171,10 @@ class AccountSession:
         return self.http.get_open_orders(self.pubkey)
 
 
-# How long the outcome of one reconnect speaks for the socket. The supervisor
-# heals sessions one after another, so the siblings of a session that just
-# gave up ask about the same socket within milliseconds; ten seconds covers
-# that pass with room to spare and is well short of the next one.
+# How long the outcome of one reconnect speaks for the socket. Every session
+# on a socket asks about it within moments of the others -- the supervisor's
+# heal, a retry once another socket is back -- so ten seconds covers them with
+# room to spare and is well short of the next incident.
 RECONNECT_SHARE_S = 10.0
 
 

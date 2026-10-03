@@ -21,7 +21,7 @@ from bulkdn import strategy as strategy_mod  # noqa: E402
 from bulkdn.accounts import OrderRejected  # noqa: E402
 from bulkdn.reconcile import cancel_all_orders  # noqa: E402
 from bulkdn.state import Phase  # noqa: E402
-from bulkdn.strategy import Strategy  # noqa: E402
+from strategy_double import bare_strategy  # noqa: E402
 
 BTC = "BTC-USD"
 
@@ -181,7 +181,7 @@ async def test_an_emergency_stop_asks_again_after_the_flatten(tmp_path, monkeypa
 
 
 async def test_a_failed_run_names_the_accounts_it_could_not_cancel(monkeypatch, caplog):
-    obj = object.__new__(Strategy)
+    obj = bare_strategy()
     obj._stop = asyncio.Event()
     obj.config = types.SimpleNamespace(active_legs=[])
     obj.symbols = [BTC]
@@ -242,7 +242,7 @@ async def pause_with(tmp_path, cancel_answer):
         return []
 
     master.cancel_all = cancel_all
-    paused = await strategy._paused_for_a_lagging_socket(
+    paused = await strategy._paused_for_its_sockets(
         key, strategy._roles_for_key(key), leg
     )
     return paused, leg

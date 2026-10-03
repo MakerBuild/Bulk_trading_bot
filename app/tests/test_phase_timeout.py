@@ -22,6 +22,7 @@ from bulkdn import strategy as strategy_module
 from bulkdn.config import ConfigError
 from bulkdn.state import Phase
 from bulkdn.strategy import Strategy, phase_budget_s
+from strategy_double import bare_strategy
 
 
 @pytest.fixture
@@ -44,7 +45,11 @@ SYMBOL = "BTC-USD"
 def build(max_phase_minutes, phase=Phase.EXIT):
     from bulkdn.state import LegState, StrategyState
 
-    s = Strategy.__new__(Strategy)
+    s = bare_strategy()
+    # Building it read the clock. The phase is what starts at the first
+    # reading, so both fake clocks start over.
+    clock.readings = 0.0
+    group_clock.readings = 0.0
     s.config = type("C", (), {
         "max_phase_minutes": max_phase_minutes,
         "chase_interval_s": 0.01,
@@ -229,7 +234,7 @@ def build_group(phase, *, held, target=0.04, refuses=0):
     async def confirmed(is_done, label, key=None):
         return is_done()
 
-    s._paused_for_a_lagging_socket = not_paused
+    s._paused_for_its_sockets = not_paused
     s._confirm_done = confirmed
     s.feed = FakeFeed()
     s.chaser = FakeChaser()
