@@ -46,6 +46,7 @@ class FakeSession:
         self.reject_streak = 0
         self.is_connected = True
         self.last_message_age_s = 0.0
+        self.stream_lagging_until = 0.0
         self.handlers = {}
         self.orders = []
         # One account per socket here, so every update on it is this

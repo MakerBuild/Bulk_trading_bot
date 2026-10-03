@@ -136,10 +136,17 @@ A slice with **no answer** — a timeout, a dropped socket — may have executed
 re-hedges exposure that may already be covered (a live run sent three duplicate hedges
 that way), and letting it lapse after the usual `overlay_ttl_ms` does the same a little
 later. So it is held as a *doubtful* reservation (`InFlight.hold_in_doubt`, up to 30s) and
-`HedgeInDoubt` is raised. `_hedge_leg` then marks the book **suspect**: the worker and the
-reconciler both refuse to hedge until a fresh position read succeeds (`_refreshed`). That
+`HedgeInDoubt` is raised. `_hedge_leg` then marks the hedgers' socket as behind and reads
+that leg's accounts in the background (`_settle_doubt_soon`); nothing else waits on it. That
 read retires the doubtful reservation (`settle_doubtful`) — only a read that *began after*
 the slice was sent, because only that one reflects whatever the slice did.
+
+The same per-account doubt (`_mark_unread`) covers every other event the book did not see:
+an update on a shared socket that named no account, a socket that fell behind, one that
+dropped and came back. A leg with such an account is neither hedged nor traded — its maker's
+order is pulled — until a read *begun after* the event has succeeded for that account; legs on
+other sockets carry on. It was one flag for the whole book once, and while it stood the worker
+blocked on a full-pool read and every hedge in the pool waited, while every maker kept filling.
 
 ### Position reads
 
@@ -503,7 +510,7 @@ Any of these cancels all orders, flattens every account, records the halt, and s
 | `max_net_exposure_usd` | Uncorrected directional exposure — per market over all accounts, **and per group** over that group's accounts. Summed over everything, two groups on one market at +$300 and −$300 read $0 while each sat directional |
 | `max_position_usd` | Per-account, per-symbol notional ceiling |
 | `max_reject_streak` | Consecutive rejected transactions on one account |
-| `ws_stale_timeout_s` | No WebSocket traffic for this long, or a socket down (after up to 3 heal passes) |
+| `ws_stale_timeout_s` | No WebSocket traffic for this long, or a socket down, that a reconnect could not fix |
 | hedge ceiling | A single required hedge above 2× the leg size — means the book and reality have diverged |
 | `max_phase_minutes` | OPEN or EXIT running this long; HOLD is exempt |
 | liquidation guard | A position closed from outside — see below |
@@ -536,7 +543,21 @@ worker and pulled nothing: every other group's order stayed on the book with no 
 
 The risk supervisor and the hedge worker are **watched** (`_until_legs_finish`). If either dies,
 or returns without a stop having been asked for, the run fails with that as the reason, rather
-than trading on with no risk limits or no hedging.
+than trading on with no risk limits or no hedging. The supervisor in turn watches the
+reconciler (`_reconcile_loop`), which runs beside it so that its reads never delay a risk check.
+
+### A socket that drops
+
+The SDK does not reconnect by itself; the supervisor notices a socket down (or silent past
+`ws_stale_timeout_s`) on its next tick and starts a **heal task for that socket**
+(`_start_heals`). It does not wait for it: a reconnect can take minutes, and the risk limits,
+the liquidation guard and the reconciler keep running meanwhile. Every leg with an account on
+that socket is paused (`_paused_for_its_sockets`): its resting order is pulled over HTTP and
+nothing is placed until the socket is back and its accounts re-read. The run halts only when a
+heal gives up, or when sockets have dropped `MAX_RECONNECTS` times in `RECONNECT_WINDOW_S` —
+counted per incident, so two sockets dropping together are one. A leg whose hedger is on the
+dropped socket holds whatever filled before its order came off until that socket returns; the
+hedge then goes at once.
 
 ### Crash recovery
 

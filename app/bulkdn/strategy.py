@@ -319,10 +319,14 @@ class Strategy:
         # Counted rather than merely logged: if this is not zero at the end of
         # a run, the book was being rebuilt from HTTP rather than followed.
         self._unattributed_fills = 0
-        # Set when something happened that the book did not see. Cleared only
-        # by a successful read from the exchange, and no hedge is sent while
-        # it stands.
-        self._book_suspect = False
+        # Per account: when something last happened there that the book did
+        # not see -- an update that named no account, a socket that fell
+        # behind or came back -- and when the last successful read of it
+        # began. A leg with an account whose read is older than its doubt is
+        # neither hedged nor traded until a read catches up. See
+        # `_mark_unread`.
+        self._unread_since: dict[str, float] = {}
+        self._read_at: dict[str, float] = {}
         # The last execution-target answer, and when it was read.
         self._target_answer: tuple[float, str | None] = (NEVER, None)
         # The largest size each leg may be drawn at, captured after the
@@ -556,17 +560,18 @@ class Strategy:
                         session.name, len(session.client.accounts),
                     )
                 self._unattributed_fills += 1
-                # The book is now behind the exchange by an unknown amount, so
-                # it is marked rather than merely stale-dated. The worker will
-                # not hedge until it has been re-read.
+                # The book is now behind the exchange by an unknown amount for
+                # every account on this socket, so they are marked rather than
+                # merely stale-dated: no leg with one of them is hedged until
+                # a read has caught up.
                 #
-                # Marking it was not enough on its own the first time: this
-                # used to only reset the freshness clock, and the worker does
-                # not consult it -- it hedges straight off the queue. So the
-                # hedge ran six times against a book that never moved, each
-                # order making the imbalance it was trying to correct larger,
-                # until the ceiling stopped it $375 off-hedge.
-                self._mark_book_suspect()
+                # Marking was not enough on its own the first time: this used
+                # to only reset the freshness clock, and the worker does not
+                # consult it -- it hedges straight off the queue. So the hedge
+                # ran six times against a book that never moved, each order
+                # making the imbalance it was trying to correct larger, until
+                # the ceiling stopped it $375 off-hedge.
+                self._mark_unread(session, "a fill named no account")
                 self._hedge_queue.put_nowait(symbol)
                 return
 
@@ -966,7 +971,7 @@ class Strategy:
                 # replaces the position outright rather than adjusting it --
                 # so a guess here would overwrite the truth for two accounts
                 # out of three.
-                self._mark_book_suspect()
+                self._mark_unread(session, "a position update named no account")
                 return
             if self._stream_lagging(session):
                 # Behind by an unknown amount, so this is an OLD position, and
@@ -1003,7 +1008,7 @@ class Strategy:
                 # one account's to another does not merely add a wrong number:
                 # it declares the other account flat in every symbol the
                 # snapshot does not mention.
-                self._mark_book_suspect()
+                self._mark_unread(session, "a snapshot named no account")
                 return
             if self._stream_lagging(session):
                 return  # stale, for the reason in the position handler
@@ -1129,17 +1134,11 @@ class Strategy:
                     # close.
                     continue
 
-                if self._book_suspect and not await self._refreshed():
-                    # Reading failed, so the book is still wrong. Hedging off
-                    # it would size the order from a number we have just been
-                    # told not to trust -- and a hedge is a market order, so
-                    # the cost of being wrong is paid immediately and in full.
-                    continue
-
-                # Pruned here, after the read above and not before it. A task
-                # that finished during that await was still listed, so a
-                # signal for its leg went into `again` for a task that had
-                # already exited -- and was dropped.
+                # Nothing here waits on a read. A book behind the exchange is
+                # judged per leg, by `_hedge_leg`, which reads in the
+                # background and requeues: this loop used to force a full-pool
+                # read inline, and every group's hedges waited behind it --
+                # with no end at all while the read kept failing.
                 for done in [k for k, task in running.items() if task.done()]:
                     del running[done]
 
@@ -1176,8 +1175,6 @@ class Strategy:
         while True:
             again.discard(leg_key)
             if self._hedging_suspended:
-                return
-            if self._book_suspect and not await self._refreshed():
                 return
             roles = self._roles_for_key(leg_key)
             if roles is None:
@@ -1315,12 +1312,17 @@ class Strategy:
         try:
             # Before the market order, not after: our own remainder is
             # resting on exactly the side it is about to sweep.
-            if self._waiting_on_a_lagging_read(roles):
-                # One of this leg's sockets is behind, and no read has begun
-                # since it was noticed. The book for these accounts may count
-                # a fill twice or hold a stale position, and a hedge sized
-                # from it is a market order paid in full. The read is under
-                # way (`_note_stream_lag` started it) and requeues this leg.
+            if self._waiting_on_a_read(roles):
+                # Something happened on one of this leg's accounts that the
+                # book did not see -- its socket fell behind or came back, or
+                # sent an update that named no account -- and no read has
+                # caught up since. The book for these accounts may count a
+                # fill twice, miss one, or hold a stale position, and a hedge
+                # sized from it is a market order paid in full. A read of them
+                # runs in the background and requeues this leg; asked for
+                # again here, so one that failed is retried on the next signal
+                # or reconcile tick.
+                self._settle_doubt_soon(roles.key)
                 return HedgeResult(roles.symbol, 0.0, 0.0, False, "waiting for a read")
             await self._clear_hedge_path(roles)
             if self._hedging_suspended:
@@ -1474,6 +1476,8 @@ class Strategy:
             return "down"
         if self._stream_lagging(session):
             return "behind"
+        if self._waiting_for(session.pubkey):
+            return "waiting on a position read"
         return ""
 
     async def _paused_for_its_sockets(self, key: str, roles: LegRoles, leg) -> bool:
@@ -1578,10 +1582,7 @@ class Strategy:
         on untouched.
         """
         now = time.monotonic()
-        noticed = self.__dict__.setdefault("_lag_noticed_at", {})
-        client = id(session.client)
-        fresh = now >= getattr(session, "stream_lagging_until", 0.0)
-        noticed[client] = now
+        fresh = now >= session.stream_lagging_until
         for other in self.all_sessions:
             if other.client is session.client:
                 other.stream_lagging_until = now + STREAM_LAG_HOLD_S
@@ -1591,39 +1592,60 @@ class Strategy:
                 "accounts come from reads, not the stream, for %.0fs",
                 session.name, why, STREAM_LAG_HOLD_S,
             )
-        for key, group in list(getattr(self, "_groups", {}).items()):
-            if any(
-                self.sessions.get(p) is not None and self.sessions[p].client is session.client
-                for p in group.accounts
-            ):
-                self._settle_doubt_soon(key)
+        self._mark_unread(session)
 
     @staticmethod
     def _stream_lagging(session: AccountSession) -> bool:
-        return time.monotonic() < getattr(session, "stream_lagging_until", 0.0)
+        return time.monotonic() < session.stream_lagging_until
 
-    def _waiting_on_a_lagging_read(self, roles: LegRoles) -> bool:
-        """Whether this leg has an account on a socket noticed lagging since
-        the last read began."""
-        noticed = getattr(self, "_lag_noticed_at", {})
-        if not noticed:
-            return False
-        read_began = getattr(self, "_read_started_at", 0.0)
-        for pubkey in roles.accounts:
-            session = self.sessions.get(pubkey)
-            if session is None:
-                continue
-            if noticed.get(id(session.client), 0.0) > read_began:
-                return True
-        return False
+    def _mark_unread(self, session: AccountSession, why: str | None = None) -> None:
+        """The book is behind something on this session's socket, as of now.
+
+        Every account on the socket, because an update that named no account
+        could have been any of theirs, and a socket behind or dropped is behind
+        for all of them. Only those: this was one flag for the whole book once,
+        and while it stood every hedge in the pool waited -- the worker blocked
+        on a full-pool read, every hedge task and the reconciler declined --
+        while every group's makers went on resting and filling. With reads that
+        kept failing, the pool stayed unhedged with no end. Now the legs with
+        an account here wait for a read of them, which starts at once in the
+        background; every other leg trades and hedges on.
+
+        Their makers are paused meanwhile (`_paused_for_its_sockets`): a leg
+        that cannot be hedged must not keep filling.
+        """
+        now = time.monotonic()
+        affected = [other for other in self.all_sessions if other.client is session.client]
+        if why is not None and not any(self._waiting_for(other.pubkey) for other in affected):
+            log.warning(
+                "%s: %s -- re-reading its socket's positions before hedging "
+                "or trading its legs",
+                session.name, why,
+            )
+        for other in affected:
+            self._unread_since[other.pubkey] = now
+        mine = {other.pubkey for other in affected}
+        for key, group in list(self._groups.items()):
+            if mine.intersection(group.accounts):
+                self._settle_doubt_soon(key)
+
+    def _waiting_for(self, pubkey: str) -> bool:
+        """Whether this account has news no successful read has caught up with."""
+        return self._unread_since.get(pubkey, NEVER) > self._read_at.get(pubkey, NEVER)
+
+    def _waiting_on_a_read(self, roles: LegRoles) -> bool:
+        """Whether this leg has an account the book is known to be behind on."""
+        return any(self._waiting_for(pubkey) for pubkey in roles.accounts)
 
     def _settle_doubt_soon(self, key: str) -> None:
-        """Re-read positions in the background for a leg with an unanswered slice.
+        """Re-read a leg's accounts in the background, and hedge it after.
 
-        Nothing waits on it. The slice's reservation already stops the leg
-        being hedged twice; the read replaces that guess with the exchange's
-        answer sooner than `doubt_ttl_s` would, and the leg is then queued to
-        be re-evaluated against the settled book.
+        For a leg with an unanswered slice, or one the book is behind on (see
+        `_mark_unread`). Nothing waits on it. A slice's reservation already
+        stops the leg being hedged twice, and a leg the book is behind on is
+        not hedged at all meanwhile; the read replaces the guess with the
+        exchange's answer, and the leg is then queued to be re-evaluated
+        against the settled book.
         """
         keys = self.__dict__.setdefault("_doubt_keys", set())
         keys.add(key)
@@ -1638,52 +1660,30 @@ class Strategy:
         while keys and not self._stop.is_set():
             batch = set(keys)
             keys.clear()
+            # Those legs' accounts, not the pool: over a hundred accounts a
+            # full read is half a minute, and only these are in question.
+            wanted = {
+                pubkey
+                for key in batch
+                if (roles := self._roles_for_key(key)) is not None
+                for pubkey in roles.accounts
+            }
             try:
-                await self._sync_positions(max_age_s=0.0)
+                await self._sync_positions(
+                    max_age_s=0.0,
+                    sessions=[self.sessions[p] for p in sorted(wanted) if p in self.sessions],
+                )
             except Exception as exc:  # noqa: BLE001 - the reservation still holds
                 log.error(
-                    "could not re-read positions to settle an unanswered hedge "
-                    "on %s: %s -- it stays reserved until the read succeeds or "
-                    "the reservation lapses",
+                    "could not re-read positions for %s: %s -- an unanswered "
+                    "hedge stays reserved, and a leg the book is behind on is "
+                    "not hedged or traded, until a read succeeds; tried again "
+                    "on its next signal or reconcile tick",
                     ", ".join(sorted(batch)), describe(exc),
                 )
                 return
             for key in batch:
                 self._hedge_queue.put_nowait(key)
-
-    def _mark_book_suspect(self) -> None:
-        """The book is behind an event it did not see, as of now."""
-        self._book_suspect = True
-        self._suspect_since = time.monotonic()
-
-    async def _refreshed(self) -> bool:
-        """Re-read positions because the book is known to be behind.
-
-        Clears the suspicion only on success. The caller declines to hedge
-        while it stands, so a failure here costs a delayed hedge -- and the
-        pair stays hedged in the meantime, because what made the book
-        suspect was an event it did not see, not a position it does not have.
-
-        Only a read that BEGAN after the suspicion clears it. Two things
-        followed from not asking that. Every leg's hedge task, the worker and
-        the reconciler each forced a full-pool read of their own, queued one
-        behind another on the sync lock -- over a hundred accounts, half a
-        minute each. And a slice that timed out while a read was already under
-        way was cleared by that read, which could not have seen it.
-        """
-        suspect_since = getattr(self, "_suspect_since", 0.0)
-        if getattr(self, "_read_started_at", 0.0) > suspect_since:
-            self._book_suspect = False
-            return True
-        try:
-            await self._sync_positions(max_age_s=0.0)
-        except Exception as exc:  # noqa: BLE001 - retried on the next signal
-            log.error("could not re-read positions: %s", describe(exc))
-            return False
-        if getattr(self, "_read_started_at", 0.0) > getattr(self, "_suspect_since", 0.0):
-            self._book_suspect = False
-            return True
-        return False
 
     async def _cancel_resting(
         self, symbols, sessions=None, *, concurrently: bool = False
@@ -2126,15 +2126,18 @@ class Strategy:
         taking the exposure limits, the liquidation guard and the reconciler
         with it while the groups traded on.
         """
+        # Behind as of the drop, whether or not this read works: a read that
+        # fails leaves its legs waiting for one that does.
+        self._mark_unread(session)
+        mine = [other for other in self.all_sessions if other.client is session.client]
         try:
-            await self._sync_positions(max_age_s=0.0)
-        except Exception as exc:  # noqa: BLE001 - the book stays suspect
+            await self._sync_positions(max_age_s=0.0, sessions=mine)
+        except Exception as exc:  # noqa: BLE001 - its legs wait for a read
             log.error(
                 "%s: could not re-read positions after reconnecting: %s -- "
-                "holding hedges until a read succeeds",
+                "its legs are not hedged or traded until a read succeeds",
                 session.name, describe(exc),
             )
-            self._mark_book_suspect()
 
     # -- supervisor --------------------------------------------------------
 
@@ -2208,22 +2211,20 @@ class Strategy:
             if self._hedging_suspended:
                 return
 
-            # The same rule the worker keeps: no hedge off a book known to
-            # be behind. The reconciler ignored it, so after a failed
-            # re-read -- logged as "holding hedges" -- it went on hedging
-            # every five seconds off the very book that had just been
-            # declared stale.
-            if not self._book_suspect or await self._refreshed():
-                try:
-                    await self._reconcile_live_legs()
-                except HedgeLimitExceeded as exc:
-                    self._trigger_halt(f"hedge limit exceeded -- {exc}")
-                    return
-                except Exception as exc:  # noqa: BLE001 - retried next tick
-                    log.error("reconcile failed: %s", describe(exc))
+            # Through `_hedge_leg`, which keeps the worker's rule: no hedge
+            # for a leg the book is known to be behind on. The reconciler
+            # once ignored it, and after a failed re-read went on hedging
+            # every five seconds off the very book just declared stale.
+            try:
+                await self._reconcile_live_legs()
+            except HedgeLimitExceeded as exc:
+                self._trigger_halt(f"hedge limit exceeded -- {exc}")
+                return
+            except Exception as exc:  # noqa: BLE001 - retried next tick
+                log.error("reconcile failed: %s", describe(exc))
 
-                self.risk.log_exposure()
-                self._log_untradeable_residuals()
+            self.risk.log_exposure()
+            self._log_untradeable_residuals()
 
             await asyncio.sleep(self.config.reconcile_interval_s)
 
@@ -2288,7 +2289,11 @@ class Strategy:
             return "periodic"
         return ""
 
-    async def _sync_positions(self, max_age_s: float = POSITION_FRESHNESS_S) -> None:
+    async def _sync_positions(
+        self,
+        max_age_s: float = POSITION_FRESHNESS_S,
+        sessions: list[AccountSession] | None = None,
+    ) -> None:
         """Read positions from the exchange, sharing one read between callers.
 
         The legs and the supervisor all want the same numbers, and they ask on
@@ -2296,28 +2301,42 @@ class Strategy:
         one's read rather than each issuing its own, which is what a live run
         showed happening: the same pair of account fetches three times over.
 
+        `sessions` narrows it to some accounts -- a leg confirming its phase,
+        a socket that came back. Every read goes through here, so each
+        account's `_read_at` says when the last read of it began, whoever
+        asked.
+
         Still the exchange's answer, not a guess -- only the request is shared.
         """
+        wanted = list(self.sessions.values()) if sessions is None else list(sessions)
         requested = time.monotonic()
         async with self._sync_lock:
-            if time.monotonic() - self._synced_at < max_age_s:
+            if sessions is None and time.monotonic() - self._synced_at < max_age_s:
                 return
-            if getattr(self, "_read_started_at", 0.0) >= requested:
+            if wanted and all(
+                self._read_at.get(s.pubkey, NEVER) >= requested for s in wanted
+            ):
                 # A read that began after this caller asked has just finished
                 # while it waited on the lock. It answers the question; a
                 # second one behind it would only repeat it.
                 return
             started = time.monotonic()
-            await sync_positions(self.sessions.values(), self.book)
-            self._synced_at = time.monotonic()
-            self._read_started_at = started
+            await sync_positions(wanted, self.book)
+            if sessions is None:
+                self._synced_at = time.monotonic()
+            for session in wanted:
+                self._read_at[session.pubkey] = started
             # A hedge slice that got no answer was held reserved because it
             # might have traded. This read began after it was sent, so the
             # book now says whether it did, and holding it any longer would
-            # count it twice.
-            in_flight = getattr(getattr(self, "hedger", None), "in_flight", None)
-            if in_flight is not None:
-                in_flight.settle_doubtful(started)
+            # count it twice -- for the legs whose accounts it read.
+            if self.hedger is not None:
+                read = {s.pubkey for s in wanted}
+                keys = None if sessions is None else [
+                    key for key, group in self._groups.items()
+                    if read.issuperset(group.accounts)
+                ]
+                self.hedger.in_flight.settle_doubtful(started, keys=keys)
 
     def _phases_by_account(self) -> dict[tuple[str, str], Phase]:
         """Each account's phase in each market it is trading.

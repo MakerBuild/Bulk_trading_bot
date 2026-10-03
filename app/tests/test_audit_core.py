@@ -410,13 +410,13 @@ def test_a_clock_offset_alone_is_not_lateness():
 
 def test_a_leg_on_a_lagging_socket_waits_for_a_read_begun_after():
     obj, a1, _a2, b1 = _lag_strategy()
-    obj._read_started_at = time.monotonic()
+    obj._read_at = {"a1": time.monotonic(), "b1": time.monotonic()}
     obj._note_stream_lag(a1, "test")
     on_a = LegRoles(symbol=BTC, maker="a1", taker="b1", maker_is_buy=True, reduce_only=False)
-    assert obj._waiting_on_a_lagging_read(on_a)
+    assert obj._waiting_on_a_read(on_a)
 
-    obj._read_started_at = time.monotonic() + 1
-    assert not obj._waiting_on_a_lagging_read(on_a)
+    obj._read_at["a1"] = time.monotonic() + 1
+    assert not obj._waiting_on_a_read(on_a)
 
 
 def test_a_forced_read_overrules_the_stream():
@@ -532,4 +532,8 @@ async def test_a_leg_on_a_lagging_socket_pulls_its_order_and_waits():
     assert pulled == [[BTC]] and leg.oid is None
 
     b1.stream_lagging_until = 0.0
+    # Caught up, but the book has not been re-read since it fell behind.
+    assert await obj._paused_for_its_sockets("g1", roles, leg) is True
+
+    obj._read_at["b1"] = time.monotonic() + 1
     assert await obj._paused_for_its_sockets("g1", roles, leg) is False

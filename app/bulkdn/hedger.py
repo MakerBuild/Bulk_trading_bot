@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .accounts import AccountSession, NotSent, OrderRejected, short_pubkey
@@ -218,14 +219,19 @@ class InFlight:
             )
         )
 
-    def settle_doubtful(self, read_started_at: float) -> None:
+    def settle_doubtful(
+        self, read_started_at: float, keys: Iterable[str] | None = None
+    ) -> None:
         """Drop doubtful reservations a position read has since accounted for.
 
         Only those sent before the read began: the read reflects whatever
         they did, so the book now carries it and the reservation would count
-        it twice.
+        it twice. And only for the legs in `keys`, when the read covered only
+        their accounts -- every leg, when it was the whole pool.
         """
-        for symbol in list(self._entries):
+        for symbol in list(self._entries) if keys is None else [
+            key for key in keys if key in self._entries
+        ]:
             self._entries[symbol] = [
                 entry for entry in self._entries[symbol]
                 if not (entry.doubtful and entry.sent_at < read_started_at)

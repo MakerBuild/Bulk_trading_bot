@@ -104,7 +104,7 @@ def build(master_succeeds_on=1, sub_connected=True, master_delay=0.0, sub_delay=
     strategy.resyncs = 0
     strategy.resync_fails = False
 
-    async def sync(max_age_s=0.0):
+    async def sync(max_age_s=0.0, sessions=None):
         """Stands in for the threaded, shared position read."""
         if strategy.resync_fails:
             raise RuntimeError("HTTP 429")
@@ -775,8 +775,9 @@ async def test_a_failed_re_read_does_not_end_the_heal():
     """It ran bare inside `_supervise` once: one 429 ended the supervisor, and
     the exposure limits, the liquidation guard and the reconciler went with it
     while the groups traded on."""
-    strategy, _master, _sub1 = build()
+    strategy, master, sub1 = build()
     strategy.resync_fails = True
 
     assert await heal(strategy) is True
-    assert strategy._book_suspect, "a book that could not be re-read is suspect"
+    assert strategy._waiting_for(master.pubkey), "a book that could not be re-read is suspect"
+    assert not strategy._waiting_for(sub1.pubkey), "a socket that never dropped was doubted"

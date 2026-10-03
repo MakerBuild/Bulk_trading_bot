@@ -210,7 +210,7 @@ def test_an_unattributable_fill_leaves_the_book_alone(tmp_path):
     assert book.effective("m1", btc) == 0.0
     assert book.effective("m1s1", btc) == 0.0
     assert book.effective("m1s2", btc) == 0.0
-    assert strategy._book_suspect is True, "it did not mark the book"
+    assert all(strategy._waiting_for(p) for p in sessions), "it did not mark the book"
     assert strategy._unattributed_fills == 3
 
 
@@ -261,22 +261,22 @@ def test_the_payload_still_wins_where_it_says_so():
 # -- and a book we know is wrong is not traded on ---------------------------
 
 
-async def test_no_hedge_is_sent_while_the_book_is_suspect(tmp_path):
+async def test_no_hedge_is_sent_while_the_book_is_behind(tmp_path):
     """What $375 off-hedge cost: the worker hedges straight off the queue and
     never consulted the freshness clock, so marking the book stale-dated did
     nothing. Six market orders went out against a book that never moved, each
     one enlarging the imbalance it was correcting."""
     import asyncio
 
-    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
-    strategy._book_suspect = True
+    strategy, _book, sessions, _client, btc = three_on_one_socket(tmp_path)
+    strategy._mark_unread(sessions["m1"], "test")
 
     hedged = []
     strategy.hedger.hedge = lambda *a, **k: hedged.append(a)
 
     reads = []
 
-    async def failing_read(max_age_s=0.0):
+    async def failing_read(max_age_s=0.0, sessions=None):
         reads.append(max_age_s)
         raise RuntimeError("exchange unreachable")
 
@@ -290,14 +290,14 @@ async def test_no_hedge_is_sent_while_the_book_is_suspect(tmp_path):
 
     assert reads, "it did not even try to re-read"
     assert not hedged, "it hedged off a book it had been told was wrong"
-    assert strategy._book_suspect is True, "the suspicion was cleared anyway"
+    assert strategy._waiting_for("m1"), "the doubt was cleared anyway"
 
 
 async def test_the_hedge_resumes_once_the_read_succeeds(tmp_path):
     import asyncio
 
-    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
-    strategy._book_suspect = True
+    strategy, _book, sessions, _client, btc = three_on_one_socket(tmp_path)
+    strategy._mark_unread(sessions["m1"], "test")
 
     hedged = []
 
@@ -306,11 +306,12 @@ async def test_the_hedge_resumes_once_the_read_succeeds(tmp_path):
 
     strategy.hedger.hedge = hedge
 
-    async def good_read(max_age_s=0.0):
-        # A read that began now: later than the suspicion, so it answers it.
+    async def good_read(max_age_s=0.0, sessions=None):
+        # A read that began now: later than the doubt, so it answers it.
         import time
 
-        strategy._read_started_at = time.monotonic()
+        for session in sessions or strategy.sessions.values():
+            strategy._read_at[session.pubkey] = time.monotonic()
 
     strategy._sync_positions = good_read
     strategy._hedge_queue.put_nowait(btc)
@@ -321,7 +322,43 @@ async def test_the_hedge_resumes_once_the_read_succeeds(tmp_path):
     await worker
 
     assert hedged == [btc]
-    assert strategy._book_suspect is False
+    assert not strategy._waiting_for("m1")
+
+
+async def test_a_book_behind_on_one_socket_does_not_hold_up_another(tmp_path):
+    """It was one flag for the whole book: an update on one socket that named
+    no account held every hedge in the pool, and with reads that kept failing,
+    held them for good while every other group's makers went on filling."""
+    import asyncio
+    import types
+
+    from test_strategy import FakeSession
+
+    strategy, _book, _sessions, _client, btc = three_on_one_socket(tmp_path)
+    elsewhere = FakeSession("m2", "m2")
+    elsewhere.client = types.SimpleNamespace(accounts=["m2"])
+    strategy.sessions["m2"] = elsewhere
+    strategy._mark_unread(elsewhere, "a fill named no account")
+
+    hedged = []
+
+    async def hedge(roles, mark_price=None, suspended=None):
+        hedged.append(roles.symbol)
+
+    strategy.hedger.hedge = hedge
+
+    async def failing_read(max_age_s=0.0, sessions=None):
+        raise RuntimeError("exchange unreachable")
+
+    strategy._sync_positions = failing_read
+    strategy._hedge_queue.put_nowait(btc)
+
+    worker = asyncio.create_task(strategy._hedge_worker())
+    await asyncio.sleep(0.05)
+    strategy._stop.set()
+    await worker
+
+    assert hedged == [btc], "a leg on a healthy socket waited on another's read"
 
 
 # -- and the leg a fill belongs to is the one its ACCOUNT is trading --------

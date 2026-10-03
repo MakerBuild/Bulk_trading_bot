@@ -527,7 +527,7 @@ async def test_an_unanswered_slice_does_not_suspect_the_whole_book():
     roles = register(obj, "g1:" + BTC, "maker-a", maker_is_buy=True)
     reads = []
 
-    async def read(max_age_s=0.0):
+    async def read(max_age_s=0.0, sessions=None):
         reads.append(max_age_s)
 
     async def unanswered(roles, mark_price=None, suspended=None):
@@ -538,7 +538,8 @@ async def test_an_unanswered_slice_does_not_suspect_the_whole_book():
 
     with pytest.raises(HedgeInDoubt):
         await obj._hedge_leg(roles)
-    assert obj._book_suspect is False, "every other leg would now wait"
+    other = register(obj, "g2:" + BTC, "maker-b", maker_is_buy=False)
+    assert not obj._waiting_on_a_read(other), "every other leg would now wait"
 
     await asyncio.sleep(0.01)
     assert reads, "nothing settled the unanswered slice"
@@ -548,9 +549,11 @@ async def test_an_unanswered_slice_does_not_suspect_the_whole_book():
 # -- a signal for a leg whose hedge just finished is not dropped -------------
 
 
-async def test_a_signal_during_the_read_is_not_lost():
-    """Finished tasks were pruned before the read; a task that ended during
-    it was still listed, and the new signal was folded into it -- dropped."""
+async def test_a_signal_while_a_hedge_runs_is_not_lost():
+    """A signal for a leg whose hedge is running is folded into one more pass
+    once it finishes. The worker used to await a read between taking the
+    signal and pruning finished tasks, and a task that ended during it was
+    still listed -- the new signal was folded into it and dropped."""
     obj = strategy()
     key = "g1:" + BTC
     register(obj, key, "maker-a", maker_is_buy=True)
@@ -562,21 +565,15 @@ async def test_a_signal_during_the_read_is_not_lost():
         if len(calls) == 1:
             await release.wait()
 
-    async def refreshed():
-        release.set()                 # the running hedge finishes meanwhile
-        await asyncio.sleep(0.01)
-        obj._book_suspect = False
-        return True
-
     obj.hedger.hedge = hedge
-    obj._refreshed = refreshed
 
     worker = asyncio.create_task(obj._hedge_worker())
     obj._hedge_queue.put_nowait(key)
     await asyncio.sleep(0.02)                      # first hedge is running
-    obj._book_suspect = True
-    obj._hedge_queue.put_nowait(key)               # new fill, read pending
-    await asyncio.sleep(0.1)
+    obj._hedge_queue.put_nowait(key)               # a new fill meanwhile
+    await asyncio.sleep(0.01)
+    release.set()
+    await asyncio.sleep(0.3)
     obj._stop.set()
     await asyncio.wait_for(worker, 2)
 
