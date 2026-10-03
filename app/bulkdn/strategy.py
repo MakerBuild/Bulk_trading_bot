@@ -63,15 +63,6 @@ import contextlib
 log = logging.getLogger(__name__)
 
 
-# Reconnects tolerated before a dropped socket is treated as a persistent fault
-# rather than a blip -- five of them inside ten minutes.
-#
-# Counted over a moving window, not per cycle. It was written as a per-cycle
-# budget and the reset was never implemented, so in practice it was five for the
-# entire run: an unlimited run halted on its sixth drop no matter how many hours
-# apart they fell. A window also survives the legs running independently, where
-# "this cycle" is two different things at once and neither is the right moment
-# to forgive a fault.
 # How long after an unanswered submission a change in that symbol might still
 # be our own.
 DOUBT_WINDOW_S = 120.0
@@ -106,6 +97,15 @@ CONFIRM_RETRY_DELAYS_S = (0.5, 1.0)
 # so gathering them costs little.
 HEDGE_COALESCE_S = 0.1
 
+# Reconnects tolerated before a dropped socket is treated as a persistent fault
+# rather than a blip -- five of them inside ten minutes.
+#
+# Counted over a moving window, not per cycle. It was written as a per-cycle
+# budget and the reset was never implemented, so in practice it was five for the
+# entire run: an unlimited run halted on its sixth drop no matter how many hours
+# apart they fell. A window also survives the legs running independently, where
+# "this cycle" is two different things at once and neither is the right moment
+# to forgive a fault.
 MAX_RECONNECTS = 5
 RECONNECT_WINDOW_S = 600.0
 
