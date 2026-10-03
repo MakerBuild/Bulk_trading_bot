@@ -45,7 +45,7 @@ from .cli import (
 from .config import Config, ConfigError, LegConfig
 from .retry import describe
 from .scripts import script, venv_folder
-from . import proxy
+from . import lock, proxy
 
 log = logging.getLogger(__name__)
 
@@ -2276,18 +2276,40 @@ def _settings_problem(settings: Settings, problem: Exception) -> bool:
     return True
 
 
+def _locked(what: str, action: Callable[[Config], None]) -> Callable[[Config], None]:
+    """`action`, holding the one-copy lock while it runs. See bulkdn/lock.py.
+
+    For the items that trade, close or read the accounts. Held per item rather
+    than for the menu's whole life: an open menu on a desk must not stop the
+    Telegram service on the same machine from working while nobody uses it.
+    """
+    def run(config: Config) -> None:
+        try:
+            lock.acquire(what)
+        except lock.Held as exc:
+            print(f"\n  {exc}")
+            _pause()
+            return
+        try:
+            action(config)
+        finally:
+            lock.release()
+
+    return run
+
+
 def run_menu(settings: Settings) -> int:
     items = [main_item(label) for label in MAIN_ITEMS] + ["0. Exit"]
     # Each is handed the Config read for that choice.
     handlers: dict[str, Callable[[Config], None]] = {
-        "Start": _start,
-        "Active Strategy": _active_strategy,
+        "Start": _locked("menu: start", _start),
+        "Active Strategy": _locked("menu: status", _active_strategy),
         "History": _history,
         "Accounts Management": lambda config: _accounts_menu(config, settings.path, settings),
         "Configuration": lambda config: _configuration(config, settings.path),
-        CLOSE_ALL_LABEL: _close_all,
+        CLOSE_ALL_LABEL: _locked("menu: close all", _close_all),
         "Logs": lambda _config: _logs(),
-        "Telegram Control": _telegram,
+        "Telegram Control": _locked("menu: telegram control", _telegram),
     }
     actions = {
         str(number): handlers[label]

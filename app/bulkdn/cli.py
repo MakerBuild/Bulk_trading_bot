@@ -39,6 +39,7 @@ from .impact import ImpactBook
 from .hedger import Hedger
 from .pairing import Pairing
 from .positions import PositionBook
+from . import lock
 from . import proxy
 from . import ratelimit
 from . import screen as screen_mod
@@ -68,6 +69,15 @@ LOG_FILE = "logs.txt"
 # so this is roughly a week of history and cannot fill a disk.
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUPS = 2
+
+# The commands that trade, close or read the accounts, which hold bulkdn.lock
+# for as long as they run -- so the menu and the Telegram service cannot work
+# the same accounts at once, and an update cannot reinstall under either.
+LOCKED_COMMANDS = ("run", "flatten", "status", "telegram")
+# Exit code when another copy holds the lock. Not 1: the Telegram service is
+# told not to restart on 1 (a setup error), and this one clears by itself once
+# the other copy stops, so the service should keep trying.
+EXIT_ALREADY_RUNNING = 4
 
 
 # Loggers whose INFO output is bookkeeping rather than news: position reads,
@@ -1519,6 +1529,14 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("LIVE TRADING ON MAINNET -- real funds are at risk")
         log.warning("=" * 70)
 
+    locked = args.command in LOCKED_COMMANDS
+    if locked:
+        try:
+            lock.acquire(args.command)
+        except lock.Held as exc:
+            _startup_error("already running", exc)
+            return EXIT_ALREADY_RUNNING
+
     try:
         if args.command == "run":
             return asyncio.run(cmd_run(config, dry_run))
@@ -1569,6 +1587,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         log.warning("interrupted")
         return 130
+    finally:
+        if locked:
+            lock.release()
 
     parser.error(f"unknown command {args.command}")
     return 1
