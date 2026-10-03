@@ -522,8 +522,11 @@ let the limits pass for exactly as long as the feed was down.
 
 ### Liquidation guard
 
-`LiquidationGuard` watches every account's position for a shrink the bot did not cause. Before
-calling it external it (1) defers, a bounded number of times, when an order of ours in that
+`LiquidationGuard` watches every account's position for a shrink the bot did not cause. Our
+own hedges can shrink a hedger while opening — the correction of an over-hedge sells back what
+it bought — so the hedger tells the guard of every slice it sends (`note_own_order`, withdrawn
+if refused), and a shrink those slices fully explain within `OWN_ORDER_HOLD_S` re-baselines the
+peak instead of being reported. Before calling any other shrink external it (1) defers, a bounded number of times, when an order of ours in that
 symbol went unanswered *and* a forced position read succeeds, and (2) re-reads positions once
 more to rule out a stale HTTP answer racing our own fill. Then it asks the exchange
 (`riskEvents`); failing to ask counts as yes.

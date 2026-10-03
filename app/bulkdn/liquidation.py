@@ -48,9 +48,17 @@ from .state import Phase
 
 log = logging.getLogger(__name__)
 
-# Phases in which the bot never reduces a position, so any reduction is
-# external. EXIT is deliberately absent.
+# Phases in which the bot only reduces a position with a hedge it has told the
+# guard about (`note_own_order`), so any other reduction is external. EXIT is
+# deliberately absent.
 _ACCUMULATING = (Phase.OPEN, Phase.HOLD)
+
+# How long a hedge of ours explains a shrink on its account. Its position
+# update normally lands within a second; a socket running behind has delivered
+# them half a minute late. Bounded rather than open-ended because an order that
+# stays on the books as an explanation also hides up to its size of a real
+# liquidation on that account -- and a refused one is withdrawn at once anyway.
+OWN_ORDER_HOLD_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -93,6 +101,65 @@ class LiquidationGuard:
     # a fully closed one is zero -- which renders every liquidated short as a
     # long.
     _peak: dict[tuple[str, str], float] = field(default_factory=dict)
+    # Hedges of ours sent on each account, as [unexplained size, sign, expiry].
+    # See `note_own_order`.
+    _own: dict[tuple[str, str], list[list[float]]] = field(default_factory=dict)
+
+    def note_own_order(self, account: str, symbol: str, signed_size: float) -> None:
+        """A hedge of ours is going out on this account.
+
+        "The bot never reduces a position while opening" was the premise of
+        this guard, and it is false for hedgers: when the book is briefly
+        wrong -- an update landing between the halves of a fill that crosses
+        zero is enough -- the hedge rule over-hedges and then sells the excess
+        back, which shrinks the hedgers it bought on. That shrink was read as
+        a position closed from outside, and a live run halted and closed every
+        account at market over its own correction, with the exchange reporting
+        no liquidation at all. Before the guard's own fix such shrinks seen
+        over the socket were silently dropped, which is the only reason this
+        had not happened earlier.
+
+        Every slice is noted, whichever way it goes. Only one pointing against
+        the account's position can explain a shrink, and `check` decides that
+        against the peak at the time.
+        """
+        if signed_size == 0:
+            return
+        self._own.setdefault((account, symbol), []).append(
+            [abs(signed_size), 1.0 if signed_size > 0 else -1.0,
+             time.monotonic() + OWN_ORDER_HOLD_S]
+        )
+
+    def withdraw_own_order(self, account: str, symbol: str, signed_size: float) -> None:
+        """The exchange refused this hedge, so it explains nothing."""
+        sign = 1.0 if signed_size > 0 else -1.0
+        entries = self._own.get((account, symbol), [])
+        for entry in entries:
+            if entry[1] == sign and abs(entry[0] - abs(signed_size)) < 1e-12:
+                entries.remove(entry)
+                return
+
+    def _explained(self, key: tuple[str, str], peak: float, shrink: float, slack: float) -> bool:
+        """Whether hedges of ours account for `shrink` off `peak`, using them up if so.
+
+        Only orders pointing against the position count -- a sell shrinks a
+        long, a buy a short -- and only when they cover all of it, within the
+        guard's usual slack. A liquidation larger than our own hedges is
+        still reported whole.
+        """
+        now = time.monotonic()
+        entries = [e for e in self._own.get(key, ()) if e[2] > now]
+        against = [e for e in entries if (e[1] > 0) != (peak > 0)]
+        if shrink > sum(e[0] for e in against) + slack:
+            self._own[key] = entries
+            return False
+        left = shrink
+        for entry in against:
+            taken = min(entry[0], left)
+            entry[0] -= taken
+            left -= taken
+        self._own[key] = [e for e in entries if e[0] > 1e-12]
+        return True
 
     def reset_symbol(self, symbol: str, accounts=None) -> None:
         """Forget peaks in one symbol, for one leg's accounts.
@@ -107,16 +174,18 @@ class LiquidationGuard:
         `accounts=None` still clears the whole symbol, which is what the halt
         path and a single configured pair both mean by it.
         """
-        for key in [
-            k for k in self._peak
-            if k[1] == symbol and (accounts is None or k[0] in accounts)
-        ]:
-            del self._peak[key]
+        for held in (self._peak, self._own):
+            for key in [
+                k for k in held
+                if k[1] == symbol and (accounts is None or k[0] in accounts)
+            ]:
+                del held[key]
 
     def reset(self) -> None:
         """Forget peaks. Called when a cycle ends, since EXIT legitimately
         takes every position back to zero."""
         self._peak.clear()
+        self._own.clear()
 
     def observe(self, account: str, symbol: str, size: float) -> None:
         """Record a position without judging it. Used during EXIT."""
@@ -198,7 +267,21 @@ class LiquidationGuard:
                     self._peak[key] = current
                     continue
 
-                if abs(peak) - abs(current) > spec.lot_size:
+                shrink = abs(peak) - abs(current)
+                if shrink > spec.lot_size and self._explained(
+                    key, peak, shrink, spec.lot_size
+                ):
+                    # Our own hedge took it down. Re-baselined here rather
+                    # than reported, so the next real shrink is measured from
+                    # what the account holds now.
+                    log.info(
+                        "%s %s shrank %+.8f -> %+.8f by a hedge of ours",
+                        self.names.get(account, account[:8]), symbol, peak, current,
+                    )
+                    self._peak[key] = current
+                    continue
+
+                if shrink > spec.lot_size:
                     found.append(
                         Liquidation(
                             account=account,

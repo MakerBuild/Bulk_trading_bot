@@ -285,6 +285,10 @@ class Strategy:
             specs=feed.specs,
             names={s.pubkey: s.name for s in self.sessions.values()},
         )
+        if hedger is not None:
+            # Every hedge slice is told to the guard, so a hedger shrunk by our
+            # own correction of an over-hedge is not taken for a liquidation.
+            hedger.own_orders = self.guard
         # Set the instant a position update shows an external reduction, so
         # the response does not wait for the next reconcile tick.
         self._liquidation_seen = asyncio.Event()

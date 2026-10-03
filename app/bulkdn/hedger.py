@@ -345,6 +345,10 @@ class Hedger:
         self.tolerance_lots = tolerance_lots
         self.max_hedge_size = max_hedge_size or {}
         self.in_flight = InFlight(in_flight_ttl_ms)
+        # Told of every slice before it goes out and of every one refused --
+        # the liquidation guard, so that a hedge of ours shrinking an account
+        # is not taken for a liquidation. Set by the strategy that owns both.
+        self.own_orders = None
         # One lock per symbol. Fills arrive faster than orders round-trip, so
         # without this two triggers could both read the same non-zero net and
         # each fire a full-size hedge, overshooting into the opposite exposure.
@@ -575,10 +579,16 @@ class Hedger:
             # Reserve before sending. The fill for an order may arrive before
             # `market()` returns, and the reservation has to already be there
             # for the fill handler to retire it.
-            for _pubkey, piece in slices:
+            for pubkey, piece in slices:
                 self.in_flight.add(
                     roles.key, piece if is_buy else -piece, awaiting_answer=True
                 )
+                # Before sending, for the same reason: its position update can
+                # land before the answer does.
+                if self.own_orders is not None:
+                    self.own_orders.note_own_order(
+                        pubkey, symbol, piece if is_buy else -piece
+                    )
             sent = 0.0
             over_http = 0
             failures: list[BaseException] = []
@@ -593,7 +603,7 @@ class Hedger:
                     ),
                     return_exceptions=True,
                 )
-                for (_pubkey, piece), result in zip(slices, results, strict=True):
+                for (pubkey, piece), result in zip(slices, results, strict=True):
                     signed = piece if is_buy else -piece
                     if result is True:
                         # Sent over HTTP: accepted, but its fill will not come
@@ -611,6 +621,8 @@ class Hedger:
                         # part that failed -- the slices that did go out are
                         # covered and must not be hedged twice.
                         self.in_flight.consume(roles.key, signed)
+                        if self.own_orders is not None:
+                            self.own_orders.withdraw_own_order(pubkey, symbol, signed)
                         failures.append(result)
                     elif isinstance(result, BaseException):
                         # No answer at all -- a timeout or a dropped socket. It
