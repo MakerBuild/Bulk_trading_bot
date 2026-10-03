@@ -114,6 +114,30 @@ def min_order_size(spec: MarketSpec, price: float | None) -> float:
     )
 
 
+def tradeable_size(spec: MarketSpec, size: float, price: float | None) -> float:
+    """`size` in whole lots, or 0.0 when that is not an order this market takes.
+
+    The one rule for "can this be sent". It was written out at eight call
+    sites and they drifted: some checked the lot alone, which passes an ETH
+    order of forty cents against a $50 minimum, and one measured the notional
+    at the mark while the order went out at the bid. Every order let through
+    that way was refused, and each refusal counts toward the reject streak.
+
+    Measured against `min_order_size`, so a cap floored there and a size
+    tested here cannot disagree. `price` is the one the order goes out at.
+    Without one the notional cannot be checked and the lot decides alone:
+    refusing to hedge or close a known position because a ticker is missing
+    leaves it open, which is the worse of the two failures.
+    """
+    rounded = round_size(size, spec)
+    return rounded if rounded >= min_order_size(spec, price) else 0.0
+
+
+def is_tradeable(spec: MarketSpec, size: float, price: float | None) -> bool:
+    """Whether `size` is an order this market takes at `price`. See `tradeable_size`."""
+    return tradeable_size(spec, size, price) > 0
+
+
 def chase_price(
     *,
     best_bid: float | None,

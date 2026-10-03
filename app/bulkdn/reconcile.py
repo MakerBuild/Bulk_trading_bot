@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
 from .hedger import Hedger, LegRoles
-from .marketdata import round_size
+from .marketdata import tradeable_size
 from .positions import PositionBook
 from .retry import describe
 
@@ -194,6 +194,33 @@ async def _read_what_can_be_read(
         )
 
 
+def _report_dust(
+    what: str,
+    sessions: dict[str, AccountSession],
+    book: PositionBook,
+    feed: MarketFeed,
+    symbols: Sequence[str],
+) -> None:
+    """Name what was left because it is under the market's minimum order.
+
+    Whole lots can still be dust: ETH takes a lot of forty cents and refuses
+    any order under $50. "All closed" is true of what can be closed, and the
+    rest is said rather than left for the operator to find.
+    """
+    dust = [
+        f"{session.name} {symbol}={book.effective(session.pubkey, symbol):+.8f}"
+        for session in sessions.values()
+        for symbol in symbols
+        if symbol in feed.specs
+        and abs(book.effective(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
+    ]
+    if dust:
+        log.warning(
+            "%s: left under the market's minimum order, which the exchange "
+            "will not take: %s", what, ", ".join(dust),
+        )
+
+
 async def flatten(
     sessions: dict[str, AccountSession],
     book: PositionBook,
@@ -226,12 +253,16 @@ async def flatten(
                 spec = feed.specs.get(symbol)
                 if spec is None:
                     continue
-                rounded = round_size(abs(size), spec)
-                if rounded >= spec.lot_size:
+                # Dust under the market's minimum is not sent: the exchange
+                # refuses it, and every refusal counts toward the reject
+                # streak in the middle of an emergency stop.
+                rounded = tradeable_size(spec, abs(size), feed.reference_price(symbol))
+                if rounded:
                     outstanding.append((session, symbol, size, rounded))
 
         if not outstanding:
             log.info("flatten: all strategy positions are closed")
+            _report_dust("flatten", sessions, book, feed, symbols)
             return
 
         log.info(
@@ -335,12 +366,18 @@ async def flatten_limit(
                     if spec is None:
                         continue
                     size = book.effective(session.pubkey, symbol)
-                    rounded = round_size(abs(size), spec)
-                    if rounded >= spec.lot_size:
+                    # Dust under the minimum is left, as in `flatten`: an
+                    # order for it would be refused on every pass until the
+                    # close ran out of time.
+                    rounded = tradeable_size(
+                        spec, abs(size), feed.reference_price(symbol)
+                    )
+                    if rounded:
                         outstanding.append((session, symbol, size, rounded, spec))
 
             if not outstanding:
                 log.info("limit close: all strategy positions are closed")
+                _report_dust("limit close", sessions, book, feed, symbols)
                 return True
 
             if asyncio.get_running_loop().time() >= deadline:

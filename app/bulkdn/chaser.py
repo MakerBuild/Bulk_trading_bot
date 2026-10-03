@@ -44,7 +44,9 @@ from dataclasses import dataclass
 from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
 from .hedger import LegRoles
-from .marketdata import chase_price, distance_bps, min_order_size, round_size
+from .marketdata import (
+    chase_price, distance_bps, is_tradeable, min_order_size, round_size,
+)
 from .retry import describe
 from .positions import PositionBook
 from .state import LegState
@@ -202,21 +204,10 @@ class Chaser:
         await self._sweep_stale(session, leg)
 
         remaining = round_size(self.remaining_size(roles, leg), spec)
+        if remaining < spec.lot_size:
+            return await self._complete(session, roles, leg, remaining)
+
         quote = self.feed.quote(symbol)
-        reference = quote.reference_price
-
-        # Leg finished: nothing left worth trading. Any resting remainder is
-        # pulled so it can't fill after the leg is considered done.
-        if remaining < spec.lot_size or (
-            reference and remaining * reference < spec.min_notional
-        ):
-            if leg.oid:
-                await self._cancel(session, leg, symbol)
-            leg.complete = True
-            leg.tightened = False
-            self._chasing_since.pop(self._chase_key(roles), None)
-            return ChaseOutcome(symbol, "complete", f"remaining={remaining:.8f}")
-
         if quote.age_s > self.price_stale_timeout_s:
             return ChaseOutcome(
                 symbol, "skipped", f"stale price ({quote.age_s:.1f}s old)"
@@ -269,6 +260,14 @@ class Chaser:
             if beyond:
                 target = own_touch
 
+        # Also finished when what is left is under the market's minimum at the
+        # price the order goes out at. It used to be measured at the mark: a
+        # buy rests below it, so a remainder that cleared the minimum there
+        # went out under it at the bid, was refused, and was sent again on
+        # every pass until the reject streak halted the run.
+        if not is_tradeable(spec, remaining, target):
+            return await self._complete(session, roles, leg, remaining)
+
         cap = (
             params.max_order_size if roles.max_order_size is None
             else roles.max_order_size
@@ -280,8 +279,6 @@ class Chaser:
         # floored again here, at the price this order goes out at.
         cap = max(cap, min_order_size(spec, target))
         desired = round_size(min(remaining, cap), spec)
-        if desired < spec.lot_size:
-            return ChaseOutcome(symbol, "skipped", "desired size below lot")
 
         resting = self._resting_order(session, leg)
 
@@ -397,6 +394,21 @@ class Chaser:
         )
 
     # -- helpers -----------------------------------------------------------
+
+    async def _complete(
+        self, session: AccountSession, roles: LegRoles, leg: LegState, remaining: float
+    ) -> ChaseOutcome:
+        """Nothing left worth trading: finish the leg.
+
+        Any resting remainder is pulled so it can't fill after the leg is
+        considered done.
+        """
+        if leg.oid:
+            await self._cancel(session, leg, roles.symbol)
+        leg.complete = True
+        leg.tightened = False
+        self._chasing_since.pop(self._chase_key(roles), None)
+        return ChaseOutcome(roles.symbol, "complete", f"remaining={remaining:.8f}")
 
     def may_be_resting(self, session: AccountSession, oid: str | None) -> bool:
         """Whether this order could still be on the book.

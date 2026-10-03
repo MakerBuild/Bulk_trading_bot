@@ -85,6 +85,9 @@ class FakeFeed:
     def quote(self, symbol):
         return self._quote
 
+    def reference_price(self, symbol):
+        return self._quote.mark_price
+
     def move(self, bid, ask):
         self._quote = FakeQuote(bid, ask)
 
@@ -182,6 +185,15 @@ def test_nothing_is_placed_when_already_flat():
 def test_dust_below_a_lot_is_left_alone():
     """Under one lot cannot be traded, so chasing it would never finish."""
     sessions, book, master, _sub1, feed = build(master_size=1e-7, sub_size=0.0)
+    assert close(sessions, book, feed, timeout_s=5) is True
+    assert master.placed == []
+
+
+def test_dust_under_the_minimum_notional_is_left_alone():
+    """Whole lots, but too small an order for the exchange to take: every
+    attempt would be refused until the close timed out."""
+    sessions, book, master, _sub1, feed = build(master_size=0.002, sub_size=0.0)
+    feed.specs[BTC] = MarketSpec(BTC, tick_size=0.5, lot_size=0.001, min_notional=500.0)
     assert close(sessions, book, feed, timeout_s=5) is True
     assert master.placed == []
 

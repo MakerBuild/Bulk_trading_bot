@@ -8,6 +8,7 @@ from bulkdn.marketdata import (
     round_price_down,
     round_price_up,
     round_size,
+    tradeable_size,
 )
 
 BTC = MarketSpec(symbol="BTC-USD", tick_size=0.5, lot_size=0.001, min_notional=10.0)
@@ -102,3 +103,35 @@ def test_distance_bps():
     assert round(distance_bps(101.0, 100.0), 6) == 100.0
     # Symmetric in magnitude.
     assert round(distance_bps(99.0, 100.0), 6) == 100.0
+
+
+# -- one rule for "can this be sent" ------------------------------------------
+#
+# It was written out at eight call sites, and they drifted: some checked the
+# lot alone, some measured the notional at a different price from the one the
+# order went out at. Each order they let through that the exchange refused
+# counted toward the reject streak.
+
+ETH = MarketSpec(symbol="ETH-USD", tick_size=0.01, lot_size=0.0001, min_notional=50.0)
+
+
+def test_a_size_is_tradeable_from_the_minimum_notional_up():
+    assert tradeable_size(ETH, 0.02, 2_600.0) == 0.02          # $52
+    assert tradeable_size(ETH, 0.019, 2_600.0) == 0.0          # $49.40
+
+
+def test_a_lot_above_dust_is_still_dust_under_the_minimum_notional():
+    """ETH takes a lot of 0.0001 -- about forty cents -- and refuses any
+    order under $50."""
+    assert tradeable_size(ETH, 0.0001, 2_600.0) == 0.0
+
+
+def test_a_tradeable_size_is_whole_lots():
+    assert tradeable_size(ETH, 0.020049, 2_600.0) == 0.02
+
+
+def test_without_a_price_the_lot_alone_decides():
+    """Refusing to hedge or close because a ticker is missing leaves the
+    position open, which is the worse of the two failures."""
+    assert tradeable_size(ETH, 0.0001, None) == 0.0001
+    assert tradeable_size(ETH, 0.00009, None) == 0.0

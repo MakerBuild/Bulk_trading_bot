@@ -608,3 +608,21 @@ async def test_a_long_unseen_order_is_still_replaced_rather_than_doubled(monkeyp
     await chaser.step(OPEN_BTC, leg)
 
     assert master.placed[-1]["cancel_oid"] == first
+
+
+
+async def test_a_remainder_under_the_minimum_at_the_order_price_completes_the_leg():
+    """The minimum was measured at the mark while the order goes out at the
+    bid. $50.75 at the mark is $49.70 at the bid: refused, and five refusals
+    in a row halt the run."""
+    sol = MarketSpec(symbol=BTC, tick_size=0.01, lot_size=0.01, min_notional=50.0)
+    quote = Quote(BTC, best_bid=142.0, best_ask=142.1, mark_price=145.0, age_s=0.0)
+    chaser, book, master, _s = build(quote=quote, max_order_size=1.0)
+    chaser.feed.specs[BTC] = sol
+    book.set_authoritative(MASTER, BTC, 1.65)
+    leg = LegState(symbol=BTC, target_size=2.0)          # 0.35 to go
+
+    outcome = await chaser.step(OPEN_BTC, leg)
+
+    assert master.placed == [], "an order under the minimum went out"
+    assert outcome.action == "complete"

@@ -121,7 +121,7 @@ async def test_a_flatten_carries_on_past_an_account_it_cannot_read():
     book = PositionBook()
     book.set_authoritative(readable.pubkey, BTC, 0.02)     # the reads find it flat
     book.set_authoritative(unreadable.pubkey, BTC, -0.02)  # last known, cannot re-read
-    feed = types.SimpleNamespace(specs={BTC: SPEC})
+    feed = types.SimpleNamespace(specs={BTC: SPEC}, reference_price=lambda s: 50_000.0)
 
     await reconcile.flatten(
         {"a": readable, "b": unreadable}, book, feed, [BTC], max_passes=1,
@@ -130,3 +130,18 @@ async def test_a_flatten_carries_on_past_an_account_it_cannot_read():
     assert unreadable.closes == [(BTC, True, 0.02)], (
         "the side that could not be read was left open"
     )
+
+
+async def test_a_flatten_does_not_send_dust_under_the_minimum_notional():
+    """More than a lot but under the market's minimum: the exchange refuses
+    it, and each refusal counts toward the reject streak in the middle of an
+    emergency stop."""
+    eth = MarketSpec(BTC, tick_size=0.01, lot_size=0.0001, min_notional=50.0)
+    account = FakeSession("m1s1")
+    book = PositionBook()
+    book.set_authoritative(account.pubkey, BTC, 0.0005)   # $1.30
+    feed = types.SimpleNamespace(specs={BTC: eth}, reference_price=lambda s: 2_600.0)
+
+    await reconcile.flatten({"a": account}, book, feed, [BTC], max_passes=1)
+
+    assert account.closes == []
