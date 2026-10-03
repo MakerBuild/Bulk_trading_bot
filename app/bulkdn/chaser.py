@@ -37,11 +37,12 @@ target rounds to the same tick and nothing is sent.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
 
-from .accounts import AccountSession, OrderRejected
+from .accounts import AccountSession, NotSent, OrderRejected
 from .feed import MarketFeed
 from .hedger import LegRoles
 from .marketdata import (
@@ -528,6 +529,29 @@ class Chaser:
                 return ChaseOutcome(symbol, "placed", "adopted after a refused cancel")
             log.warning("%s: chase order rejected: %s", symbol, describe(exc))
             return ChaseOutcome(symbol, "skipped", f"rejected: {exc}")
+        except NotSent:
+            # Nothing left this process: there is no order anywhere to track.
+            raise
+        except (Exception, asyncio.CancelledError) as exc:
+            # No answer -- a timeout, a reply that could not be read, a socket
+            # that closed, a caller that stopped waiting. The order may be
+            # resting right now. Its id travels on the exception
+            # (`place_limit` attaches it), and dropping it left an order
+            # nothing tracked: the next pass placed another beside it, both
+            # free to fill. Kept as the leg's own instead -- the next pass
+            # finds it in the order map, or replaces it with the cancel riding
+            # in the same transaction, so there is never a second order. The
+            # order it was replacing may not have been cancelled either, and
+            # goes on the sweep list. Re-raised: the caller still treats the
+            # submission as unanswered.
+            placed_oid = getattr(exc, "order_id", None)
+            if placed_oid:
+                log.warning(
+                    "%s: no answer to order %s (%s) -- tracking it as possibly resting",
+                    symbol, placed_oid[:8], describe(exc),
+                )
+                self._track(roles, leg, placed_oid, price, size, uncertain=True)
+            raise
 
         # The cancel half was answered as done -- a refused one raises above
         # -- so the order it replaced is not put on the sweep list. It used to

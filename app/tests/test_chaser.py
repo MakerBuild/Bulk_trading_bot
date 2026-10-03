@@ -1,5 +1,6 @@
 """Chasing: replace only on real drift, and never leave two orders working."""
 
+import asyncio
 from dataclasses import dataclass
 
 import pytest
@@ -626,3 +627,47 @@ async def test_a_remainder_under_the_minimum_at_the_order_price_completes_the_le
 
     assert master.placed == [], "an order under the minimum went out"
     assert outcome.action == "complete"
+
+
+@pytest.mark.parametrize("failure", [TimeoutError, asyncio.CancelledError])
+async def test_an_unanswered_placement_stays_tracked(failure):
+    """A placement that timed out may be resting. `place_limit` carries its
+    id on the exception; dropping it left an order nothing tracked, and the
+    next pass placed a second one beside it."""
+    chaser, book, master, _s = build(max_distance_bps=5.0)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    old = leg.oid
+
+    async def no_answer(**kwargs):
+        exc = failure()
+        exc.order_id, exc.placed = "in-doubt-oid", None
+        raise exc
+
+    master.place_limit = no_answer
+    chaser.feed._quote = Quote(
+        BTC, best_bid=101_000.0, best_ask=101_010.0, mark_price=101_005.0, age_s=0.0
+    )
+    with pytest.raises(failure):
+        await chaser.step(OPEN_BTC, leg)
+
+    assert leg.oid == "in-doubt-oid", "the possibly-resting order was forgotten"
+    assert leg.stale_oids == [old], "the order it replaced may still rest"
+    assert chaser.may_be_resting(master, "in-doubt-oid")
+
+
+async def test_a_placement_that_never_left_is_not_tracked():
+    from bulkdn.accounts import NotConnected
+
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+
+    async def down(**kwargs):
+        raise NotConnected("socket down")
+
+    master.place_limit = down
+    with pytest.raises(NotConnected):
+        await chaser.step(OPEN_BTC, leg)
+    assert leg.oid is None
