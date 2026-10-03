@@ -210,7 +210,9 @@ class Chaser:
         quote = self.feed.quote(symbol)
         if quote.age_s > self.price_stale_timeout_s:
             return ChaseOutcome(
-                symbol, "skipped", f"stale price ({quote.age_s:.1f}s old)"
+                symbol, "skipped",
+                "no price heard yet" if quote.age_s == float("inf")
+                else f"stale price ({quote.age_s:.1f}s old)",
             )
 
         since = self._chasing_since.get(self._chase_key(roles))
