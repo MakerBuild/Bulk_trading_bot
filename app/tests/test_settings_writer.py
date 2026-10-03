@@ -150,3 +150,23 @@ def test_writes_go_through_one_save():
     source = pathlib.Path(menu.__file__).read_text(encoding="utf-8")
     assert source.count('open(config_path, "w"') == 0
     assert source.count("_save_settings(config_path") >= 4
+
+
+def test_a_briefly_locked_file_is_retried_not_lost(tmp_path, monkeypatch):
+    """Notepad or a scanner holding the file turns the rename into a sharing
+    violation for a few milliseconds."""
+    path = write(tmp_path, MARKETS)
+    real = menu.os.replace
+    attempts = []
+
+    def locked_once(src, dst):
+        attempts.append(dst)
+        if len(attempts) == 1:
+            raise PermissionError(32, "in use")
+        real(src, dst)
+
+    monkeypatch.setattr(menu.os, "replace", locked_once)
+    monkeypatch.setattr(menu.time, "sleep", lambda _s: None)
+    menu._write_mode(str(path), "single")
+    assert len(attempts) == 2
+    assert load(path).mode == "single"

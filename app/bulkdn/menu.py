@@ -22,6 +22,7 @@ import pathlib
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -1285,13 +1286,12 @@ def _save_settings(config_path: str, edit: Callable[[list[str]], list[str]]) -> 
 
     The edited text goes to a temporary file beside the real one, is loaded by
     the same `load_config` the bot starts with, and only then replaces the
-    file -- atomically, with the retry the key store uses for a destination
-    Windows briefly has locked. Line endings and a leading byte-order mark are
+    file -- atomically, retried like the key store and the state file while Windows
+    briefly has the destination locked. Line endings and a leading byte-order mark are
     kept as the file had them: Notepad saves CRLF, and a file that is half one
     and half the other is a file the next editor "fixes" in a diff of every
     line.
     """
-    from . import keystore
     from .config import load_config
 
     path = pathlib.Path(config_path)
@@ -1325,10 +1325,32 @@ def _save_settings(config_path: str, edit: Callable[[list[str]], list[str]]) -> 
                 f"not saved -- {config_path} would not load afterwards: "
                 f"{str(exc).replace(temp, config_path)}"
             ) from exc
-        keystore._replace_with_retry(temp, str(path))
+        _replace_with_retry(temp, str(path))
     finally:
         with contextlib.suppress(FileNotFoundError):
             os.remove(temp)
+
+
+def _replace_with_retry(temp: str, path: str) -> None:
+    """`os.replace`, retried while Windows has the destination locked.
+
+    Notepad, OneDrive or a virus scanner holding settings.yaml for a moment
+    turns the rename into a sharing violation that is gone milliseconds
+    later. The key store and the state file retry the same way, on the one
+    schedule they share, so there is one number to tune.
+    """
+    from .state import REPLACE_ATTEMPTS, REPLACE_RETRY_DELAY_S
+
+    delay = REPLACE_RETRY_DELAY_S
+    for attempt in range(1, REPLACE_ATTEMPTS + 1):
+        try:
+            os.replace(temp, path)
+            return
+        except PermissionError:
+            if attempt == REPLACE_ATTEMPTS:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 def _write_target(config_path: str, key: str, value: float, defaults) -> None:
