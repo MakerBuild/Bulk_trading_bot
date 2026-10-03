@@ -122,9 +122,15 @@ class LegState:
 
 @dataclass
 class StrategyState:
+    # From before legs had phases of their own. Each leg carries its phase
+    # and hold now, and `from_dict` hands an old file's values down to legs
+    # that lack them. What `phase` still means is the halt -- HALTED here
+    # halts every leg -- and the answer `summary_phase` gives with no legs;
+    # `to_dict` writes it from the legs. `hold_until` is read by nothing but
+    # that migration.
     phase: Phase = Phase.IDLE
+    # Not a copy of the legs' `cycle_index`: the groups this run has finished.
     cycle_index: int = 0
-    cycle_started_at: float = 0.0
     hold_until: float = 0.0
     legs: dict[str, LegState] = field(default_factory=dict)
     halted_reason: str | None = None
@@ -203,9 +209,6 @@ class StrategyState:
             self.legs[key] = LegState(symbol=symbol or key, id=key)
         return self.legs[key]
 
-    def hold_remaining_s(self) -> float:
-        return max(0.0, self.hold_until - time.time())
-
     @property
     def summary_phase(self) -> Phase:
         """One phase to show for a pair whose legs may be in different ones.
@@ -252,7 +255,6 @@ class StrategyState:
         return cls(
             phase=Phase(data.get("phase", Phase.IDLE.value)),
             cycle_index=int(data.get("cycle_index", 0)),
-            cycle_started_at=float(data.get("cycle_started_at", 0.0)),
             hold_until=float(data.get("hold_until", 0.0)),
             legs=legs,
             halted_reason=data.get("halted_reason"),

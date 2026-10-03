@@ -84,8 +84,18 @@ def test_remember_stale_ignores_the_current_order():
 
 
 def test_hold_remaining_never_negative():
-    state = StrategyState(hold_until=0.0)
-    assert state.hold_remaining_s() == 0.0
+    leg = LegState(symbol="BTC-USD", hold_until=0.0)
+    assert leg.hold_remaining_s() == 0.0
+
+
+def test_an_old_files_cycle_fields_are_handed_down_to_its_legs():
+    """Written before legs had phases, holds and counts of their own."""
+    loaded = StrategyState.from_dict({
+        "phase": "HOLD", "hold_until": 123.0, "cycle_index": 2,
+        "cycle_started_at": 100.0, "legs": {"BTC-USD": {"symbol": "BTC-USD"}},
+    })
+    leg = loaded.leg("BTC-USD")
+    assert (leg.phase, leg.hold_until, leg.cycle_index) == (Phase.HOLD, 123.0, 2)
 
 
 # -- a locked destination must not kill a live run ---------------------------
