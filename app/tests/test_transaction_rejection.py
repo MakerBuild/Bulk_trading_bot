@@ -184,6 +184,55 @@ async def test_no_answer_at_all_is_still_in_doubt_and_not_a_rejection():
     assert master.symbols_in_doubt(60.0) == {BTC}
 
 
+# -- an answer that cannot be read -------------------------------------------
+
+
+def accepted(request_id, status_key):
+    return {
+        "type": "post",
+        "id": request_id,
+        "data": {"type": "action", "payload": {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{status_key: {"oid": "x"}}]}},
+        }},
+    }
+
+
+async def test_an_answer_that_cannot_be_read_is_in_doubt_at_once():
+    """The SDK popped the waiting request, then failed to parse the reply; the
+    receive loop swallowed the error and the caller waited out its timeout for
+    an answer that had already come."""
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    answer = asyncio.create_task(
+        answer_when_sent(client, 1, lambda sent: [accepted(sent[0]["id"], "somethingEntirelyNew")])
+    )
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(SubmissionInDoubt):
+        await master.submit([FakeAction()], timeout=2.0)
+    await answer
+
+    assert asyncio.get_running_loop().time() - started < 1.0, "it waited out the timeout"
+    assert client.pending_requests == {}
+    assert master.reject_streak == 0, "an unread answer is not a refusal"
+    assert master.symbols_in_doubt(60.0) == {BTC}
+
+
+async def test_an_answer_that_can_be_read_is_delivered():
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    answer = asyncio.create_task(
+        answer_when_sent(client, 1, lambda sent: [accepted(sent[0]["id"], "resting")])
+    )
+    (response,) = await master.submit([FakeAction()], timeout=2.0)
+    await answer
+
+    assert response.status is OrderStatus.RESTING
+    assert client.pending_requests == {}
+
+
 # -- an error frame on a shared socket ---------------------------------------
 
 

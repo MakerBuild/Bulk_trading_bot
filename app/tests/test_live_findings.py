@@ -51,13 +51,24 @@ def test_the_statuses_that_already_worked_still_do(spelling, expected):
     assert OrderStatus.from_string(spelling).name == expected
 
 
-def test_an_unknown_terminal_status_still_delivers_the_response():
-    """Dropping the reply costs a hedge. Both of these are terminal by their
-    prefix, so nothing downstream acts on which one it was."""
+@pytest.mark.parametrize("spelling", ["cancelSomethingNew", "cancelledSomethingNew",
+                                      "rejectedSomethingNew"])
+def test_an_unknown_status_is_not_guessed_from_its_prefix(spelling):
+    """"cancel..." used to be read as cancelled. The SDK's own
+    `cancelOneRejected` starts that way and means the order is still live."""
     from bulk_api.common.enums import OrderStatus
 
-    assert OrderStatus.from_string("cancelledSomethingNew") is OrderStatus.CANCELLED
-    assert OrderStatus.from_string("rejectedSomethingNew") is OrderStatus.REJECTED_INVALID
+    with pytest.raises(ValueError, match="Unknown order status"):
+        OrderStatus.from_string(spelling)
+
+
+@pytest.mark.parametrize("spelling", ["cancelOneRejected", "CANCELALLREJECTED"])
+def test_a_refused_cancel_reads_as_refused_not_as_cancelled(spelling):
+    from bulk_api.common.enums import OrderStatus
+
+    status = OrderStatus.from_string(spelling)
+    assert status is OrderStatus.CANCEL_REJECT
+    assert status is not OrderStatus.CANCELLED
 
 
 def test_an_unknown_status_that_is_not_terminal_is_refused():

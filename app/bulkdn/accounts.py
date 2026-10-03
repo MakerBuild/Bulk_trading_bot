@@ -320,17 +320,41 @@ class RoutedWsClient(BulkWebSocketClient):
         `TransactionRejected` is what lets `AccountSession.submit` count it
         toward the reject streak instead of filing it with the timeouts.
 
-        An "ok" reply is left to the SDK, which parses the per-action
-        statuses.
+        An "ok" reply is parsed here too, rather than handed to the SDK. The
+        SDK pops the waiting future first and parses second, so a reply it
+        could not parse -- an order status it has never heard of -- raised
+        out of the handler, the receive loop logged and swallowed it, and the
+        future was gone from `pending_requests` with nothing left to resolve
+        it. The caller waited out its whole timeout for an answer that had
+        already arrived. An unreadable reply is now resolved at once as in
+        doubt: the transaction was accepted, but what became of each action in
+        it is unknown, and a position read is what settles that.
         """
         response_data = data.get("data") if isinstance(data, dict) else None
         payload = response_data.get("payload") if isinstance(response_data, dict) else None
         status = payload.get("status") if isinstance(payload, dict) else None
+        request_id = data.get("id") if isinstance(data, dict) else None
+        future = self.pending_requests.pop(request_id, None)
+
         if status == "ok":
-            await super()._handle_post_response(data)
+            try:
+                responses = OrderResponse.from_api(data)
+            except Exception as exc:  # noqa: BLE001 - whatever it was, the answer is unread
+                log.error(
+                    "could not read the exchange's answer to request %s (%s) -- the "
+                    "transaction was accepted, but what became of each action in it "
+                    "is unknown until positions are re-read: %s",
+                    request_id, describe(exc), response_data,
+                )
+                if future is not None and not future.done():
+                    future.set_exception(
+                        SubmissionInDoubt(f"unreadable answer: {describe(exc)}")
+                    )
+                return
+            if future is not None and not future.done():
+                future.set_result(responses)
             return
 
-        future = self.pending_requests.pop(data.get("id"), None)
         log.error("transaction refused by the exchange: %s", response_data)
         if future is not None and not future.done():
             future.set_exception(

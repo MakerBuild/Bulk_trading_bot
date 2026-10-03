@@ -150,11 +150,15 @@ def _tolerant_status_from_string(original):
     Matching case-insensitively against the SDK's own list of spellings is
     exact: it never invents a status, it only forgives capitalisation.
 
-    A status on neither list is different. Raising drops the response and costs
-    a hedge; guessing could be worse -- reading a new NON-terminal status as
-    cancelled would tell the chaser its order had died and it would place a
-    second one. So the guess is confined to the two prefixes that are terminal
-    by construction, and anything else still raises.
+    A status on neither list raises, and is not guessed at. It used to be: any
+    status starting "cancel" was read as `cancelled` and any starting "reject"
+    as `rejectedInvalid`, on the theory that both prefixes are terminal by
+    construction. They are not -- the SDK's own `cancelAllRejected` and
+    `cancelOneRejected` start with "cancel" and mean the cancel was refused and
+    the order is still live. Read as cancelled, the chaser would place a second
+    order beside one that never died. Raising no longer costs a hedge either:
+    `RoutedWsClient._handle_post_response` resolves an unreadable reply as in
+    doubt at once instead of leaving the caller to time out.
     """
 
     def parse(cls, s: str):
@@ -168,21 +172,10 @@ def _tolerant_status_from_string(original):
             log.debug("order status %r accepted as %r", s, spelled)
             return original(spelled)
 
-        text = str(s).lower()
-        for prefix, fallback in (("cancel", "cancelled"), ("reject", "rejectedInvalid")):
-            if text.startswith(prefix):
-                log.warning(
-                    "unknown order status %r -- treating it as %r so the order "
-                    "response is still delivered. Both are terminal, so nothing "
-                    "downstream acts on the difference.",
-                    s, fallback,
-                )
-                return original(fallback)
-
         log.error(
-            "unknown order status %r, and it is neither a cancel nor a reject. "
-            "Refusing to guess: reading a non-terminal status as terminal would "
-            "have the chaser replace an order that is still live.",
+            "unknown order status %r -- refusing to guess: reading a live order "
+            "as finished would have the chaser replace an order that is still "
+            "on the book",
             s,
         )
         raise ValueError(f"Unknown order status {s}")
