@@ -16,6 +16,7 @@ cannot fix.
 import asyncio
 import pytest
 
+from bulkdn.accounts import SharedReconnect
 from bulkdn.risk import Violation
 from bulkdn.strategy import Strategy
 
@@ -28,6 +29,7 @@ class FakeClient:
         self.attempts = 0
         self.disconnects = 0
         self.is_connected = False
+        self.reconnect_share = SharedReconnect()
 
     async def connect(self):
         self.attempts += 1

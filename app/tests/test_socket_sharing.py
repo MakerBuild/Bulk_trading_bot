@@ -16,7 +16,7 @@ import logging
 import pytest
 
 import bulkdn.accounts as accounts_mod
-from bulkdn.accounts import AccountSession, RoutedWsClient, _owner_of
+from bulkdn.accounts import AccountSession, RoutedWsClient, SharedReconnect, _owner_of
 
 MASTER = "MASTER-PUB"
 SUB1 = "SUB1-PUB"
@@ -31,6 +31,7 @@ class DeadClient:
         self.connect_delay = connect_delay
         self.attempts = 0
         self.is_connected = False
+        self.reconnect_share = SharedReconnect()
 
     async def connect(self):
         self.attempts += 1
@@ -113,8 +114,8 @@ async def test_the_verdict_expires():
     master, sub1 = sessions_on(client, MASTER, SUB1)
 
     assert await master.reconnect(attempts=2) is False
-    ok, generation, at = client._bulkdn_reconnect_outcome
-    client._bulkdn_reconnect_outcome = (ok, generation, at - accounts_mod.RECONNECT_SHARE_S - 1)
+    ok, generation, at = client.reconnect_share.outcome
+    client.reconnect_share.outcome = (ok, generation, at - accounts_mod.RECONNECT_SHARE_S - 1)
 
     assert await sub1.reconnect(attempts=2) is False
     assert client.attempts == 4, "a later heal must try again"
@@ -226,3 +227,25 @@ async def test_a_stranger_is_logged_and_rate_limited(monkeypatch, caplog):
     assert owners == [None, None], "it was attributed to an account it names wrongly"
     warned = [r for r in caplog.records if "not one of the" in r.getMessage()]
     assert len(warned) == 1, "one warning per interval, not one per frame"
+
+
+def test_the_reconnect_state_is_declared_on_the_socket_not_set_onto_it():
+    """It used to be `_bulkdn_reconnect*` attributes setattr'd onto the SDK
+    client from outside, and a module global for the generation."""
+    client = RoutedWsClient(url="wss://x", symbols=[], accounts=[])
+    assert isinstance(client.reconnect_share, SharedReconnect)
+    assert client.reconnect_share.task is None
+    assert not hasattr(accounts_mod, "_reconnect_generation")
+
+
+async def test_a_session_reads_its_own_lag_without_reaching_for_it():
+    """`stream_lagging_until` was set from outside and read back with getattr."""
+    import time
+
+    client = DeadClient(succeed_on=1)
+    client.is_connected = True
+    (session,) = sessions_on(client, MASTER)
+    assert session.stream_lagging_until == 0.0
+    assert session._socket_unreliable() is False
+    session.stream_lagging_until = time.monotonic() + 60
+    assert session._socket_unreliable() is True

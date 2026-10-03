@@ -26,7 +26,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 from collections.abc import Callable, Sequence
 
 import requests
@@ -203,6 +203,9 @@ class RoutedWsClient(BulkWebSocketClient):
         # When the SDK's receive loop last saw this socket close. See
         # `_reconnect`.
         self.dropped_at: float | None = None
+        # The supervisor's reconnect of this socket, shared by every session
+        # on it. See `reconnect_client`.
+        self.reconnect_share = SharedReconnect()
 
     # -- connection --------------------------------------------------------
 
@@ -659,13 +662,29 @@ class SendPacer:
             await asyncio.sleep(min(self._sent[0] + 1.0 - now, deadline - now) + 0.001)
 
 
-# One pacer per socket, not per account: subaccounts share their master's
-# socket, and it is the socket the exchange counts.
-_PACERS: dict[int, SendPacer] = {}
+@dataclass
+class SharedReconnect:
+    """One socket's reconnect, as every session on it sees it.
 
+    Declared state, held by the client because the client IS the socket. It
+    used to be three attributes set onto the client from outside by name
+    (`_bulkdn_reconnect`, `..._waiters`, `..._outcome`) and a module global
+    for the generation. See `reconnect_client` for how they are used.
+    """
 
-def pacer_for(client: object) -> SendPacer:
-    return _PACERS.setdefault(id(client), SendPacer())
+    # The attempts under way, if any.
+    task: asyncio.Future | None = None
+    # How many sessions are waiting on `task`. See `_await_shared`.
+    waiters: int = 0
+    # (succeeded, generation, when) of the last run that finished.
+    outcome: tuple[bool, int, float] | None = None
+
+    # Bumped whenever ANY socket reconnects. A failure is shared with the next
+    # caller only while this is unchanged: one socket coming back is proof the
+    # network did, and the supervisor retries the ones that failed before it
+    # for exactly that reason. A shared failure must not refuse that retry.
+    # Process-wide by design, so a class attribute rather than a field.
+    generation: ClassVar[int] = 0
 
 
 @dataclass
@@ -677,6 +696,12 @@ class AccountSession:
     client: RoutedWsClient
     http: BulkHttpClient
     dry_run: bool = False
+    # The socket's submission count, for `place_limit` to yield to. One per
+    # SOCKET, not per account: subaccounts share their master's socket, and
+    # it is the socket the exchange counts -- so `build_pool` hands every
+    # session on a socket the same one. It used to be a module dict keyed by
+    # `id(client)`, never cleaned and wrong for any id Python reused.
+    pacer: SendPacer = field(default_factory=SendPacer)
     reject_streak: int = 0
     # Throttled transactions since the exchange last answered anything else.
     # See THROTTLE_STREAK_LIMIT.
@@ -692,6 +717,11 @@ class AccountSession:
     # Without this the liquidation guard reads our own unacknowledged fill as
     # someone else closing the position, which is the opposite conclusion.
     unconfirmed: dict[str, float] = field(default_factory=dict)
+    # Until when this account's stream is known to be behind the exchange, by
+    # the monotonic clock. Set by the strategy when fills arrive late, read
+    # here and by the reconciler: a socket behind is not trusted to carry a
+    # cancel or a close, and its updates are not trusted over an HTTP read.
+    stream_lagging_until: float = 0.0
 
     def symbols_in_doubt(self, within_s: float) -> set[str]:
         """Symbols with a submission whose outcome is still unknown."""
@@ -816,7 +846,7 @@ class AccountSession:
             # Named explicitly: one socket may carry several accounts, and the
             # session is the only thing that knows which of them this is.
             kwargs.setdefault("account", self.pubkey)
-            pacer_for(self.client).note()
+            self.pacer.note()
             responses = await self.client.submit(actions, **kwargs)
         except NotSent as exc:
             # Nothing left this process, so nothing is in doubt -- and a fault
@@ -954,7 +984,7 @@ class AccountSession:
 
         # Only here: a resting order -- the chaser's, or a limit close's -- is
         # the one submission that can afford to wait.
-        await pacer_for(self.client).room_for_chase()
+        await self.pacer.room_for_chase()
         try:
             responses = await self.submit(actions)
         except OrderRejected as exc:
@@ -1031,7 +1061,7 @@ class AccountSession:
     def _socket_unreliable(self) -> bool:
         if not self.client.is_connected:
             return True
-        return time.monotonic() < getattr(self, "stream_lagging_until", 0.0)
+        return time.monotonic() < self.stream_lagging_until
 
     async def _cancel_all_http(self, symbols: Sequence[str]) -> list[OrderResponse]:
         await self._post_http([CancelAll(symbols=list(symbols))], "cancel-all")
@@ -1130,12 +1160,6 @@ class AccountSession:
 # that pass with room to spare and is well short of the next one.
 RECONNECT_SHARE_S = 10.0
 
-# Bumped whenever ANY socket reconnects. A failure is shared with the next
-# caller only while this is unchanged: one socket coming back is proof the
-# network did, and the supervisor retries the ones that failed before it for
-# exactly that reason. A shared failure must not refuse that retry.
-_reconnect_generation = 0
-
 
 async def reconnect_client(
     client, *, label: str, attempts: int = 6, delay: float = 2.0
@@ -1154,22 +1178,22 @@ async def reconnect_client(
       full budget against the same dead endpoint.
     * Otherwise run the attempts.
 
-    The state lives on the client object because the client IS the socket --
-    which is also how `Strategy._trees` groups sessions by key.
+    The state lives on the client (`SharedReconnect`) because the client IS
+    the socket -- which is also how `Strategy._trees` groups sessions by key.
     """
-    running = getattr(client, "_bulkdn_reconnect", None)
+    share: SharedReconnect = client.reconnect_share
+    running = share.task
     if running is not None and not running.done():
         log.info("%s: joining the reconnect already under way on this socket", label)
-        return await _await_shared(client, running)
+        return await _await_shared(share, running)
 
-    outcome = getattr(client, "_bulkdn_reconnect_outcome", None)
-    if outcome is not None:
-        ok, generation, at = outcome
+    if share.outcome is not None:
+        ok, generation, at = share.outcome
         if time.monotonic() - at < RECONNECT_SHARE_S:
             if ok and client.is_connected:
                 log.info("%s: this socket was reconnected moments ago", label)
                 return True
-            if not ok and generation == _reconnect_generation:
+            if not ok and generation == SharedReconnect.generation:
                 log.warning(
                     "%s: this socket gave up reconnecting moments ago and "
                     "nothing has come back since -- not retrying it again",
@@ -1178,12 +1202,12 @@ async def reconnect_client(
                 return False
 
     task = asyncio.ensure_future(_reconnect_attempts(client, label, attempts, delay))
-    client._bulkdn_reconnect = task
-    client._bulkdn_reconnect_waiters = 0
-    return await _await_shared(client, task)
+    share.task = task
+    share.waiters = 0
+    return await _await_shared(share, task)
 
 
-async def _await_shared(client, task: asyncio.Future) -> bool:
+async def _await_shared(share: SharedReconnect, task: asyncio.Future) -> bool:
     """Wait on a shared reconnect without letting one waiter cancel it for all.
 
     Shielded, so a session whose own caller is cancelled does not take the
@@ -1191,15 +1215,15 @@ async def _await_shared(client, task: asyncio.Future) -> bool:
     waiter is cancelled -- shutdown -- the attempts stop too, rather than
     running on in the background and reopening a socket after the run ended.
     """
-    client._bulkdn_reconnect_waiters = getattr(client, "_bulkdn_reconnect_waiters", 0) + 1
+    share.waiters += 1
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        if client._bulkdn_reconnect_waiters <= 1 and not task.done():
+        if share.waiters <= 1 and not task.done():
             task.cancel()
         raise
     finally:
-        client._bulkdn_reconnect_waiters -= 1
+        share.waiters -= 1
 
 
 async def _reconnect_attempts(client, label: str, attempts: int, delay: float) -> bool:
@@ -1229,10 +1253,9 @@ async def _reconnect_attempts(client, label: str, attempts: int, delay: float) -
 
 
 def _record_reconnect(client, ok: bool) -> None:
-    global _reconnect_generation
     if ok:
-        _reconnect_generation += 1
-    client._bulkdn_reconnect_outcome = (ok, _reconnect_generation, time.monotonic())
+        SharedReconnect.generation += 1
+    client.reconnect_share.outcome = (ok, SharedReconnect.generation, time.monotonic())
 
 
 def build_pool(
@@ -1290,11 +1313,14 @@ def build_pool(
             accounts=[pubkey for _name, pubkey in fresh],
             dry_run=dry_run,
         )
+        # One per socket, shared by every session on it -- see the field.
+        pacer = SendPacer()
         for name, pubkey in fresh:
             seen.add(pubkey)
             sessions.append(
                 AccountSession(
-                    name=name, pubkey=pubkey, client=client, http=http, dry_run=dry_run
+                    name=name, pubkey=pubkey, client=client, http=http,
+                    dry_run=dry_run, pacer=pacer,
                 )
             )
 
