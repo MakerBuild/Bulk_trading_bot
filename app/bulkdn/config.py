@@ -68,7 +68,7 @@ PRIVATE_KEY_TEMPLATE = """# Paste your BULK master account's base58 private key 
 # never did. What had expired was a root in the WINDOWS certificate store, which
 # `requests` never consulted because it ships certifi -- so HTTP worked while the
 # socket, trusting the system store, failed. With the socket on certifi too,
-# `ws_ssl_auto_bypass` is no longer needed and is off by default.
+# the TLS bypass settings had nothing left to fix and were removed.
 MAINNET_HTTP_URL = "https://mainnet-api1.bulk.trade/api/v1"
 MAINNET_WS_URL = "wss://mainnet-ws1.bulk.trade"
 
@@ -497,19 +497,6 @@ class Config:
     # See bulkdn/pause.py. Off unless asked for.
     pause: PauseConfig = field(default_factory=PauseConfig)
 
-    # Escape hatches for TLS, both OFF by default.
-    #
-    # The WebSocket was once thought to serve an expired certificate, and the
-    # bypass was switched on by default to keep the account stream up. The
-    # certificate was fine: an expired root in the Windows store was rejecting
-    # it, and verifying against certifi (ws_compat) fixed the actual cause. A
-    # default that quietly drops verification would now only ever fire on a
-    # certificate that really is wrong -- which is the one case where the fills
-    # and positions every hedge is computed from must not be trusted. Kept, off,
-    # for an operator whose network genuinely cannot connect any other way.
-    ws_insecure_ssl: bool = False
-    ws_ssl_auto_bypass: bool = False
-
     # Optional endpoint overrides, for when the derived host is wrong.
     http_url_override: str = ""
     ws_url_override: str = ""
@@ -793,8 +780,8 @@ _TOP_KEYS = frozenset({
     "max_phase_minutes", "chase_interval_s", "reconcile_interval_s",
     "position_sync_interval_s", "cycles", "execution_target",
     "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
-    "state_file", "log_level", "http_url", "ws_url", "ws_insecure_ssl",
-    "ws_ssl_auto_bypass", "telegram", "access", "pause",
+    "state_file", "log_level", "http_url", "ws_url", "telegram", "access",
+    "pause",
 })
 _PAUSE_KEYS = frozenset({"max_move_bps", "window_minutes", "calm_minutes", "schedule"})
 _POOL_KEYS = frozenset({"max_groups", "max_takers", "single_master"})
@@ -820,6 +807,18 @@ _RETIRED = {
         "no longer used and can be deleted. A tightened order now follows the "
         "touch tick by tick, which is what that setting was trying to "
         "approximate in the wrong unit."
+    ),
+    # Both turned TLS verification off on the WebSocket. Ignored rather than
+    # refused, so an old settings file still starts -- with verification on.
+    "ws_insecure_ssl": (
+        "removed and ignored: the WebSocket always verifies its certificate "
+        "now (against certifi's bundle, which fixed the Windows certificate "
+        "store problem this switch was for). Delete the line."
+    ),
+    "ws_ssl_auto_bypass": (
+        "removed and ignored: the WebSocket always verifies its certificate "
+        "now (against certifi's bundle, which fixed the Windows certificate "
+        "store problem this switch was for). Delete the line."
     ),
 }
 
@@ -1240,11 +1239,6 @@ def load_config(
         log_level=_log_level(raw.get("log_level", "INFO")),
         http_url_override=_as_str(raw.get("http_url") or "", "http_url"),
         ws_url_override=_as_str(raw.get("ws_url") or "", "ws_url"),
-        ws_insecure_ssl=_as_bool(raw.get("ws_insecure_ssl", False), "ws_insecure_ssl"),
-        # Off by default -- see the field on Config for why.
-        ws_ssl_auto_bypass=_as_bool(
-            raw.get("ws_ssl_auto_bypass", False), "ws_ssl_auto_bypass"
-        ),
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
         access=_access_from_dict(raw.get("access") or {}),
         pause=_pause_from_dict(raw.get("pause") or {}),

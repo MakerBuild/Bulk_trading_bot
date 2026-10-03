@@ -11,9 +11,13 @@ the account stream also emits the short forms (`sym`, `oid`, `px`, `sz`, `b`,
 symbol and size 0.0 -- which this bot would treat as "nothing filled" and never
 hedge. Both spellings are accepted here.
 
-**2. `tradeId` is discarded.** Added in API v1.0.17 and needed to recognise
-replayed fills. `Fill` has no such field upstream, so it is attached
-dynamically; the dataclass has no `__slots__`, so this is safe.
+**2. The trade id is discarded.** Needed to recognise replayed fills. `Fill`
+has no such field upstream, so it is attached dynamically; the dataclass has no
+`__slots__`, so this is safe. It is read by `wire.trade_id`, the same identity
+the fee walk counts trades by: `slot` and `sequence`, which is what mainnet
+sends, or `tradeId` (API v1.0.17) where that is all there is. Reading only
+`tradeId`, as this once did, left every mainnet fill with no id at all -- and
+the replay guard, which treats a missing id as new, silently off.
 
 **3. TLS verification fails against the live endpoints -- on Windows.** This was
 read the wrong way round for a while, and the wrong reading is worth recording
@@ -31,8 +35,15 @@ means the system store, so it failed where every HTTP call succeeded.
 
 So the socket is opened against certifi's bundle -- the same trust anchors the
 HTTP half of this bot has been using all along -- and verification stays on.
-The bypass below survives only as a last resort for an operator who cannot
-connect at all, and it is no longer reached in normal use.
+
+There used to be a way to turn it off: `ws_insecure_ssl`, and an automatic
+bypass that retried without verification after a rejected certificate and then
+stayed latched off for the rest of the process. Both were written for the
+Windows store problem, which certifi fixed at the cause. What was left for
+them to catch was a certificate that really is wrong -- the one case where the
+fills and positions every hedge is computed from must not be believed -- so
+they are gone, and a socket that cannot be verified is a socket that does not
+open.
 """
 
 from __future__ import annotations
@@ -45,45 +56,24 @@ from bulk_api.common import Side
 from bulk_api.messages.trade import Fill
 from websockets.asyncio.client import connect as _original_ws_connect
 
+from .wire import first as _first
+from .wire import is_buy as _fill_is_buy
+from .wire import trade_id as _trade_id
+
 log = logging.getLogger(__name__)
 
 _PATCHED = False
-_insecure_ssl = False
-_auto_bypass = False
-_bypass_latched = False
+# Said once per process: a fill without an id is a fact about the stream's
+# shape, and it would otherwise be repeated on every fill of a run.
+_no_trade_id_warned = False
 
 # The SDK's default is short enough that a cold connection can miss it.
 _OPEN_TIMEOUT = 30
 
 # How often to ping, and how long to wait for the pong before calling the
-# socket dead. See _connect_with_ssl_fallback.
+# socket dead. See _connect_verified.
 _PING_INTERVAL = 20.0
 _PING_TIMEOUT = 60.0
-
-
-def set_ssl_options(*, insecure: bool = False, auto_bypass: bool = False) -> None:
-    """Configure TLS behaviour before connecting.
-
-    `insecure` skips verification outright; `auto_bypass` keeps verification on
-    but retries once without it if the certificate is rejected. Both default
-    to off, as `ws_ssl_auto_bypass` does in the config: the certificate
-    failures that once made the bypass necessary came from the system store,
-    and verification now goes through certifi's bundle. A caller that does not
-    pass the setting -- a tool, a test, a future entry point -- must not get
-    unverified TLS by omission.
-    """
-    global _insecure_ssl, _auto_bypass, _bypass_latched
-    _insecure_ssl = insecure
-    _auto_bypass = auto_bypass
-    if insecure:
-        _bypass_latched = True
-
-
-def _insecure_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
 
 
 def verified_context() -> ssl.SSLContext:
@@ -111,16 +101,12 @@ def verified_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
-async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
-    """Open a socket, verifying against certifi's bundle.
+async def _connect_verified(url: str, **kwargs: Any):
+    """Open a socket, verifying against certifi's bundle, with our keepalive.
 
-    Only if that is rejected too does the bypass come into play, and then it
-    stays latched for the process so reconnects don't pay a failed handshake
-    every time. Before certifi was used here the bypass fired on every run on
-    Windows, which meant the account stream -- fills and positions, the input
-    to every hedge -- came from an endpoint nothing had authenticated.
+    A certificate that fails verification fails the connect, every time. See
+    the module docstring for the bypass that used to sit here and why it went.
     """
-    global _bypass_latched
     kwargs["open_timeout"] = kwargs.get("open_timeout") or _OPEN_TIMEOUT
 
     # ASSIGNED, NOT setdefault -- and that is the whole point of these two lines.
@@ -142,30 +128,10 @@ async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
     kwargs["ping_interval"] = _PING_INTERVAL
     kwargs["ping_timeout"] = _PING_TIMEOUT
 
-    if _insecure_ssl or _bypass_latched:
-        kwargs["ssl"] = _insecure_context()
-        return await _original_ws_connect(url, **kwargs)
-
     # Verified against certifi rather than the system store -- see
     # verified_context. Only set when the caller has not chosen for itself.
     kwargs.setdefault("ssl", verified_context())
-
-    try:
-        return await _original_ws_connect(url, **kwargs)
-    except ssl.SSLCertVerificationError as exc:
-        if not _auto_bypass:
-            raise
-        _bypass_latched = True
-        log.warning(
-            "TLS verification failed for %s even against certifi's certificate "
-            "bundle (%s). Retrying WITHOUT certificate checks: traffic stays "
-            "encrypted, but nothing proves the endpoint is BULK, and fills and "
-            "positions read from it are what every hedge is based on. If this "
-            "persists, check the URL and the system clock before trusting it.",
-            url, exc.verify_message or exc,
-        )
-        kwargs["ssl"] = _insecure_context()
-        return await _original_ws_connect(url, **kwargs)
+    return await _original_ws_connect(url, **kwargs)
 
 
 # Every spelling `OrderStatus.from_string` accepts, in its own capitalisation.
@@ -195,11 +161,15 @@ def _tolerant_status_from_string(original):
     Matching case-insensitively against the SDK's own list of spellings is
     exact: it never invents a status, it only forgives capitalisation.
 
-    A status on neither list is different. Raising drops the response and costs
-    a hedge; guessing could be worse -- reading a new NON-terminal status as
-    cancelled would tell the chaser its order had died and it would place a
-    second one. So the guess is confined to the two prefixes that are terminal
-    by construction, and anything else still raises.
+    A status on neither list raises, and is not guessed at. It used to be: any
+    status starting "cancel" was read as `cancelled` and any starting "reject"
+    as `rejectedInvalid`, on the theory that both prefixes are terminal by
+    construction. They are not -- the SDK's own `cancelAllRejected` and
+    `cancelOneRejected` start with "cancel" and mean the cancel was refused and
+    the order is still live. Read as cancelled, the chaser would place a second
+    order beside one that never died. Raising no longer costs a hedge either:
+    `RoutedWsClient._handle_post_response` resolves an unreadable reply as in
+    doubt at once instead of leaving the caller to time out.
     """
 
     def parse(cls, s: str):
@@ -213,54 +183,15 @@ def _tolerant_status_from_string(original):
             log.debug("order status %r accepted as %r", s, spelled)
             return original(spelled)
 
-        text = str(s).lower()
-        for prefix, fallback in (("cancel", "cancelled"), ("reject", "rejectedInvalid")):
-            if text.startswith(prefix):
-                log.warning(
-                    "unknown order status %r -- treating it as %r so the order "
-                    "response is still delivered. Both are terminal, so nothing "
-                    "downstream acts on the difference.",
-                    s, fallback,
-                )
-                return original(fallback)
-
         log.error(
-            "unknown order status %r, and it is neither a cancel nor a reject. "
-            "Refusing to guess: reading a non-terminal status as terminal would "
-            "have the chaser replace an order that is still live.",
+            "unknown order status %r -- refusing to guess: reading a live order "
+            "as finished would have the chaser replace an order that is still "
+            "on the book",
             s,
         )
         raise ValueError(f"Unknown order status {s}")
 
     return classmethod(parse)
-
-
-def _first(data: dict, *names: str, default: Any = None) -> Any:
-    for name in names:
-        if name in data and data[name] is not None:
-            return data[name]
-    return default
-
-
-# Where a fill's side may be stated. `isBuy`/`b` are what the stream sends; a
-# `side` string is accepted too, in the spellings an exchange tends to use.
-_SIDE_WORDS = {"buy": True, "b": True, "bid": True, "sell": False, "s": False,
-               "a": False, "ask": False}
-
-
-def _fill_is_buy(data: dict) -> bool | None:
-    """True for a buy, False for a sell, None when the fill does not say."""
-    flag = _first(data, "isBuy", "b")
-    if isinstance(flag, bool):
-        return flag
-    if isinstance(flag, (int, float)) and flag in (0, 1):
-        return bool(flag)
-    if isinstance(flag, str) and flag.lower() in ("true", "false"):
-        return flag.lower() == "true"
-    word = _first(data, "side")
-    if isinstance(word, str):
-        return _SIDE_WORDS.get(word.strip().lower())
-    return None
 
 
 @classmethod
@@ -304,16 +235,30 @@ def _robust_fill_from_api(cls, data: dict) -> Fill:
         is_maker=bool(_first(data, "maker", "mk", default=False)),
     )
     fill.side_missing = is_buy is None
-    # v1.0.17 trade id, used to drop replayed fills. Not a field on Fill
-    # upstream, so it is attached here.
-    fill.trade_id = _first(data, "tradeId", "tid")
+    # Used to drop replayed fills. Not a field on Fill upstream, so it is
+    # attached here. See point 2 in the module docstring.
+    fill.trade_id = _trade_id(data)
+    if fill.trade_id is None and size:
+        _warn_no_trade_id(data)
     return fill
 
 
-def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = False) -> None:
+def _warn_no_trade_id(data: dict) -> None:
+    global _no_trade_id_warned
+    if _no_trade_id_warned:
+        return
+    _no_trade_id_warned = True
+    log.warning(
+        "a fill arrived with no trade id (neither slot+sequence nor tradeId; "
+        "fields: %s) -- a fill replayed after a reconnect cannot be recognised "
+        "and may be applied to the book twice until positions are re-read",
+        sorted(data),
+    )
+
+
+def apply_ws_compat() -> None:
     """Install the patches. Idempotent."""
     global _PATCHED
-    set_ssl_options(insecure=insecure_ssl, auto_bypass=auto_bypass)
     if _PATCHED:
         return
 
@@ -333,12 +278,12 @@ def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = False) ->
     #
     # `websockets.asyncio.client.connect` used to be replaced as well, which
     # changed `websockets.connect` for the whole process: every other library
-    # opening a socket got this module's keepalive overrides and its TLS
-    # bypass latch, and a test or tool importing websockets after this ran
+    # opening a socket got this module's keepalive overrides and what was
+    # then its TLS bypass, and a test or tool importing websockets after this ran
     # saw a function that was not websockets'. Nothing in the SDK or in this
     # bot reaches the global name -- `bulk_ws.connect` is the only caller --
     # so the global patch bought nothing for what it put at risk.
-    bulk_ws_module.ws_connect = _connect_with_ssl_fallback  # type: ignore[attr-defined]
+    bulk_ws_module.ws_connect = _connect_verified  # type: ignore[attr-defined]
 
     _PATCHED = True
     log.debug("WebSocket compatibility patches applied")

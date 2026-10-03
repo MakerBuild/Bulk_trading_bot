@@ -323,10 +323,10 @@ uses it — which is why every HTTP call worked while the socket, going through
 trust the same anchors and verification stays on. `certifi` is pinned in `requirements.txt` by
 name for that reason.
 
-`ws_ssl_auto_bypass` now **defaults to false**, in `config.py` and in the shipped settings. It
-survives for an operator who cannot connect at all, and when it does fire it says plainly that
-fills and positions — the input to every hedge — are then coming from an endpoint nothing has
-authenticated.
+The two switches that turned verification off, `ws_insecure_ssl` and `ws_ssl_auto_bypass`, are
+**removed**. With the cause fixed, all they could still catch was a certificate that really is
+wrong — the one case where fills and positions, the input to every hedge, must not be believed.
+An old settings file that still has them loads with a warning that they are ignored.
 
 Test in this order:
 

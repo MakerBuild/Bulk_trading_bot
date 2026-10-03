@@ -26,13 +26,15 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 from collections.abc import Callable, Sequence
 
 import requests
 from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
+from bulk_api.api.bulk_ws import ConnectionState
 from .retry import describe, post_signed
+from .wire import unwrap_full_account
 from bulk_api.common import (
     OrderStatus,
     Side,
@@ -80,7 +82,14 @@ class TransactionRejected(OrderRejected):
         self.detail = detail
 
 
-_RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "ratelimit", "too many", "throttl")
+# Phrases that say throttling and nothing else. "too many" used to be one of
+# them, and "too many open orders" -- a refusal for cause, and exactly the kind
+# the reject streak exists to catch -- read as throttling, so it was never
+# counted and the kill switch could not trip on it. "Too Many Requests" is the
+# 429 status's own reason phrase, and is matched whole.
+_RATE_LIMIT_MARKERS = (
+    "rate limit", "rate-limit", "ratelimit", "throttl", "too many requests",
+)
 # The status code on its own, not as digits inside a longer number. The
 # refusal's text carries the whole response -- ids, nonces, prices -- and a
 # bare substring match read "bad signature" with a 429 somewhere in a nonce as
@@ -92,12 +101,25 @@ def is_rate_limited(exc: BaseException) -> bool:
     """Whether a refusal is the exchange throttling us rather than saying no.
 
     Judged from the text, which is all a refusal carries: the reply has no
-    code for it that this bot has seen.
+    code for it that this bot has seen. So only phrases that cannot mean
+    anything else count, and a 429 standing on its own.
     """
     text = f"{exc} {getattr(exc, 'detail', '') or ''}".lower()
     return any(marker in text for marker in _RATE_LIMIT_MARKERS) or bool(
         _STATUS_429.search(text)
     )
+
+
+# How many throttled transactions in a row an account absorbs before each
+# further one counts toward the reject streak. Throttling is kept off the streak
+# because a burst of 429s on a shared socket reached five inside five seconds
+# of chasing, and the streak halts the run and closes every account at market
+# -- no answer to an outage of a few seconds. But throttling that never lets up
+# is an account that cannot trade, and it must still halt eventually rather than
+# chase forever. Thirty is about half a minute of nothing but refusals at the
+# chaser's pace of one re-price a second; with the default streak limit of five
+# the run halts on the thirty-fifth.
+THROTTLE_STREAK_LIMIT = 30
 
 
 class NotSent(RuntimeError):
@@ -108,6 +130,19 @@ class NotSent(RuntimeError):
     fails this way is released rather than held in doubt -- held, a
     persistent fault here re-hedged, doubted and re-read forever without
     ever moving the reject streak.
+    """
+
+
+class NotConnected(NotSent):
+    """Not sent because the socket is down.
+
+    A state the supervisor already knows about and is repairing -- the risk
+    layer reports the socket as disconnected and the heal reconnects it -- not
+    a fault in the key or the account. It is NOT counted toward the reject
+    streak. It used to be: a one-second drop with a few re-prices in flight
+    reached the streak limit of five, and the run halted and closed every
+    account at market over a blip the reconnect would have healed. A socket
+    that stays down halts the run through the disconnected check instead.
     """
 
 
@@ -166,6 +201,12 @@ class RoutedWsClient(BulkWebSocketClient):
         # When an update last named an account this socket does not carry.
         # See `_warn_unknown_owner`.
         self._unknown_owner_warned_at: float | None = None
+        # When the SDK's receive loop last saw this socket close. See
+        # `_reconnect`.
+        self.dropped_at: float | None = None
+        # The supervisor's reconnect of this socket, shared by every session
+        # on it. See `reconnect_client`.
+        self.reconnect_share = SharedReconnect()
 
     # -- connection --------------------------------------------------------
 
@@ -223,6 +264,49 @@ class RoutedWsClient(BulkWebSocketClient):
             # that no longer existed, and the kill switch fired anyway.
             self.last_message_at = time.monotonic()
         return connected
+
+    async def _reconnect(self) -> None:
+        """Mark the socket down. Reconnecting is the supervisor's job, not the SDK's.
+
+        The SDK's receive loop calls this when its socket closes, and the
+        SDK's version slept and called `connect` itself. That made two owners
+        of one socket: the supervisor's heal (`reconnect_client`) saw the
+        socket down and ran its own disconnect/connect at the same time, each
+        tearing down what the other was building. And while the SDK sat in its
+        RECONNECTING state every submission was refused as not connected, and
+        each refusal counted toward the reject streak -- so a one-second drop
+        with a few re-prices in flight halted the run and closed everything at
+        market.
+
+        Now the socket is only marked down. The risk layer reads that as
+        "disconnected" on its next pass, and `reconnect_client` restores it
+        under the budget and sharing rules it already has. Requests still
+        waiting on the dead socket are failed as in doubt at once -- no answer
+        can arrive on it, and waiting out their timeouts would only stall the
+        callers -- and submissions meanwhile raise `NotConnected`, which is not
+        a rejection.
+        """
+        if self.receive_task is not None and asyncio.current_task() is not self.receive_task:
+            # A receive loop belonging to a socket that has since been
+            # replaced. The live one is not this one's to mark down.
+            return
+        self.state = ConnectionState.DISCONNECTED
+        self.dropped_at = time.monotonic()
+        log.warning(
+            "WebSocket closed (%d account(s) on it) -- marked down; the "
+            "supervisor reconnects it",
+            len(self.accounts),
+        )
+        if self.ws is not None:
+            with contextlib.suppress(Exception):
+                await self.ws.close()
+        pending = list(self.pending_requests.items())
+        self.pending_requests.clear()
+        for _request_id, waiting in pending:
+            if not waiting.done():
+                waiting.set_exception(
+                    SubmissionInDoubt("the socket closed before an answer arrived")
+                )
 
     async def _handle_message(self, data: dict) -> None:
         # Liveness is tracked off raw traffic so the risk layer can tell a quiet
@@ -320,17 +404,41 @@ class RoutedWsClient(BulkWebSocketClient):
         `TransactionRejected` is what lets `AccountSession.submit` count it
         toward the reject streak instead of filing it with the timeouts.
 
-        An "ok" reply is left to the SDK, which parses the per-action
-        statuses.
+        An "ok" reply is parsed here too, rather than handed to the SDK. The
+        SDK pops the waiting future first and parses second, so a reply it
+        could not parse -- an order status it has never heard of -- raised
+        out of the handler, the receive loop logged and swallowed it, and the
+        future was gone from `pending_requests` with nothing left to resolve
+        it. The caller waited out its whole timeout for an answer that had
+        already arrived. An unreadable reply is now resolved at once as in
+        doubt: the transaction was accepted, but what became of each action in
+        it is unknown, and a position read is what settles that.
         """
         response_data = data.get("data") if isinstance(data, dict) else None
         payload = response_data.get("payload") if isinstance(response_data, dict) else None
         status = payload.get("status") if isinstance(payload, dict) else None
+        request_id = data.get("id") if isinstance(data, dict) else None
+        future = self.pending_requests.pop(request_id, None)
+
         if status == "ok":
-            await super()._handle_post_response(data)
+            try:
+                responses = OrderResponse.from_api(data)
+            except Exception as exc:  # noqa: BLE001 - whatever it was, the answer is unread
+                log.error(
+                    "could not read the exchange's answer to request %s (%s) -- the "
+                    "transaction was accepted, but what became of each action in it "
+                    "is unknown until positions are re-read: %s",
+                    request_id, describe(exc), response_data,
+                )
+                if future is not None and not future.done():
+                    future.set_exception(
+                        SubmissionInDoubt(f"unreadable answer: {describe(exc)}")
+                    )
+                return
+            if future is not None and not future.done():
+                future.set_result(responses)
             return
 
-        future = self.pending_requests.pop(data.get("id"), None)
         log.error("transaction refused by the exchange: %s", response_data)
         if future is not None and not future.done():
             future.set_exception(
@@ -400,19 +508,34 @@ class RoutedWsClient(BulkWebSocketClient):
         """
         return self.signer
 
-    def signed_transaction(self, actions: Sequence[Action], account: str) -> dict:
-        """The same signed transaction `submit` sends, for sending over HTTP.
+    def signed_transaction(
+        self, actions: Sequence[Action], account: str, nonce: int | None = None
+    ) -> dict:
+        """The signed transaction for `actions` on `account`, as `submit` sends it.
 
-        For when the socket is the problem. The exchange takes this exact
-        envelope at `/order` -- the SDK's own HTTP path posts it there -- and
-        unlike the SDK's, it names the account, so it works for a sub-account.
+        Also sent over HTTP when the socket is the problem. The exchange takes
+        this exact envelope at `/order` -- the SDK's own HTTP path posts it
+        there -- and unlike the SDK's, it names the account, so it works for a
+        sub-account.
+
+        Mirrors the SDK's `place_orders` but sets `account` to the traded
+        account while leaving `signer` as the key that actually signs. Actions
+        also carry `pubkey`, which feeds the client-side order-ID hash -- it
+        must be the traded account or the computed IDs won't match the
+        exchange's.
         """
         signer = self._signing_key
         if not signer:
             raise NotSent("signer not configured")
+        if not account:
+            raise NotSent("account_pubkey not configured")
         if self.accounts and account not in self.accounts:
+            # A socket signs only for the accounts its key was built for.
+            # Sending for another would be rejected by the exchange, but the
+            # useful moment to notice is here, where the account is named.
             raise NotSent(f"this connection does not carry {short_pubkey(account)}")
-        nonce = int(time.time_ns())
+        if nonce is None:
+            nonce = int(time.time_ns())
         payload_actions = []
         for index, action in enumerate(actions):
             action.seqno = index
@@ -421,6 +544,9 @@ class RoutedWsClient(BulkWebSocketClient):
             payload_actions.append(action.to_api())
         tx = {
             "actions": payload_actions,
+            # A decimal string, as the SDK sends it on every signed path, WS
+            # and HTTP alike. `bulkdn.tx` sends a number instead, on purpose;
+            # see there.
             "nonce": f"{nonce}",
             "account": account,
             "signer": signer.public_key,
@@ -436,49 +562,18 @@ class RoutedWsClient(BulkWebSocketClient):
     ) -> list[OrderResponse]:
         """Sign and submit a batch of actions for one account.
 
-        Mirrors the SDK's `place_orders` but sets `account` to the traded
-        account while leaving `signer` as the key that actually signs. Actions
-        also carry `pubkey`, which feeds the client-side order-ID hash -- it
-        must be the traded account or the computed IDs won't match the
-        exchange's.
+        Signed by `signed_transaction`, which the HTTP fallback sends too, so
+        the two paths cannot drift apart. In a dry run it is signed and not
+        sent, which costs nothing and stamps the actions the same way -- their
+        order ids depend on it.
 
         `account` defaults to this client's own, which is every caller that
         predates the pool. A shared socket passes it per call, because with
         several accounts on one connection the alternative is a mutable
         "current account" and orders landing on whichever one was set last.
         """
-        signer = self._signing_key
-        if not signer:
-            raise NotSent("signer not configured")
         account = account or self.account_pubkey
-        if not account:
-            raise NotSent("account_pubkey not configured")
-        if self.accounts and account not in self.accounts:
-            # A socket signs only for the accounts its key was built for.
-            # Sending for another would be rejected by the exchange, but the
-            # useful moment to notice is here, where the account is named.
-            raise NotSent(
-                f"this connection does not carry {short_pubkey(account)}"
-            )
-        if nonce is None:
-            nonce = int(time.time_ns())
-
-        payload_actions = []
-        for index, action in enumerate(actions):
-            action.seqno = index
-            action.nonce = nonce
-            action.pubkey = account
-            payload_actions.append(action.to_api())
-
-        tx = {
-            "actions": payload_actions,
-            # A decimal string, as the SDK sends it on every signed path, WS
-            # and HTTP alike. `bulkdn.tx` sends a number instead, on purpose;
-            # see there.
-            "nonce": f"{nonce}",
-            "account": account,
-            "signer": signer.public_key,
-        }
+        tx = self.signed_transaction(actions, account, nonce)
 
         if self.dry_run:
             log.info(
@@ -497,9 +592,7 @@ class RoutedWsClient(BulkWebSocketClient):
             ]
 
         if not self.is_connected:
-            raise NotSent("not connected to WebSocket")
-
-        tx = signer.sign_transaction(tx, self.signature_domain)
+            raise NotConnected("not connected to WebSocket")
 
         self.request_id += 1
         request_id = self.request_id
@@ -520,11 +613,12 @@ class RoutedWsClient(BulkWebSocketClient):
             return await asyncio.wait_for(
                 future, timeout=timeout if timeout is not None else self.default_timeout
             )
-        except Exception:
-            # Only the failure path cleans up: on success the SDK's message
-            # handler pops the entry when it resolves the future.
+        finally:
+            # On every way out, cancellation included. On success the message
+            # handler has already popped the entry and this does nothing; it
+            # used to run only on `Exception`, and a cancelled caller -- not an
+            # Exception -- left its request in the map for good.
             self.pending_requests.pop(request_id, None)
-            raise
 
 
 # A chase re-price waits once its socket has carried this many submissions in
@@ -569,13 +663,29 @@ class SendPacer:
             await asyncio.sleep(min(self._sent[0] + 1.0 - now, deadline - now) + 0.001)
 
 
-# One pacer per socket, not per account: subaccounts share their master's
-# socket, and it is the socket the exchange counts.
-_PACERS: dict[int, SendPacer] = {}
+@dataclass
+class SharedReconnect:
+    """One socket's reconnect, as every session on it sees it.
 
+    Declared state, held by the client because the client IS the socket. It
+    used to be three attributes set onto the client from outside by name
+    (`_bulkdn_reconnect`, `..._waiters`, `..._outcome`) and a module global
+    for the generation. See `reconnect_client` for how they are used.
+    """
 
-def pacer_for(client: object) -> SendPacer:
-    return _PACERS.setdefault(id(client), SendPacer())
+    # The attempts under way, if any.
+    task: asyncio.Future | None = None
+    # How many sessions are waiting on `task`. See `_await_shared`.
+    waiters: int = 0
+    # (succeeded, generation, when) of the last run that finished.
+    outcome: tuple[bool, int, float] | None = None
+
+    # Bumped whenever ANY socket reconnects. A failure is shared with the next
+    # caller only while this is unchanged: one socket coming back is proof the
+    # network did, and the supervisor retries the ones that failed before it
+    # for exactly that reason. A shared failure must not refuse that retry.
+    # Process-wide by design, so a class attribute rather than a field.
+    generation: ClassVar[int] = 0
 
 
 @dataclass
@@ -587,7 +697,16 @@ class AccountSession:
     client: RoutedWsClient
     http: BulkHttpClient
     dry_run: bool = False
+    # The socket's submission count, for `place_limit` to yield to. One per
+    # SOCKET, not per account: subaccounts share their master's socket, and
+    # it is the socket the exchange counts -- so `build_pool` hands every
+    # session on a socket the same one. It used to be a module dict keyed by
+    # `id(client)`, never cleaned and wrong for any id Python reused.
+    pacer: SendPacer = field(default_factory=SendPacer)
     reject_streak: int = 0
+    # Throttled transactions since the exchange last answered anything else.
+    # See THROTTLE_STREAK_LIMIT.
+    throttle_streak: int = 0
     # What the exchange said about the most recent counted rejection. The
     # streak alone says a kill switch fired; this says why, which is the part
     # anyone reading the halt an hour later actually needs.
@@ -599,6 +718,11 @@ class AccountSession:
     # Without this the liquidation guard reads our own unacknowledged fill as
     # someone else closing the position, which is the opposite conclusion.
     unconfirmed: dict[str, float] = field(default_factory=dict)
+    # Until when this account's stream is known to be behind the exchange, by
+    # the monotonic clock. Set by the strategy when fills arrive late, read
+    # here and by the reconciler: a socket behind is not trusted to carry a
+    # cancel or a close, and its updates are not trusted over an HTTP read.
+    stream_lagging_until: float = 0.0
 
     def symbols_in_doubt(self, within_s: float) -> set[str]:
         """Symbols with a submission whose outcome is still unknown."""
@@ -723,13 +847,15 @@ class AccountSession:
             # Named explicitly: one socket may carry several accounts, and the
             # session is the only thing that knows which of them this is.
             kwargs.setdefault("account", self.pubkey)
-            pacer_for(self.client).note()
+            self.pacer.note()
             responses = await self.client.submit(actions, **kwargs)
         except NotSent as exc:
             # Nothing left this process, so nothing is in doubt -- and a fault
-            # that stops every order is exactly what the streak is for.
+            # that stops every order is exactly what the streak is for. A
+            # socket that is down is not such a fault: the supervisor knows
+            # and is healing it. See `NotConnected`.
             self._settle(actions)
-            if count_rejects:
+            if count_rejects and not isinstance(exc, NotConnected):
                 self.reject_streak += 1
                 self.last_reject = str(exc)
             raise
@@ -745,20 +871,22 @@ class AccountSession:
             # asking for a position read that could only say "nothing
             # happened".
             self._settle(actions)
-            if count_rejects and not is_rate_limited(exc):
+            if count_rejects and is_rate_limited(exc):
+                self._throttled(exc)
+            elif count_rejects:
+                self.throttle_streak = 0
                 self.reject_streak += 1
                 self.last_reject = str(exc)
-            elif count_rejects:
-                # Throttled, not refused for cause. The streak halts the run
-                # and closes every account at market, and a burst of 429s on a
-                # shared socket reached five inside five seconds of chasing --
-                # an outage of a few seconds is no reason to do that.
-                log.warning("%s: throttled by the exchange: %s", self.name, describe(exc))
             raise
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # No answer came back. The actions may have executed anyway, so
             # every symbol they touched is now in doubt until a position read
             # settles it. A rejection is not in doubt -- that IS an answer.
+            #
+            # A cancelled caller is the same case: it stopped waiting, it did
+            # not learn the outcome, and the transaction may already be on the
+            # wire. `CancelledError` is not an `Exception`, so it used to skip
+            # this and leave the symbol looking settled.
             at = time.monotonic()
             for action in actions:
                 symbol = getattr(action, "symbol", None)
@@ -767,6 +895,10 @@ class AccountSession:
             raise
 
         self._settle(actions)
+        if count_rejects:
+            # Answered, and not with a throttle: whatever else this reply
+            # says, the exchange is letting us through.
+            self.throttle_streak = 0
 
         rejected = [r for r in responses if r.is_error()]
         if rejected:
@@ -785,6 +917,27 @@ class AccountSession:
             self.reject_streak = 0
             self.last_reject = ""
         return responses
+
+    def _throttled(self, exc: BaseException) -> None:
+        """Count a throttled transaction, and past the limit, count it as a reject.
+
+        Not refused for cause, so not on the streak at first: the streak halts
+        the run and closes every account at market, and a few seconds of 429s
+        is no reason to. Past THROTTLE_STREAK_LIMIT in a row it is no longer a
+        burst, and each one more is counted, so the kill switch still trips --
+        later than for a refusal, but it trips.
+        """
+        self.throttle_streak += 1
+        if self.throttle_streak <= THROTTLE_STREAK_LIMIT:
+            log.warning("%s: throttled by the exchange: %s", self.name, describe(exc))
+            return
+        self.reject_streak += 1
+        self.last_reject = f"throttled {self.throttle_streak} times in a row: {exc}"
+        log.error(
+            "%s: throttled %d times in a row -- now counted toward the reject "
+            "streak: %s",
+            self.name, self.throttle_streak, describe(exc),
+        )
 
     def _settle(self, actions: Sequence[Action]) -> None:
         """An answer came back, so these symbols are no longer in doubt."""
@@ -832,7 +985,7 @@ class AccountSession:
 
         # Only here: a resting order -- the chaser's, or a limit close's -- is
         # the one submission that can afford to wait.
-        await pacer_for(self.client).room_for_chase()
+        await self.pacer.room_for_chase()
         try:
             responses = await self.submit(actions)
         except OrderRejected as exc:
@@ -851,6 +1004,20 @@ class AccountSession:
             # caller of `submit` relies on a rejection raising.
             exc.order_id = _safe_order_id(order)
             exc.placed = _order_accepted(order, actions, exc.responses)
+            raise
+        except NotSent:
+            # Nothing left this process: there is no order anywhere to track.
+            raise
+        except (Exception, asyncio.CancelledError) as exc:
+            # No answer -- a timeout, a reply that could not be read, a socket
+            # that closed, a caller that stopped waiting. The order may be
+            # resting right now, and its id was lost with the answer: it was
+            # attached only to a rejection. It does not need the answer, being
+            # a hash of the fields stamped on before signing, so it travels on
+            # this exception too and the chaser can track or cancel an order
+            # it would otherwise never hear of. `placed` is None: not known.
+            exc.order_id = _safe_order_id(order)
+            exc.placed = None
             raise
         # order_id() is a deterministic hash of the signed fields, so it is
         # known once seqno/nonce/pubkey have been stamped on by submit().
@@ -909,7 +1076,7 @@ class AccountSession:
     def _socket_unreliable(self) -> bool:
         if not self.client.is_connected:
             return True
-        return time.monotonic() < getattr(self, "stream_lagging_until", 0.0)
+        return time.monotonic() < self.stream_lagging_until
 
     async def _cancel_all_http(self, symbols: Sequence[str]) -> list[OrderResponse]:
         await self._post_http([CancelAll(symbols=list(symbols))], "cancel-all")
@@ -1008,12 +1175,6 @@ class AccountSession:
 # that pass with room to spare and is well short of the next one.
 RECONNECT_SHARE_S = 10.0
 
-# Bumped whenever ANY socket reconnects. A failure is shared with the next
-# caller only while this is unchanged: one socket coming back is proof the
-# network did, and the supervisor retries the ones that failed before it for
-# exactly that reason. A shared failure must not refuse that retry.
-_reconnect_generation = 0
-
 
 async def reconnect_client(
     client, *, label: str, attempts: int = 6, delay: float = 2.0
@@ -1032,22 +1193,22 @@ async def reconnect_client(
       full budget against the same dead endpoint.
     * Otherwise run the attempts.
 
-    The state lives on the client object because the client IS the socket --
-    which is also how `Strategy._trees` groups sessions by key.
+    The state lives on the client (`SharedReconnect`) because the client IS
+    the socket -- which is also how `Strategy._trees` groups sessions by key.
     """
-    running = getattr(client, "_bulkdn_reconnect", None)
+    share: SharedReconnect = client.reconnect_share
+    running = share.task
     if running is not None and not running.done():
         log.info("%s: joining the reconnect already under way on this socket", label)
-        return await _await_shared(client, running)
+        return await _await_shared(share, running)
 
-    outcome = getattr(client, "_bulkdn_reconnect_outcome", None)
-    if outcome is not None:
-        ok, generation, at = outcome
+    if share.outcome is not None:
+        ok, generation, at = share.outcome
         if time.monotonic() - at < RECONNECT_SHARE_S:
             if ok and client.is_connected:
                 log.info("%s: this socket was reconnected moments ago", label)
                 return True
-            if not ok and generation == _reconnect_generation:
+            if not ok and generation == SharedReconnect.generation:
                 log.warning(
                     "%s: this socket gave up reconnecting moments ago and "
                     "nothing has come back since -- not retrying it again",
@@ -1056,12 +1217,12 @@ async def reconnect_client(
                 return False
 
     task = asyncio.ensure_future(_reconnect_attempts(client, label, attempts, delay))
-    client._bulkdn_reconnect = task
-    client._bulkdn_reconnect_waiters = 0
-    return await _await_shared(client, task)
+    share.task = task
+    share.waiters = 0
+    return await _await_shared(share, task)
 
 
-async def _await_shared(client, task: asyncio.Future) -> bool:
+async def _await_shared(share: SharedReconnect, task: asyncio.Future) -> bool:
     """Wait on a shared reconnect without letting one waiter cancel it for all.
 
     Shielded, so a session whose own caller is cancelled does not take the
@@ -1069,15 +1230,15 @@ async def _await_shared(client, task: asyncio.Future) -> bool:
     waiter is cancelled -- shutdown -- the attempts stop too, rather than
     running on in the background and reopening a socket after the run ended.
     """
-    client._bulkdn_reconnect_waiters = getattr(client, "_bulkdn_reconnect_waiters", 0) + 1
+    share.waiters += 1
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        if client._bulkdn_reconnect_waiters <= 1 and not task.done():
+        if share.waiters <= 1 and not task.done():
             task.cancel()
         raise
     finally:
-        client._bulkdn_reconnect_waiters -= 1
+        share.waiters -= 1
 
 
 async def _reconnect_attempts(client, label: str, attempts: int, delay: float) -> bool:
@@ -1107,10 +1268,9 @@ async def _reconnect_attempts(client, label: str, attempts: int, delay: float) -
 
 
 def _record_reconnect(client, ok: bool) -> None:
-    global _reconnect_generation
     if ok:
-        _reconnect_generation += 1
-    client._bulkdn_reconnect_outcome = (ok, _reconnect_generation, time.monotonic())
+        SharedReconnect.generation += 1
+    client.reconnect_share.outcome = (ok, SharedReconnect.generation, time.monotonic())
 
 
 def build_pool(
@@ -1168,11 +1328,14 @@ def build_pool(
             accounts=[pubkey for _name, pubkey in fresh],
             dry_run=dry_run,
         )
+        # One per socket, shared by every session on it -- see the field.
+        pacer = SendPacer()
         for name, pubkey in fresh:
             seen.add(pubkey)
             sessions.append(
                 AccountSession(
-                    name=name, pubkey=pubkey, client=client, http=http, dry_run=dry_run
+                    name=name, pubkey=pubkey, client=client, http=http,
+                    dry_run=dry_run, pacer=pacer,
                 )
             )
 
@@ -1355,21 +1518,8 @@ def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:
     log.info("verified %s is a sub-account of %s", short_pubkey(sub1.pubkey), short_pubkey(master.pubkey))
 
 
-def unwrap_full_account(payload: Any) -> dict:
-    """Flatten a `/account` response down to the account body.
-
-    Observed shapes: `{"fullAccount": {...}}`, `[{"fullAccount": {...}}]`, and
-    a bare `{...}`. All three are accepted so a change in envelope does not
-    silently turn a funded account into an apparently empty one.
-    """
-    if isinstance(payload, list):
-        payload = payload[0] if payload else {}
-    if not isinstance(payload, dict):
-        return {}
-    inner = payload.get("fullAccount")
-    if isinstance(inner, dict):
-        return inner
-    return payload
+# `unwrap_full_account` lives in `wire`, beside the other envelope readers,
+# and is imported above; `menu` and the tests still import it from here.
 
 
 def short_pubkey(pubkey: str | None) -> str:

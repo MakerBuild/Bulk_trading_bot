@@ -7,7 +7,11 @@ over RDP, types the key password once, and after that the phone is enough.
 
 It is the same bot underneath. A run started here is `cmd_run` on a fresh copy
 of the settings, a close is `cmd_flatten`, and the idle status is `cmd_status`
--- nothing here trades on its own account.
+-- nothing here trades on its own account. "Fresh" means re-read: given the
+settings file's path, each /run, /close and /status reads it again, so an edit
+made while this process runs is what the next run trades. The signing keys
+are not re-read -- they were decrypted once, at start, with the password typed
+then.
 
 Driven by buttons: a keyboard under the chat for the everyday commands, and
 Start / Cancel buttons on the message that asks for a confirmation. The slash
@@ -48,6 +52,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from . import ratelimit
 from .notify import AlertHandler, Notifier, telegram_proxy
 from .retry import describe
 
@@ -59,9 +64,9 @@ _BOT_LOG = logging.getLogger("bulkdn")
 CONFIRM_TTL_S = 60.0
 # Seconds Telegram holds a getUpdates open waiting for a message.
 POLL_TIMEOUT_S = 25
-# Telegram refuses a message past 4096 characters, and the notifier splits
-# longer ones -- through a <pre> if need be, leaving each half with an unclosed
-# tag, which Telegram refuses outright. So bodies are kept well inside one.
+# A reply is one message -- and on a refresh, one EDITED message -- so it cannot
+# be split the way the notifier splits what it sends. Its free text is cut to
+# its tail instead, measured before escaping, well inside Telegram's 4096.
 _MAX_TEXT = 1700
 LOG_LINES_DEFAULT = 15
 LOG_LINES_MAX = 30
@@ -279,8 +284,12 @@ class Controller:
         alerts: AlertHandler | None = None,
         margin: dict[str, Callable] | None = None,
         submit_transfers: Callable | None = None,
+        reload: Callable[[], object] | None = None,
     ):
         self.config = config
+        # Reads the settings file again; None keeps the config given at start.
+        # See `config_reloader`.
+        self.reload = reload
         self.dry_run = dry_run
         self.run_fn = run_fn
         self.flatten_fn = flatten_fn
@@ -299,6 +308,8 @@ class Controller:
         self.work_kind = ""
         self.work_started = 0.0
         self.strategy = None
+        # Set once a starting run has a strategy to stop. See `_do_close`.
+        self._strategy_ready = asyncio.Event()
 
     # -- state -------------------------------------------------------------
 
@@ -312,6 +323,22 @@ class Controller:
 
     def _set_strategy(self, strategy) -> None:
         self.strategy = strategy
+        self._strategy_ready.set()
+
+    def _refresh_config(self) -> str | None:
+        """Re-read the settings file. None if it read, else why not.
+
+        On failure the last copy that read is kept: a typo saved into the file
+        must not leave Close all unable to close.
+        """
+        if self.reload is None:
+            return None
+        try:
+            self.config = self.reload()
+        except Exception as exc:  # noqa: BLE001 - reported, the last good copy stays
+            log.warning("telegram control: could not re-read the settings: %s", describe(exc))
+            return describe(exc)
+        return None
 
     # -- messages ------------------------------------------------------------
 
@@ -329,6 +356,22 @@ class Controller:
 
         if command in ("/help", "/start"):
             return Reply(HELP, keyboard=True)
+        if command in ("/run", "/close", "/status"):
+            problem = self._refresh_config()
+            if problem is not None:
+                if command == "/run":
+                    # Not on the last good copy: whoever just edited the file
+                    # expects the run to trade what they wrote.
+                    return Reply(
+                        f"⚠️ settings.yaml could not be read: {html.escape(problem)}\n"
+                        "Fix it and ask again -- no run was started."
+                    )
+                reply = await self._status() if command == "/status" else self._ask_close()
+                reply.text = (
+                    f"⚠️ settings.yaml could not be read ({html.escape(problem)}) -- "
+                    f"using the last copy that did.\n{reply.text}"
+                )
+                return reply
         if command == "/status":
             return await self._status()
         if command == "/log":
@@ -351,7 +394,10 @@ class Controller:
         """Answer a button press. The reply replaces the pressed message."""
         action, _, code = (data or "").partition(":")
         if action == "refresh":
-            return await self._status() if code == "status" else self._log([])
+            if code != "status":
+                return self._log([])
+            self._refresh_config()
+            return await self._status()
         if action == "margin":
             # Only reads: the plan it shows is confirmed separately.
             return await self._plan_margin(code)
@@ -561,8 +607,10 @@ class Controller:
             log.exception("transfers started from telegram failed")
             await self.send(f"⚠️ Transfers failed: {html.escape(describe(exc))} -- check 💰 Accounts.")
             return
+        # Whole, not cut to its tail: the notifier splits a long report into
+        # messages that each parse, and every transfer's outcome matters.
         report = "\n".join(line.lstrip("\n") for line in lines)
-        await self.send(f"💸 Transfers\n<pre>{html.escape(report[-_MAX_TEXT:])}</pre>")
+        await self.send("💸 Transfers", plain=report, pre=True)
 
     def _new_pending(self, action: str, volume: float | None = None) -> str:
         code = self.make_code()
@@ -623,6 +671,7 @@ class Controller:
         config = copy.deepcopy(self.config)
         if volume is not None:
             config.target.volume_usd = volume
+        self._strategy_ready.clear()
         try:
             code = await self.run_fn(config, self.dry_run, on_strategy=self._set_strategy)
         except Exception as exc:  # noqa: BLE001 - reported, and the loop carries on
@@ -632,14 +681,21 @@ class Controller:
             await self.send(f"The run has ended (exit code {code}).")
         finally:
             self.strategy = None
+            self._strategy_ready.clear()
 
     async def _do_close(self, running: asyncio.Task | None) -> None:
         if running is not None:
             # A run still starting has no strategy to stop yet. Waiting on the
             # task alone would wait out the whole run, so the stop is sent the
-            # moment there is something to send it to.
-            while not running.done() and self.strategy is None:
-                await asyncio.sleep(0.5)
+            # moment there is something to send it to -- woken by the strategy
+            # arriving or the run ending, whichever is first, rather than by
+            # looking every half second.
+            if self.strategy is None and not running.done():
+                ready = asyncio.ensure_future(self._strategy_ready.wait())
+                try:
+                    await asyncio.wait({running, ready}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    ready.cancel()
             if self.strategy is not None:
                 self.strategy.request_stop("telegram close")
             # Waited for, not cancelled: a run cut off between sending an order
@@ -726,12 +782,28 @@ def authorised_press(update: dict, allowed: set[int], strangers: set[int]) -> di
 
 
 async def capture_status(config) -> str:
-    """`cmd_status`'s printout, as text."""
+    """`cmd_status`'s printout, as text, read in a worker thread.
+
+    `cmd_status` is a coroutine in name only: it discovers every account and
+    reads every position and open order with blocking HTTP, paced by
+    ratelimit. Awaited here it ran on this loop, which then answered no button
+    and polled no update until the last read came back. In a thread, on a loop
+    of its own that serves nothing else, the wait is that thread's alone.
+
+    `redirect_stdout` swaps `sys.stdout` for the whole process while it runs,
+    so anything this loop printed meanwhile would land in the status too.
+    Nothing here prints after startup; the log handlers hold their own
+    streams.
+    """
+    return await asyncio.to_thread(_status_text, config)
+
+
+def _status_text(config) -> str:
     from .cli import cmd_status
 
     buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
-        await cmd_status(config)
+    with ratelimit.private_loop(), contextlib.redirect_stdout(buffer):
+        asyncio.run(cmd_status(config))
     return buffer.getvalue()
 
 
@@ -759,8 +831,40 @@ async def _handle_update(update: dict, api: BotApi, controller: Controller,
         await api.send(chat, reply)
 
 
-async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
-    """Listen for commands until interrupted."""
+def config_reloader(path: str, loaded, *, mode: str | None = None) -> Callable[[], object]:
+    """A function that reads the settings at `path` again, keeping `loaded`'s keys.
+
+    The file is read without credentials -- the key file is encrypted, and
+    asking for its password on every /run from a phone is not an option -- and
+    the keys decrypted at start are put back before the result is validated
+    as fully as a fresh start would. `mode` is the command line's override,
+    if there was one, which a re-read must not undo.
+    """
+    def reload():
+        from .config import load_config
+
+        fresh = load_config(path, require_credentials=False, mode=mode)
+        fresh.private_keys = list(loaded.private_keys)
+        fresh.private_key = loaded.private_key
+        fresh.validate(require_credentials=True)
+        return fresh
+
+    return reload
+
+
+async def serve(
+    config,
+    dry_run: bool,
+    *,
+    log_path: str = "logs.txt",
+    config_path: str | None = None,
+    mode: str | None = None,
+) -> int:
+    """Listen for commands until interrupted.
+
+    With `config_path`, every /run, /close and /status re-reads the settings
+    from it (see `config_reloader`); without, they use `config` throughout.
+    """
     from .cli import cmd_flatten, cmd_run
 
     telegram = config.telegram
@@ -778,6 +882,7 @@ async def serve(config, dry_run: bool, *, log_path: str = "logs.txt") -> int:
         send=notifier.send, log_path=log_path, alerts=AlertHandler(notifier),
         margin={"balance": plan_balance, "collect": plan_collect},
         submit_transfers=submit_plan,
+        reload=config_reloader(config_path, config, mode=mode) if config_path else None,
     )
     poller = TelegramPoller(telegram.bot_token)
     strangers: set[int] = set()

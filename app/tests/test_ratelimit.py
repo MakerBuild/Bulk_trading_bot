@@ -108,6 +108,45 @@ async def test_never_sleeps_on_the_event_loop(exchange):
     assert time.monotonic() - started < 0.04
 
 
+async def test_a_read_on_the_loop_names_where_it_came_from_once(exchange, caplog):
+    """It used to skip the wait in silence, so nothing pointed at the caller."""
+    import logging
+
+    session, adapter = exchange
+    with caplog.at_level(logging.WARNING, logger="bulkdn.ratelimit"):
+        for _ in range(4):
+            session.post(f"{API}/account", json={})
+        session.post(f"{API}/account", json={})   # a second call site
+
+    warnings = [m for m in caplog.messages if "event loop" in m]
+    assert len(warnings) == 2, warnings
+    assert all("test_ratelimit.py" in m for m in warnings)
+    assert "test_a_read_on_the_loop_names_where_it_came_from_once" in warnings[0]
+    assert "skipping" in warnings[0] or "skipping" in warnings[1]
+
+
+async def test_a_worker_thread_with_a_loop_of_its_own_is_paced(exchange, caplog):
+    """A status read runs `asyncio.run` in a thread; that loop serves nothing
+    else, and its reads should keep the pace like any worker thread's."""
+    import asyncio
+    import logging
+
+    session, adapter = exchange
+
+    def walk():
+        async def reads():
+            for _ in range(3):
+                session.post(f"{API}/account", json={})
+
+        with ratelimit.private_loop():
+            asyncio.run(reads())
+
+    with caplog.at_level(logging.WARNING, logger="bulkdn.ratelimit"):
+        await asyncio.to_thread(walk)
+    assert min(gaps(adapter)) >= 0.045
+    assert not [m for m in caplog.messages if "event loop" in m]
+
+
 def test_installing_twice_does_not_stack(exchange):
     session, adapter = exchange
     ratelimit.install(API)

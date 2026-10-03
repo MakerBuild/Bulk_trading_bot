@@ -82,12 +82,31 @@ async def test_hedges_and_cancels_count_but_never_wait(monkeypatch):
         await session.submit([types.SimpleNamespace(symbol="BTC-USD")])
     assert time.monotonic() - started < 0.05
     assert len(sent) == 5
-    assert accounts.pacer_for(session.client)._recent(time.monotonic()) == 5
+    assert session.pacer._recent(time.monotonic()) == 5
 
 
-def test_subaccounts_on_one_socket_share_its_count():
-    client = object()
-    assert accounts.pacer_for(client) is accounts.pacer_for(client)
+def test_subaccounts_on_one_socket_share_its_count(monkeypatch):
+    """One pacer per socket, handed to every session on it -- not a module
+    dict keyed by `id(client)` that was never cleaned."""
+    monkeypatch.setattr(accounts, "TransactionSigner", lambda key: types.SimpleNamespace(
+        public_key=f"{key}-pub"))
+    monkeypatch.setattr(accounts, "BulkHttpClient", lambda **kwargs: object())
+
+    class FakeWs:
+        def __init__(self, **kwargs):
+            self.accounts = list(kwargs.get("accounts") or [])
+
+    monkeypatch.setattr(accounts, "RoutedWsClient", FakeWs)
+    pool = accounts.build_pool(
+        private_keys=["k1", "k2"], ws_url="wss://x", http_url="https://x",
+        domain=None, symbols=["BTC-USD"], dry_run=True,
+        discover=lambda *, private_key, http_url: (f"{private_key}-pub", [f"{private_key}-s1"]),
+    )
+    m1, m1s1, m2, m2s1 = pool
+    assert m1.client is m1s1.client and m1.pacer is m1s1.pacer
+    assert m1.pacer is not m2.pacer, "two sockets shared one count"
+    assert m2.pacer is m2s1.pacer
+    assert not hasattr(accounts, "_PACERS")
 
 
 # -- a burst of fills is hedged together --------------------------------------

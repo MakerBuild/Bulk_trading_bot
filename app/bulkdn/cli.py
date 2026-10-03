@@ -184,10 +184,7 @@ class Runtime:
 
         # Must be installed before any client is constructed: it repairs fill
         # parsing and TLS handling inside the SDK itself.
-        apply_ws_compat(
-            insecure_ssl=config.ws_insecure_ssl,
-            auto_bypass=config.ws_ssl_auto_bypass,
-        )
+        apply_ws_compat()
         # Now that the SDK is fully imported, silence the rest of its printing.
         quieten_sdk_prints()
 

@@ -184,6 +184,55 @@ async def test_no_answer_at_all_is_still_in_doubt_and_not_a_rejection():
     assert master.symbols_in_doubt(60.0) == {BTC}
 
 
+# -- an answer that cannot be read -------------------------------------------
+
+
+def accepted(request_id, status_key):
+    return {
+        "type": "post",
+        "id": request_id,
+        "data": {"type": "action", "payload": {
+            "status": "ok",
+            "response": {"type": "order", "data": {"statuses": [{status_key: {"oid": "x"}}]}},
+        }},
+    }
+
+
+async def test_an_answer_that_cannot_be_read_is_in_doubt_at_once():
+    """The SDK popped the waiting request, then failed to parse the reply; the
+    receive loop swallowed the error and the caller waited out its timeout for
+    an answer that had already come."""
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    answer = asyncio.create_task(
+        answer_when_sent(client, 1, lambda sent: [accepted(sent[0]["id"], "somethingEntirelyNew")])
+    )
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(SubmissionInDoubt):
+        await master.submit([FakeAction()], timeout=2.0)
+    await answer
+
+    assert asyncio.get_running_loop().time() - started < 1.0, "it waited out the timeout"
+    assert client.pending_requests == {}
+    assert master.reject_streak == 0, "an unread answer is not a refusal"
+    assert master.symbols_in_doubt(60.0) == {BTC}
+
+
+async def test_an_answer_that_can_be_read_is_delivered():
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    answer = asyncio.create_task(
+        answer_when_sent(client, 1, lambda sent: [accepted(sent[0]["id"], "resting")])
+    )
+    (response,) = await master.submit([FakeAction()], timeout=2.0)
+    await answer
+
+    assert response.status is OrderStatus.RESTING
+    assert client.pending_requests == {}
+
+
 # -- an error frame on a shared socket ---------------------------------------
 
 
@@ -362,15 +411,9 @@ async def test_a_submission_that_never_left_counts_toward_the_streak():
 
     class Client:
         async def submit(self, actions, **kwargs):
-            raise NotSent("not connected to WebSocket")
+            raise NotSent("signer not configured")
 
-    session = object.__new__(AccountSession)
-    session.name = "m1s1"
-    session.pubkey = "m1s1-key"
-    session.client = Client()
-    session.reject_streak = 0
-    session.last_reject = ""
-    session.unconfirmed = {}
+    session = AccountSession(name="m1s1", pubkey="m1s1-key", client=Client(), http=None)
 
     class Action:
         symbol = "BTC-USD"
@@ -397,3 +440,224 @@ def test_a_429_status_is_still_throttling():
     assert is_rate_limited(OrderRejected("HTTP 429: slow down", []))
     assert is_rate_limited(OrderRejected("status=429", []))
     assert is_rate_limited(OrderRejected("Too Many Requests", []))
+
+
+def test_too_many_open_orders_is_a_refusal_not_throttling():
+    """`too many` was a throttling marker, so this never counted toward the
+    streak and the kill switch could not trip on it."""
+    from bulkdn.accounts import OrderRejected, is_rate_limited
+
+    assert not is_rate_limited(OrderRejected("too many open orders", []))
+    assert not is_rate_limited(TransactionRejected("refused", {"message": "too many orders"}))
+
+
+async def test_a_refusal_for_too_many_orders_counts_toward_the_kill_switch():
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    for n in range(1, 6):
+        answer = asyncio.create_task(
+            answer_when_sent(
+                client, n, lambda sent: [refused(sent[-1]["id"], "too many open orders")]
+            )
+        )
+        with pytest.raises(OrderRejected):
+            await master.submit([FakeAction()])
+        await answer
+
+    assert master.reject_streak == 5
+
+
+async def throttle(client, master, times, already=0):
+    for n in range(already + 1, already + times + 1):
+        answer = asyncio.create_task(
+            answer_when_sent(client, n, lambda sent: [refused(sent[-1]["id"], "rate limited")])
+        )
+        with pytest.raises(OrderRejected):
+            await master.submit([FakeAction()])
+        await answer
+
+
+async def test_throttling_that_never_lets_up_still_trips_the_kill_switch(monkeypatch):
+    """A burst is absorbed; an account that cannot get a transaction through
+    for half a minute must not chase forever."""
+    import bulkdn.accounts as accounts_mod
+
+    monkeypatch.setattr(accounts_mod, "THROTTLE_STREAK_LIMIT", 3)
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    await throttle(client, master, 3)
+    assert master.reject_streak == 0, "a burst of throttling was counted"
+
+    await throttle(client, master, 5, already=3)
+    assert master.reject_streak == 5
+    assert "throttled 8 times in a row" in master.last_reject
+
+
+async def test_an_accepted_transaction_ends_the_throttling_count(monkeypatch):
+    import bulkdn.accounts as accounts_mod
+
+    monkeypatch.setattr(accounts_mod, "THROTTLE_STREAK_LIMIT", 3)
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    await throttle(client, master, 3)
+    answer = asyncio.create_task(
+        answer_when_sent(client, 4, lambda sent: [accepted(sent[-1]["id"], "resting")])
+    )
+    await master.submit([FakeAction()])
+    await answer
+    assert master.throttle_streak == 0
+
+    await throttle(client, master, 3, already=4)
+    assert master.reject_streak == 0
+
+
+# -- a socket that drops ------------------------------------------------------
+
+
+class ClosingSocket:
+    """Delivers nothing, then closes the way websockets reports it."""
+
+    def __init__(self):
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        from websockets.exceptions import ConnectionClosed
+
+        raise ConnectionClosed(None, None)
+
+    async def close(self):
+        self.closed = True
+
+
+async def test_the_sdk_does_not_reconnect_a_dropped_socket_behind_the_supervisor():
+    """Its receive loop called its own `_reconnect`, which slept and dialled
+    again while the supervisor's heal was doing the same."""
+    client = socket_client()
+    client.ws = ClosingSocket()
+    dialled = []
+
+    async def connect():
+        dialled.append(True)
+        return True
+
+    client.connect = connect
+    waiting = asyncio.get_running_loop().create_future()
+    client.pending_requests[7] = waiting
+
+    client.receive_task = asyncio.create_task(client._receive_loop())
+    await asyncio.wait_for(client.receive_task, timeout=1.0)
+
+    assert dialled == [], "the SDK reconnected on its own"
+    assert not client.is_connected, "the supervisor must see the socket as down"
+    assert client.dropped_at is not None
+    assert isinstance(waiting.exception(), SubmissionInDoubt), (
+        "a request on the dead socket was left to time out"
+    )
+
+
+async def test_orders_refused_while_the_socket_is_down_do_not_trip_the_kill_switch():
+    """A one-second drop with five re-prices in flight halted a run and closed
+    every account at market."""
+    from bulkdn.accounts import NotConnected, NotSent
+
+    client = socket_client()
+    client.state = ConnectionState.DISCONNECTED
+    master = session_on(client, "m1", MASTER)
+
+    for _ in range(10):
+        with pytest.raises(NotSent) as caught:
+            await master.submit([FakeAction()])
+        assert isinstance(caught.value, NotConnected)
+
+    assert master.reject_streak == 0
+    assert master.symbols_in_doubt(60.0) == set(), "nothing left, nothing in doubt"
+
+
+async def test_an_order_for_an_account_the_socket_does_not_carry_still_counts():
+    """Persistent faults on this side are what the streak is for."""
+    from bulkdn.accounts import NotSent
+
+    client = socket_client()
+    stranger = session_on(client, "x", "NOT-ON-THIS-SOCKET")
+
+    with pytest.raises(NotSent):
+        await stranger.submit([FakeAction()])
+    assert stranger.reject_streak == 1
+
+
+# -- a caller that stops waiting ----------------------------------------------
+
+
+async def test_a_cancelled_submission_is_in_doubt_and_leaves_nothing_pending():
+    """`CancelledError` is not an `Exception`: it skipped both the cleanup of
+    the pending request and the step that marks the symbol in doubt."""
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    call = asyncio.create_task(master.submit([FakeAction()], timeout=5.0))
+    while not client.ws.sent:
+        await asyncio.sleep(0)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    assert client.pending_requests == {}, "the cancelled request was never removed"
+    assert master.symbols_in_doubt(60.0) == {BTC}, "it may have executed"
+    assert master.reject_streak == 0
+
+
+async def test_submit_sends_exactly_what_signed_transaction_signs():
+    """The HTTP fallback sends `signed_transaction`; the socket must send the
+    same envelope, not a copy of the code that builds it."""
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    call = asyncio.create_task(master.submit([FakeAction()], nonce=42, timeout=0.05))
+    while not client.ws.sent:
+        await asyncio.sleep(0)
+    with pytest.raises(asyncio.TimeoutError):
+        await call
+
+    sent = client.ws.sent[0]["request"]["payload"]
+    assert sent == client.signed_transaction([FakeAction()], MASTER, nonce=42)
+
+
+@pytest.mark.parametrize("silence", [
+    asyncio.TimeoutError(), SubmissionInDoubt("unreadable answer"), asyncio.CancelledError(),
+])
+async def test_an_order_with_no_answer_still_carries_its_id(silence):
+    """It may be resting. Its id is a hash of fields stamped before sending,
+    but it travelled only on a rejection -- so a placement that timed out left
+    a possibly-live order the chaser could neither track nor cancel."""
+    class Silent:
+        async def submit(self, actions, **kwargs):
+            stamped(actions)
+            raise silence
+
+    s = AccountSession(name="m1", pubkey=MASTER, client=Silent(), http=None)
+    with pytest.raises(type(silence)) as caught:
+        await s.place_limit(BTC, True, 100.0, 0.001, cancel_oid="old")
+
+    assert caught.value.order_id
+    assert caught.value.order_id != "old"
+    assert caught.value.placed is None, "nobody knows whether it was placed"
+    assert s.symbols_in_doubt(60.0) == {BTC}
+
+
+async def test_an_order_that_never_left_carries_no_id():
+    from bulkdn.accounts import NotSent
+
+    class Unsigned:
+        async def submit(self, actions, **kwargs):
+            raise NotSent("signer not configured")
+
+    s = AccountSession(name="m1", pubkey=MASTER, client=Unsigned(), http=None)
+    with pytest.raises(NotSent) as caught:
+        await s.place_limit(BTC, True, 100.0, 0.001)
+    assert not hasattr(caught.value, "order_id")
