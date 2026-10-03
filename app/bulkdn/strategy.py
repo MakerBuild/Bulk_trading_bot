@@ -1675,7 +1675,7 @@ class Strategy:
 
     def _trigger_halt(self, reason: str) -> None:
         if self._halt_reason is None:
-            log.critical("HALT: %s", reason)
+            log.critical("HALT: %s", reason, extra={"alert": True})
             self._halt_reason = reason
             self.title.halted(reason)
             # Fire-and-forget: the halt path has orders to cancel and positions
@@ -3388,7 +3388,8 @@ class Strategy:
             # landed with no hedge coming. One 429 inside a residual sweep
             # was enough.
             log.critical(
-                "run failed (%s) -- cancelling every resting order", describe(exc)
+                "run failed (%s) -- cancelling every resting order", describe(exc),
+                extra={"alert": True},
             )
             await self._wind_down()
             raise
