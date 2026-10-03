@@ -1359,7 +1359,8 @@ class Strategy:
         So the leg's resting order is pulled -- cancel-all, which goes over
         HTTP when the socket cannot carry it -- and nothing is placed until
         the socket has kept up for `STREAM_LAG_HOLD_S`. Hedging is not paused:
-        what is already open still has to be covered.
+        what is already open still has to be covered. An order the cancel
+        could not pull stays tracked as the leg's own.
         """
         lagging = [
             self.sessions[p] for p in roles.accounts
@@ -1379,11 +1380,24 @@ class Strategy:
             )
             maker = self.sessions.get(roles.maker)
             if maker is not None:
+                # Taken before the await, for the reason `_clear_own_orders`
+                # gives: a hedge clearing its path can change it meanwhile.
+                oid = leg.oid
                 try:
                     await maker.cancel_all([roles.symbol])
-                except Exception as exc:  # noqa: BLE001 - retried by the orphan sweep
-                    log.error("%s: could not pull its order: %s", key, describe(exc))
-                leg.oid = None
+                except Exception as exc:  # noqa: BLE001 - the order stays tracked
+                    # Kept, not cleared. It was dropped on the claim that the
+                    # orphan sweep would retry, but that sweep runs only for a
+                    # symbol an unanswered submission left in doubt. Tracked,
+                    # the order is still pulled by a hedge sweeping its side,
+                    # and replaced or pulled by the chaser when the leg resumes.
+                    log.error(
+                        "%s: could not pull its order: %s -- still tracking it",
+                        key, describe(exc),
+                    )
+                else:
+                    if leg.oid == oid:
+                        leg.oid = None
         return True
 
     def _note_fill_delay(self, session: AccountSession, fill) -> None:

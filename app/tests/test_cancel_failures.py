@@ -217,3 +217,48 @@ async def test_a_failed_run_names_the_accounts_it_could_not_cancel(monkeypatch, 
         "COULD NOT CANCEL" in r.getMessage() and "m1s3" in r.getMessage()
         for r in caplog.records
     ), "the failure path's cancel failed in silence"
+
+
+# -- a leg paused for a lagging socket keeps track of what it could not pull --
+
+
+async def pause_with(tmp_path, cancel_answer):
+    import time
+
+    from bulkdn.pairing import Group
+    from test_strategy import MASTER, SUB1, build
+
+    strategy, _book, master, sub1 = build(tmp_path)
+    key = strategy.group_key(1, BTC)
+    strategy._groups[key] = Group(BTC, maker=MASTER, takers=(SUB1,), shares=(1.0,))
+    leg = strategy.state.leg(key, BTC)
+    leg.phase = Phase.OPEN
+    leg.oid = "resting-one"
+    sub1.stream_lagging_until = time.monotonic() + 30
+
+    async def cancel_all(symbols):
+        if isinstance(cancel_answer, BaseException):
+            raise cancel_answer
+        return []
+
+    master.cancel_all = cancel_all
+    paused = await strategy._paused_for_a_lagging_socket(
+        key, strategy._roles_for_key(key), leg
+    )
+    return paused, leg
+
+
+async def test_a_paused_leg_keeps_the_order_it_could_not_pull(tmp_path):
+    """It was dropped on the claim that the orphan sweep would retry -- which
+    it does only for a symbol left in doubt by an unanswered submission."""
+    paused, leg = await pause_with(tmp_path, TimeoutError())
+
+    assert paused is True
+    assert leg.oid == "resting-one", "an order that may still rest was forgotten"
+
+
+async def test_a_paused_leg_forgets_the_order_it_did_pull(tmp_path):
+    paused, leg = await pause_with(tmp_path, None)
+
+    assert paused is True
+    assert leg.oid is None
