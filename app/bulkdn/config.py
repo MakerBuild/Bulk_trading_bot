@@ -8,6 +8,7 @@ signing authority.
 
 from __future__ import annotations
 
+import contextlib
 import difflib
 import logging
 import math
@@ -22,7 +23,7 @@ import yaml
 from . import keystore
 from .notify import TelegramConfig
 from .pause import PauseConfig, Window
-from .referral import AccessConfig
+from .referral import AccessConfig, is_sealed
 
 log = logging.getLogger(__name__)
 
@@ -557,7 +558,10 @@ class Config:
     ws_insecure_ssl: bool = False
     ws_ssl_auto_bypass: bool = False
 
-    # Optional endpoint overrides, for when the derived host is wrong.
+    # Optional endpoint overrides. Nothing is derived: the hosts are the
+    # MAINNET_* constants above, and these replace them outright when set --
+    # which also replaces what the signature domain was pinned beside, so
+    # they are for a host the exchange itself publishes, not for a guess.
     http_url_override: str = ""
     ws_url_override: str = ""
 
@@ -724,7 +728,7 @@ class Config:
             if market.max_order_span is not None:
                 cap = max(cap, market.max_order_span.high)
             if cap > 0 and limit <= cap:
-                log.warning(
+                _warn(
                     "risk.max_net_exposure_usd ($%s) is not above %s's per-order "
                     "cap ($%s): one resting order filling in full would trip "
                     "the exposure halt before the hedge lands. Twice the cap is "
@@ -828,6 +832,62 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
     return value
 
 
+# -- warnings, said once ----------------------------------------------------
+#
+# The menu reads the file again for every action, so that what it shows and
+# what a run trades are what the file says now. A warning logged on every read
+# would then repeat on every keypress, and the one that matters would scroll
+# away under copies of the rest. So everything the loader warns about is
+# collected while it reads, and said once for each version of the file: the
+# same file read twice says nothing new, and an edit gets its own say.
+
+_collecting: list[list[tuple[str, tuple[Any, ...]]]] = []
+_last_said: dict[str, tuple[int, int] | None] = {}
+
+
+def _warn(message: str, *args: Any) -> None:
+    """A warning about the settings, held back until the read is over."""
+    if _collecting:
+        _collecting[-1].append((message, args))
+    else:
+        log.warning(message, *args)
+
+
+def _version(path: str) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+@contextlib.contextmanager
+def _warnings_for(path: str, say: bool):
+    """Collect the warnings of one read, and say them unless already said."""
+    pending: list[tuple[str, tuple[Any, ...]]] = []
+    _collecting.append(pending)
+    try:
+        yield
+    finally:
+        _collecting.pop()
+        if say:
+            key = os.path.abspath(path)
+            version = _version(path)
+            if _last_said.get(key, ()) != version:
+                _last_said[key] = version
+                for message, args in pending:
+                    log.warning(message, *args)
+
+
+def _renamed(old: str, new: str) -> None:
+    """An older spelling, still read, and what it is called now."""
+    _warn(
+        "%s still works, but it is the older spelling: the current one is %s. "
+        "Renaming it is optional and changes nothing about how the bot runs.",
+        old, new,
+    )
+
+
 # -- spotting typos ----------------------------------------------------------
 #
 # Unknown keys were ignored in silence, so `notional_ust: 5000` loaded, traded
@@ -882,16 +942,16 @@ def _warn_unknown(raw: dict[str, Any], known: frozenset[str], where: str) -> Non
     for key in raw:
         path = f"{where}.{key}" if where else str(key)
         if not isinstance(key, str):
-            log.warning("%s is not a setting this bot reads, so it has no effect", path)
+            _warn("%s is not a setting this bot reads, so it has no effect", path)
             continue
         if key in known:
             continue
         if key in _RETIRED:
-            log.warning("%s is %s", path, _RETIRED[key])
+            _warn("%s is %s", path, _RETIRED[key])
             continue
         near = difflib.get_close_matches(key, sorted(known), n=1, cutoff=0.6)
         hint = f" -- did you mean `{near[0]}`?" if near else ""
-        log.warning(
+        _warn(
             "%s is not a setting this bot reads, so it has no effect%s", path, hint
         )
 
@@ -1000,6 +1060,7 @@ def _mode_from_raw(value: Any) -> str:
     """
     mode = str(value).strip().lower()
     if mode == "pool":
+        _renamed("mode: pool", "mode: multi")
         return "multi"
     return mode
 
@@ -1016,6 +1077,15 @@ def _markets_from_raw(
     operator reading a complaint about `legs.sub_account` can find that line.
     """
     raw_markets = raw.get("markets")
+    if raw_markets is not None and legs:
+        # One of the two used to be ignored without a word -- `legs:` -- so an
+        # operator editing that block was editing nothing.
+        raise ConfigError(
+            "the settings file has both `markets:` and `legs:`, and only one "
+            "of them can say what to trade. Keep one: `markets:` is the current "
+            "spelling. Move any market from `legs:` into it, then delete the "
+            "`legs:` block."
+        )
     if raw_markets is not None:
         if not isinstance(raw_markets, list) or not raw_markets:
             raise ConfigError("markets must be a non-empty list")
@@ -1041,11 +1111,16 @@ def _markets_from_raw(
     # plainly say. Refusing them had become a trap of its own -- a market
     # added from the menu was named after its coin, and a `sol:` block was
     # turned away by a message about a rename from two versions ago.
+    _renamed(
+        "`legs:`",
+        "a `markets:` list, one `- symbol: ...` entry per market -- "
+        "app/settings.default.yaml shows the shape",
+    )
     names = [f"legs.{name}" for name in legs]
     return [_leg_from_dict(legs[name], f"legs.{name}") for name in legs], names
 
 
-def _load_private_keys(required: bool) -> list[str]:
+def load_private_keys(required: bool = True) -> list[str]:
     """Every signing key, from the environment or the key file, in order.
 
     The environment wins so an unattended run needs no password prompt, and it
@@ -1076,6 +1151,11 @@ def _telegram_from_dict(raw: Any) -> TelegramConfig:
         raise ConfigError("telegram must be a mapping")
     _warn_unknown(raw, _TELEGRAM_KEYS, "telegram")
 
+    if "user_id" in raw:
+        if "user_ids" in raw:
+            _warn("telegram.user_id is ignored because telegram.user_ids is set -- delete it")
+        else:
+            _renamed("telegram.user_id", "telegram.user_ids")
     user_ids = raw.get("user_ids", raw.get("user_id", []))
     if user_ids is None:
         user_ids = []
@@ -1123,11 +1203,36 @@ def _pause_from_dict(raw: Any) -> PauseConfig:
     )
 
 
+def _access_from_raw(raw: Any) -> AccessConfig:
+    """The `access:` block -- or, in a sealed build, nothing at all.
+
+    A sealed build carries its owner compiled in and ignores this block
+    entirely (see bulkdn/referral.py), yet it was still parsed and validated
+    here, so a stray word in a block nothing reads could stop the bot
+    starting. It is now skipped, and the operator is told it does nothing.
+    """
+    if is_sealed():
+        if raw:
+            _warn(
+                "access: is ignored in this build -- who may run it is built in. "
+                "The block can be deleted."
+            )
+        return AccessConfig()
+    return _access_from_dict(raw or {})
+
+
 def _access_from_dict(raw: Any) -> AccessConfig:
     """Read referral-gating settings, tolerating a single code given unwrapped."""
     if not isinstance(raw, dict):
         raise ConfigError("access must be a mapping")
     _warn_unknown(raw, _ACCESS_KEYS, "access")
+
+    for old, new in (("code", "codes"), ("wallet", "wallets")):
+        if old in raw:
+            if new in raw:
+                _warn("access.%s is ignored because access.%s is set -- delete it", old, new)
+            else:
+                _renamed(f"access.{old}", f"access.{new}")
 
     def as_list(value) -> list[str]:
         if value is None:
@@ -1202,7 +1307,7 @@ def _log_level(value: Any) -> str:
     """
     level = _as_str(value, "log_level")
     if not isinstance(logging.getLevelName(level.upper()), int):
-        log.warning(
+        _warn(
             "log_level %r is not a level this understands -- logging at INFO. "
             "Use INFO, or DEBUG when diagnosing something.",
             level,
@@ -1214,6 +1319,9 @@ def load_config(
     path: str,
     require_credentials: bool = True,
     mode: str | None = None,
+    *,
+    private_keys: list[str] | None = None,
+    warn: bool = True,
 ) -> Config:
     """Load, merge, and validate configuration.
 
@@ -1222,7 +1330,22 @@ def load_config(
     line that asks for something contradictory is refused by the same rules as
     a settings file that does -- rather than running with a config nothing ever
     checked.
+
+    `private_keys` hands in keys already read, so a caller that re-reads the
+    file -- the menu does, before every action -- asks for the key password
+    once rather than every time. `warn=False` reads without saying anything,
+    for a check of a file that is about to be written.
     """
+    with _warnings_for(path, say=warn):
+        return _load_config(path, require_credentials, mode, private_keys)
+
+
+def _load_config(
+    path: str,
+    require_credentials: bool,
+    mode: str | None,
+    private_keys: list[str] | None,
+) -> Config:
     raw = _read_yaml(path)
     _warn_unknown(raw, _TOP_KEYS, "")
 
@@ -1270,8 +1393,13 @@ def load_config(
     # `cycles` was a top-level key before execution targets existed; the
     # top-level spelling still works and the nested one wins.
     if target_raw.get("cycles") is not None:
+        if raw.get("cycles") is not None:
+            _warn("cycles at the top level is ignored because execution_target.cycles "
+                  "is set -- delete the top-level one")
         cycles = whole(target_raw, "cycles", target_default.cycles, "execution_target")
     else:
+        if raw.get("cycles") is not None:
+            _renamed("`cycles:` at the top level", "`cycles:` under `execution_target:`")
         cycles = whole(raw, "cycles", target_default.cycles)
     target = ExecutionTarget(
         cycles=cycles,
@@ -1282,8 +1410,13 @@ def load_config(
     )
 
     if raw.get("single_master") is not None:
+        if pool_raw.get("single_master") is not None:
+            _warn("pool.single_master is ignored because single_master is set at the "
+                  "top level -- delete the one under pool:")
         single_master = whole(raw, "single_master", defaults.single_master)
     else:
+        if pool_raw.get("single_master") is not None:
+            _renamed("pool.single_master", "`single_master:` at the top level")
         single_master = whole(pool_raw, "single_master", defaults.single_master, "pool")
 
     config = Config(
@@ -1326,9 +1459,12 @@ def load_config(
             raw.get("ws_ssl_auto_bypass", False), "ws_ssl_auto_bypass"
         ),
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
-        access=_access_from_dict(raw.get("access") or {}),
+        access=_access_from_raw(raw.get("access")),
         pause=_pause_from_dict(raw.get("pause") or {}),
-        private_keys=_load_private_keys(require_credentials),
+        private_keys=(
+            list(private_keys) if private_keys is not None
+            else load_private_keys(require_credentials)
+        ),
     )
     config.validate(require_credentials=require_credentials)
     return config
