@@ -14,16 +14,15 @@ old one was $200. The exchange answers with a rejection that says nothing about
 the cause. `notional_usd: 200` means the same thing in either market.
 
 **Coins into what fits.** The configured size is then treated as a ceiling
-rather than an instruction. When
-both accounts can carry it, it is used exactly as written. When they cannot,
-every leg is scaled by the same factor until the whole cycle fits inside
-`max_margin_fraction` of the smaller account's available margin.
+rather than an instruction. When every account can carry it within
+`MARGIN_HEADROOM` of its available margin, it is used exactly as written. When
+one cannot, every leg is scaled by the same factor until the whole cycle fits
+inside `max_margin_fraction` of the smallest account's available margin.
 
-**Both accounts are checked, and the smaller one decides.** Each holds one side
-of both legs -- the master is long the first and short the second, the sub the
-reverse -- so the same total margin is needed on each, and a cycle sized for the
-richer account would strand the poorer one mid-entry with a position it cannot
-hedge.
+**Every account is checked, and the smallest one decides.** Any account in the
+pool can be drawn as a group's maker, which carries one side of the whole
+cycle, so a cycle sized for a richer account would strand the poorer one
+mid-entry with a position it cannot hedge.
 
 **Scaling is proportional.** Halving one leg and leaving the other would change
 the balance between them, which is a decision the operator made in the config,
@@ -147,12 +146,10 @@ def draw_sizes(legs: list) -> None:
     cannot help but advertise about itself.
     """
     for leg in legs:
-        span = getattr(leg, "notional_span", None)
-        if span is not None and span.is_range:
-            leg.notional_usd = span.pick()
-        span = getattr(leg, "max_order_span", None)
-        if span is not None and span.is_range:
-            leg.max_order_notional_usd = span.pick()
+        if leg.notional_span is not None and leg.notional_span.is_range:
+            leg.notional_usd = leg.notional_span.pick()
+        if leg.max_order_span is not None and leg.max_order_span.is_range:
+            leg.max_order_notional_usd = leg.max_order_span.pick()
 
 
 def resolve_notionals(
@@ -250,6 +247,13 @@ def plan_sizes(
     `available_margin` is keyed by account; the smallest value binds. Returns
     the configured sizes unchanged when they already fit.
 
+    There is a step between the two rules, and it is the documented one: a
+    cycle needing 79% of margin is used as written, one needing 81% is cut to
+    `max_margin_fraction` -- a quarter by default, so to about a third of what
+    was asked. Smoothing it to just under the headroom would put the case
+    this was built for, a size written for another market, on most of the
+    margin; the fraction is the operator's to raise.
+
     Raises `InsufficientMargin` when a scaled leg would fall below the
     exchange's minimum order size, since trading it is not possible and a
     rejection at the first order is a worse way to find out.
@@ -288,11 +292,14 @@ def plan_sizes(
         # "scaled" cycle came out LARGER than written, on all of the margin.
         budget = smallest * min(max_margin_fraction, MARGIN_HEADROOM)
         scale = min(1.0, budget / required)
+        # It used to say "80% of it may be used" and then scale to a quarter,
+        # which read as a miscalculation.
         log.warning(
-            "configured sizes need $%.2f of margin but only $%.2f is available "
-            "(%.0f%% of it may be used) -- scaling every leg to %.1f%% so the "
-            "cycle fits inside $%.2f",
-            required, smallest, MARGIN_HEADROOM * 100, scale * 100, budget,
+            "configured sizes need $%.2f of margin, more than %.0f%% of the $%.2f "
+            "available -- falling back to max_margin_fraction (%.0f%%): scaling "
+            "every leg to %.1f%% so the cycle fits inside $%.2f",
+            required, MARGIN_HEADROOM * 100, smallest,
+            min(max_margin_fraction, MARGIN_HEADROOM) * 100, scale * 100, budget,
         )
 
     planned: list[LegSizing] = []
