@@ -589,3 +589,40 @@ async def test_an_order_for_an_account_the_socket_does_not_carry_still_counts():
     with pytest.raises(NotSent):
         await stranger.submit([FakeAction()])
     assert stranger.reject_streak == 1
+
+
+# -- a caller that stops waiting ----------------------------------------------
+
+
+async def test_a_cancelled_submission_is_in_doubt_and_leaves_nothing_pending():
+    """`CancelledError` is not an `Exception`: it skipped both the cleanup of
+    the pending request and the step that marks the symbol in doubt."""
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    call = asyncio.create_task(master.submit([FakeAction()], timeout=5.0))
+    while not client.ws.sent:
+        await asyncio.sleep(0)
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+
+    assert client.pending_requests == {}, "the cancelled request was never removed"
+    assert master.symbols_in_doubt(60.0) == {BTC}, "it may have executed"
+    assert master.reject_streak == 0
+
+
+async def test_submit_sends_exactly_what_signed_transaction_signs():
+    """The HTTP fallback sends `signed_transaction`; the socket must send the
+    same envelope, not a copy of the code that builds it."""
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    call = asyncio.create_task(master.submit([FakeAction()], nonce=42, timeout=0.05))
+    while not client.ws.sent:
+        await asyncio.sleep(0)
+    with pytest.raises(asyncio.TimeoutError):
+        await call
+
+    sent = client.ws.sent[0]["request"]["payload"]
+    assert sent == client.signed_transaction([FakeAction()], MASTER, nonce=42)

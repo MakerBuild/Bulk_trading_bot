@@ -504,19 +504,34 @@ class RoutedWsClient(BulkWebSocketClient):
         """
         return self.signer
 
-    def signed_transaction(self, actions: Sequence[Action], account: str) -> dict:
-        """The same signed transaction `submit` sends, for sending over HTTP.
+    def signed_transaction(
+        self, actions: Sequence[Action], account: str, nonce: int | None = None
+    ) -> dict:
+        """The signed transaction for `actions` on `account`, as `submit` sends it.
 
-        For when the socket is the problem. The exchange takes this exact
-        envelope at `/order` -- the SDK's own HTTP path posts it there -- and
-        unlike the SDK's, it names the account, so it works for a sub-account.
+        Also sent over HTTP when the socket is the problem. The exchange takes
+        this exact envelope at `/order` -- the SDK's own HTTP path posts it
+        there -- and unlike the SDK's, it names the account, so it works for a
+        sub-account.
+
+        Mirrors the SDK's `place_orders` but sets `account` to the traded
+        account while leaving `signer` as the key that actually signs. Actions
+        also carry `pubkey`, which feeds the client-side order-ID hash -- it
+        must be the traded account or the computed IDs won't match the
+        exchange's.
         """
         signer = self._signing_key
         if not signer:
             raise NotSent("signer not configured")
+        if not account:
+            raise NotSent("account_pubkey not configured")
         if self.accounts and account not in self.accounts:
+            # A socket signs only for the accounts its key was built for.
+            # Sending for another would be rejected by the exchange, but the
+            # useful moment to notice is here, where the account is named.
             raise NotSent(f"this connection does not carry {short_pubkey(account)}")
-        nonce = int(time.time_ns())
+        if nonce is None:
+            nonce = int(time.time_ns())
         payload_actions = []
         for index, action in enumerate(actions):
             action.seqno = index
@@ -525,6 +540,9 @@ class RoutedWsClient(BulkWebSocketClient):
             payload_actions.append(action.to_api())
         tx = {
             "actions": payload_actions,
+            # A decimal string, as the SDK sends it on every signed path, WS
+            # and HTTP alike. `bulkdn.tx` sends a number instead, on purpose;
+            # see there.
             "nonce": f"{nonce}",
             "account": account,
             "signer": signer.public_key,
@@ -540,49 +558,18 @@ class RoutedWsClient(BulkWebSocketClient):
     ) -> list[OrderResponse]:
         """Sign and submit a batch of actions for one account.
 
-        Mirrors the SDK's `place_orders` but sets `account` to the traded
-        account while leaving `signer` as the key that actually signs. Actions
-        also carry `pubkey`, which feeds the client-side order-ID hash -- it
-        must be the traded account or the computed IDs won't match the
-        exchange's.
+        Signed by `signed_transaction`, which the HTTP fallback sends too, so
+        the two paths cannot drift apart. In a dry run it is signed and not
+        sent, which costs nothing and stamps the actions the same way -- their
+        order ids depend on it.
 
         `account` defaults to this client's own, which is every caller that
         predates the pool. A shared socket passes it per call, because with
         several accounts on one connection the alternative is a mutable
         "current account" and orders landing on whichever one was set last.
         """
-        signer = self._signing_key
-        if not signer:
-            raise NotSent("signer not configured")
         account = account or self.account_pubkey
-        if not account:
-            raise NotSent("account_pubkey not configured")
-        if self.accounts and account not in self.accounts:
-            # A socket signs only for the accounts its key was built for.
-            # Sending for another would be rejected by the exchange, but the
-            # useful moment to notice is here, where the account is named.
-            raise NotSent(
-                f"this connection does not carry {short_pubkey(account)}"
-            )
-        if nonce is None:
-            nonce = int(time.time_ns())
-
-        payload_actions = []
-        for index, action in enumerate(actions):
-            action.seqno = index
-            action.nonce = nonce
-            action.pubkey = account
-            payload_actions.append(action.to_api())
-
-        tx = {
-            "actions": payload_actions,
-            # A decimal string, as the SDK sends it on every signed path, WS
-            # and HTTP alike. `bulkdn.tx` sends a number instead, on purpose;
-            # see there.
-            "nonce": f"{nonce}",
-            "account": account,
-            "signer": signer.public_key,
-        }
+        tx = self.signed_transaction(actions, account, nonce)
 
         if self.dry_run:
             log.info(
@@ -603,8 +590,6 @@ class RoutedWsClient(BulkWebSocketClient):
         if not self.is_connected:
             raise NotConnected("not connected to WebSocket")
 
-        tx = signer.sign_transaction(tx, self.signature_domain)
-
         self.request_id += 1
         request_id = self.request_id
         request = {
@@ -624,11 +609,12 @@ class RoutedWsClient(BulkWebSocketClient):
             return await asyncio.wait_for(
                 future, timeout=timeout if timeout is not None else self.default_timeout
             )
-        except Exception:
-            # Only the failure path cleans up: on success the SDK's message
-            # handler pops the entry when it resolves the future.
+        finally:
+            # On every way out, cancellation included. On success the message
+            # handler has already popped the entry and this does nothing; it
+            # used to run only on `Exception`, and a cancelled caller -- not an
+            # Exception -- left its request in the map for good.
             self.pending_requests.pop(request_id, None)
-            raise
 
 
 # A chase re-price waits once its socket has carried this many submissions in
@@ -861,10 +847,15 @@ class AccountSession:
                 self.reject_streak += 1
                 self.last_reject = str(exc)
             raise
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             # No answer came back. The actions may have executed anyway, so
             # every symbol they touched is now in doubt until a position read
             # settles it. A rejection is not in doubt -- that IS an answer.
+            #
+            # A cancelled caller is the same case: it stopped waiting, it did
+            # not learn the outcome, and the transaction may already be on the
+            # wire. `CancelledError` is not an `Exception`, so it used to skip
+            # this and leave the symbol looking settled.
             at = time.monotonic()
             for action in actions:
                 symbol = getattr(action, "symbol", None)
