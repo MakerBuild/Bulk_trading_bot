@@ -1549,7 +1549,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "telegram":
             from .telegram_control import serve
 
-            return asyncio.run(serve(config, dry_run))
+            # With the file, so every command re-reads it -- see
+            # `telegram_control.config_reloader`.
+            return asyncio.run(
+                serve(config, dry_run, config_path=args.config, mode=args.mode)
+            )
         if args.command == "status":
             return asyncio.run(cmd_status(config))
         if args.command == "check":

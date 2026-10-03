@@ -736,3 +736,48 @@ def test_a_re_read_keeps_the_keys_decrypted_at_start(tmp_path, monkeypatch):
     assert fresh.private_keys == ["KEY-ONE", "KEY-TWO"]
     assert fresh.private_key == "KEY-ONE"
     assert fresh.markets[0].symbol == "BTC-USD"
+
+
+# -- the service is given the file to re-read -------------------------------
+#
+# `config_reloader` existed, but neither way in handed `serve` a path: the CLI
+# called `serve(config, dry_run)` and the menu `serve(config, dry_run=...)`,
+# so every /run and /close used the settings as they were at start.
+
+
+def _capture_serve(monkeypatch):
+    seen = {}
+
+    async def fake_serve(config, dry_run, **kwargs):
+        seen.update(kwargs, dry_run=dry_run)
+        return 0
+
+    monkeypatch.setattr(tc, "serve", fake_serve)
+    return seen
+
+
+def test_the_cli_hands_telegram_control_its_settings_file(monkeypatch, tmp_path):
+    from bulkdn import cli, lock
+
+    seen = _capture_serve(monkeypatch)
+    monkeypatch.setattr(lock, "LOCK_FILE", str(tmp_path / "bot.lock"))
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: object())
+    monkeypatch.setattr(cli, "configure_logging", lambda *a, **k: None)
+    monkeypatch.setattr(cli.proxy, "configure", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "_ready", lambda *a, **k: None)
+
+    assert cli.main(["--config", "elsewhere.yaml", "telegram"]) == 0
+    assert seen["config_path"] == "elsewhere.yaml"
+
+
+def test_the_menu_hands_telegram_control_its_settings_file(monkeypatch):
+    from bulkdn import menu
+
+    seen = _capture_serve(monkeypatch)
+    monkeypatch.setattr(menu, "_ask", lambda _prompt: "1")
+    monkeypatch.setattr(menu, "_pause", lambda: None)
+    config = types.SimpleNamespace(telegram=types.SimpleNamespace(enabled=True))
+
+    menu._telegram(config, "settings.yaml", "multi")
+    assert seen["config_path"] == "settings.yaml"
+    assert seen["mode"] == "multi"

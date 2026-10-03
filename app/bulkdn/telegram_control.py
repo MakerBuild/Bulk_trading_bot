@@ -834,20 +834,16 @@ async def _handle_update(update: dict, api: BotApi, controller: Controller,
 def config_reloader(path: str, loaded, *, mode: str | None = None) -> Callable[[], object]:
     """A function that reads the settings at `path` again, keeping `loaded`'s keys.
 
-    The file is read without credentials -- the key file is encrypted, and
-    asking for its password on every /run from a phone is not an option -- and
-    the keys decrypted at start are put back before the result is validated
-    as fully as a fresh start would. `mode` is the command line's override,
-    if there was one, which a re-read must not undo.
+    The keys decrypted at start are handed in rather than read again -- the
+    key file is encrypted, and asking for its password on every /run from a
+    phone is not an option -- and the result is validated as fully as a fresh
+    start would be. `mode` is the command line's override, if there was one,
+    which a re-read must not undo.
     """
     def reload():
         from .config import load_config
 
-        fresh = load_config(path, require_credentials=False, mode=mode)
-        fresh.private_keys = list(loaded.private_keys)
-        fresh.private_key = loaded.private_key
-        fresh.validate(require_credentials=True)
-        return fresh
+        return load_config(path, mode=mode, private_keys=list(loaded.private_keys))
 
     return reload
 

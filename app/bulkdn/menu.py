@@ -301,8 +301,14 @@ def _start(config: Config) -> None:
     _pause()
 
 
-def _telegram(config: Config) -> None:
-    """Hand the bot over to Telegram until Ctrl+C."""
+def _telegram(config: Config, config_path: str | None = None, mode: str | None = None) -> None:
+    """Hand the bot over to Telegram until Ctrl+C.
+
+    `config_path` is handed on so every /run, /close and /status reads the
+    settings file again, as the menu does before every choice. Without it the
+    service ran on the settings as they were when Telegram control started,
+    however the file was edited since.
+    """
     from .telegram_control import SETUP_HELP, serve
 
     if not config.telegram.enabled:
@@ -325,7 +331,7 @@ def _telegram(config: Config) -> None:
         _pause()
         return
     try:
-        asyncio.run(serve(config, dry_run=not live))
+        asyncio.run(serve(config, dry_run=not live, config_path=config_path, mode=mode))
     except KeyboardInterrupt:
         print("\n  Telegram control stopped.")
     _pause()
@@ -2309,7 +2315,10 @@ def run_menu(settings: Settings) -> int:
         "Configuration": lambda config: _configuration(config, settings.path),
         CLOSE_ALL_LABEL: _locked("menu: close all", _close_all),
         "Logs": lambda _config: _logs(),
-        "Telegram Control": _locked("menu: telegram control", _telegram),
+        "Telegram Control": _locked(
+            "menu: telegram control",
+            lambda config: _telegram(config, settings.path, settings.mode),
+        ),
     }
     actions = {
         str(number): handlers[label]
