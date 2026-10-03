@@ -167,9 +167,14 @@ async def reconcile_net(
 ) -> list[str]:
     """Re-run the hedge rule for each leg, correcting any drift.
 
-    This is the same operation the fill handler performs. Running it on a timer
-    catches whatever the event path missed: a dropped frame, a hedge that was
-    rejected, or exposure inherited from a previous process.
+    This is the same operation the fill handler performs, run once at startup
+    to correct exposure inherited from a previous process.
+
+    Only recovery still calls it, and it goes straight to the hedger: a
+    correction sent from here does not pull our own resting orders out of its
+    path first, which the strategy's own reconcile pass does. Recovery
+    cancels every order just before calling it, so there is nothing in the
+    way there -- but this should go once recovery uses the strategy's pass.
     """
     corrections: list[str] = []
     for leg in roles:
