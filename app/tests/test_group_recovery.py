@@ -249,8 +249,8 @@ async def test_recovery_reconciles_the_restored_groups_not_the_pair(tmp_path, mo
         reconciled.append([r.key for r in roles])
         return []
 
-    async def cancel_all(sessions, symbols):
-        return None
+    async def cancel_all(sessions, symbols, **kw):
+        return []
 
     async def no_read(sessions, book):
         return None

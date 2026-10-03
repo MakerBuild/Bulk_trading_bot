@@ -253,3 +253,26 @@ def test_cycles_caps_the_groups_a_pool_run_starts(tmp_path):
 
     asyncio.run(drive())
     assert len(obj.started) == 2
+
+
+def test_the_run_is_stopping_before_a_failed_groups_siblings_are_cancelled(tmp_path):
+    """Whatever the siblings do on the way out, they must read it as the end
+    of the run -- it is one."""
+    obj = strategy(tmp_path, max_groups=2)
+    stopping_when_cancelled = []
+
+    async def run_group(group_id, group, size):
+        obj.started.append(group_id)
+        if len(obj.started) == 1:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                stopping_when_cancelled.append(obj._stop.is_set())
+                raise
+        raise RuntimeError("exchange said no")
+
+    obj._run_group = run_group
+
+    with pytest.raises(RuntimeError, match="exchange said no"):
+        asyncio.run(asyncio.wait_for(obj._dispatch_groups({BTC: 1.0}), timeout=5))
+    assert stopping_when_cancelled == [True]

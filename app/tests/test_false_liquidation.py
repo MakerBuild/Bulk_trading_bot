@@ -19,6 +19,7 @@ import time
 import pytest
 
 from bulkdn.liquidation import Liquidation, recent_liquidations
+from bulkdn.state import StrategyState
 from bulkdn.strategy import DOUBT_WINDOW_S, MAX_DOUBT_DEFERRALS
 
 ETH = "ETH-USD"
@@ -186,6 +187,9 @@ class FakeSession:
         # Through `market`, which tests replace to watch or refuse the close.
         return await self.market(symbol, is_buy, size, reduce_only=True)
 
+    async def cancel_all(self, symbols):
+        return []
+
 
 class Bot:
     """Just enough Strategy to exercise the guard's decision."""
@@ -193,7 +197,7 @@ class Bot:
     @property
     def all_sessions(self):
         """Stands in for Strategy's own: every account the run trades."""
-        return [self.master, self.sub1]
+        return list(self.sessions.values())
 
     def __init__(self, *, in_doubt=False, sync_fails=False, liquidated=False,
                  confirm_fails=False):
@@ -201,6 +205,10 @@ class Bot:
 
         self.master = FakeSession("master")
         self.sub1 = FakeSession("sub1")
+        self.sessions = {s.pubkey: s for s in (self.master, self.sub1)}
+        # No groups: the configured pair, whose two accounts are the run.
+        self._groups = {}
+        self.pairing = None
         if in_doubt:
             self.master.unconfirmed[ETH] = time.monotonic()
         self._doubt_deferrals = {}
@@ -211,10 +219,19 @@ class Bot:
         self.halted = None
         self.notifier = self
         self._guard_liquidation = Strategy._guard_liquidation.__get__(self)
+        self._respond_to_shrinks = Strategy._respond_to_shrinks.__get__(self)
         self._deferred_to_our_own_orders = (
             Strategy._deferred_to_our_own_orders.__get__(self)
         )
         self._liquidation_confirmed = Strategy._liquidation_confirmed.__get__(self)
+        self._exchange_liquidated = Strategy._exchange_liquidated.__get__(self)
+        self._key_for_account = Strategy._key_for_account.__get__(self)
+        self._leg_accounts = Strategy._leg_accounts.__get__(self)
+        self._cancel_resting = Strategy._cancel_resting.__get__(self)
+        for name in ("_accounts_hit", "_holding_hedges", "_close_broken_legs",
+                     "_clear_own_orders"):
+            setattr(self, name, getattr(Strategy, name).__get__(self))
+        self._hedge_queue = asyncio.Queue()
         self._settled_by_a_fresh_read = (
             Strategy._settled_by_a_fresh_read.__get__(self)
         )
@@ -252,7 +269,8 @@ def bot_with(events, **kw):
     bot.book.set_authoritative(bot.master.pubkey, ETH, 0.3066)
     bot.guard = type("G", (), {
         "check": lambda self, *a: events,
-        "reset_symbol": lambda self, symbol: None,
+        "acknowledge": lambda self, found: None,
+        "reset_symbol": lambda self, symbol, accounts=None: None,
     })()
     bot.config = type("C", (), {"http_url": "http://x"})()
     return bot
@@ -276,6 +294,7 @@ def patch_confirm(monkeypatch, bot):
 
 def no_waiting(monkeypatch):
     monkeypatch.setattr("bulkdn.strategy.SHRINK_RECHECK_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr("bulkdn.strategy.CONFIRM_RETRY_DELAYS_S", (0.0, 0.0))
 
 
 def run_guard(monkeypatch, bot):
@@ -328,6 +347,135 @@ def test_an_unreachable_exchange_is_treated_as_a_liquidation(monkeypatch):
     bot = bot_with([liquidation_event()], in_doubt=False, confirm_fails=True)
     run_guard(monkeypatch, bot)
     assert bot.halted is not None and "liquidation" in bot.halted
+
+
+# -- a reprieve covers the group it was earned in -------------------------
+#
+# Deferring to our own unanswered order used to wipe the market for every
+# group trading it: every account's high-water mark in the symbol, and every
+# account's "in doubt" mark -- which is also what tells the orphan sweep that
+# an order of ours may be resting unaccounted for.
+
+
+def two_groups(bot):
+    """Put master+sub1 in one group on ETH, and two more accounts in another."""
+    from bulkdn.pairing import Group
+
+    for name in ("other", "other2"):
+        bot.sessions[f"{name}-KEY"] = FakeSession(name)
+    bot._groups = {
+        "g1:ETH-USD": Group(ETH, maker="master-KEY", takers=("sub1-KEY",), shares=(1.0,)),
+        "g2:ETH-USD": Group(ETH, maker="other-KEY", takers=("other2-KEY",), shares=(1.0,)),
+    }
+    # No orders resting: nothing for the guard to pull out of its closes' way.
+    bot.state = StrategyState()
+    bot.pairing = object()
+    resets = []
+    bot.guard.reset_symbol = lambda symbol, accounts=None: resets.append(
+        (symbol, None if accounts is None else set(accounts))
+    )
+    return resets
+
+
+def test_a_reprieve_leaves_other_groups_peaks_and_doubts_alone(monkeypatch):
+    bot = bot_with([liquidation_event()], in_doubt=True)
+    resets = two_groups(bot)
+    other = bot.sessions["other-KEY"]
+    other.unconfirmed[ETH] = time.monotonic()
+
+    assert run_guard(monkeypatch, bot) is False
+
+    assert resets == [(ETH, {"master-KEY"})], "other groups' peaks were wiped"
+    assert ETH in other.unconfirmed, "another group's order in doubt was forgotten"
+    assert ETH not in bot.master.unconfirmed
+
+
+def test_another_groups_unanswered_order_does_not_excuse_this_one(monkeypatch):
+    bot = bot_with([liquidation_event()], in_doubt=False)
+    two_groups(bot)
+    bot.sessions["other-KEY"].unconfirmed[ETH] = time.monotonic()
+
+    assert run_guard(monkeypatch, bot) is True, "a stranger's timeout excused it"
+
+
+# -- asking the exchange about the accounts that shrank, not the pool ------
+#
+# It asked every account in the pool, one after another, and the first that
+# failed to answer -- any of a hundred, most of them nowhere near the event --
+# made the shrink a liquidation: every account closed at market, run halted.
+
+
+def asked_about(monkeypatch, answers):
+    """Have riskEvents answer per account from `answers`; record who was asked.
+
+    Each answer is a list of events, an exception, or a list of those taken
+    one per attempt.
+    """
+    asked = []
+
+    def query(http_url, user, **kw):
+        asked.append(user)
+        answer = answers.get(user, [])
+        if isinstance(answer, list) and answer and isinstance(answer[0], (list, Exception)):
+            answer = answer.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr("bulkdn.strategy.recent_liquidations", query)
+    no_waiting(monkeypatch)
+    return asked
+
+
+def test_only_the_accounts_that_shrank_are_asked(monkeypatch):
+    bot = bot_with([liquidation_event()])
+    asked = asked_about(monkeypatch, {})
+
+    confirmed = asyncio.run(bot._liquidation_confirmed([liquidation_event()]))
+
+    assert confirmed is False
+    assert asked == ["master-KEY"], "accounts nowhere near the event were asked"
+
+
+def test_an_unrelated_account_that_cannot_answer_does_not_make_it_a_liquidation(
+    monkeypatch,
+):
+    bot = bot_with([liquidation_event()])
+    asked_about(monkeypatch, {"sub1-KEY": TimeoutError()})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event()])) is False
+
+
+def test_a_liquidation_in_another_market_is_not_this_one(monkeypatch):
+    bot = bot_with([liquidation_event(ETH)])
+    asked_about(monkeypatch, {"master-KEY": [[event(symbol=BTC)]]})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event(ETH)])) is False
+
+
+def test_a_liquidation_in_this_market_is_confirmed(monkeypatch):
+    bot = bot_with([liquidation_event(ETH)])
+    asked_about(monkeypatch, {"master-KEY": [[event(symbol=ETH)]]})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event(ETH)])) is True
+
+
+def test_one_failed_answer_is_asked_again_before_failing_safe(monkeypatch):
+    """Asked in the middle of whatever went wrong, so a blip is likely --
+    and failing safe closes every account at market."""
+    bot = bot_with([liquidation_event()])
+    asked = asked_about(monkeypatch, {"master-KEY": [TimeoutError(), []]})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event()])) is False
+    assert asked == ["master-KEY", "master-KEY"]
+
+
+def test_an_account_that_never_answers_still_fails_safe(monkeypatch):
+    bot = bot_with([liquidation_event()])
+    asked = asked_about(monkeypatch, {"master-KEY": TimeoutError()})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event()])) is True
+    assert len(asked) == 3, "it gave up without retrying"
 
 
 def test_doubt_does_not_excuse_it_when_positions_cannot_be_re_read(monkeypatch):
@@ -506,8 +654,9 @@ def test_hedging_is_suspended_before_the_first_close(monkeypatch):
     bot = bot_with([liquidation_event()], in_doubt=False)
     order = []
 
-    async def cancel_all(sessions, symbols):
+    async def cancel_all(sessions, symbols, **kw):
         order.append(("cancel", tuple(symbols)))
+        return []
 
     real_market = bot.master.market
 

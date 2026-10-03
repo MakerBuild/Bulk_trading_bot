@@ -130,23 +130,64 @@ class _SimplePosition:
 
 
 async def cancel_all_orders(
-    sessions: Sequence[AccountSession], symbols: Sequence[str]
-) -> None:
-    """Cancel every order both accounts have working in the strategy's symbols.
+    sessions: Sequence[AccountSession],
+    symbols: Sequence[str],
+    *,
+    concurrently: bool = False,
+    retry_delay_s: float = 0.5,
+) -> list[tuple[AccountSession, BaseException]]:
+    """Cancel every order these accounts have working in `symbols`.
 
-    Used on startup and on halt. Orders left over from a previous run cannot be
-    matched to the current plan with confidence, and an unknown resting order is
-    an unhedged fill waiting to happen.
+    Used on startup, on every ending of a run, and before the liquidation
+    guard's closes. Orders left over from a previous run cannot be matched to
+    the current plan with confidence, and an unknown resting order is an
+    unhedged fill waiting to happen.
+
+    Returns the accounts it could not cancel on, each with why, after one more
+    try. It used to return nothing and log every failure as a warning, so no
+    caller could tell, and their "COULD NOT CANCEL -- cancel them by hand" line
+    could never fire: an emergency stop flattened beside orders still working,
+    and a restart forgot the ids of orders it had failed to pull.
+
+    A rejection is a failure too. It was read as "nothing to cancel" and logged
+    at debug, but nothing says that is what it means: the SDK raises
+    `OrderRejected` for a refused transaction (signature, rate limit) and for
+    an action marked rejected, and either way the orders are where they were.
+    The status a cancel-all has of its own, `cancelAllRejected`, is one the SDK
+    does not count as an error: if that is how "nothing to cancel" comes back,
+    it returns normally and never reaches here, and if it comes back some other
+    way, it cannot be told from a refusal here and is taken as one.
+
+    `concurrently` sends every account's cancel at once, for a caller that is
+    waiting on all of them before it can act -- the liquidation guard's closes.
     """
-    for session in sessions:
-        try:
-            await session.cancel_all(symbols)
+
+    async def cancel(session: AccountSession) -> tuple[AccountSession, BaseException] | None:
+        for attempt in (1, 2):
+            try:
+                await session.cancel_all(symbols)
+            except Exception as exc:  # noqa: BLE001 - returned to the caller
+                what = "refused" if isinstance(exc, OrderRejected) else "failed"
+                if attempt == 1:
+                    log.warning(
+                        "%s: cancel-all %s (%s) -- trying once more",
+                        session.name, what, describe(exc),
+                    )
+                    await asyncio.sleep(retry_delay_s)
+                    continue
+                log.error(
+                    "%s: cancel-all %s again: %s", session.name, what, describe(exc)
+                )
+                return session, exc
             log.info("%s: cancelled all orders in %s", session.name, ", ".join(symbols))
-        except OrderRejected as exc:
-            # Nothing to cancel is the common case and is not an error.
-            log.debug("%s: cancel-all returned %s", session.name, exc)
-        except Exception as exc:
-            log.warning("%s: cancel-all failed: %s", session.name, describe(exc))
+            return None
+        return None
+
+    if concurrently:
+        results = await asyncio.gather(*(cancel(session) for session in sessions))
+    else:
+        results = [await cancel(session) for session in sessions]
+    return [failure for failure in results if failure is not None]
 
 
 async def reconcile_net(

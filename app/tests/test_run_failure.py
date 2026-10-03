@@ -103,8 +103,9 @@ async def test_any_failure_cancels_every_resting_order(monkeypatch):
     obj._recover = recover
     cancelled = []
 
-    async def cancel_all(sessions, symbols):
+    async def cancel_all(sessions, symbols, **kw):
         cancelled.append(list(symbols))
+        return []
 
     monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
 
@@ -112,3 +113,97 @@ async def test_any_failure_cancels_every_resting_order(monkeypatch):
         await obj.run()
 
     assert cancelled == [["BTC-USD"]], "resting orders were left on the book"
+
+
+async def test_a_failed_run_hedges_what_filled_while_it_cancelled(monkeypatch):
+    """The stop path hedged fills that landed during its cancel sweep; the
+    failure path cancelled the same way and exited holding them."""
+    obj = bare()
+    obj.config = types.SimpleNamespace(active_legs=[])
+    obj.symbols = ["BTC-USD"]
+    obj.sessions = {"a": object()}
+    obj._stop_requested = None
+    obj._halt_reason = None
+    obj.install_handlers = lambda: None
+    obj._hedge_worker = forever
+    obj._supervise = forever
+    obj._refresh_status = forever
+    obj._log_open_positions = lambda: None
+    steps = []
+
+    async def recover():
+        raise RuntimeError("HTTP 504")
+
+    async def cancel_all(sessions, symbols, **kw):
+        steps.append(("cancel", obj._stop.is_set()))
+        return []
+
+    async def last_pass():
+        steps.append(("hedge", obj._stop.is_set()))
+
+    obj._recover = recover
+    obj._last_hedge_pass = last_pass
+    monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
+
+    with pytest.raises(RuntimeError, match="504"):
+        await obj.run()
+
+    assert steps == [("cancel", True), ("hedge", True)], steps
+
+
+# -- and the lines that need a person say so ---------------------------------
+#
+# Telegram picks its alerts by a flag on the record, not by matching the text
+# of the line, so rewording a message cannot silently stop it being sent.
+
+
+async def test_the_failure_line_is_marked_as_an_alert(monkeypatch, caplog):
+    import logging
+
+    obj = bare()
+    obj.config = types.SimpleNamespace(active_legs=[])
+    obj.symbols = ["BTC-USD"]
+    obj.sessions = {}
+    obj._stop_requested = None
+    obj._halt_reason = None
+    obj.install_handlers = lambda: None
+    obj._hedge_worker = forever
+    obj._supervise = forever
+    obj._refresh_status = forever
+    obj._log_open_positions = lambda: None
+
+    async def recover():
+        raise RuntimeError("HTTP 504")
+
+    async def nothing():
+        return None
+
+    async def cancel_all(sessions, symbols, **kw):
+        return []
+
+    obj._recover = recover
+    obj._last_hedge_pass = nothing
+    monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
+
+    with caplog.at_level(logging.CRITICAL), pytest.raises(RuntimeError):
+        await obj.run()
+
+    failed = [r for r in caplog.records if "run failed" in r.getMessage()]
+    assert failed and all(getattr(r, "alert", False) for r in failed)
+
+
+def test_the_halt_line_is_marked_as_an_alert(caplog):
+    import logging
+
+    obj = bare()
+    obj._halt_reason = None
+    obj.title = types.SimpleNamespace(halted=lambda reason: None)
+    obj.notifier = types.SimpleNamespace(
+        send_soon=lambda message: None, halted=lambda reason: reason
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        obj._trigger_halt("hedge limit exceeded")
+
+    halts = [r for r in caplog.records if r.getMessage().startswith("HALT:")]
+    assert halts and all(getattr(r, "alert", False) for r in halts)

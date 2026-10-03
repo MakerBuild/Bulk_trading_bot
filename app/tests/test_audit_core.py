@@ -242,8 +242,11 @@ async def test_a_close_that_raises_still_halts():
     obj._closing_out = False
     obj.guard = types.SimpleNamespace(check=lambda *a: [types.SimpleNamespace(
         symbol="GONE-USD", describe=lambda: "m GONE-USD 1 -> 0", account="m",
-    )])
+    )], acknowledge=lambda events: None)
     obj.sessions = {}
+    obj._groups = {}
+    obj.pairing = None
+    obj._hedge_queue = asyncio.Queue()
     obj.book = PositionBook()
     obj.feed = types.SimpleNamespace(specs={})
     obj.notifier = types.SimpleNamespace(
@@ -261,8 +264,8 @@ async def test_a_close_that_raises_still_halts():
 
     import bulkdn.strategy as strategy_module
 
-    async def cancel_all(sessions, symbols):
-        return None
+    async def cancel_all(sessions, symbols, **kw):
+        return []
 
     original = strategy_module.cancel_all_orders
     strategy_module.cancel_all_orders = cancel_all
