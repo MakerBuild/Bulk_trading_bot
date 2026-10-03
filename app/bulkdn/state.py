@@ -12,6 +12,7 @@ after a crash.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,8 +26,9 @@ import contextlib
 log = logging.getLogger(__name__)
 
 # How hard to try when the destination is locked by another process. Five
-# attempts starting at 50ms and doubling covers roughly 1.5s in total, which is
-# far longer than a sync client or a virus scanner holds a small file.
+# attempts, sleeping 50ms before the second and doubling, wait 0.75s in
+# total, which is far longer than a sync client or a virus scanner holds a
+# small file.
 REPLACE_ATTEMPTS = 5
 REPLACE_RETRY_DELAY_S = 0.05
 
@@ -290,6 +292,9 @@ class StateStore:
         # What was last written, so an unchanged save is a no-op. None means
         # "nothing written yet this process", which forces the first save.
         self._last_signature: str | None = None
+        # Orders `save_async` writes, so an older state's thread cannot land
+        # after a newer one's. Made on first use, inside the running loop.
+        self._write_lock: asyncio.Lock | None = None
 
     def load(self) -> StrategyState:
         """Read persisted state, or return a fresh IDLE state if none exists.
@@ -316,18 +321,55 @@ class StateStore:
         once per chase tick per leg -- twice a second -- while the contents
         change only on a phase transition. Any process that watches the folder
         therefore had a file rewritten under it twice a second, all cycle.
+
+        Blocking: the fsync, and the retries on a locked file, run on the
+        caller's thread. On the event loop use `save_async`.
         """
+        snapshot = self._snapshot(state)
+        if snapshot is None:
+            return
+        payload, signature = snapshot
+        self._write(payload)
+        self._last_signature = signature
+
+    async def save_async(self, state: StrategyState) -> None:
+        """`save`, with the file work on a worker thread.
+
+        The state is serialised here, on the loop, because the loop is what
+        changes it -- a thread reading it mid-update could write half of one.
+        Only the write, the fsync and the retries move off: on a locked file
+        those sleep up to 0.75s, which on the loop is that long without a fill
+        handled or a hedge sent.
+
+        Saves are written one at a time, in the order they were made. Mixed
+        with `save` from the same loop that order is not kept, so a caller
+        uses one or the other.
+        """
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        async with self._write_lock:
+            snapshot = self._snapshot(state)
+            if snapshot is None:
+                return
+            payload, signature = snapshot
+            await asyncio.to_thread(self._write, payload)
+            self._last_signature = signature
+
+    def _snapshot(self, state: StrategyState) -> tuple[str, str] | None:
+        """The file's contents and their signature, or None when unchanged."""
         state.updated_at = time.time()
-        payload = json.dumps(state.to_dict(), indent=2)
+        data = state.to_dict()
         # `updated_at` alone is not a change worth a write; it is a timestamp of
         # the write itself, so comparing without it is what makes this work.
         signature = json.dumps(
-            {k: v for k, v in state.to_dict().items() if k != "updated_at"},
-            sort_keys=True,
+            {k: v for k, v in data.items() if k != "updated_at"}, sort_keys=True
         )
         if signature == self._last_signature and os.path.exists(self.path):
-            return
+            return None
+        return json.dumps(data, indent=2), signature
 
+    def _write(self, payload: str) -> None:
+        """Write `payload` to a temp file, fsync it, and move it into place."""
         directory = os.path.dirname(os.path.abspath(self.path))
         os.makedirs(directory, exist_ok=True)
 
@@ -344,7 +386,6 @@ class StateStore:
             with contextlib.suppress(OSError):
                 os.unlink(handle.name)
             raise
-        self._last_signature = signature
 
     def _replace_with_retry(self, temp_name: str) -> None:
         """`os.replace`, which on Windows is not reliably atomic in practice.

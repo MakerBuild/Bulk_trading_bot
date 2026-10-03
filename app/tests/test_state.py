@@ -1,5 +1,6 @@
 """State persistence has to survive a crash mid-write."""
 
+import asyncio
 import json
 import os
 
@@ -261,3 +262,69 @@ def test_a_dry_run_never_writes_the_live_state_file():
     live = "./app/state/strategy_state.json"
     assert dry_run_path(live) != live
     assert dry_run_path(live).endswith(".dry.json")
+
+
+# -- the write stays off the event loop ----------------------------------------
+#
+# `save` runs on the loop, and a locked file there means fsync plus up to four
+# sleeps -- three quarters of a second in which no fill is handled and no hedge
+# goes out.
+
+
+async def test_an_async_save_writes_the_file_off_the_event_loop(tmp_path, monkeypatch):
+    import threading
+
+    from bulkdn import state as state_module
+
+    store = StateStore(str(tmp_path / "state.json"))
+    loop_thread = threading.current_thread()
+    seen = []
+    real_replace = state_module.os.replace
+
+    def recording(src, dst):
+        seen.append(threading.current_thread())
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(state_module.os, "replace", recording)
+    await store.save_async(StrategyState(phase=Phase.HOLD))
+
+    assert seen and seen[0] is not loop_thread
+    assert store.load().phase == Phase.HOLD
+
+
+async def test_async_saves_land_in_the_order_they_were_made(tmp_path):
+    store = StateStore(str(tmp_path / "state.json"))
+    state = StrategyState()
+    saves = []
+    for cycle in range(1, 6):
+        state.cycle_index = cycle
+        saves.append(asyncio.ensure_future(store.save_async(state)))
+    await asyncio.gather(*saves)
+
+    assert store.load().cycle_index == 5
+
+
+async def test_an_unchanged_async_save_writes_nothing(tmp_path, monkeypatch):
+    from bulkdn import state as state_module
+
+    store = StateStore(str(tmp_path / "state.json"))
+    state = StrategyState(phase=Phase.HOLD)
+    await store.save_async(state)
+    writes = []
+    monkeypatch.setattr(state_module.os, "replace", lambda *a: writes.append(a))
+
+    await store.save_async(state)
+    assert writes == []
+
+
+def test_a_save_builds_the_state_once(tmp_path, monkeypatch):
+    calls = []
+    real = StrategyState.to_dict
+
+    def counted(self):
+        calls.append(1)
+        return real(self)
+
+    monkeypatch.setattr(StrategyState, "to_dict", counted)
+    StateStore(str(tmp_path / "state.json")).save(StrategyState())
+    assert len(calls) == 1
