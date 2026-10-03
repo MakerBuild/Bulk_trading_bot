@@ -156,3 +156,61 @@ async def test_nothing_is_sent_without_telegram(sent):
         handler.detach(logger)
 
     assert sent == []
+
+
+# -- the strategy's own lines that need a person carry the flag --------------
+
+
+def _alerts(caplog):
+    return [r.getMessage() for r in caplog.records if getattr(r, "alert", False)]
+
+
+async def test_a_failure_of_the_liquidation_guard_is_an_alert(caplog):
+    from strategy_double import bare_strategy
+
+    obj = bare_strategy()
+
+    async def boom(phases):
+        raise RuntimeError("HTTP 504")
+
+    obj._guard_liquidation = boom
+    await obj._answer_liquidation()
+    assert any("liquidation guard failed" in line for line in _alerts(caplog))
+
+
+async def test_a_hedge_task_that_dies_is_an_alert(caplog):
+    from strategy_double import bare_strategy
+
+    obj = bare_strategy()
+
+    async def boom(leg_key, again):
+        raise KeyError("BTC-USD")
+
+    obj._hedge_until_quiet = boom
+    await obj._hedge_leg_until_quiet("g1:BTC-USD", set())
+    assert any("hedge task for g1:BTC-USD died" in line for line in _alerts(caplog))
+
+
+async def test_fills_the_stop_could_not_hedge_are_an_alert(caplog):
+    from strategy_double import bare_strategy
+
+    obj = bare_strategy()
+
+    async def boom(max_age_s=0.0, sessions=None):
+        raise RuntimeError("HTTP 429")
+
+    obj._sync_positions = boom
+    await obj._last_hedge_pass()
+    assert any("could not hedge fills" in line for line in _alerts(caplog))
+
+
+def test_a_group_whose_key_is_gone_is_an_alert(caplog):
+    from strategy_double import bare_strategy
+
+    from bulkdn.state import Phase
+
+    obj = bare_strategy()
+    leg = obj.state.leg("g7:BTC-USD", "BTC-USD")
+    leg.group_id, leg.maker, leg.takers, leg.phase = 7, "GONE-PUB", ["ALSO-GONE"], Phase.HOLD
+    obj.restore_groups()
+    assert any("needs the key that opened it" in line for line in _alerts(caplog))

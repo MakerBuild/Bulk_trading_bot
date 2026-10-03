@@ -880,6 +880,7 @@ class Strategy:
                 "the liquidation guard failed: %s -- it looks again on the next "
                 "position update and reconcile",
                 describe(exc),
+                extra={"alert": True},
             )
 
     async def _deferred_to_our_own_orders(self, events) -> bool:
@@ -1180,7 +1181,10 @@ class Strategy:
             # A task's exception is only seen by whoever awaits it, and the
             # worker does not. When this ran inline, anything unexpected ended
             # the worker loudly; here it would vanish.
-            log.critical("hedge task for %s died: %s", leg_key, describe(exc))
+            log.critical(
+                "hedge task for %s died: %s", leg_key, describe(exc),
+                extra={"alert": True},
+            )
 
     async def _hedge_until_quiet(self, leg_key: str, again: set[str]) -> None:
         while True:
@@ -2795,6 +2799,7 @@ class Strategy:
                     "-- its position is still open and needs the key that "
                     "opened it",
                     key, ", ".join(short_pubkey(a) for a in missing),
+                    extra={"alert": True},
                 )
                 continue
             self._groups[key] = group
@@ -3458,6 +3463,7 @@ class Strategy:
                 "could not hedge fills that landed during the stop: %s -- "
                 "check the positions below",
                 describe(exc),
+                extra={"alert": True},
             )
 
     async def _until_legs_finish(
