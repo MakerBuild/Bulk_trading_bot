@@ -58,8 +58,5 @@ overlay_ttl_ms: 2000
 
 max_margin_fraction: 0.25
 
-ws_ssl_auto_bypass: false
-ws_insecure_ssl: false
-
 state_file: "./app/state/strategy_state.json"
 log_level: INFO

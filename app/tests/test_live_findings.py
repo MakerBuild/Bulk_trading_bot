@@ -212,14 +212,28 @@ def test_a_missing_certifi_degrades_rather_than_crashing(monkeypatch):
     assert ctx.verify_mode is ssl_module.CERT_REQUIRED
 
 
-def test_the_bypass_is_still_reachable_but_no_longer_the_default():
-    """Kept for an operator who genuinely cannot connect -- and only then."""
+async def test_a_rejected_certificate_fails_the_connect_every_time(monkeypatch):
+    """There used to be a bypass that retried without verification and then
+    stayed off for the rest of the process. A certificate certifi rejects is
+    now a socket that does not open -- on the first connect and every later
+    one."""
     import ssl as ssl_module
 
-    from bulkdn.ws_compat import _insecure_context, verified_context
+    from bulkdn import ws_compat
 
-    assert _insecure_context().verify_mode is ssl_module.CERT_NONE
-    assert verified_context().verify_mode is ssl_module.CERT_REQUIRED
+    contexts = []
+
+    async def refuse(url, **kwargs):
+        contexts.append(kwargs["ssl"])
+        raise ssl_module.SSLCertVerificationError("certificate verify failed")
+
+    monkeypatch.setattr(ws_compat, "_original_ws_connect", refuse)
+    for _ in range(2):
+        with pytest.raises(ssl_module.SSLCertVerificationError):
+            await ws_compat._connect_verified("wss://example.invalid")
+    assert len(contexts) == 2, "it retried behind the caller's back"
+    assert all(ctx.verify_mode is ssl_module.CERT_REQUIRED for ctx in contexts)
+    assert not hasattr(ws_compat, "_insecure_context")
 
 
 def test_install_bat_names_certifi():

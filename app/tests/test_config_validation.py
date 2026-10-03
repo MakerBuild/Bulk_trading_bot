@@ -64,11 +64,14 @@ def test_a_word_that_is_neither_is_refused(tmp_path):
         load(settings(tmp_path, market_extra='    enabled: "maybe"'))
 
 
-def test_the_tls_switches_are_parsed_the_same_way(tmp_path):
-    config = load(settings(tmp_path, top_extra='ws_ssl_auto_bypass: "false"'))
-    assert config.ws_ssl_auto_bypass is False
-    with pytest.raises(ConfigError, match="ws_insecure_ssl"):
-        load(settings(tmp_path, top_extra='ws_insecure_ssl: "sure"'))
+@pytest.mark.parametrize("key", ["ws_insecure_ssl", "ws_ssl_auto_bypass"])
+def test_an_old_tls_switch_is_ignored_with_a_warning_not_refused(tmp_path, caplog, key):
+    """Both turned certificate checks off. An old settings file that still
+    says `true` must start -- verified -- and say the line does nothing."""
+    with caplog.at_level(logging.WARNING, logger="bulkdn.config"):
+        config = load(settings(tmp_path, top_extra=f"{key}: true"))
+    assert not hasattr(config, key)
+    assert any(key in m and "removed and ignored" in m for m in caplog.messages)
 
 
 # -- numbers ----------------------------------------------------------------
@@ -169,7 +172,7 @@ def test_the_shipped_settings_load_without_a_single_warning(caplog):
     with caplog.at_level(logging.WARNING, logger="bulkdn.config"):
         config = load_config(str(shipped), require_credentials=False)
     assert caplog.messages == []
-    assert config.ws_ssl_auto_bypass is False, "TLS bypass must ship switched off"
+    assert config.markets
 
 
 # -- the exposure limit and the order cap are a pair ------------------------
@@ -198,6 +201,6 @@ def test_a_config_repr_never_shows_the_keys():
     assert "SECRET" not in shown
 
 
-def test_the_tls_bypass_defaults_off():
-    assert Config.ws_ssl_auto_bypass is False
-    assert Config.ws_insecure_ssl is False
+def test_there_is_no_tls_bypass_to_turn_on():
+    assert not hasattr(Config, "ws_ssl_auto_bypass")
+    assert not hasattr(Config, "ws_insecure_ssl")

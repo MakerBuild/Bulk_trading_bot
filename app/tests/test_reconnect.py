@@ -385,7 +385,7 @@ async def _captured_kwargs(monkeypatch, **caller_kwargs):
         return Socket()
 
     monkeypatch.setattr(ws_compat, "_original_ws_connect", fake_connect)
-    await ws_compat._connect_with_ssl_fallback("wss://example.invalid", **caller_kwargs)
+    await ws_compat._connect_verified("wss://example.invalid", **caller_kwargs)
     return seen
 
 

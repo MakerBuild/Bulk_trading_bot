@@ -31,8 +31,15 @@ means the system store, so it failed where every HTTP call succeeded.
 
 So the socket is opened against certifi's bundle -- the same trust anchors the
 HTTP half of this bot has been using all along -- and verification stays on.
-The bypass below survives only as a last resort for an operator who cannot
-connect at all, and it is no longer reached in normal use.
+
+There used to be a way to turn it off: `ws_insecure_ssl`, and an automatic
+bypass that retried without verification after a rejected certificate and then
+stayed latched off for the rest of the process. Both were written for the
+Windows store problem, which certifi fixed at the cause. What was left for
+them to catch was a certificate that really is wrong -- the one case where the
+fills and positions every hedge is computed from must not be believed -- so
+they are gone, and a socket that cannot be verified is a socket that does not
+open.
 """
 
 from __future__ import annotations
@@ -48,42 +55,14 @@ from websockets.asyncio.client import connect as _original_ws_connect
 log = logging.getLogger(__name__)
 
 _PATCHED = False
-_insecure_ssl = False
-_auto_bypass = False
-_bypass_latched = False
 
 # The SDK's default is short enough that a cold connection can miss it.
 _OPEN_TIMEOUT = 30
 
 # How often to ping, and how long to wait for the pong before calling the
-# socket dead. See _connect_with_ssl_fallback.
+# socket dead. See _connect_verified.
 _PING_INTERVAL = 20.0
 _PING_TIMEOUT = 60.0
-
-
-def set_ssl_options(*, insecure: bool = False, auto_bypass: bool = False) -> None:
-    """Configure TLS behaviour before connecting.
-
-    `insecure` skips verification outright; `auto_bypass` keeps verification on
-    but retries once without it if the certificate is rejected. Both default
-    to off, as `ws_ssl_auto_bypass` does in the config: the certificate
-    failures that once made the bypass necessary came from the system store,
-    and verification now goes through certifi's bundle. A caller that does not
-    pass the setting -- a tool, a test, a future entry point -- must not get
-    unverified TLS by omission.
-    """
-    global _insecure_ssl, _auto_bypass, _bypass_latched
-    _insecure_ssl = insecure
-    _auto_bypass = auto_bypass
-    if insecure:
-        _bypass_latched = True
-
-
-def _insecure_context() -> ssl.SSLContext:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
 
 
 def verified_context() -> ssl.SSLContext:
@@ -111,16 +90,12 @@ def verified_context() -> ssl.SSLContext:
     return ssl.create_default_context(cafile=certifi.where())
 
 
-async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
-    """Open a socket, verifying against certifi's bundle.
+async def _connect_verified(url: str, **kwargs: Any):
+    """Open a socket, verifying against certifi's bundle, with our keepalive.
 
-    Only if that is rejected too does the bypass come into play, and then it
-    stays latched for the process so reconnects don't pay a failed handshake
-    every time. Before certifi was used here the bypass fired on every run on
-    Windows, which meant the account stream -- fills and positions, the input
-    to every hedge -- came from an endpoint nothing had authenticated.
+    A certificate that fails verification fails the connect, every time. See
+    the module docstring for the bypass that used to sit here and why it went.
     """
-    global _bypass_latched
     kwargs["open_timeout"] = kwargs.get("open_timeout") or _OPEN_TIMEOUT
 
     # ASSIGNED, NOT setdefault -- and that is the whole point of these two lines.
@@ -142,30 +117,10 @@ async def _connect_with_ssl_fallback(url: str, **kwargs: Any):
     kwargs["ping_interval"] = _PING_INTERVAL
     kwargs["ping_timeout"] = _PING_TIMEOUT
 
-    if _insecure_ssl or _bypass_latched:
-        kwargs["ssl"] = _insecure_context()
-        return await _original_ws_connect(url, **kwargs)
-
     # Verified against certifi rather than the system store -- see
     # verified_context. Only set when the caller has not chosen for itself.
     kwargs.setdefault("ssl", verified_context())
-
-    try:
-        return await _original_ws_connect(url, **kwargs)
-    except ssl.SSLCertVerificationError as exc:
-        if not _auto_bypass:
-            raise
-        _bypass_latched = True
-        log.warning(
-            "TLS verification failed for %s even against certifi's certificate "
-            "bundle (%s). Retrying WITHOUT certificate checks: traffic stays "
-            "encrypted, but nothing proves the endpoint is BULK, and fills and "
-            "positions read from it are what every hedge is based on. If this "
-            "persists, check the URL and the system clock before trusting it.",
-            url, exc.verify_message or exc,
-        )
-        kwargs["ssl"] = _insecure_context()
-        return await _original_ws_connect(url, **kwargs)
+    return await _original_ws_connect(url, **kwargs)
 
 
 # Every spelling `OrderStatus.from_string` accepts, in its own capitalisation.
@@ -310,10 +265,9 @@ def _robust_fill_from_api(cls, data: dict) -> Fill:
     return fill
 
 
-def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = False) -> None:
+def apply_ws_compat() -> None:
     """Install the patches. Idempotent."""
     global _PATCHED
-    set_ssl_options(insecure=insecure_ssl, auto_bypass=auto_bypass)
     if _PATCHED:
         return
 
@@ -333,12 +287,12 @@ def apply_ws_compat(*, insecure_ssl: bool = False, auto_bypass: bool = False) ->
     #
     # `websockets.asyncio.client.connect` used to be replaced as well, which
     # changed `websockets.connect` for the whole process: every other library
-    # opening a socket got this module's keepalive overrides and its TLS
-    # bypass latch, and a test or tool importing websockets after this ran
+    # opening a socket got this module's keepalive overrides and what was
+    # then its TLS bypass, and a test or tool importing websockets after this ran
     # saw a function that was not websockets'. Nothing in the SDK or in this
     # bot reaches the global name -- `bulk_ws.connect` is the only caller --
     # so the global patch bought nothing for what it put at risk.
-    bulk_ws_module.ws_connect = _connect_with_ssl_fallback  # type: ignore[attr-defined]
+    bulk_ws_module.ws_connect = _connect_verified  # type: ignore[attr-defined]
 
     _PATCHED = True
     log.debug("WebSocket compatibility patches applied")

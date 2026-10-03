@@ -281,10 +281,10 @@ def test_the_connect_patch_stays_inside_the_sdk(patched):
     from bulk_api.api import bulk_ws
     from websockets.asyncio import client
 
-    from bulkdn.ws_compat import _connect_with_ssl_fallback
+    from bulkdn.ws_compat import _connect_verified
 
-    assert bulk_ws.ws_connect is _connect_with_ssl_fallback
-    assert client.connect is not _connect_with_ssl_fallback
+    assert bulk_ws.ws_connect is _connect_verified
+    assert client.connect is not _connect_verified
 
 
 # -- proxy: the password never reaches a message -----------------------------
