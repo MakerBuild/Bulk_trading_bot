@@ -3049,9 +3049,9 @@ class Strategy:
         else:
             log.warning("%s: resuming new groups", symbol)
             text, prefix = f"{symbol}: market calm again, opening new groups", "▶️ resume"
-        notifier = getattr(self, "notifier", None)
-        if notifier is not None:
-            notifier.send_soon(notifier.send(text, prefix=prefix))
+        # As plain text: the reason is the gate's own words, and as HTML a
+        # "<" in it made Telegram refuse the whole message.
+        self.notifier.send_soon(self.notifier.send(prefix=prefix, plain=text))
 
     async def _run_leg(self, key: str, configured_size: float, once: bool = False) -> None:
         """OPEN -> HOLD -> EXIT for one leg on its own clock.

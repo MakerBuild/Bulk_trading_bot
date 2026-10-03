@@ -152,9 +152,11 @@ class Feed:
 class Notes:
     def __init__(self):
         self.sent = []
+        self.html = []
 
-    async def send(self, text, prefix=""):
-        self.sent.append((prefix, text))
+    async def send(self, text="", *, prefix="", plain=""):
+        self.sent.append((prefix, text + plain))
+        self.html.append(text)
 
     def send_soon(self, coro):
         asyncio.ensure_future(coro)
@@ -249,3 +251,19 @@ def test_groups_already_trading_are_not_touched_by_a_pause(tmp_path):
 
     asyncio.run(run())
     assert finished == obj.started == [obj.started[0]], "it was cut off, or a new one opened"
+
+
+async def test_a_pause_is_announced_as_plain_text():
+    """The gate's reason went to Telegram as HTML, where a "<" in it made the
+    whole message unparseable."""
+    import types
+
+    from strategy_double import bare_strategy
+
+    obj = bare_strategy()
+    obj.notifier = Notes()
+    obj._announce_pause("BTC-USD", types.SimpleNamespace(paused=True, reason="moved > 1% <5 min"))
+    await asyncio.sleep(0)
+
+    assert obj.notifier.html == [""], "the reason was sent as HTML"
+    assert "moved > 1% <5 min" in obj.notifier.sent[0][1]
