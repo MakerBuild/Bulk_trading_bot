@@ -1024,6 +1024,16 @@ class Strategy:
                 return
             if self._stream_lagging(session):
                 return  # stale, for the reason in the position handler
+            if not session.snapshot_lists_positions():
+                # The SDK reads a missing field as no positions, and applying
+                # that would declare the account flat everywhere. Not knowing
+                # is not flat: the book keeps what it has, and the next read
+                # or position update says what is true.
+                log.warning(
+                    "%s: an account snapshot arrived without a positions list "
+                    "-- not applied", session.name,
+                )
+                return
 
             positions = [
                 p for p in (getattr(snapshot, "positions", None) or [])

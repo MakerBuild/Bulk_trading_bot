@@ -59,6 +59,9 @@ class FakeSession:
     def owns_this_update(self):
         return self.owns
 
+    def snapshot_lists_positions(self):
+        return getattr(self, "lists_positions", True)
+
     async def market(self, symbol, is_buy, size, reduce_only=False):
         self.orders.append((symbol, is_buy, size, reduce_only))
         return []
@@ -480,3 +483,59 @@ def test_a_key_for_a_market_we_do_not_trade_resolves_to_nothing(tmp_path):
     is not holding."""
     strategy, _book, _master, _sub1 = build(tmp_path)
     assert strategy._roles_for_key("DOGE-USD") is None
+
+
+# -- a snapshot that does not list positions is not a flat account ----------
+
+
+@dataclass
+class FakePosition:
+    symbol: str
+    size: float
+
+
+def test_a_snapshot_without_a_positions_list_does_not_flatten_the_book(tmp_path):
+    """The SDK reads a missing `positions` field as an empty list, and a
+    snapshot is applied as everything the account holds."""
+    strategy, book, master, _sub1 = build(tmp_path)
+    book.set_authoritative(MASTER, BTC, 0.25)
+    strategy.install_handlers()
+    (handler,) = master.handlers[Topic.ACCOUNT]
+
+    master.lists_positions = False
+    handler(type("Snapshot", (), {"positions": []})())
+    assert book.authoritative(MASTER, BTC) == 0.25, "read as flat"
+
+    master.lists_positions = True
+    handler(type("Snapshot", (), {"positions": [FakePosition(BTC, 0.5)]})())
+    assert book.authoritative(MASTER, BTC) == 0.5
+
+
+async def test_the_socket_says_when_a_snapshot_left_positions_out(monkeypatch):
+    import time
+
+    from bulk_api import BulkWebSocketClient
+
+    from bulkdn.accounts import RoutedWsClient
+
+    client = RoutedWsClient.__new__(RoutedWsClient)
+    client.accounts = [MASTER]
+    client.last_message_at = time.monotonic()
+    client._dispatch_owner = None
+    client._dispatch_lists_positions = True
+    seen = []
+
+    async def dispatch(self, data):
+        seen.append(self.snapshot_lists_positions)
+
+    monkeypatch.setattr(BulkWebSocketClient, "_handle_message", dispatch)
+    topic = f"account:{MASTER}"
+    await client._handle_message(
+        {"type": "account", "topic": topic, "data": {"type": "accountSnapshot"}}
+    )
+    await client._handle_message(
+        {"type": "account", "topic": topic,
+         "data": {"type": "accountSnapshot", "positions": []}}
+    )
+    assert seen == [False, True]
+    assert client.snapshot_lists_positions is True, "left set after the dispatch"

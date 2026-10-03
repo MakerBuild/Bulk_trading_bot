@@ -197,6 +197,9 @@ class RoutedWsClient(BulkWebSocketClient):
         # Set only while an account update is being dispatched. See
         # `_handle_message`.
         self._dispatch_owner: str | None = None
+        # False only while an account snapshot WITHOUT a positions list is
+        # being dispatched. See `snapshot_lists_positions`.
+        self._dispatch_lists_positions = True
         self._owner_warned = False
         # When an update last named an account this socket does not carry.
         # See `_warn_unknown_owner`.
@@ -334,10 +337,17 @@ class RoutedWsClient(BulkWebSocketClient):
                     self._warn_unknown_owner(stranger)
                 else:
                     self._warn_unattributable(data)
+            inner = data.get("data")
+            self._dispatch_lists_positions = not (
+                isinstance(inner, dict)
+                and inner.get("type") == "accountSnapshot"
+                and not isinstance(inner.get("positions"), list)
+            )
             try:
                 await super()._handle_message(data)
             finally:
                 self._dispatch_owner = None
+                self._dispatch_lists_positions = True
             return
 
         await super()._handle_message(data)
@@ -392,6 +402,17 @@ class RoutedWsClient(BulkWebSocketClient):
     def message_owner(self) -> str | None:
         """The account the update being dispatched belongs to, if it says."""
         return self._dispatch_owner
+
+    @property
+    def snapshot_lists_positions(self) -> bool:
+        """Whether the account snapshot being dispatched has a positions list.
+
+        The SDK reads a snapshot's missing `positions` field as an empty
+        list, and a snapshot is applied as every position the account holds
+        -- so a frame that left the field out would declare the account flat
+        in every market. Only the raw frame can tell the two apart.
+        """
+        return self._dispatch_lists_positions
 
     # -- answers to our requests -------------------------------------------
 
@@ -826,6 +847,14 @@ class AccountSession:
         if len(getattr(self.client, "accounts", None) or ()) <= 1:
             return True
         return None
+
+    def snapshot_lists_positions(self) -> bool:
+        """Whether the account snapshot being dispatched lists positions at all.
+
+        See `RoutedWsClient.snapshot_lists_positions`. A client that cannot say
+        is taken to list them, as every snapshot so far has.
+        """
+        return getattr(self.client, "snapshot_lists_positions", True) is not False
 
     # -- order helpers -----------------------------------------------------
 
