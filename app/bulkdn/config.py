@@ -264,14 +264,21 @@ class ExecutionTarget:
     `volume_usd` counts qualifying volume only. Fills that crossed between the
     master and its own sub-account are real spend but earn no tier credit, so
     counting them would overstate progress toward a volume goal.
+
+    The defaults are what app/settings.default.yaml ships, because that file is
+    what every installed copy started from -- test_defaults keeps the two equal.
+    `cycles` used to default to 1 here and to 0 in the loader, and `burn_usd`
+    to 0 here and to 3 in the shipped file: three answers to "what happens when
+    the line is missing", depending on who asked.
     """
 
-    cycles: int = 1
+    # Groups to start in this run; 0 = no limit.
+    cycles: int = 0
     # How much fee activity to accumulate before stopping, as a plain amount.
     # A maker-heavy pair earns more than it pays and so runs a negative total;
     # the sign is not something to configure, so this counts the distance from
     # zero either way. 0 disables it.
-    burn_usd: float = 0.0
+    burn_usd: float = 3.0
     volume_usd: float = 0.0
 
     def validate(self) -> None:
@@ -345,7 +352,7 @@ class Span:
             else:
                 return cls._checked(number, number, value, name)
             # YAML reads `0.5-1` as a string, which is the spelling the
-            # settings file documents, so it is the one that must work. The
+            # guide documents, so it is the one that must work. The
             # first character is skipped when looking for the dash, so a
             # negative low end (`-5-10`) splits after its sign and is then
             # refused for being negative, which is what it is.
@@ -450,7 +457,10 @@ class Config:
     # rejections means finding out during a cycle rather than before one.
     max_groups: int = 5
     max_takers: int = 1
-    hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(5.0, 5.0))
+    # Drawn fresh for every hold; see HoldTime. The shipped file's range, for
+    # the same reason as ExecutionTarget's defaults: it used to be a fixed five
+    # minutes here, which no installed copy has ever run.
+    hold_minutes: HoldTime = field(default_factory=lambda: HoldTime(0.5, 1.5))
     # How long OPEN or EXIT may run before the cycle is called stuck.
     # HOLD is exempt: it ends on a clock it sets itself.
     #
@@ -474,7 +484,6 @@ class Config:
     # already enough to draw a 429 from the exchange; the pool this is
     # being prepared for has a hundred.
     position_sync_interval_s: float = 60.0
-    cycles: int = 1
     hedge_tolerance_lots: float = 1.0
     overlay_ttl_ms: int = 2000
     # Fallback when the configured sizes need more margin than the accounts
@@ -507,6 +516,16 @@ class Config:
         being sized, chased or capped after it stopped trading.
         """
         return [market for market in self.markets if market.enabled]
+
+    @property
+    def cycles(self) -> int:
+        """The cycle limit, which is `target.cycles` under its older name.
+
+        It was a field of its own that duplicated `target.cycles`, and the menu
+        had to remember to set both. Read-only, so there is one place to write
+        it and the strategy's `config.cycles` still reads the same number.
+        """
+        return self.target.cycles
 
     @property
     def master_account(self) -> LegConfig:
@@ -676,8 +695,6 @@ class Config:
             raise ConfigError("reconcile_interval_s must be > 0")
         if self.position_sync_interval_s <= 0:
             raise ConfigError("position_sync_interval_s must be > 0")
-        if self.cycles < 0:
-            raise ConfigError("cycles must be >= 0 (0 means run forever)")
         # Below one lot the exchange cannot express the correction, so a
         # sub-lot tolerance would make the hedger spin on an uncorrectable
         # residual.
@@ -901,12 +918,16 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
     # conclude the bot ignores its own config.
     _warn_unknown(raw, _LEG_KEYS, name)
 
-    def number(key: str, default: float) -> float:
-        value = raw.get(key)
-        return default if value is None else _as_float(value, f"{name}.{key}")
+    # Defaults are read off the dataclass, not written out again here: a
+    # second copy is a second number to forget when the first one changes.
+    default = LegConfig(symbol="")
 
-    size = number("size", 0.0)
-    cap_size = number("max_order_size", 0.0)
+    def number(key: str) -> float:
+        value = raw.get(key)
+        return getattr(default, key) if value is None else _as_float(value, f"{name}.{key}")
+
+    size = number("size")
+    cap_size = number("max_order_size")
 
     # Both dollar settings may be written as a range. The value carried
     # forward is the HIGH end, because the margin plan at startup is built
@@ -945,14 +966,14 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
             max_order_span=cap_span,
             offset_bps=offset_span.low if offset_span else 0.0,
             offset_span=offset_span,
-            max_distance_bps=number("max_distance_bps", 5.0),
-            chase_patience_s=number("chase_patience_s", 3.0),
+            max_distance_bps=number("max_distance_bps"),
+            chase_patience_s=number("chase_patience_s"),
             improve_ticks=(
                 _as_int(raw["improve_ticks"], f"{name}.improve_ticks")
                 if raw.get("improve_ticks") is not None
-                else 1
+                else default.improve_ticks
             ),
-            join_depth_usd=number("join_depth_usd", 0.0),
+            join_depth_usd=number("join_depth_usd"),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(
@@ -960,7 +981,10 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
                 if raw.get("leverage") is not None
                 else None
             ),
-            enabled=_as_bool(raw.get("enabled", True), f"{name}.enabled"),
+            enabled=_as_bool(
+                raw["enabled"] if raw.get("enabled") is not None else default.enabled,
+                f"{name}.enabled",
+            ),
         )
     except KeyError as exc:
         raise ConfigError(f"legs.{name} is missing required key {exc}") from exc
@@ -1085,14 +1109,16 @@ def _pause_from_dict(raw: Any) -> PauseConfig:
     except ValueError as exc:
         raise ConfigError(f"pause.schedule: {exc}") from exc
 
-    def number(key: str, default: float) -> float:
+    default = PauseConfig()
+
+    def number(key: str) -> float:
         value = raw.get(key)
-        return default if value is None else _as_float(value, f"pause.{key}")
+        return getattr(default, key) if value is None else _as_float(value, f"pause.{key}")
 
     return PauseConfig(
-        max_move_bps=number("max_move_bps", 0.0),
-        window_minutes=number("window_minutes", 15.0),
-        calm_minutes=number("calm_minutes", 10.0),
+        max_move_bps=number("max_move_bps"),
+        window_minutes=number("window_minutes"),
+        calm_minutes=number("calm_minutes"),
         schedule=windows,
     )
 
@@ -1200,6 +1226,16 @@ def load_config(
     raw = _read_yaml(path)
     _warn_unknown(raw, _TOP_KEYS, "")
 
+    # Every default below is read off the dataclasses rather than written out
+    # again. They used to be written three times -- the dataclass, this
+    # function, and the shipped settings file -- and had drifted: `cycles` was
+    # 1 in one and 0 in another, `hold_minutes` five minutes against the
+    # file's 0.5-1.5. The dataclasses are the one copy now, and test_defaults
+    # holds the shipped file to them.
+    defaults = Config(markets=[])
+    risk_default = RiskConfig()
+    target_default = ExecutionTarget()
+
     def number(block: dict[str, Any], key: str, default: float, where: str = "") -> float:
         value = block.get(key)
         name = f"{where}.{key}" if where else key
@@ -1209,6 +1245,12 @@ def load_config(
         value = block.get(key)
         name = f"{where}.{key}" if where else key
         return default if value is None else _as_int(value, name)
+
+    def top(key: str) -> float:
+        return number(raw, key, getattr(defaults, key))
+
+    def risk(key: str) -> float:
+        return number(risk_raw, key, getattr(risk_default, key), "risk")
 
     pool_raw = _mapping(raw.get("pool"), "pool")
     _warn_unknown(pool_raw, _POOL_KEYS, "pool")
@@ -1227,56 +1269,55 @@ def load_config(
     _warn_unknown(target_raw, _TARGET_KEYS, "execution_target")
     # `cycles` was a top-level key before execution targets existed; the
     # top-level spelling still works and the nested one wins.
-    #
-    # Absent means unlimited, as the shipped file says. It meant 1 in the code,
-    # which a pool run never honoured -- so settings written before cycles were
-    # counted per group would suddenly have run one group and stopped.
     if target_raw.get("cycles") is not None:
-        cycles = whole(target_raw, "cycles", 0, "execution_target")
+        cycles = whole(target_raw, "cycles", target_default.cycles, "execution_target")
     else:
-        cycles = whole(raw, "cycles", 0)
+        cycles = whole(raw, "cycles", target_default.cycles)
     target = ExecutionTarget(
         cycles=cycles,
-        burn_usd=number(target_raw, "burn_usd", 0.0, "execution_target"),
-        volume_usd=number(target_raw, "volume_usd", 0.0, "execution_target"),
+        burn_usd=number(target_raw, "burn_usd", target_default.burn_usd, "execution_target"),
+        volume_usd=number(
+            target_raw, "volume_usd", target_default.volume_usd, "execution_target"
+        ),
     )
 
     if raw.get("single_master") is not None:
-        single_master = whole(raw, "single_master", 1)
+        single_master = whole(raw, "single_master", defaults.single_master)
     else:
-        single_master = whole(pool_raw, "single_master", 1, "pool")
+        single_master = whole(pool_raw, "single_master", defaults.single_master, "pool")
 
     config = Config(
         markets=markets,
         market_names=market_names,
-        mode=_mode_from_raw(mode if mode is not None else raw.get("mode", "multi")),
+        mode=_mode_from_raw(mode if mode is not None else raw.get("mode") or defaults.mode),
         single_master=single_master,
-        max_groups=whole(pool_raw, "max_groups", 5, "pool"),
-        max_takers=whole(pool_raw, "max_takers", 1, "pool"),
-        hold_minutes=HoldTime.parse(
-            raw["hold_minutes"] if raw.get("hold_minutes") is not None else 5.0
+        max_groups=whole(pool_raw, "max_groups", defaults.max_groups, "pool"),
+        max_takers=whole(pool_raw, "max_takers", defaults.max_takers, "pool"),
+        hold_minutes=(
+            HoldTime.parse(raw["hold_minutes"])
+            if raw.get("hold_minutes") is not None
+            else defaults.hold_minutes
         ),
-        max_phase_minutes=number(raw, "max_phase_minutes", 30.0),
-        chase_interval_s=number(raw, "chase_interval_s", 1.0),
-        reconcile_interval_s=number(raw, "reconcile_interval_s", 5.0),
-        position_sync_interval_s=number(raw, "position_sync_interval_s", 60.0),
-        cycles=target.cycles,
+        max_phase_minutes=top("max_phase_minutes"),
+        chase_interval_s=top("chase_interval_s"),
+        reconcile_interval_s=top("reconcile_interval_s"),
+        position_sync_interval_s=top("position_sync_interval_s"),
         target=target,
-        hedge_tolerance_lots=number(raw, "hedge_tolerance_lots", 1.0),
-        overlay_ttl_ms=whole(raw, "overlay_ttl_ms", 2000),
-        max_margin_fraction=number(raw, "max_margin_fraction", 0.25),
+        hedge_tolerance_lots=top("hedge_tolerance_lots"),
+        overlay_ttl_ms=whole(raw, "overlay_ttl_ms", defaults.overlay_ttl_ms),
+        max_margin_fraction=top("max_margin_fraction"),
         risk=RiskConfig(
-            max_net_exposure_usd=number(risk_raw, "max_net_exposure_usd", 500.0, "risk"),
-            max_position_usd=number(risk_raw, "max_position_usd", 5000.0, "risk"),
-            max_reject_streak=whole(risk_raw, "max_reject_streak", 5, "risk"),
-            max_hedge_impact_bps=number(risk_raw, "max_hedge_impact_bps", 0.0, "risk"),
-            ws_stale_timeout_s=number(risk_raw, "ws_stale_timeout_s", 30.0, "risk"),
-            price_stale_timeout_s=number(risk_raw, "price_stale_timeout_s", 15.0, "risk"),
+            max_net_exposure_usd=risk("max_net_exposure_usd"),
+            max_position_usd=risk("max_position_usd"),
+            max_reject_streak=whole(
+                risk_raw, "max_reject_streak", risk_default.max_reject_streak, "risk"
+            ),
+            max_hedge_impact_bps=risk("max_hedge_impact_bps"),
+            ws_stale_timeout_s=risk("ws_stale_timeout_s"),
+            price_stale_timeout_s=risk("price_stale_timeout_s"),
         ),
-        state_file=_as_str(
-            raw.get("state_file", "./app/state/strategy_state.json"), "state_file"
-        ),
-        log_level=_log_level(raw.get("log_level", "INFO")),
+        state_file=_as_str(raw.get("state_file") or defaults.state_file, "state_file"),
+        log_level=_log_level(raw.get("log_level") or defaults.log_level),
         http_url_override=_as_str(raw.get("http_url") or "", "http_url"),
         ws_url_override=_as_str(raw.get("ws_url") or "", "ws_url"),
         ws_insecure_ssl=_as_bool(raw.get("ws_insecure_ssl", False), "ws_insecure_ssl"),

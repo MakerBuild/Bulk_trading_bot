@@ -1209,8 +1209,6 @@ def _edit_target(config: Config, config_path: str, key: str, label: str) -> None
 
     _write_target(config_path, key, value, config.target)
     setattr(config.target, key, int(value) if key == "cycles" else value)
-    if key == "cycles":
-        config.cycles = int(value)
     print(f"  {label} set to {_render_number(value)} in {config_path}")
 
 

@@ -387,7 +387,7 @@ def test_the_live_confirmation_names_the_real_stop_conditions(monkeypatch):
 
 
 def test_no_limit_at_all_is_said_plainly():
-    config = real_config(target=ExecutionTarget(cycles=0))
+    config = real_config(target=ExecutionTarget(cycles=0, burn_usd=0.0))
     assert "runs until you press S" in menu._stop_conditions(config)
 
 

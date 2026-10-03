@@ -14,7 +14,7 @@ import random
 
 import pytest
 
-from bulkdn.config import Config, LegConfig, RiskConfig
+from bulkdn.config import Config, ExecutionTarget, LegConfig, RiskConfig
 from bulkdn.pairing import Pairing
 from bulkdn.state import StateStore, StrategyState
 from bulkdn.strategy import Strategy
@@ -31,7 +31,7 @@ def strategy(tmp_path, pool_size=8, max_groups=3, cycles_each=None, cycles=0):
                       max_distance_bps=5.0),
         ],
         mode="pool",
-        cycles=cycles,
+        target=ExecutionTarget(cycles=cycles),
         chase_interval_s=0.001,
         risk=RiskConfig(),
         private_key="x",
