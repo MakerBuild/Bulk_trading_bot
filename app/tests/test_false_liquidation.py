@@ -186,6 +186,9 @@ class FakeSession:
         # Through `market`, which tests replace to watch or refuse the close.
         return await self.market(symbol, is_buy, size, reduce_only=True)
 
+    async def cancel_all(self, symbols):
+        return []
+
 
 class Bot:
     """Just enough Strategy to exercise the guard's decision."""
@@ -223,6 +226,7 @@ class Bot:
         self._exchange_liquidated = Strategy._exchange_liquidated.__get__(self)
         self._key_for_account = Strategy._key_for_account.__get__(self)
         self._leg_accounts = Strategy._leg_accounts.__get__(self)
+        self._cancel_resting = Strategy._cancel_resting.__get__(self)
         self._settled_by_a_fresh_read = (
             Strategy._settled_by_a_fresh_read.__get__(self)
         )
@@ -643,8 +647,9 @@ def test_hedging_is_suspended_before_the_first_close(monkeypatch):
     bot = bot_with([liquidation_event()], in_doubt=False)
     order = []
 
-    async def cancel_all(sessions, symbols):
+    async def cancel_all(sessions, symbols, **kw):
         order.append(("cancel", tuple(symbols)))
+        return []
 
     real_market = bot.master.market
 

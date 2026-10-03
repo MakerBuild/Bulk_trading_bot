@@ -724,12 +724,10 @@ class Strategy:
         # run ended through the generic failure path, which cancels orders
         # but flattens nothing and records no halt for the next start to see.
         try:
-            try:
-                await cancel_all_orders(self.all_sessions, sorted(affected))
-            except Exception as exc:  # noqa: BLE001 - the closes still go
-                log.critical(
-                    "could not cancel resting orders before closing: %s", describe(exc)
-                )
+            # The closes go whether or not this worked, and it names any
+            # account it did not: a position left open costs more than a
+            # resting order that may fill against a close.
+            await self._cancel_resting(sorted(affected))
             for symbol in affected:
                 spec = self.feed.specs.get(symbol)
                 if spec is None:
@@ -1528,6 +1526,30 @@ class Strategy:
             self._book_suspect = False
             return True
         return False
+
+    async def _cancel_resting(
+        self, symbols, sessions=None, *, concurrently: bool = False
+    ) -> set[str]:
+        """Cancel resting orders in `symbols`, and name every account it could not.
+
+        Every account the run trades unless `sessions` narrows it. Returns the
+        pubkeys whose cancel failed, so the caller can act on them -- not least
+        by not forgetting the orders it failed to pull.
+        """
+        failures = await cancel_all_orders(
+            self.all_sessions if sessions is None else list(sessions),
+            list(symbols),
+            concurrently=concurrently,
+        )
+        if failures:
+            log.critical(
+                "COULD NOT CANCEL resting orders in %s on %s -- cancel them by "
+                "hand now; an order left working fills with nothing hedging it",
+                ", ".join(symbols),
+                ", ".join(f"{session.name} ({describe(exc)})" for session, exc in failures),
+                extra={"alert": True},
+            )
+        return {session.pubkey for session, _exc in failures}
 
     def _trigger_halt(self, reason: str) -> None:
         if self._halt_reason is None:
@@ -3186,7 +3208,7 @@ class Strategy:
                 log.warning(
                     "stopped on %s -- cancelling resting orders", self._stop_requested
                 )
-                await cancel_all_orders(self.all_sessions, self.symbols)
+                await self._cancel_resting(self.symbols)
                 await self._last_hedge_pass()
                 self._log_open_positions()
 
@@ -3209,7 +3231,7 @@ class Strategy:
             raise
         except asyncio.CancelledError:
             log.warning("interrupted -- cancelling strategy orders")
-            await cancel_all_orders(self.all_sessions, self.symbols)
+            await self._cancel_resting(self.symbols)
             raise
         except Exception as exc:
             # Anything else used to leave straight through `finally`, which
@@ -3220,14 +3242,7 @@ class Strategy:
             log.critical(
                 "run failed (%s) -- cancelling every resting order", describe(exc)
             )
-            try:
-                await cancel_all_orders(self.all_sessions, self.symbols)
-            except Exception as cancel_exc:  # noqa: BLE001 - still report the cause
-                log.critical(
-                    "COULD NOT CANCEL resting orders: %s -- cancel them by hand "
-                    "now; nothing is hedging them",
-                    describe(cancel_exc),
-                )
+            await self._cancel_resting(self.symbols)
             with contextlib.suppress(Exception):
                 self._log_open_positions()
             raise
@@ -3510,7 +3525,7 @@ class Strategy:
             #
             # Its orders are pulled all the same: refusing to start is no
             # reason to leave the halted run's orders working.
-            await cancel_all_orders(self.all_sessions, self.symbols)
+            await self._cancel_resting(self.symbols)
             raise RuntimeError(
                 f"state file records a halt: {self.state.halted_reason}. "
                 f"Read that reason first. Then `{script('run')} flatten --live` to clear "
@@ -3533,7 +3548,7 @@ class Strategy:
                 # resting while the operator reads why is not. They are pulled
                 # first, below, on every other path -- this one raised before
                 # getting there.
-                await cancel_all_orders(self.all_sessions, self.symbols)
+                await self._cancel_resting(self.symbols)
                 raise
             symbols_to_recover: list[str] = []
         else:
@@ -3575,8 +3590,15 @@ class Strategy:
 
         # Resting orders cannot be reliably matched to the recovered plan, and
         # an unrecognised order is an unhedged fill waiting to happen.
-        await cancel_all_orders(self.all_sessions, self.symbols)
-        for leg in self.state.legs.values():
+        failed = await self._cancel_resting(self.symbols)
+        for key, leg in list(self.state.legs.items()):
+            if failed and self._order_account(key, leg) in failed | {None}:
+                # Its cancel failed, so its order may still be resting. The ids
+                # stay: the chaser then finds it in the order map and replaces
+                # or pulls it as its own. Every leg used to be wiped whatever
+                # the cancel said, and an order that survived it rested on with
+                # nothing in this run knowing it was there.
+                continue
             leg.oid = None
             leg.price = None
             leg.size = None
@@ -3590,6 +3612,11 @@ class Strategy:
             log.warning("recovery corrected %s", correction)
 
         self._persist()
+
+    def _order_account(self, key: str, leg) -> str | None:
+        """The account a leg's resting order is on: its maker's, as of its phase."""
+        roles = self._roles_for_key(key)
+        return roles.maker if roles is not None else leg.maker
 
     def _refuse_unowned_positions(self) -> None:
         """Stop before trading if a position belongs to no restored group.
@@ -3630,8 +3657,17 @@ class Strategy:
         self.state.halted_reason = reason
         self._persist()
 
-        await cancel_all_orders(self.all_sessions, self.symbols)
+        failed = await self._cancel_resting(self.symbols)
+        # Flattened whatever the cancel said: the positions are the exposure,
+        # and a resting order is only a chance of more.
         await flatten(self.sessions, self.book, self.feed, self.symbols)
+        if failed:
+            # Once more for the accounts that refused. An order still working
+            # there can reopen what the flatten just closed, with nothing left
+            # running to hedge it.
+            await self._cancel_resting(
+                self.symbols, [self.sessions[p] for p in failed if p in self.sessions]
+            )
         self._persist()
 
 

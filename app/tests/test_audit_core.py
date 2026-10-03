@@ -261,8 +261,8 @@ async def test_a_close_that_raises_still_halts():
 
     import bulkdn.strategy as strategy_module
 
-    async def cancel_all(sessions, symbols):
-        return None
+    async def cancel_all(sessions, symbols, **kw):
+        return []
 
     original = strategy_module.cancel_all_orders
     strategy_module.cancel_all_orders = cancel_all

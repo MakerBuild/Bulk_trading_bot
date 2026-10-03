@@ -103,8 +103,9 @@ async def test_any_failure_cancels_every_resting_order(monkeypatch):
     obj._recover = recover
     cancelled = []
 
-    async def cancel_all(sessions, symbols):
+    async def cancel_all(sessions, symbols, **kw):
         cancelled.append(list(symbols))
+        return []
 
     monkeypatch.setattr(strategy_mod, "cancel_all_orders", cancel_all)
 
