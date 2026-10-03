@@ -60,8 +60,14 @@ from the master at startup. Nothing about sub-accounts goes in the settings.
 
 Open `settings.yaml`. Everything you normally change is in the first half:
 which markets, which accounts (`mode`), how many groups at once, how much per
-cycle, leverage, how long to hold, when to stop, and the safety limits. Each
-option says what it does.
+cycle, leverage, how long to hold, when to stop, and the safety limits. The
+guide's settings table says what each one does. A line left out means the value
+in `app/settings.default.yaml`, which is what the code defaults to as well.
+
+Markets are a `markets:` list, one `- symbol: ...` entry each. An older file
+with a `legs:` block still works; the log says once that it is the older
+spelling. The menu reads `settings.yaml` again before every action, so an edit
+made while it is open counts from the next Start -- no restart.
 
 Sizes are in dollars -- `notional_usd: 100` is $100 of whatever `symbol` names,
 converted to a quantity at the current price when the bot starts. The size and
@@ -91,7 +97,8 @@ multi    every master and every sub-account, in one pool     (the default)
 ```
 
 Both modes trade every market switched on; they differ only in who can be on
-the other side of a trade. With more than one master in play, a group's maker
+the other side of a trade. Closing and status always cover every key in the
+file, whichever mode is set. With more than one master in play, a group's maker
 comes from one master's tree and its hedgers from another's. With one key in
 the file the two modes are the same thing.
 Switch it from **Configuration → Markets & Accounts → Accounts**.
