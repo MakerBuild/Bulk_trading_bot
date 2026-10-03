@@ -44,6 +44,7 @@ from .sizing import draw_sizes, resolve_notionals
 from .notify import Notifier
 from .accounts import short_pubkey
 from .pairing import Group, Pairing
+from .pause import PauseGate
 from .positions import PositionBook, SeenTrades
 from .scripts import script
 from .reconcile import (
@@ -2569,6 +2570,11 @@ class Strategy:
                 drawn = None
                 if self.pairing is not None:
                     symbol = self._rng.choice(self.symbols)
+                    if self._market_paused(symbol):
+                        # Fast market or a scheduled hour: no new group. Those
+                        # already trading carry on and finish their cycle.
+                        await asyncio.sleep(self.config.chase_interval_s)
+                        continue
                     drawn = self.pairing.draw(
                         symbol, maker_is_buy=self._least_crowded_side(symbol)
                     )
@@ -2599,6 +2605,38 @@ class Strategy:
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
+
+    def _market_paused(self, symbol: str) -> bool:
+        """Whether new groups on `symbol` are held back right now.
+
+        Every market's gate is fed on every call, not only the one asked about:
+        the movement window needs a steady stream of prices to mean anything,
+        and the dispatcher asks about one market at a time.
+        """
+        pause = getattr(self.config, "pause", None)
+        if pause is None or not pause.enabled:
+            return False
+        gates = self.__dict__.setdefault("_pause_gates", {})
+        for sym in self.symbols:
+            gate = gates.get(sym)
+            if gate is None:
+                gate = gates[sym] = PauseGate(pause, label=sym.split("-")[0])
+            change = gate.update(self.feed.reference_price(sym))
+            if change is not None:
+                self._announce_pause(sym, change)
+        gate = gates.get(symbol)
+        return gate is not None and gate.paused
+
+    def _announce_pause(self, symbol: str, change) -> None:
+        if change.paused:
+            log.warning("%s: pausing new groups -- %s", symbol, change.reason)
+            text, prefix = f"{symbol}: no new groups -- {change.reason}", "⏸ pause"
+        else:
+            log.warning("%s: resuming new groups", symbol)
+            text, prefix = f"{symbol}: market calm again, opening new groups", "▶️ resume"
+        notifier = getattr(self, "notifier", None)
+        if notifier is not None:
+            notifier.send_soon(notifier.send(text, prefix=prefix))
 
     async def _run_leg(self, key: str, configured_size: float, once: bool = False) -> None:
         """OPEN -> HOLD -> EXIT for one leg on its own clock.
@@ -2880,7 +2918,14 @@ class Strategy:
 
         exposure = sum(self.risk.net_exposure_usd(s) for s in self.symbols)
         elapsed = humanise(time.monotonic() - self._started_at)
-        note = self._halt_reason or self._stop_requested or "S = stop and cancel"
+        paused = [
+            f"{sym} paused: {gate.reason}"
+            for sym, gate in getattr(self, "_pause_gates", {}).items() if gate.paused
+        ]
+        note = (
+            self._halt_reason or self._stop_requested
+            or ("; ".join(paused) if paused else "S = stop and cancel")
+        )
         lines.append(f"  {self._cost_text(burned)}   off-hedge ${exposure:,.0f}   "
                      f"running {elapsed}   |   {note}")
         return lines

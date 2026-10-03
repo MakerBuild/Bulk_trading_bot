@@ -44,6 +44,12 @@ risk:
 
 max_phase_minutes: 30
 
+pause:
+  max_move_bps: 0
+  window_minutes: 15
+  calm_minutes: 10
+  schedule: []
+
 chase_interval_s: 1.0
 reconcile_interval_s: 5.0
 position_sync_interval_s: 60.0

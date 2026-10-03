@@ -20,6 +20,7 @@ import yaml
 
 from . import keystore
 from .notify import TelegramConfig
+from .pause import PauseConfig, Window
 from .referral import AccessConfig
 
 log = logging.getLogger(__name__)
@@ -492,6 +493,9 @@ class Config:
     # Referral gating, checked once at startup. See bulkdn/referral.py for what
     # a client-side gate does and does not actually prevent.
     access: AccessConfig = field(default_factory=AccessConfig)
+    # Holding back new groups while the market moves fast, or at set hours.
+    # See bulkdn/pause.py. Off unless asked for.
+    pause: PauseConfig = field(default_factory=PauseConfig)
 
     # Escape hatches for TLS, both OFF by default.
     #
@@ -634,6 +638,10 @@ class Config:
             )
         if self.max_phase_minutes < 0:
             raise ConfigError("max_phase_minutes must be >= 0 (0 disables it)")
+        try:
+            self.pause.validate()
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
         if self.chase_interval_s <= 0:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
@@ -786,8 +794,9 @@ _TOP_KEYS = frozenset({
     "position_sync_interval_s", "cycles", "execution_target",
     "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
     "state_file", "log_level", "http_url", "ws_url", "ws_insecure_ssl",
-    "ws_ssl_auto_bypass", "telegram", "access",
+    "ws_ssl_auto_bypass", "telegram", "access", "pause",
 })
+_PAUSE_KEYS = frozenset({"max_move_bps", "window_minutes", "calm_minutes", "schedule"})
 _POOL_KEYS = frozenset({"max_groups", "max_takers", "single_master"})
 _RISK_KEYS = frozenset({
     "max_net_exposure_usd", "max_position_usd", "max_reject_streak",
@@ -1024,6 +1033,33 @@ def _telegram_from_dict(raw: Any) -> TelegramConfig:
     return TelegramConfig(bot_token=token, user_ids=parsed_ids)
 
 
+def _pause_from_dict(raw: Any) -> PauseConfig:
+    """Read the pause settings; a schedule entry that does not parse is refused."""
+    if not isinstance(raw, dict):
+        raise ConfigError("pause must be a mapping")
+    _warn_unknown(raw, _PAUSE_KEYS, "pause")
+    schedule = raw.get("schedule") or []
+    if isinstance(schedule, str):
+        schedule = [schedule]
+    if not isinstance(schedule, list):
+        raise ConfigError('pause.schedule must be a list, like ["sun 22:00-02:00"]')
+    try:
+        windows = [Window.parse(entry) for entry in schedule]
+    except ValueError as exc:
+        raise ConfigError(f"pause.schedule: {exc}") from exc
+
+    def number(key: str, default: float) -> float:
+        value = raw.get(key)
+        return default if value is None else _as_float(value, f"pause.{key}")
+
+    return PauseConfig(
+        max_move_bps=number("max_move_bps", 0.0),
+        window_minutes=number("window_minutes", 15.0),
+        calm_minutes=number("calm_minutes", 10.0),
+        schedule=windows,
+    )
+
+
 def _access_from_dict(raw: Any) -> AccessConfig:
     """Read referral-gating settings, tolerating a single code given unwrapped."""
     if not isinstance(raw, dict):
@@ -1211,6 +1247,7 @@ def load_config(
         ),
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
         access=_access_from_dict(raw.get("access") or {}),
+        pause=_pause_from_dict(raw.get("pause") or {}),
         private_keys=_load_private_keys(require_credentials),
     )
     config.validate(require_credentials=require_credentials)
