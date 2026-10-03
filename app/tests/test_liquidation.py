@@ -156,15 +156,47 @@ def test_one_side_filled_before_the_other_is_not_a_liquidation():
     assert g.check(book, Phase.HOLD, ACCOUNTS) == []
 
 
-def test_an_event_is_reported_once_not_every_tick():
+def test_an_event_is_reported_once_it_is_answered_not_every_tick():
     g = guard()
     book = book_with({(MASTER, BTC): 1.0})
     g.check(book, Phase.HOLD, ACCOUNTS)
 
     book.set_authoritative(MASTER, BTC, 0.0)
-    assert len(g.check(book, Phase.HOLD, ACCOUNTS)) == 1
+    found = g.check(book, Phase.HOLD, ACCOUNTS)
+    assert len(found) == 1
+    g.acknowledge(found)
     assert g.check(book, Phase.HOLD, ACCOUNTS) == []
     assert g.check(book, Phase.HOLD, ACCOUNTS) == []
+
+
+def test_a_further_shrink_after_an_answer_is_a_new_event():
+    g = guard()
+    book = book_with({(MASTER, BTC): 1.0})
+    g.check(book, Phase.HOLD, ACCOUNTS)
+    book.set_authoritative(MASTER, BTC, 0.5)
+    g.acknowledge(g.check(book, Phase.HOLD, ACCOUNTS))
+
+    book.set_authoritative(MASTER, BTC, 0.0)
+    found = g.check(book, Phase.HOLD, ACCOUNTS)
+
+    assert [(f.previous, f.current) for f in found] == [(0.5, 0.0)]
+
+
+def test_an_answer_does_not_lower_a_peak_set_after_it():
+    """The position grew again before the answer came: that is a new high,
+    and lowering it would hide the next real shrink."""
+    g = guard()
+    book = book_with({(MASTER, BTC): 1.0})
+    g.check(book, Phase.HOLD, ACCOUNTS)
+    book.set_authoritative(MASTER, BTC, 0.5)
+    found = g.check(book, Phase.HOLD, ACCOUNTS)
+    book.set_authoritative(MASTER, BTC, 1.5)
+    g.check(book, Phase.HOLD, ACCOUNTS)
+
+    g.acknowledge(found)
+    book.set_authoritative(MASTER, BTC, 1.0)
+
+    assert g.check(book, Phase.HOLD, ACCOUNTS), "the shrink from the new high went unseen"
 
 
 def test_reset_clears_peaks_between_cycles():

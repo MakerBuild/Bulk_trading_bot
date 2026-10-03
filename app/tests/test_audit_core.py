@@ -242,7 +242,7 @@ async def test_a_close_that_raises_still_halts():
     obj._closing_out = False
     obj.guard = types.SimpleNamespace(check=lambda *a: [types.SimpleNamespace(
         symbol="GONE-USD", describe=lambda: "m GONE-USD 1 -> 0", account="m",
-    )])
+    )], acknowledge=lambda events: None)
     obj.sessions = {}
     obj.book = PositionBook()
     obj.feed = types.SimpleNamespace(specs={})

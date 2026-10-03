@@ -130,7 +130,16 @@ class LiquidationGuard:
         phase: Phase | dict[str, Phase] | dict[tuple[str, str], Phase],
         accounts: list[str],
     ) -> list[Liquidation]:
-        """Return any position that shrank externally since the last check.
+        """Return every position that has shrunk externally and not yet been
+        acknowledged.
+
+        Asking does not use the answer up. A shrink stays reported until
+        `acknowledge` says it was dealt with, because more than one caller
+        looks: the position handler checks on every update to notice it at
+        once, and the worker that responds checks again to find out what it is
+        responding to. This used to lower the peak as it reported, so the
+        handler's look consumed the event, the worker's found nothing, and a
+        liquidation seen over the socket was flagged and then dropped.
 
         Uses confirmed positions only. An optimistic overlay exists to make
         hedging fast and can briefly show a fill the exchange has not applied;
@@ -199,11 +208,23 @@ class LiquidationGuard:
                             current=current,
                         )
                     )
-                    # Re-baseline, so one event is reported once rather than on
-                    # every tick until the phase ends.
-                    self._peak[key] = current
 
         return found
+
+    def acknowledge(self, events: list[Liquidation]) -> None:
+        """Take these shrinks as dealt with, so each is reported once.
+
+        The peak comes down to the size the event reported, and only if it
+        still stands where the event found it: a position that has grown again
+        since has set a new high of its own, and lowering it would hide the
+        next real shrink. One that has shrunk further is reported again, from
+        here, as the new event it is.
+        """
+        for event in events:
+            key = (event.account, event.symbol)
+            peak = self._peak.get(key)
+            if peak is not None and abs(peak) <= abs(event.previous):
+                self._peak[key] = event.current
 
 
 def recent_liquidations(

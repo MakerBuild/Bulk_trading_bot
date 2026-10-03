@@ -664,7 +664,17 @@ class Strategy:
         be trading blind, which is the thing this exists to prevent. When the
         read works, the guess is replaced by the exchange's own answer and the
         ordinary hedge rule can correct from there.
+
+        One response at a time. The worker and the supervisor both come here,
+        and `guard.check` no longer uses up what it reports -- so without the
+        lock both would find the same shrink and close it twice. The second
+        caller waits, looks again, and finds it acknowledged or explained.
         """
+        lock = self.__dict__.setdefault("_guard_lock", asyncio.Lock())
+        async with lock:
+            return await self._respond_to_shrinks(phase)
+
+    async def _respond_to_shrinks(self, phase) -> bool:
         # Every account. A position closed out from under us on the fifth
         # account of a pool is the same event as one on the first, and the
         # response -- stop rebuilding the pair -- is the same too.
@@ -686,6 +696,11 @@ class Strategy:
         label = "liquidation" if confirmed else "position closed externally"
         for event in events:
             log.critical("%s: %s", label.upper(), event.describe())
+        # Answered from here on, so a look while the closes go out does not
+        # report these again. Not before: until this point the response could
+        # still have ended in "not a close at all", and an event acknowledged
+        # then and not acted on would be lost.
+        self.guard.acknowledge(events)
 
         # Close everything still standing in the affected symbols, on both
         # accounts. Which side was hit does not change the answer -- the pair
@@ -1521,9 +1536,9 @@ class Strategy:
 
         The response to this guard is irreversible, so it is worth one HTTP
         round trip to be sure. A real close does not come back; a stale read
-        does. The check that reported the event already re-baselined the peak
-        to the low reading, so a recovered position simply reads as a new high
-        and nothing is reported twice.
+        does. The check that reported the event left the peak where it was --
+        only acting on an event acknowledges it -- so a recovered position
+        reads as no change at all and nothing is reported twice.
 
         A read that fails answers "no", for the same reason the liquidation
         query does: not being able to ask must land on the same side as yes.

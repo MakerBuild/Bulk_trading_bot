@@ -211,6 +211,7 @@ class Bot:
         self.halted = None
         self.notifier = self
         self._guard_liquidation = Strategy._guard_liquidation.__get__(self)
+        self._respond_to_shrinks = Strategy._respond_to_shrinks.__get__(self)
         self._deferred_to_our_own_orders = (
             Strategy._deferred_to_our_own_orders.__get__(self)
         )
@@ -252,7 +253,8 @@ def bot_with(events, **kw):
     bot.book.set_authoritative(bot.master.pubkey, ETH, 0.3066)
     bot.guard = type("G", (), {
         "check": lambda self, *a: events,
-        "reset_symbol": lambda self, symbol: None,
+        "acknowledge": lambda self, found: None,
+        "reset_symbol": lambda self, symbol, accounts=None: None,
     })()
     bot.config = type("C", (), {"http_url": "http://x"})()
     return bot
