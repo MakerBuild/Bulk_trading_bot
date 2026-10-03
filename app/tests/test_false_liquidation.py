@@ -216,6 +216,7 @@ class Bot:
             Strategy._deferred_to_our_own_orders.__get__(self)
         )
         self._liquidation_confirmed = Strategy._liquidation_confirmed.__get__(self)
+        self._exchange_liquidated = Strategy._exchange_liquidated.__get__(self)
         self._settled_by_a_fresh_read = (
             Strategy._settled_by_a_fresh_read.__get__(self)
         )
@@ -278,6 +279,7 @@ def patch_confirm(monkeypatch, bot):
 
 def no_waiting(monkeypatch):
     monkeypatch.setattr("bulkdn.strategy.SHRINK_RECHECK_DELAYS_S", (0.0, 0.0))
+    monkeypatch.setattr("bulkdn.strategy.CONFIRM_RETRY_DELAYS_S", (0.0, 0.0))
 
 
 def run_guard(monkeypatch, bot):
@@ -330,6 +332,86 @@ def test_an_unreachable_exchange_is_treated_as_a_liquidation(monkeypatch):
     bot = bot_with([liquidation_event()], in_doubt=False, confirm_fails=True)
     run_guard(monkeypatch, bot)
     assert bot.halted is not None and "liquidation" in bot.halted
+
+
+# -- asking the exchange about the accounts that shrank, not the pool ------
+#
+# It asked every account in the pool, one after another, and the first that
+# failed to answer -- any of a hundred, most of them nowhere near the event --
+# made the shrink a liquidation: every account closed at market, run halted.
+
+
+def asked_about(monkeypatch, answers):
+    """Have riskEvents answer per account from `answers`; record who was asked.
+
+    Each answer is a list of events, an exception, or a list of those taken
+    one per attempt.
+    """
+    asked = []
+
+    def query(http_url, user, **kw):
+        asked.append(user)
+        answer = answers.get(user, [])
+        if isinstance(answer, list) and answer and isinstance(answer[0], (list, Exception)):
+            answer = answer.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr("bulkdn.strategy.recent_liquidations", query)
+    no_waiting(monkeypatch)
+    return asked
+
+
+def test_only_the_accounts_that_shrank_are_asked(monkeypatch):
+    bot = bot_with([liquidation_event()])
+    asked = asked_about(monkeypatch, {})
+
+    confirmed = asyncio.run(bot._liquidation_confirmed([liquidation_event()]))
+
+    assert confirmed is False
+    assert asked == ["master-KEY"], "accounts nowhere near the event were asked"
+
+
+def test_an_unrelated_account_that_cannot_answer_does_not_make_it_a_liquidation(
+    monkeypatch,
+):
+    bot = bot_with([liquidation_event()])
+    asked_about(monkeypatch, {"sub1-KEY": TimeoutError()})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event()])) is False
+
+
+def test_a_liquidation_in_another_market_is_not_this_one(monkeypatch):
+    bot = bot_with([liquidation_event(ETH)])
+    asked_about(monkeypatch, {"master-KEY": [[event(symbol=BTC)]]})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event(ETH)])) is False
+
+
+def test_a_liquidation_in_this_market_is_confirmed(monkeypatch):
+    bot = bot_with([liquidation_event(ETH)])
+    asked_about(monkeypatch, {"master-KEY": [[event(symbol=ETH)]]})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event(ETH)])) is True
+
+
+def test_one_failed_answer_is_asked_again_before_failing_safe(monkeypatch):
+    """Asked in the middle of whatever went wrong, so a blip is likely --
+    and failing safe closes every account at market."""
+    bot = bot_with([liquidation_event()])
+    asked = asked_about(monkeypatch, {"master-KEY": [TimeoutError(), []]})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event()])) is False
+    assert asked == ["master-KEY", "master-KEY"]
+
+
+def test_an_account_that_never_answers_still_fails_safe(monkeypatch):
+    bot = bot_with([liquidation_event()])
+    asked = asked_about(monkeypatch, {"master-KEY": TimeoutError()})
+
+    assert asyncio.run(bot._liquidation_confirmed([liquidation_event()])) is True
+    assert len(asked) == 3, "it gave up without retrying"
 
 
 def test_doubt_does_not_excuse_it_when_positions_cannot_be_re_read(monkeypatch):

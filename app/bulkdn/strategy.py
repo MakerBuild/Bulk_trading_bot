@@ -93,6 +93,10 @@ DEFERRAL_WINDOW_S = 900.0
 # close to the exchange, can still be served from before our own fill; one
 # sent a READ_LAG_S later cannot. See `_settled_after_waiting`.
 SHRINK_RECHECK_DELAYS_S = (1.0, 2.0)
+# Pauses before asking the exchange again whether an account was liquidated,
+# when it did not answer. Short: the shrink it is asked about may be a lone
+# leg, and the fallback after the last one is to treat it as a liquidation.
+CONFIRM_RETRY_DELAYS_S = (0.5, 1.0)
 
 # How long a leg's hedge task waits before hedging AGAIN for fills that came in
 # while it was busy. The first hedge after a fill still goes at once. From
@@ -690,7 +694,7 @@ class Strategy:
         if await self._settled_by_a_fresh_read(events):
             return False
 
-        confirmed = await self._liquidation_confirmed()
+        confirmed = await self._liquidation_confirmed(events)
         if not confirmed and await self._settled_after_waiting(events):
             return False
         label = "liquidation" if confirmed else "position closed externally"
@@ -1594,7 +1598,7 @@ class Strategy:
                 return True
         return False
 
-    async def _liquidation_confirmed(self) -> bool:
+    async def _liquidation_confirmed(self, events) -> bool:
         """Did the exchange actually liquidate something? True if it cannot say.
 
         Fails safe on purpose. This is asked in the middle of whatever went
@@ -1602,33 +1606,66 @@ class Strategy:
         not ask" must land on the same side as "yes": closing a healthy pair
         costs a spread, while trading on into a real liquidation does not have
         a bounded cost.
+
+        Only the accounts that shrank are asked, about the markets they shrank
+        in, all at once. It used to ask every account in the pool, one after
+        another, and the first that failed to answer -- any of a hundred, most
+        of them nowhere near the event -- made the shrink a liquidation; a
+        liquidation of some other market in the last five minutes did the
+        same. An account that does not answer is asked again before it counts.
         """
-        for session in self.all_sessions:
-            try:
-                events = await asyncio.to_thread(
-                    recent_liquidations, self.config.http_url, session.pubkey
-                )
-            except Exception as exc:  # noqa: BLE001 - unreachable means unknown
-                log.warning(
-                    "could not confirm with the exchange whether %s was "
-                    "liquidated (%s) -- treating it as one",
-                    session.name, describe(exc),
-                )
-                return True
-            if events:
-                for event in events:
-                    log.critical(
-                        "exchange confirms %s on %s: %s",
-                        event.get("eventType", "risk event"), session.name,
-                        event.get("reason", ""),
-                    )
-                return True
+        wanted: dict[str, tuple[str, set[str]]] = {}
+        for event in events:
+            name, symbols = wanted.setdefault(event.account, (event.account_name, set()))
+            symbols.add(event.symbol)
+        answers = await asyncio.gather(*(
+            self._exchange_liquidated(pubkey, name, symbols)
+            for pubkey, (name, symbols) in wanted.items()
+        ))
+        if any(answers):
+            return True
         log.warning(
-            "the exchange reports no liquidation on either account, so this "
-            "was something else closing the position -- a manual close, or an "
-            "order of ours we never saw the answer to"
+            "the exchange reports no liquidation on %s, so this was something "
+            "else closing the position -- a manual close, or an order of ours "
+            "we never saw the answer to",
+            ", ".join(sorted(name for name, _symbols in wanted.values())),
         )
         return False
+
+    async def _exchange_liquidated(self, pubkey: str, name: str, symbols: set[str]) -> bool:
+        """Whether the exchange recorded a risk event on this account in these
+        markets recently. True when it could not be asked."""
+        failure: Exception | None = None
+        for delay in (0.0, *CONFIRM_RETRY_DELAYS_S):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                recorded = await asyncio.to_thread(
+                    recent_liquidations, self.config.http_url, pubkey
+                )
+            except Exception as exc:  # noqa: BLE001 - asked again, then unknown
+                failure = exc
+                continue
+            # This account, these markets. An event that does not name its
+            # market or its account cannot be ruled out, so it counts.
+            relevant = [
+                event for event in recorded
+                if event.get("symbol") in (None, *symbols)
+                and (event.get("user") or event.get("account") or pubkey) == pubkey
+            ]
+            for event in relevant:
+                log.critical(
+                    "exchange confirms %s on %s %s: %s",
+                    event.get("eventType", "risk event"), name,
+                    event.get("symbol", ""), event.get("reason", ""),
+                )
+            return bool(relevant)
+        log.warning(
+            "could not confirm with the exchange whether %s was liquidated "
+            "(%s, %d attempts) -- treating it as one",
+            name, describe(failure), 1 + len(CONFIRM_RETRY_DELAYS_S),
+        )
+        return True
 
     async def _clear_orphans(self, key: str) -> None:
         """Cancel anything resting in this leg's market after a silent submission.
