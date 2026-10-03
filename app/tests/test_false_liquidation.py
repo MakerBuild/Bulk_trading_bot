@@ -19,6 +19,7 @@ import time
 import pytest
 
 from bulkdn.liquidation import Liquidation, recent_liquidations
+from bulkdn.state import StrategyState
 from bulkdn.strategy import DOUBT_WINDOW_S, MAX_DOUBT_DEFERRALS
 
 ETH = "ETH-USD"
@@ -227,6 +228,10 @@ class Bot:
         self._key_for_account = Strategy._key_for_account.__get__(self)
         self._leg_accounts = Strategy._leg_accounts.__get__(self)
         self._cancel_resting = Strategy._cancel_resting.__get__(self)
+        for name in ("_accounts_hit", "_holding_hedges", "_close_broken_legs",
+                     "_clear_own_orders"):
+            setattr(self, name, getattr(Strategy, name).__get__(self))
+        self._hedge_queue = asyncio.Queue()
         self._settled_by_a_fresh_read = (
             Strategy._settled_by_a_fresh_read.__get__(self)
         )
@@ -362,6 +367,8 @@ def two_groups(bot):
         "g1:ETH-USD": Group(ETH, maker="master-KEY", takers=("sub1-KEY",), shares=(1.0,)),
         "g2:ETH-USD": Group(ETH, maker="other-KEY", takers=("other2-KEY",), shares=(1.0,)),
     }
+    # No orders resting: nothing for the guard to pull out of its closes' way.
+    bot.state = StrategyState()
     bot.pairing = object()
     resets = []
     bot.guard.reset_symbol = lambda symbol, accounts=None: resets.append(

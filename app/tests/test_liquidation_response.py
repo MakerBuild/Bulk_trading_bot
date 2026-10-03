@@ -168,3 +168,129 @@ async def test_the_worker_and_the_supervisor_do_not_both_answer_one_shrink(
     )
 
     assert sub1.closes == [(BTC, True, 0.5)]
+
+
+# -- the response holds the broken group, and only that group ----------------
+#
+# It ran inline in the hedge worker: every group's hedges waited behind its
+# reads and re-reads -- seconds -- and then behind a cancel-all sent to every
+# account in the pool, one after another, before the first close went out.
+
+
+def two_groups(tmp_path, monkeypatch):
+    from test_strategy import FakeFeed, FakeSession, make_config
+
+    from bulkdn.hedger import HedgeResult
+    from bulkdn.positions import PositionBook
+    from bulkdn.state import StateStore, StrategyState
+    from bulkdn.strategy import Strategy
+
+    accounts = [equip(FakeSession(name, f"{name}-KEY")) for name in ("a", "b", "c", "d")]
+    a, b, c, d = accounts
+    book = PositionBook(overlay_ttl_ms=5000)
+    hedged = []
+
+    class Hedger:
+        def actionable_hedge(self, roles, price=None):
+            return 0.0
+
+        async def hedge(self, roles, mark_price=None, suspended=None):
+            if suspended is not None and suspended():
+                return HedgeResult(roles.symbol, 0.0, 0.0, False, "suspended")
+            hedged.append(roles.key)
+            return HedgeResult(roles.symbol, 0.0, 0.0, False, "flat")
+
+    strategy = Strategy(
+        config=make_config(), master=a, sub1=b, feed=FakeFeed(), book=book,
+        hedger=Hedger(), chaser=None, risk=None,
+        store=StateStore(str(tmp_path / "state.json")),
+        state=StrategyState(), sessions=accounts,
+    )
+    strategy.pairing = object()
+    for group_id, (maker, taker) in ((1, (a, b)), (2, (c, d))):
+        key = strategy.group_key(group_id, BTC)
+        strategy._groups[key] = Group(
+            BTC, maker=maker.pubkey, takers=(taker.pubkey,), shares=(1.0,)
+        )
+        strategy.state.leg(key, BTC).phase = Phase.HOLD
+        book.set_authoritative(maker.pubkey, BTC, 0.5)
+        book.set_authoritative(taker.pubkey, BTC, -0.5)
+    strategy.notifier = types.SimpleNamespace(
+        send_soon=lambda coro: getattr(coro, "close", lambda: None)(),
+        halted=lambda reason: reason,
+    )
+    strategy.title = types.SimpleNamespace(halted=lambda reason: None)
+    strategy._persist = lambda: None
+
+    async def no_read(max_age_s=0.0):
+        return None
+
+    strategy._sync_positions = no_read
+    strategy.guard.check(book, strategy._phases_by_account(), [s.pubkey for s in accounts])
+    return strategy, book, accounts, hedged
+
+
+async def test_other_groups_hedge_while_the_guard_makes_up_its_mind(tmp_path, monkeypatch):
+    strategy, book, (a, b, c, d), hedged = two_groups(tmp_path, monkeypatch)
+    deciding, decide = asyncio.Event(), asyncio.Event()
+
+    async def slow_answer(events):
+        deciding.set()
+        await decide.wait()
+        return True
+
+    strategy._liquidation_confirmed = slow_answer
+    book.set_authoritative(b.pubkey, BTC, 0.0)        # group 1's hedger is wiped
+    strategy._make_position_handler(b)(Update(BTC, 0.0))
+
+    worker = asyncio.create_task(strategy._hedge_worker())
+    await asyncio.wait_for(deciding.wait(), 3)
+    strategy._hedge_queue.put_nowait("g1:BTC-USD")
+    strategy._hedge_queue.put_nowait("g2:BTC-USD")
+    for _ in range(50):
+        if hedged:
+            break
+        await asyncio.sleep(0.01)
+
+    assert hedged == ["g2:BTC-USD"], "the guard held every group, or none"
+
+    decide.set()
+    await until_stopped(strategy, worker)
+
+    assert strategy._halt_reason is not None
+    assert a.closes == [(BTC, False, 0.5)], "the survivor was left open"
+    assert c.closes == [] and d.closes == [], "another group was closed by the guard"
+    assert a.cancels and b.cancels
+    assert c.cancels == [] and d.cancels == [], "every account was cancelled first"
+
+
+async def test_a_held_group_is_hedged_once_the_guard_lets_it_go(tmp_path, monkeypatch):
+    strategy, book, (a, b, c, d), hedged = two_groups(tmp_path, monkeypatch)
+    deciding, decide = asyncio.Event(), asyncio.Event()
+
+    async def settled(events):
+        deciding.set()
+        await decide.wait()
+        book.set_authoritative(b.pubkey, BTC, -0.5)   # a stale reading after all
+        return True
+
+    strategy._settled_by_a_fresh_read = settled
+    book.set_authoritative(b.pubkey, BTC, 0.0)
+    strategy._make_position_handler(b)(Update(BTC, 0.0))
+
+    worker = asyncio.create_task(strategy._hedge_worker())
+    await asyncio.wait_for(deciding.wait(), 3)
+    strategy._hedge_queue.put_nowait("g1:BTC-USD")
+    await asyncio.sleep(0.05)
+    assert "g1:BTC-USD" not in hedged, "hedged while the guard was deciding"
+
+    decide.set()
+    for _ in range(100):
+        if "g1:BTC-USD" in hedged:
+            break
+        await asyncio.sleep(0.01)
+    strategy._stop.set()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    assert "g1:BTC-USD" in hedged, "the held signal was dropped"
+    assert strategy._halt_reason is None

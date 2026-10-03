@@ -244,6 +244,9 @@ async def test_a_close_that_raises_still_halts():
         symbol="GONE-USD", describe=lambda: "m GONE-USD 1 -> 0", account="m",
     )], acknowledge=lambda events: None)
     obj.sessions = {}
+    obj._groups = {}
+    obj.pairing = None
+    obj._hedge_queue = asyncio.Queue()
     obj.book = PositionBook()
     obj.feed = types.SimpleNamespace(specs={})
     obj.notifier = types.SimpleNamespace(

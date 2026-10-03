@@ -688,82 +688,168 @@ class Strategy:
         if not events:
             return False
 
-        if await self._deferred_to_our_own_orders(events):
-            return False
+        # The legs the events are in, and only those. Their hedges wait while
+        # this decides -- the hedge rule's answer to a liquidated hedger is a
+        # fresh position on the account that just ran out of margin -- and
+        # every other group trades and hedges on. This ran inline in the hedge
+        # worker once, and every group's hedges waited out its reads, re-reads
+        # and pauses behind it.
+        hit = [s for s in self.all_sessions if s.pubkey in self._accounts_hit(events)]
+        async with self._holding_hedges({s.pubkey for s in hit}):
+            if await self._deferred_to_our_own_orders(events):
+                return False
 
-        if await self._settled_by_a_fresh_read(events):
-            return False
+            if await self._settled_by_a_fresh_read(events):
+                return False
 
-        confirmed = await self._liquidation_confirmed(events)
-        if not confirmed and await self._settled_after_waiting(events):
-            return False
-        label = "liquidation" if confirmed else "position closed externally"
-        for event in events:
-            log.critical("%s: %s", label.upper(), event.describe())
-        # Answered from here on, so a look while the closes go out does not
-        # report these again. Not before: until this point the response could
-        # still have ended in "not a close at all", and an event acknowledged
-        # then and not acted on would be lost.
-        self.guard.acknowledge(events)
+            confirmed = await self._liquidation_confirmed(events)
+            if not confirmed and await self._settled_after_waiting(events):
+                return False
+            label = "liquidation" if confirmed else "position closed externally"
+            for event in events:
+                log.critical("%s: %s", label.upper(), event.describe())
+            # Answered from here on, so a look while the closes go out does
+            # not report these again. Not before: until this point the
+            # response could still have ended in "not a close at all", and an
+            # event acknowledged then and not acted on would be lost.
+            self.guard.acknowledge(events)
 
-        # Close everything still standing in the affected symbols, on both
-        # accounts. Which side was hit does not change the answer -- the pair
-        # is broken either way, and a lone leg is outright exposure.
-        affected = {event.symbol for event in events}
-        # Hedging stops before the first close goes out, and our own resting
-        # orders come off the book. The hedge worker used to run on beside
-        # this: on a live run it "hedged" the closes as they filled, and
-        # the accounts the guard had just closed ended holding fresh shorts
-        # (m1s1 -0.0103, m1s4 -0.0211). A resting order filling mid-close
-        # would have been the same thing from the other side.
-        self._closing_out = True
-        reason = f"{label} -- " + "; ".join(event.describe() for event in events)
-        # The halt is raised whatever happens in between. It used to follow the
-        # closes, so anything escaping them -- a market with no spec is a
-        # KeyError -- left the guard with hedging suspended and no halt: the
-        # run ended through the generic failure path, which cancels orders
-        # but flattens nothing and records no halt for the next start to see.
-        try:
-            # The closes go whether or not this worked, and it names any
-            # account it did not: a position left open costs more than a
+            # Hedging stops before the first close goes out, everywhere: the
+            # run halts after this, and the emergency stop that follows closes
+            # every account. The hedge worker used to run on beside this: on a
+            # live run it "hedged" the closes as they filled, and the accounts
+            # the guard had just closed ended holding fresh shorts (m1s1
+            # -0.0103, m1s4 -0.0211). A resting order filling mid-close would
+            # have been the same thing from the other side.
+            self._closing_out = True
+            reason = f"{label} -- " + "; ".join(event.describe() for event in events)
+            # The halt is raised whatever happens in between. It used to follow
+            # the closes, so anything escaping them -- a market with no spec is
+            # a KeyError -- left the guard with hedging suspended and no halt:
+            # the run ended through the generic failure path, which cancels
+            # orders but flattens nothing and records no halt for the next
+            # start to see.
+            try:
+                await self._close_broken_legs(hit, events, label)
+            finally:
+                # `_trigger_halt` sends the notification itself; sending it here
+                # too delivered every liquidation halt twice.
+                self._trigger_halt(reason)
+        return True
+
+    async def _close_broken_legs(self, hit, events, label: str) -> None:
+        """Close what the broken legs still hold in the markets they broke in.
+
+        Every account of each broken leg, whichever of them was hit: the pair
+        is broken either way, and a lone leg is outright exposure. Other
+        groups are hedged pairs, and the emergency stop the halt leads to
+        closes them after.
+        """
+        affected = sorted({event.symbol for event in events})
+        hit_keys = {s.pubkey for s in hit}
+        async with contextlib.AsyncExitStack() as swept:
+            # Both sides held as swept for as long as the cancels and closes
+            # take: a chaser whose order is pulled re-places on its next tick
+            # unless told not to, and a later close here would fill it.
+            for symbol in affected:
+                await swept.enter_async_context(self._sweep(symbol, True))
+                await swept.enter_async_context(self._sweep(symbol, False))
+            # All at once, and only these accounts -- this used to cancel every
+            # account in the pool, one after another, before the first close.
+            # Other groups' orders in the way of a close come off too, by id.
+            # The closes go whether or not this worked, and any account it did
+            # not work on is named: a position left open costs more than a
             # resting order that may fill against a close.
-            await self._cancel_resting(sorted(affected))
+            await asyncio.gather(
+                self._cancel_resting(affected, hit, concurrently=True),
+                *(
+                    self._clear_own_orders(symbol, side, skip=hit_keys)
+                    for symbol in affected
+                    for side in (True, False)
+                ),
+            )
             for symbol in affected:
                 spec = self.feed.specs.get(symbol)
                 if spec is None:
                     log.critical(
                         "no market spec for %s -- cannot size its close; "
                         "close it by hand now", symbol,
+                        extra={"alert": True},
                     )
                     continue
-                # Both sides held as swept for as long as the closes take.
-                # `cancel_all_orders` cleared the book, but a chaser whose
-                # order it cancelled re-places on its next tick unless told
-                # not to, and a later close in this loop would fill it.
-                async with self._sweep(symbol, True), self._sweep(symbol, False):
-                    for session in self.all_sessions:
-                        size = self.book.authoritative(session.pubkey, symbol)
-                        rounded = round_size(abs(size), spec)
-                        if rounded < spec.lot_size:
-                            continue
-                        try:
-                            # size > 0 is long, so closing it is a sell.
-                            await session.close_market(symbol, size < 0, rounded)
-                            log.critical(
-                                "closed %s %.8f on %s after %s",
-                                symbol, rounded, session.name, label,
-                            )
-                        except Exception as exc:  # noqa: BLE001 - the next close still goes
-                            log.critical(
-                                "COULD NOT CLOSE %s on %s after %s: %s -- "
-                                "close it by hand now",
-                                symbol, session.name, label, describe(exc),
-                            )
+                for session in hit:
+                    size = self.book.authoritative(session.pubkey, symbol)
+                    rounded = round_size(abs(size), spec)
+                    if rounded < spec.lot_size:
+                        continue
+                    try:
+                        # size > 0 is long, so closing it is a sell.
+                        await session.close_market(symbol, size < 0, rounded)
+                        log.critical(
+                            "closed %s %.8f on %s after %s",
+                            symbol, rounded, session.name, label,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - the next close still goes
+                        log.critical(
+                            "COULD NOT CLOSE %s on %s after %s: %s -- "
+                            "close it by hand now",
+                            symbol, session.name, label, describe(exc),
+                            extra={"alert": True},
+                        )
+
+    def _accounts_hit(self, events) -> set[str]:
+        """Every account in a leg that one of these events is in."""
+        return {
+            pubkey
+            for event in events
+            for pubkey in self._leg_accounts(event.account, event.symbol)
+        }
+
+    @contextlib.asynccontextmanager
+    async def _holding_hedges(self, accounts: set[str]):
+        """Hold every hedge on a leg with an account in `accounts`, meanwhile.
+
+        A held hedge is not dropped: its leg is queued again on the way out, so
+        a leg the guard lets go is hedged against whatever came in while it
+        was held.
+        """
+        holds = self.__dict__.setdefault("_guard_holds", {})
+        for pubkey in accounts:
+            holds[pubkey] = holds.get(pubkey, 0) + 1
+        try:
+            yield
         finally:
-            # `_trigger_halt` sends the notification itself; sending it here too
-            # delivered every liquidation halt twice.
-            self._trigger_halt(reason)
+            for pubkey in accounts:
+                holds[pubkey] -= 1
+                if not holds[pubkey]:
+                    del holds[pubkey]
+            waiting = self.__dict__.setdefault("_held_keys", set())
+            for key in sorted(waiting):
+                self._hedge_queue.put_nowait(key)
+            waiting.clear()
+
+    def _held_by_guard(self, roles: LegRoles) -> bool:
+        """Whether the liquidation guard is deciding about this leg; if so,
+        it is noted to be queued again once the guard lets it go."""
+        holds = self.__dict__.get("_guard_holds")
+        if not holds or not any(pubkey in holds for pubkey in roles.accounts):
+            return False
+        self.__dict__.setdefault("_held_keys", set()).add(roles.key)
         return True
+
+    async def _answer_liquidation(self) -> None:
+        """The guard's response to a shrink the position handler saw, as a task."""
+        try:
+            await self._guard_liquidation(self._phases_by_account())
+        except Exception as exc:  # noqa: BLE001 - a task nobody awaits must say so
+            # Nothing is lost: an event is reported until it is acknowledged,
+            # so the next position update flags it again, and the
+            # supervisor's reconcile tick asks on its own.
+            log.critical(
+                "the liquidation guard failed: %s -- it looks again on the next "
+                "position update and reconcile",
+                describe(exc),
+            )
 
     async def _deferred_to_our_own_orders(self, events) -> bool:
         """True when every event is explained by an order of ours in the dark.
@@ -1001,16 +1087,21 @@ class Strategy:
         """
         running: dict[str, asyncio.Task] = {}
         again: set[str] = set()
+        responder: asyncio.Task | None = None
         try:
             while not self._stop.is_set():
-                # Checked first and on every pass, including the idle one. A
-                # liquidation leaves the survivor outright directional, so it
-                # must not queue behind a hedge -- and it makes any pending
-                # hedge moot.
-                if self._liquidation_seen.is_set():
+                # Checked first and on every pass, including the idle one, and
+                # answered by a task of its own. A liquidation leaves the
+                # survivor outright directional, so it must not queue behind a
+                # hedge; and it is no reason for every other group's hedges to
+                # queue behind it -- the guard holds the legs it is deciding
+                # about itself (`_holding_hedges`). One response at a time: a
+                # flag raised while one runs is answered after it.
+                if self._liquidation_seen.is_set() and (
+                    responder is None or responder.done()
+                ):
                     self._liquidation_seen.clear()
-                    await self._guard_liquidation(self._phases_by_account())
-                    continue
+                    responder = asyncio.create_task(self._answer_liquidation())
 
                 try:
                     key = await asyncio.wait_for(self._hedge_queue.get(), timeout=0.5)
@@ -1048,8 +1139,11 @@ class Strategy:
             # Waited for, not cancelled: a hedge cut off between sending its
             # order and hearing back is exactly the one nobody can account for.
             # `wait`, not `gather`, so a cancel of this task does not cascade
-            # into them.
-            pending = [task for task in running.values() if not task.done()]
+            # into them. The guard's response likewise: it may be mid-close.
+            pending = [
+                task for task in (*running.values(), responder)
+                if task is not None and not task.done()
+            ]
             if pending:
                 await asyncio.wait(pending, timeout=15)
 
@@ -1190,6 +1284,16 @@ class Strategy:
         A slice with no answer stays reserved against this leg, and a position
         read in the background settles it. Nothing else waits for that read.
         """
+        if self._held_by_guard(roles):
+            # The liquidation guard is deciding whether this leg was broken,
+            # and it queues the leg again when it lets go.
+            return HedgeResult(roles.symbol, 0.0, 0.0, False, "held by the liquidation guard")
+
+        def suspended() -> bool:
+            # Asked again once the hedger holds the leg's lock: the guard may
+            # have started on this leg while the hedge waited for it.
+            return self._hedging_suspended or self._held_by_guard(roles)
+
         side = (roles.symbol, roles.maker_is_buy)
         sweeping = self.__dict__.setdefault("_sweeping", {})
         sweeping[side] = sweeping.get(side, 0) + 1
@@ -1212,7 +1316,7 @@ class Strategy:
             return await self.hedger.hedge(
                 roles,
                 mark_price=self.feed.reference_price(roles.symbol),
-                suspended=lambda: self._hedging_suspended,
+                suspended=suspended,
             )
         except HedgeInDoubt:
             # This leg only. Marking the whole book suspect stopped every
@@ -1291,13 +1395,17 @@ class Strategy:
             return
         await self._clear_own_orders(roles.symbol, roles.maker_is_buy)
 
-    async def _clear_own_orders(self, symbol: str, resting_is_buy: bool) -> None:
+    async def _clear_own_orders(
+        self, symbol: str, resting_is_buy: bool, skip: set[str] | frozenset = frozenset()
+    ) -> None:
         """Pull every live group's resting order off one side of `symbol`.
 
         `resting_is_buy` is the side a taking order is about to sweep: the
         bid for a market sell, the ask for a market buy. For a hedge that is
         the hedging maker's own side (`_clear_hedge_path`); for a cut-short
         close, which trades the same way as its maker, it is the other one.
+        `skip` names makers whose orders are already being cancelled another
+        way.
         """
         # Live groups, for the reason spelled out in `_least_crowded_side`:
         # a released leg no longer has a group to take its side from, and
@@ -1318,7 +1426,7 @@ class Strategy:
             if other is None or other.maker_is_buy != resting_is_buy:
                 continue
             session = self.sessions.get(other.maker)
-            if session is None:
+            if session is None or other.maker in skip:
                 continue
             if not self.chaser.may_be_resting(session, leg.oid):
                 continue
