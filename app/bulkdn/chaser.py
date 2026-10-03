@@ -51,10 +51,17 @@ from .state import LegState
 
 log = logging.getLogger(__name__)
 
-# How long to wait for a placement to show up in the order map before treating
-# the order as gone. Covers the gap between the transaction being accepted and
-# the orderUpdate arriving.
+# How long to wait for a placement to show up in the order map before acting
+# on it without that confirmation. Covers the usual gap between the
+# transaction being accepted and the orderUpdate arriving.
 ACK_GRACE_S = 3.0
+# How long an order the order map has never shown is still treated as one
+# that may be resting. The map is filled from orderUpdate alone, which has run
+# seven to thirty seconds behind the answer that accepted the order, so the
+# grace above is not long enough to conclude anything from absence. Past this
+# an order nobody is chasing any more stops being watched: nothing still on
+# its way is that late.
+UNSEEN_WATCH_S = 60.0
 
 # `join_depth_usd`: how far behind the touch a level may be and still be
 # joined. Further back is the deliberate resting offset under another name,
@@ -67,6 +74,26 @@ JOIN_SCAN_LEVELS = 20
 # `join_depth_usd`. Without it an order would hop every time the queue around
 # it crossed the line, and each hop goes to the back of the new queue.
 JOIN_KEEP_FRACTION = 0.5
+
+
+@dataclass
+class _Placed:
+    """What the chaser knows about one order it placed."""
+
+    symbol: str
+    is_buy: bool
+    maker: str
+    placed_at: float
+    # Shown by the order map at least once. Once seen, an order's absence
+    # means it is gone -- filled or cancelled. Never seen, absence means
+    # nothing yet: the orderUpdate may simply not have arrived.
+    seen: bool = False
+    # Kept after a replace was refused. See `_place`.
+    adopted: bool = False
+    # No longer any leg's order: replaced, or a cancel of it went unanswered.
+    # Still watched until it is known gone, but it holds no level for
+    # `_ours_at` -- its own leg has already moved on.
+    superseded: bool = False
 
 
 @dataclass
@@ -130,24 +157,22 @@ class Chaser:
         self.book = book
         self.params = params
         self.price_stale_timeout_s = price_stale_timeout_s
-        self._placed_at: dict[str, float] = {}
-        # Orders the order map has shown at least once. Once seen, an order's
-        # absence means it is gone -- filled or cancelled -- rather than not
-        # yet acknowledged. See `may_be_resting`.
-        self._seen: set[str] = set()
+        # Every order this chaser has placed that may still rest, across all
+        # legs. One record per order, rather than four dicts kept in step by
+        # hand at every place an order came or went. One Chaser serves every
+        # group, so this is also how a leg tells another group's order at the
+        # touch from a stranger's. See `_ours_at`. Pruned on every step by
+        # `_forget_gone`.
+        self._orders: dict[str, _Placed] = {}
         # When each leg, in its current direction, first put an order on the
         # book. Patience is measured from here, not from the current order:
         # every drift replace reset the old clock, so in a market that kept
         # moving away the order was re-placed at its offset forever and never
         # moved onto the touch -- the opposite of "unfilled for this long".
+        #
+        # Keyed by leg and direction, not by order, so it is not part of the
+        # per-order record above: it outlives every order the leg places.
         self._chasing_since: dict[tuple[str, bool], float] = {}
-        # Orders kept after a replace was refused. See `_place`.
-        self._adopted: set[str] = set()
-        # Every order this chaser has placed that may still rest, across all
-        # legs: oid -> (symbol, is_buy, maker pubkey). One Chaser serves every
-        # group, so this is how a leg tells another group's order at the touch
-        # from a stranger's. See `_ours_at`.
-        self._ours: dict[str, tuple[str, bool, str]] = {}
 
     # -- sizing ------------------------------------------------------------
 
@@ -173,6 +198,7 @@ class Chaser:
         params = self.params[symbol]
         session = self.sessions[roles.maker]
 
+        self._forget_gone()
         await self._sweep_stale(session, leg)
 
         remaining = round_size(self.remaining_size(roles, leg), spec)
@@ -260,11 +286,30 @@ class Chaser:
         resting = self._resting_order(session, leg)
 
         if resting is None:
-            if leg.oid and time.monotonic() - self._placed_at.get(leg.oid, float("-inf")) < ACK_GRACE_S:
-                return ChaseOutcome(symbol, "waiting", "awaiting order ack")
+            record = self._orders.get(leg.oid) if leg.oid else None
+            if record is not None and not record.seen:
+                # Accepted, and never shown by the order map: unknown, not
+                # gone. orderUpdate has run up to thirty seconds behind, and
+                # this used to forget the id three seconds in and place a
+                # second order beside the first -- both resting, both free to
+                # fill, the leg past its size.
+                age = time.monotonic() - record.placed_at
+                if age < ACK_GRACE_S:
+                    return ChaseOutcome(symbol, "waiting", "awaiting order ack")
+                # So it is replaced like any resting order: the cancel rides
+                # in the same transaction, and whichever it turns out to be --
+                # resting or already filled -- there is never a second order.
+                # A cancel refused because it had filled is the adopted case
+                # in `_place`.
+                return await self._place(
+                    session, roles, leg, target, desired, replace_oid=leg.oid,
+                    reason=f"not in the order map after {age:.0f}s",
+                )
             if leg.oid:
-                # Gone from the book: filled, or cancelled behind our back.
-                # Either way the next pass re-derives from position.
+                # Shown, then gone: filled, or cancelled behind our back.
+                # Either way there is nothing left to cancel, so the next
+                # order goes out now and the next pass re-derives from
+                # position.
                 log.debug("%s: order %s no longer resting", symbol, leg.oid[:8])
                 leg.oid = None
             return await self._place(session, roles, leg, target, desired, replace_oid=None)
@@ -279,8 +324,10 @@ class Chaser:
         # Only for an adopted order. For any other, a fill can reach the book
         # before the order map shrinks the order, and the check would fire on
         # every such fill.
+        record = self._orders.get(leg.oid)
         oversized = (
-            leg.oid in self._adopted and resting.size > remaining + spec.lot_size / 2
+            record is not None and record.adopted
+            and resting.size > remaining + spec.lot_size / 2
         )
         if oversized:
             return await self._place(
@@ -356,26 +403,34 @@ class Chaser:
 
         Yes if the order map has it. No if the map has shown it before and no
         longer does: it was filled or cancelled, and filled is the usual reason
-        a hedge is running. The acknowledgement grace is only for an order the
-        map has never shown -- one placed so recently it may already be resting
-        with nothing here to say so.
+        a hedge is running. An order the map has never shown may be resting
+        with nothing here to say so yet -- orderUpdate has run up to thirty
+        seconds late -- so it counts as resting for `UNSEEN_WATCH_S`.
 
-        It used to apply the grace by age alone, so any order younger than
-        ACK_GRACE_S counted as possibly resting even after it had shown up and
-        gone. On the touch an order is re-placed about every second, and 49%
-        of maker fills on a live run landed inside that window: each one still
-        sent a cancel for an order that no longer existed, and the hedge waited
-        a second round trip behind it -- the median went from one (~330ms) to
-        two (~650ms).
+        It used to apply a three-second grace by age alone, both ways. Any
+        order younger than that counted as possibly resting even after it had
+        shown up and gone: on the touch an order is re-placed about every
+        second, and 49% of maker fills on a live run landed inside that
+        window, each one sending a cancel for an order that no longer existed
+        while the hedge waited a second round trip behind it -- the median
+        went from one (~330ms) to two (~650ms). And any order older than that
+        counted as gone even if the map had simply not caught up with it,
+        which left it in the hedge's path.
         """
         if not oid:
             return False
         if oid in session.client.get_order_map():
-            self._seen.add(oid)
+            self._mark_seen(oid)
             return True
-        if oid in self._seen:
+        record = self._orders.get(oid)
+        if record is None or record.seen:
             return False
-        return time.monotonic() - self._placed_at.get(oid, float("-inf")) < ACK_GRACE_S
+        return time.monotonic() - record.placed_at < UNSEEN_WATCH_S
+
+    def _mark_seen(self, oid: str) -> None:
+        record = self._orders.get(oid)
+        if record is not None:
+            record.seen = True
 
     def _resting_order(self, session: AccountSession, leg: LegState):
         if not leg.oid:
@@ -384,8 +439,29 @@ class Chaser:
         if order is not None:
             # Every chase step passes through here, so an order that rests
             # for a step is recorded as acknowledged well before it fills.
-            self._seen.add(leg.oid)
+            self._mark_seen(leg.oid)
         return order
+
+    def _forget_gone(self) -> None:
+        """Drop the records of orders known to be gone, across every leg.
+
+        Seen and then absent is gone. A superseded order never seen is kept
+        for `UNSEEN_WATCH_S`, for the reason in `may_be_resting`. A leg's
+        current order is never dropped unseen: without its record the next
+        step would take it for gone and place a second one beside it, which is
+        the failure the record exists to prevent. Without any of this the
+        records would only ever grow, by one per replace for the life of the
+        process.
+        """
+        now = time.monotonic()
+        for oid, record in list(self._orders.items()):
+            session = self.sessions.get(record.maker)
+            if session is not None and oid in session.client.get_order_map():
+                record.seen = True
+            elif record.seen or (
+                record.superseded and now - record.placed_at >= UNSEEN_WATCH_S
+            ):
+                del self._orders[oid]
 
     async def _place(
         self,
@@ -408,8 +484,9 @@ class Chaser:
                 cancel_oid=replace_oid,
             )
         except OrderRejected as exc:
-            # A rejected replace can leave the original resting, so it stays on
-            # the sweep list until it is confirmed gone.
+            # A rejected replace leaves `leg.oid` on the original, which is
+            # still the leg's order -- resting, or gone and found so by the
+            # next pass.
             #
             # With ALO orders the common rejection is `rejectedCrossing`: the
             # book reached the target between reading it and the order landing.
@@ -418,8 +495,6 @@ class Chaser:
             # order and places fresh, which bounds the gap at one chase
             # interval. `mod` would avoid it by changing size in place, but the
             # Python SDK has no message type for that action.
-            if replace_oid:
-                leg.remember_stale(replace_oid)
             placed_oid = getattr(exc, "order_id", None)
             if getattr(exc, "placed", False) and placed_oid:
                 # The batch was refused as a whole because its CANCEL half
@@ -427,23 +502,25 @@ class Chaser:
                 # new order was accepted and is resting. Dropping its id left
                 # an order nothing tracked: the next pass placed another, and
                 # the leg filled past its size. Adopted instead; the next pass
-                # resizes it if the fill left it too big.
+                # resizes it if the fill left it too big. The order it
+                # replaced goes on the sweep list: its cancel was refused, so
+                # it is gone only once the order map says so.
                 log.warning(
                     "%s: replace refused but the new order rests (%s) -- keeping it",
                     symbol, describe(exc),
                 )
-                self._track(roles, leg, placed_oid, price, size)
-                self._adopted.add(placed_oid)
+                self._track(roles, leg, placed_oid, price, size, uncertain=True)
+                self._orders[placed_oid].adopted = True
                 return ChaseOutcome(symbol, "placed", "adopted after a refused cancel")
             log.warning("%s: chase order rejected: %s", symbol, describe(exc))
             return ChaseOutcome(symbol, "skipped", f"rejected: {exc}")
 
-        if replace_oid:
-            # The cancel and the placement were atomic, but the cancel can still
-            # fail on its own terms (already filled, unknown id). Verifying on a
-            # later pass is cheaper than trusting it.
-            leg.remember_stale(replace_oid)
-
+        # The cancel half was answered as done -- a refused one raises above
+        # -- so the order it replaced is not put on the sweep list. It used to
+        # be, by a call that never took effect: `remember_stale` skips the
+        # leg's current order, and the old id was still current at that point.
+        # Making it take effect would send a second cancel for every replace
+        # whose orderUpdate is late, which on the touch is most of them.
         self._track(roles, leg, oid, price, size)
 
         action = "replaced" if replace_oid else "placed"
@@ -468,24 +545,36 @@ class Chaser:
         return (roles.key, roles.reduce_only)
 
     def _track(
-        self, roles: LegRoles, leg: LegState, oid: str, price: float, size: float
+        self,
+        roles: LegRoles,
+        leg: LegState,
+        oid: str,
+        price: float,
+        size: float,
+        uncertain: bool = False,
     ) -> None:
-        """Record `oid` as the leg's resting order."""
+        """Record `oid` as the leg's resting order.
+
+        `uncertain` says the order it replaces may not have been cancelled,
+        which puts that one on the leg's sweep list.
+        """
         previous = leg.oid
-        if previous and previous != oid:
-            # Replaced. The stale list sweeps it if it is somehow still there;
-            # these two only ever grew, by one entry per replace for the life
-            # of the process.
-            self._placed_at.pop(previous, None)
-            self._seen.discard(previous)
-            self._adopted.discard(previous)
-            self._ours.pop(previous, None)
-        self._ours[oid] = (roles.symbol, roles.maker_is_buy, roles.maker)
+        now = time.monotonic()
+        self._orders[oid] = _Placed(
+            symbol=roles.symbol, is_buy=roles.maker_is_buy, maker=roles.maker,
+            placed_at=now,
+        )
         leg.oid = oid
         leg.price = price
         leg.size = size
-        now = time.monotonic()
-        self._placed_at[oid] = now
+        if previous and previous != oid:
+            superseded = self._orders.get(previous)
+            if superseded is not None:
+                superseded.superseded = True
+            if uncertain:
+                # Only once `leg.oid` has moved on: `remember_stale` skips
+                # the leg's current order.
+                leg.remember_stale(previous)
         self._chasing_since.setdefault(self._chase_key(roles), now)
 
     def _join_target(self, roles: LegRoles, leg: LegState, quote, depth_usd: float):
@@ -520,17 +609,25 @@ class Chaser:
                 return price
         return touch
 
+    def _ours_resting(self, symbol: str, is_buy: bool, except_oid: str | None = None):
+        """Every leg's current order of ours on this side that the map shows."""
+        for oid, record in list(self._orders.items()):
+            if (
+                oid == except_oid or record.superseded
+                or record.symbol != symbol or record.is_buy != is_buy
+            ):
+                continue
+            session = self.sessions.get(record.maker)
+            order = session.client.get_order_map().get(oid) if session else None
+            if order is not None:
+                yield order
+
     def _our_size_at(self, symbol: str, is_buy: bool, price: float) -> float:
         """How much of ours rests at `price` on this side, every leg together."""
-        total = 0.0
-        for oid, (sym, buy, maker) in list(self._ours.items()):
-            if sym != symbol or buy != is_buy:
-                continue
-            session = self.sessions.get(maker)
-            order = session.client.get_order_map().get(oid) if session else None
-            if order is not None and order.price == price:
-                total += order.size
-        return total
+        return sum(
+            order.size for order in self._ours_resting(symbol, is_buy)
+            if order.price == price
+        )
 
     def _ours_at(
         self, symbol: str, is_buy: bool, price: float, except_oid: str | None
@@ -538,29 +635,18 @@ class Chaser:
         """Whether another leg's order of ours rests at `price` on this side.
 
         Read from the order maps, not from what was placed: an order that
-        filled or was cancelled no longer holds the level. Entries whose order
-        is gone are dropped as they are found, once the order map has shown
-        them or their acknowledgement grace has passed.
+        filled or was cancelled no longer holds the level.
         """
-        now = time.monotonic()
-        found = False
-        for oid, (sym, buy, maker) in list(self._ours.items()):
-            if oid == except_oid or sym != symbol or buy != is_buy:
-                continue
-            session = self.sessions.get(maker)
-            order = session.client.get_order_map().get(oid) if session else None
-            if order is None:
-                if oid in self._seen or now - self._placed_at.get(oid, float("-inf")) > ACK_GRACE_S:
-                    self._ours.pop(oid, None)
-                continue
-            if order.price == price:
-                found = True
-        return found
+        return any(
+            order.price == price
+            for order in self._ours_resting(symbol, is_buy, except_oid)
+        )
 
     async def _cancel(self, session: AccountSession, leg: LegState, symbol: str) -> None:
         oid = leg.oid
         if not oid:
             return
+        answered = True
         try:
             await session.cancel(symbol, oid)
             log.info("%s: cancelled %s on %s", symbol, oid[:8], session.name)
@@ -569,12 +655,20 @@ class Chaser:
             log.debug("%s: cancel of %s not accepted: %s", symbol, oid[:8], exc)
         except Exception as exc:
             log.warning("%s: cancel of %s failed: %s", symbol, oid[:8], describe(exc))
-            leg.remember_stale(oid)
+            answered = False
         leg.oid = None
         leg.price = None
         leg.size = None
-        self._placed_at.pop(oid, None)
-        self._seen.discard(oid)
+        if answered:
+            self._orders.pop(oid, None)
+            return
+        # It may still rest. Remembered only once `leg.oid` is cleared: it
+        # used to be remembered before, `remember_stale` skipped it as the
+        # leg's current order, and the order was forgotten instead of swept.
+        leg.remember_stale(oid)
+        record = self._orders.get(oid)
+        if record is not None:
+            record.superseded = True
 
     async def _sweep_stale(self, session: AccountSession, leg: LegState) -> None:
         """Cancel any superseded order that is somehow still on the book.
@@ -587,6 +681,13 @@ class Chaser:
             return
         order_map = session.client.get_order_map()
         still_resting = [oid for oid in leg.stale_oids if oid in order_map]
+        # One the map has never shown is not gone for being absent -- its
+        # orderUpdate may be late -- so it is kept until it surfaces and is
+        # cancelled, or until `_forget_gone` stops watching for it.
+        unseen = {
+            oid for oid in leg.stale_oids
+            if oid in self._orders and not self._orders[oid].seen
+        }
 
         for oid in still_resting:
             log.warning(
@@ -599,8 +700,10 @@ class Chaser:
             except Exception as exc:
                 log.warning("%s: sweep cancel of %s failed: %s", leg.symbol, oid[:8], describe(exc))
 
-        # Anything no longer on the book needs no further attention.
-        leg.stale_oids = [oid for oid in leg.stale_oids if oid in order_map]
+        # Anything known to be off the book needs no further attention.
+        leg.stale_oids = [
+            oid for oid in leg.stale_oids if oid in order_map or oid in unseen
+        ]
 
     async def cancel_leg(self, roles: LegRoles, leg: LegState) -> None:
         """Public cancel, used on phase transitions and shutdown."""

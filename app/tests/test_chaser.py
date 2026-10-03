@@ -314,8 +314,8 @@ async def test_a_filled_order_is_not_resting():
     book.set_authoritative(MASTER, BTC, 0.0)
     leg = LegState(symbol=BTC, target_size=1.0)
     await chaser.step(OPEN_BTC, leg)
-    master.client.order_map.pop(leg.oid)                 # filled
-    chaser._placed_at[leg.oid] -= 60                     # and acknowledged long ago
+    await chaser.step(OPEN_BTC, leg)                     # acknowledged
+    master.client.order_map.pop(leg.oid)                 # and filled
 
     assert not chaser.may_be_resting(master, leg.oid)
 
@@ -433,7 +433,7 @@ async def test_a_level_our_order_has_left_is_a_strangers_again():
     leg1 = LegState(symbol=BTC, target_size=1.0, tightened=True)
     leg2 = LegState(symbol=BTC, target_size=1.0, tightened=True)
     await chaser.step(G1, leg1)                          # ours at 100_000.5
-    chaser._seen.add(leg1.oid)
+    chaser._orders[leg1.oid].seen = True
     master.client.order_map.clear()                      # ... and filled
 
     chaser.feed._quote = Quote(                          # a stranger joined there
@@ -442,3 +442,169 @@ async def test_a_level_our_order_has_left_is_a_strangers_again():
     await chaser.step(G2, leg2)
 
     assert sub1.placed[0]["price"] == 100_001.0
+
+
+# -- an order the map has not shown yet is unknown, not gone -----------------
+#
+# The order map is filled from orderUpdate alone, and orderUpdate has run
+# seven to thirty seconds behind the answer that accepted the order. The step
+# used to treat an order missing from the map for three seconds as gone: it
+# forgot the id and placed a second order beside the first, and both could
+# fill.
+
+
+def _later(monkeypatch, seconds):
+    """Move the chaser's clock forward without touching the event loop's."""
+    import time as real_time
+    import types
+
+    from bulkdn import chaser as chaser_module
+
+    monkeypatch.setattr(
+        chaser_module, "time",
+        types.SimpleNamespace(monotonic=lambda: real_time.monotonic() + seconds),
+    )
+
+
+async def test_an_order_the_map_never_showed_is_replaced_not_forgotten(monkeypatch):
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    first = leg.oid
+    master.client.order_map.pop(first)                   # its orderUpdate is late
+
+    _later(monkeypatch, 10.0)
+    outcome = await chaser.step(OPEN_BTC, leg)
+
+    assert outcome.action == "replaced"
+    assert master.placed[-1]["cancel_oid"] == first, (
+        "a second order went out beside one that may still rest"
+    )
+
+
+async def test_an_order_not_yet_shown_is_waited_for_inside_the_grace():
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    master.client.order_map.pop(leg.oid)
+
+    outcome = await chaser.step(OPEN_BTC, leg)
+
+    assert outcome.action == "waiting"
+    assert len(master.placed) == 1
+
+
+async def test_an_order_shown_and_then_gone_is_re_placed_at_once():
+    """Seen, then gone, means gone -- filled or cancelled. Nothing is left to
+    cancel, so the next order goes out without waiting out the grace."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    await chaser.step(OPEN_BTC, leg)                     # held: seen resting
+    master.client.order_map.pop(leg.oid)                 # and gone
+
+    outcome = await chaser.step(OPEN_BTC, leg)
+
+    assert outcome.action == "placed"
+    assert master.placed[-1]["cancel_oid"] is None
+
+
+async def test_an_order_never_shown_may_still_be_resting_after_the_grace(monkeypatch):
+    """A hedge pulls our orders out of its way, and one the map has not
+    caught up with is as much in the way as one it shows."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    master.client.order_map.pop(leg.oid)
+
+    _later(monkeypatch, 10.0)
+    assert chaser.may_be_resting(master, leg.oid)
+
+
+async def test_a_cancel_that_got_no_answer_is_kept_for_the_sweep():
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    oid = leg.oid
+
+    async def unanswered(symbol, oid):
+        raise TimeoutError("no answer")
+
+    master.cancel = unanswered
+    await chaser.cancel_leg(OPEN_BTC, leg)
+
+    assert leg.oid is None
+    assert leg.stale_oids == [oid], "an order that may still rest was forgotten"
+
+
+async def test_the_sweep_waits_for_an_order_the_map_has_not_shown_yet():
+    """A superseded order the map has never shown cannot be judged gone by
+    its absence. It is kept, and cancelled the moment it surfaces."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    ghost = leg.oid
+    master.client.order_map.pop(ghost)
+
+    async def unanswered(symbol, oid):
+        raise TimeoutError("no answer")
+
+    real_cancel = master.cancel
+    master.cancel = unanswered
+    await chaser.cancel_leg(OPEN_BTC, leg)
+    master.cancel = real_cancel
+
+    await chaser.step(OPEN_BTC, leg)                     # not in the map yet
+    assert ghost in leg.stale_oids
+
+    master.client.order_map[ghost] = FakeOrder(price=100_000.0, size=1.0)
+    await chaser.step(OPEN_BTC, leg)                     # its update arrives
+    assert ghost in master.cancelled
+
+
+async def test_the_order_an_adopted_one_replaced_goes_on_the_sweep_list():
+    """The cancel half of the replace was refused, so the old order's fate is
+    the exchange's word against nothing; it is watched until it is gone."""
+    from bulkdn.accounts import OrderRejected
+
+    chaser, book, master, _s = build(max_distance_bps=5.0)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    old = leg.oid
+
+    async def cancel_half_refused(**kwargs):
+        exc = OrderRejected("cancel refused")
+        exc.order_id, exc.placed = "adopted-oid", True
+        raise exc
+
+    master.place_limit = cancel_half_refused
+    chaser.feed._quote = Quote(
+        BTC, best_bid=101_000.0, best_ask=101_010.0, mark_price=101_005.0, age_s=0.0
+    )
+    await chaser.step(OPEN_BTC, leg)
+
+    assert leg.oid == "adopted-oid"
+    assert leg.stale_oids == [old]
+
+
+async def test_a_long_unseen_order_is_still_replaced_rather_than_doubled(monkeypatch):
+    """However long the leg was not stepped -- a stale price holds it -- its
+    order is not forgotten for having never shown up."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+    first = leg.oid
+    master.client.order_map.pop(first)
+
+    _later(monkeypatch, 600.0)
+    await chaser.step(OPEN_BTC, leg)
+
+    assert master.placed[-1]["cancel_oid"] == first
