@@ -262,8 +262,8 @@ async def test_close_during_startup_does_not_wait_out_the_whole_run():
     await h.settle()
 
     started.set()                    # the strategy exists now
-    await asyncio.sleep(0.6)
-    assert h.strategy.stops == ["telegram close"]
+    await h.settle()
+    assert h.strategy.stops == ["telegram close"], "the stop waited for a poll"
     h.release.set()
     await h.settle()
     assert h.closes == [False]
@@ -667,3 +667,72 @@ async def test_the_idle_status_is_read_off_the_control_loop(monkeypatch):
 
     assert "all flat" in text
     assert seen["thread"] != threading.get_ident(), "it ran on the control loop"
+
+
+# -- the settings are read again ----------------------------------------------
+
+
+async def test_each_run_reads_the_settings_again():
+    """The config from process start was used for every run, so an edit made
+    while the control loop ran never reached a run."""
+    h = Harness()
+    versions = iter([settings(volume=1.0), settings(volume=2.0)])
+    h.c.reload = lambda: next(versions)
+
+    ask = await h.say("▶️ Run")
+    assert "$1" in ask.text
+    await h.c.press(button(ask, "▶️ Start"))
+    await h.settle()
+    assert h.runs[0][0].target.volume_usd == 1.0
+    h.release.set()
+    await h.settle()
+
+    h.release.clear()
+    ask = await h.say("▶️ Run")
+    assert "$2" in ask.text
+    h.release.set()
+
+
+async def test_a_settings_file_that_does_not_read_starts_no_run():
+    h = Harness()
+
+    def broken():
+        raise ValueError("markets[0].size must be a number")
+
+    h.c.reload = broken
+    reply = await h.say("▶️ Run")
+    assert "could not be read" in reply.text and "markets[0].size" in reply.text
+    assert not reply.buttons, "it offered to start a run on a file it could not read"
+
+
+async def test_a_settings_file_that_does_not_read_still_lets_close_all_close():
+    h = Harness()
+
+    def broken():
+        raise ValueError("bad yaml")
+
+    h.c.reload = broken
+    ask = await h.say("🛑 Close all")
+    assert "could not be read" in ask.text
+    await h.c.press(button(ask, "✅"))
+    await h.settle()
+    assert h.closes == [False]
+
+
+def test_a_re_read_keeps_the_keys_decrypted_at_start(tmp_path, monkeypatch):
+    """The key file is encrypted; a re-read must not ask for its password."""
+    from bulkdn import config as config_mod
+
+    path = tmp_path / "settings.yaml"
+    path.write_text(
+        "mode: multi\nmarkets:\n  - symbol: BTC-USD\n    notional_usd: 100\n"
+        "    max_order_notional_usd: 100\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv(config_mod.PRIVATE_KEY_ENV, raising=False)
+    loaded = types.SimpleNamespace(private_keys=["KEY-ONE", "KEY-TWO"], private_key="KEY-ONE")
+
+    fresh = tc.config_reloader(str(path), loaded)()
+    assert fresh.private_keys == ["KEY-ONE", "KEY-TWO"]
+    assert fresh.private_key == "KEY-ONE"
+    assert fresh.markets[0].symbol == "BTC-USD"
