@@ -362,6 +362,18 @@ class Hedger:
     def tolerance(self, symbol: str) -> float:
         return self.specs[symbol].lot_size * self.tolerance_lots
 
+    def sweeps_bid(self, roles: LegRoles) -> bool:
+        """Whether this leg's hedge, as things stand, sells -- and so takes bids.
+
+        Usually the opposite of the maker's own side: a maker that bought is
+        covered by a sale. Not always. A leg that is over-hedged is brought
+        back by trading the maker's way, and that order sweeps the OTHER side
+        -- where another group's order of ours may be resting. With nothing to
+        hedge it is the maker's side, which is the one the caller would mark.
+        """
+        net = self.effective_net(roles)
+        return net > 0 if net else roles.maker_is_buy
+
     def effective_net(self, roles: LegRoles) -> float:
         """Net exposure including hedges that are already on their way.
 

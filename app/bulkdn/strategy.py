@@ -1360,7 +1360,13 @@ class Strategy:
             # have started on this leg while the hedge waited for it.
             return self._hedging_suspended or self._held_by_guard(roles)
 
-        side = (roles.symbol, roles.maker_is_buy)
+        # The side the order will take, from the way it trades -- not from the
+        # maker's side. They agree for every ordinary hedge, and disagree for
+        # the one that corrects an over-hedge: that trades the maker's way, and
+        # on a live run it sold into another group's resting buy on a second
+        # account of ours, because the path cleared and marked was the asks.
+        sweeps_bid = self.hedger.sweeps_bid(roles)
+        side = (roles.symbol, sweeps_bid)
         sweeping = self.__dict__.setdefault("_sweeping", {})
         sweeping[side] = sweeping.get(side, 0) + 1
         try:
@@ -1467,6 +1473,12 @@ class Strategy:
         order -- the filling leg's own -- and the chaser re-places it on the
         next tick.
 
+        "That side" is the one the hedge trades into (`Hedger.sweeps_bid`),
+        which is the maker's own only for an ordinary hedge. A hedge correcting
+        an over-hedge trades the maker's way and sweeps the other side; with
+        the maker's side cleared instead, a live correction sold straight into
+        another group's resting buy.
+
         A cancel that fails does NOT stop the hedge. Unhedged exposure has no
         bounded cost and a self-trade costs a fee; when only one of the two can
         be avoided, it is never the hedge.
@@ -1477,7 +1489,7 @@ class Strategy:
             # because a cancel costs a request against an exchange that has
             # answered 429 to two accounts polling every five seconds.
             return
-        await self._clear_own_orders(roles.symbol, roles.maker_is_buy)
+        await self._clear_own_orders(roles.symbol, self.hedger.sweeps_bid(roles))
 
     async def _clear_own_orders(
         self, symbol: str, resting_is_buy: bool, skip: set[str] | frozenset = frozenset()

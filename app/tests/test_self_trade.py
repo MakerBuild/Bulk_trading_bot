@@ -46,12 +46,18 @@ class FakeSession:
 
 
 class FakeHedger:
-    def __init__(self, actionable=1.0):
+    def __init__(self, actionable=1.0, sells=None):
         self.actionable = actionable
+        # Which way the hedge trades. None is an ordinary hedge, which
+        # sweeps the maker's own side.
+        self.sells = sells
         self.hedged = []
 
     def actionable_hedge(self, roles, price):
         return self.actionable
+
+    def sweeps_bid(self, roles):
+        return roles.maker_is_buy if self.sells is None else self.sells
 
     async def hedge(self, roles, mark_price=None, suspended=None):
         self.hedged.append(roles.key)
@@ -578,3 +584,66 @@ async def test_a_signal_while_a_hedge_runs_is_not_lost():
     await asyncio.wait_for(worker, 2)
 
     assert calls == [key, key], "the second signal was dropped"
+
+
+# -- a hedge that trades the maker's way --------------------------------------
+#
+# Live: a group whose maker sold was over-hedged, and its correction SOLD --
+# into the bid, where another group's reduce-only buy was resting on a second
+# account of ours. The path cleared and marked was the asks, the maker's side,
+# so the correction filled that buy: our own hedge trading against our own
+# order.
+
+
+async def test_a_correcting_hedge_clears_the_side_it_actually_sweeps():
+    obj = strategy()
+    obj.hedger.sells = True                      # over-hedged: the fix sells
+    roles = register(obj, "g4:" + BTC, "maker-s", maker_is_buy=False, oid="ask-4")
+    register(obj, "g1:" + BTC, "maker-b", maker_is_buy=True, oid="bid-1")
+
+    await obj._clear_hedge_path(roles)
+
+    assert obj.sessions["maker-b"].cancelled == [(BTC, "bid-1")], (
+        "the buy in the correction's path was left resting"
+    )
+    assert obj.sessions["maker-s"].cancelled == [], (
+        "the maker's own ask is not in a sale's path"
+    )
+
+
+async def test_a_correcting_hedge_marks_the_side_it_sweeps():
+    """While it runs, no group re-places onto that side."""
+    obj = strategy()
+    obj.hedger.sells = True
+    roles = register(obj, "g4:" + BTC, "maker-s", maker_is_buy=False, oid="ask-4")
+    buyer = register(obj, "g1:" + BTC, "maker-b", maker_is_buy=True, oid="bid-1")
+    seen = []
+
+    async def hedge(roles, mark_price=None, suspended=None):
+        from bulkdn.hedger import HedgeResult
+
+        seen.append((obj._being_swept(buyer), obj._being_swept(roles)))
+        return HedgeResult(BTC, 0.0, 0.0, False, "flat")
+
+    obj.hedger.hedge = hedge
+    await obj._hedge_leg(roles)
+
+    assert seen == [(True, False)]
+
+
+def test_the_hedger_says_which_way_a_hedge_trades():
+    from bulkdn.hedger import Hedger, LegRoles
+    from bulkdn.marketdata import MarketSpec
+    from bulkdn.positions import PositionBook
+
+    book = PositionBook()
+    hedger = Hedger(
+        book=book, sessions={}, specs={BTC: MarketSpec(BTC, 0.01, 0.000001, 1.0)},
+    )
+    roles = LegRoles(BTC, maker="M", taker="H", maker_is_buy=False, reduce_only=False)
+
+    book.set_authoritative("M", BTC, -0.003296)   # the maker sold
+    assert hedger.sweeps_bid(roles) is False, "its hedge buys, taking asks"
+
+    book.set_authoritative("H", BTC, 0.005430)    # and was hedged too far
+    assert hedger.sweeps_bid(roles) is True, "the correction sells, taking bids"

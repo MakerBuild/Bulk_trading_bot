@@ -192,6 +192,9 @@ def two_groups(tmp_path, monkeypatch):
         def actionable_hedge(self, roles, price=None):
             return 0.0
 
+        def sweeps_bid(self, roles):
+            return roles.maker_is_buy
+
         async def hedge(self, roles, mark_price=None, suspended=None):
             if suspended is not None and suspended():
                 return HedgeResult(roles.symbol, 0.0, 0.0, False, "suspended")
