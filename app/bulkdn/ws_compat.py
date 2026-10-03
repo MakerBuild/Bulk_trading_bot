@@ -11,9 +11,13 @@ the account stream also emits the short forms (`sym`, `oid`, `px`, `sz`, `b`,
 symbol and size 0.0 -- which this bot would treat as "nothing filled" and never
 hedge. Both spellings are accepted here.
 
-**2. `tradeId` is discarded.** Added in API v1.0.17 and needed to recognise
-replayed fills. `Fill` has no such field upstream, so it is attached
-dynamically; the dataclass has no `__slots__`, so this is safe.
+**2. The trade id is discarded.** Needed to recognise replayed fills. `Fill`
+has no such field upstream, so it is attached dynamically; the dataclass has no
+`__slots__`, so this is safe. It is read by `wire.trade_id`, the same identity
+the fee walk counts trades by: `slot` and `sequence`, which is what mainnet
+sends, or `tradeId` (API v1.0.17) where that is all there is. Reading only
+`tradeId`, as this once did, left every mainnet fill with no id at all -- and
+the replay guard, which treats a missing id as new, silently off.
 
 **3. TLS verification fails against the live endpoints -- on Windows.** This was
 read the wrong way round for a while, and the wrong reading is worth recording
@@ -52,9 +56,16 @@ from bulk_api.common import Side
 from bulk_api.messages.trade import Fill
 from websockets.asyncio.client import connect as _original_ws_connect
 
+from .wire import first as _first
+from .wire import is_buy as _fill_is_buy
+from .wire import trade_id as _trade_id
+
 log = logging.getLogger(__name__)
 
 _PATCHED = False
+# Said once per process: a fill without an id is a fact about the stream's
+# shape, and it would otherwise be repeated on every fill of a run.
+_no_trade_id_warned = False
 
 # The SDK's default is short enough that a cold connection can miss it.
 _OPEN_TIMEOUT = 30
@@ -183,34 +194,6 @@ def _tolerant_status_from_string(original):
     return classmethod(parse)
 
 
-def _first(data: dict, *names: str, default: Any = None) -> Any:
-    for name in names:
-        if name in data and data[name] is not None:
-            return data[name]
-    return default
-
-
-# Where a fill's side may be stated. `isBuy`/`b` are what the stream sends; a
-# `side` string is accepted too, in the spellings an exchange tends to use.
-_SIDE_WORDS = {"buy": True, "b": True, "bid": True, "sell": False, "s": False,
-               "a": False, "ask": False}
-
-
-def _fill_is_buy(data: dict) -> bool | None:
-    """True for a buy, False for a sell, None when the fill does not say."""
-    flag = _first(data, "isBuy", "b")
-    if isinstance(flag, bool):
-        return flag
-    if isinstance(flag, (int, float)) and flag in (0, 1):
-        return bool(flag)
-    if isinstance(flag, str) and flag.lower() in ("true", "false"):
-        return flag.lower() == "true"
-    word = _first(data, "side")
-    if isinstance(word, str):
-        return _SIDE_WORDS.get(word.strip().lower())
-    return None
-
-
 @classmethod
 def _robust_fill_from_api(cls, data: dict) -> Fill:
     """Parse a fill from either the long or short field spelling.
@@ -252,10 +235,25 @@ def _robust_fill_from_api(cls, data: dict) -> Fill:
         is_maker=bool(_first(data, "maker", "mk", default=False)),
     )
     fill.side_missing = is_buy is None
-    # v1.0.17 trade id, used to drop replayed fills. Not a field on Fill
-    # upstream, so it is attached here.
-    fill.trade_id = _first(data, "tradeId", "tid")
+    # Used to drop replayed fills. Not a field on Fill upstream, so it is
+    # attached here. See point 2 in the module docstring.
+    fill.trade_id = _trade_id(data)
+    if fill.trade_id is None and size:
+        _warn_no_trade_id(data)
     return fill
+
+
+def _warn_no_trade_id(data: dict) -> None:
+    global _no_trade_id_warned
+    if _no_trade_id_warned:
+        return
+    _no_trade_id_warned = True
+    log.warning(
+        "a fill arrived with no trade id (neither slot+sequence nor tradeId; "
+        "fields: %s) -- a fill replayed after a reconnect cannot be recognised "
+        "and may be applied to the book twice until positions are re-read",
+        sorted(data),
+    )
 
 
 def apply_ws_compat() -> None:

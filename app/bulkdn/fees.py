@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 
 import requests
 
+from . import wire
 from .marketdata import epoch_seconds
 
 log = logging.getLogger(__name__)
@@ -115,16 +116,13 @@ def account_fee_tier(
     if response.status_code == 404:
         return None
     response.raise_for_status()
-    data = response.json()
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    if not isinstance(data, dict) or not data:
-        return None
     # The quote arrives wrapped: `[{"feeTier": {...}}]`. Reading the outer
     # object found none of the fields and every `or 0.0` filled in a zero, so
     # the menu printed "taker 0.0 bps" over a real 3.5 -- a fee schedule that
     # does not exist, stated as fact.
-    data = data.get("feeTier") if isinstance(data.get("feeTier"), dict) else data
+    data = wire.unwrap(response.json(), "feeTier")
+    if not data:
+        return None
 
     # No rate in the payload means no quote, not a free account. A zero here is
     # the difference between "trading costs nothing" and "we could not tell",
@@ -300,18 +298,11 @@ def _is_buy(fill: dict) -> bool | None:
     """Which side THIS account was on, or None when the row does not say.
 
     `isBuy` is the side of the account whose history it is, which is what a
-    cash flow needs. A row without it is left out of the price result rather
-    than guessed.
+    cash flow needs. Read by `wire.is_buy`, the same parser the fill stream
+    uses. A row that does not say is left out of the price result rather than
+    guessed.
     """
-    value = fill.get("isBuy", fill.get("b"))
-    if isinstance(value, bool):
-        return value
-    side = str(fill.get("side") or "").lower()
-    if side in ("buy", "b", "bid"):
-        return True
-    if side in ("sell", "s", "ask"):
-        return False
-    return None
+    return wire.is_buy(fill)
 
 
 # Fields that describe one account's VIEW of a trade rather than the trade:
@@ -323,24 +314,22 @@ _VIEW_FIELDS = frozenset({"fee", "makerFee", "takerFee", "isBuy", "side", "user"
 def _trade_key(fill: dict):
     """What identifies the trade a row belongs to, for counting it once.
 
-    `slot` and `sequence` together, when both are there -- verified unique
-    across a live history: 1830 rows, 1465 ids, no collisions. That is the
-    only shape seen so far.
+    `wire.trade_id`: `slot` and `sequence` together when both are there --
+    verified unique across a live history: 1830 rows, 1465 ids, no collisions,
+    and the only shape seen so far -- else a `tradeId`. The fill stream
+    identifies its fills by the same function.
 
-    It used to be those two and nothing else, so a row missing either one got
-    the key `(None, None)` -- and so did every other such row. The first was
-    counted and every later one was taken for a repeat of it: a history in
-    another shape would have totalled one trade's volume, and a volume target
-    would never have been reached. A `tradeId` is used instead where there is
-    one; failing that, the row's own contents minus the per-account fields, so
-    that two rows are only ever merged when they genuinely say the same thing.
+    It used to be slot and sequence and nothing else, so a row missing either
+    one got the key `(None, None)` -- and so did every other such row. The
+    first was counted and every later one was taken for a repeat of it: a
+    history in another shape would have totalled one trade's volume, and a
+    volume target would never have been reached. With no id at all, the key
+    is the row's own contents minus the per-account fields, so that two rows
+    are only ever merged when they genuinely say the same thing.
     """
-    slot, sequence = fill.get("slot"), fill.get("sequence")
-    if slot is not None and sequence is not None:
-        return ("slot", slot, sequence)
-    trade_id = fill.get("tradeId", fill.get("tid"))
-    if trade_id is not None:
-        return ("id", str(trade_id))
+    trade = wire.trade_id(fill)
+    if trade is not None:
+        return ("id", trade)
     return ("row",) + tuple(
         sorted((k, repr(v)) for k, v in fill.items() if k not in _VIEW_FIELDS)
     )
@@ -395,18 +384,7 @@ def fills_page(http, user: str, limit: int, cursor: str | None) -> tuple[list[di
 
     response = requests.post(f"{http.base_url}/account", json=payload, timeout=30)
     response.raise_for_status()
-    body = response.json()
-
-    # A history query answers with {data, page}; a current-state query answers
-    # with a bare list. Both are accepted so a shape change degrades to "no
-    # rows" rather than an exception.
-    if isinstance(body, list):
-        return [row for row in body if isinstance(row, dict)], None
-
-    rows = [row for row in (body.get("data") or []) if isinstance(row, dict)]
-    page = body.get("page") or {}
-    next_cursor = page.get("nextCursor") or page.get("next_cursor")
-    return rows, next_cursor
+    return wire.page(response.json())
 
 
 # Accounts already warned about in this process. The walk runs every thirty

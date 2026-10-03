@@ -34,6 +34,7 @@ from bulk_api import BulkWebSocketClient
 from bulk_api.api.bulk_http import BulkHttpClient
 from bulk_api.api.bulk_ws import ConnectionState
 from .retry import describe, post_signed
+from .wire import unwrap_full_account
 from bulk_api.common import (
     OrderStatus,
     Side,
@@ -1503,21 +1504,8 @@ def verify_sub_account(master: AccountSession, sub1: AccountSession) -> None:
     log.info("verified %s is a sub-account of %s", short_pubkey(sub1.pubkey), short_pubkey(master.pubkey))
 
 
-def unwrap_full_account(payload: Any) -> dict:
-    """Flatten a `/account` response down to the account body.
-
-    Observed shapes: `{"fullAccount": {...}}`, `[{"fullAccount": {...}}]`, and
-    a bare `{...}`. All three are accepted so a change in envelope does not
-    silently turn a funded account into an apparently empty one.
-    """
-    if isinstance(payload, list):
-        payload = payload[0] if payload else {}
-    if not isinstance(payload, dict):
-        return {}
-    inner = payload.get("fullAccount")
-    if isinstance(inner, dict):
-        return inner
-    return payload
+# `unwrap_full_account` lives in `wire`, beside the other envelope readers,
+# and is imported above; `menu` and the tests still import it from here.
 
 
 def short_pubkey(pubkey: str | None) -> str:
