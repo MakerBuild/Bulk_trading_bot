@@ -40,8 +40,10 @@ BULKDN = pathlib.Path(__file__).resolve().parent.parent / "bulkdn"
 # the referral gate, the run's identity line -- need one and do not care
 # which. What they may not do is stand in for "the accounts".
 ALLOWED = {
-    # The pool's first two, which is where the names come from.
-    ("cli.py", "self.master, self.sub1 = self.pool[0], self.pool[1]"),
+    # The pool's first two, which is where the names come from. A runtime
+    # that only closes or looks may hold one account, so sub1 can be None.
+    ("cli.py", "self.master = self.pool[0]"),
+    ("cli.py", "self.sub1 = self.pool[1] if len(self.pool) > 1 else None"),
     # The market data socket borrows an HTTP client for the exchange's public
     # endpoints (specs, ticker); any key's would do, and the first is at hand.
     ("cli.py", "ws_url=config.ws_url, http=self.master.http,"),
@@ -49,8 +51,9 @@ ALLOWED = {
     ("cli.py", "decision = check_referral_access(self.master.pubkey, self.config.access)"),
     # Parent-child is a claim about two specific accounts, and it is guarded
     # by `_same_tree` so it is only made inside one tree.
-    ("cli.py", "if verify and self._same_tree(self.master, self.sub1):"),
+    ("cli.py", "if verify and self.sub1 is not None and self._same_tree(self.master, self.sub1):"),
     ("cli.py", "verify_sub_account(self.master, self.sub1)"),
+    ("cli.py", "if runtime.sub1 is None:"),
     ("cli.py", "if not Runtime._same_tree(runtime.master, runtime.sub1):"),
     ("cli.py", "verify_sub_account(runtime.master, runtime.sub1)"),
     # Handed to the strategy, which keeps them for the same reasons.
@@ -70,7 +73,7 @@ ALLOWED = {
 # wrong, and fixing it does not change what the bot does.
 LOG_ONLY = {
     ("cli.py", "self.master.pubkey,"),
-    ("cli.py", "self.sub1.pubkey,"),
+    ("cli.py", 'self.sub1.pubkey if self.sub1 is not None else "-",'),
     ("cli.py", "master=runtime.master.pubkey,"),
     ("cli.py", "sub1=runtime.sub1.pubkey,"),
 }

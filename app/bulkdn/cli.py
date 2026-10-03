@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
 import logging
 import logging.handlers
 import os
@@ -170,11 +171,30 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
 
 
 class Runtime:
-    """Wires the components together and owns their lifecycle."""
+    """Wires the components together and owns their lifecycle.
+
+    `trading=False` is for the commands that only look or close -- status,
+    check, flatten. They act on EVERY key in the file, whatever the mode, and
+    need no second account: closing one master's positions does not need
+    anything to pair with, and a mode is a choice about what to OPEN.
+    """
 
     def __init__(
-        self, config: Config, dry_run: bool, symbols: list[str] | None = None
+        self,
+        config: Config,
+        dry_run: bool,
+        symbols: list[str] | None = None,
+        *,
+        trading: bool = True,
     ):
+        # A private copy, which is this run's plan. The sizing below replaces
+        # each leg's size with what the thinnest account can carry, and a leg
+        # written as a range redraws its size every cycle; the chaser, the
+        # hedge ceilings and the exit sizes all read those resolved numbers
+        # from here. Doing it to the caller's Config meant the caller had to
+        # copy defensively before every run -- the menu did, Telegram did --
+        # and a caller that forgot ran its next run on the last one's sizes.
+        config = copy.deepcopy(config)
         self.config = config
         self.dry_run = dry_run
         # The markets this runtime subscribes to and acts on. A trading run
@@ -202,7 +222,7 @@ class Runtime:
         # `multi` hands over every key, so a group can span two masters. The
         # drawing, the trading and the accounting are the same code either
         # way -- which is why there is no second path to keep in step.
-        keys = self._keys_in_play(config)
+        keys = self._keys_in_play(config) if trading else list(config.private_keys)
         # Every account under every key in play, on one socket per key.
         # Discovery is an HTTP call per key rather than something the operator
         # copies by hand: a sub-account is a fact about its master, and a list
@@ -215,15 +235,25 @@ class Runtime:
             symbols=self.symbols,
             dry_run=dry_run,
         )
-        if len(self.pool) < 2:
+        # Only a run that opens positions needs two accounts. Status, check
+        # and flatten used to refuse here too, so a master whose only
+        # sub-account had not been created yet could not even be closed.
+        if trading and len(self.pool) < 2:
             raise ConfigError(
                 f"{config.mode} mode needs at least two accounts to pair, and "
                 f"the key(s) it uses produced {len(self.pool)}. Create a "
                 "sub-account from Accounts Management."
             )
+        if not self.pool:
+            raise ConfigError(
+                "the keys in the key file produced no accounts at all. A BULK "
+                "account is created by a deposit -- make one first."
+            )
         # The first two keep their old names for the commands that act on
-        # one account -- status, transfer, the market feed's socket.
-        self.master, self.sub1 = self.pool[0], self.pool[1]
+        # one account -- status, transfer, the market feed's socket. A closing
+        # runtime may have only the one.
+        self.master = self.pool[0]
+        self.sub1 = self.pool[1] if len(self.pool) > 1 else None
         log.info(
             "%s: %d accounts under %d key(s) on %d socket(s)",
             config.mode,
@@ -317,7 +347,7 @@ class Runtime:
             "mainnet mode=%s master=%s sub1=%s legs=%s (%s)",
             "DRY-RUN" if self.dry_run else "LIVE",
             self.master.pubkey,
-            self.sub1.pubkey,
+            self.sub1.pubkey if self.sub1 is not None else "-",
             ",".join(self.symbols),
             self.config.mode,
         )
@@ -339,7 +369,7 @@ class Runtime:
         if trading:
             self.check_access()
 
-        if verify and self._same_tree(self.master, self.sub1):
+        if verify and self.sub1 is not None and self._same_tree(self.master, self.sub1):
             verify_sub_account(self.master, self.sub1)
 
         if not trading:
@@ -444,10 +474,11 @@ class Runtime:
         Runs in dry-run too, so a rehearsal shows the sizes a live run would
         really use rather than the ones written in the file.
 
-        The legs are mutated in place because everything downstream -- the
+        The legs are resized in place because everything downstream -- the
         chaser's targets, the hedge ceilings, the exit sizes -- reads them from
         the config, and a second source of truth for size is how the two end up
-        disagreeing.
+        disagreeing. It is this runtime's own copy that changes (see
+        `__init__`), never the Config the caller handed in.
         """
         legs = list(self.config.active_legs)
         # Priced over HTTP, not from the feed: this runs before the WebSocket
@@ -769,7 +800,11 @@ async def cmd_flatten(
     # ones only and then reset the state, so a market turned off with a
     # position still open was left on the exchange and forgotten.
     every_market = list(dict.fromkeys(market.symbol for market in config.markets))
-    runtime = Runtime(config, dry_run, symbols=every_market)
+    # Every key, whatever the mode. In single mode the trading runtime holds
+    # one master's accounts only, and closing through it left every other
+    # master's positions open -- and then reset the state to IDLE as if they
+    # were not there.
+    runtime = Runtime(config, dry_run, symbols=every_market, trading=False)
     await runtime.start(verify=False, trading=False)
     closed = True
     try:
@@ -867,7 +902,9 @@ async def cmd_status(config: Config) -> int:
     # exactly what someone reading `status` needs to see, and it was the one
     # thing this left out.
     every_market = list(dict.fromkeys(market.symbol for market in config.markets))
-    runtime = Runtime(config, dry_run=True, symbols=every_market)
+    # Every key too, for the same reason as `flatten`: a status that answers
+    # for one master in single mode says nothing about the others.
+    runtime = Runtime(config, dry_run=True, symbols=every_market, trading=False)
     # Not strict: one delisted or misspelled market must not hide the rest.
     runtime.load_specs(strict=False)
     switched_off = {m.symbol for m in config.markets if not m.enabled}
@@ -932,9 +969,15 @@ async def cmd_status(config: Config) -> int:
 
 async def cmd_check(config: Config) -> int:
     """Validate configuration and account wiring without connecting to trade."""
-    runtime = Runtime(config, dry_run=True)
+    runtime = Runtime(config, dry_run=True, trading=False)
     runtime.feed.load_specs()
     print("market specs OK")
+    if runtime.sub1 is None:
+        print(
+            "only one account: a run needs two to pair. Create a sub-account "
+            "from Accounts Management -> Create New Subaccount."
+        )
+        return 1
     if not Runtime._same_tree(runtime.master, runtime.sub1):
         # Nothing is wrong: in multi mode the pool's first two accounts can be
         # two different masters, and neither is the other's child.

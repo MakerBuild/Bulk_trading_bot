@@ -472,7 +472,7 @@ def test_status_covers_switched_off_markets(monkeypatch, capsys):
             return []
 
     class Status:
-        def __init__(self, cfg, dry_run, symbols=None):
+        def __init__(self, cfg, dry_run, symbols=None, trading=True):
             made.append(symbols)
             self.symbols = symbols
             self.pool = [Session()]

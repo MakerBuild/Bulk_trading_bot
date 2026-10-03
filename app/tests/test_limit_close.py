@@ -296,7 +296,7 @@ class FakeRuntime:
     # elsewhere" check: {account: {symbol: size}}.
     leftover = {}
 
-    def __init__(self, config, dry_run, symbols=None):
+    def __init__(self, config, dry_run, symbols=None, trading=True):
         from bulkdn.state import StrategyState
 
         self.config = config
