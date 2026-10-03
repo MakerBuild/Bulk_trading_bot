@@ -446,3 +446,75 @@ def test_a_429_status_is_still_throttling():
     assert is_rate_limited(OrderRejected("HTTP 429: slow down", []))
     assert is_rate_limited(OrderRejected("status=429", []))
     assert is_rate_limited(OrderRejected("Too Many Requests", []))
+
+
+def test_too_many_open_orders_is_a_refusal_not_throttling():
+    """`too many` was a throttling marker, so this never counted toward the
+    streak and the kill switch could not trip on it."""
+    from bulkdn.accounts import OrderRejected, is_rate_limited
+
+    assert not is_rate_limited(OrderRejected("too many open orders", []))
+    assert not is_rate_limited(TransactionRejected("refused", {"message": "too many orders"}))
+
+
+async def test_a_refusal_for_too_many_orders_counts_toward_the_kill_switch():
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    for n in range(1, 6):
+        answer = asyncio.create_task(
+            answer_when_sent(
+                client, n, lambda sent: [refused(sent[-1]["id"], "too many open orders")]
+            )
+        )
+        with pytest.raises(OrderRejected):
+            await master.submit([FakeAction()])
+        await answer
+
+    assert master.reject_streak == 5
+
+
+async def throttle(client, master, times, already=0):
+    for n in range(already + 1, already + times + 1):
+        answer = asyncio.create_task(
+            answer_when_sent(client, n, lambda sent: [refused(sent[-1]["id"], "rate limited")])
+        )
+        with pytest.raises(OrderRejected):
+            await master.submit([FakeAction()])
+        await answer
+
+
+async def test_throttling_that_never_lets_up_still_trips_the_kill_switch(monkeypatch):
+    """A burst is absorbed; an account that cannot get a transaction through
+    for half a minute must not chase forever."""
+    import bulkdn.accounts as accounts_mod
+
+    monkeypatch.setattr(accounts_mod, "THROTTLE_STREAK_LIMIT", 3)
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    await throttle(client, master, 3)
+    assert master.reject_streak == 0, "a burst of throttling was counted"
+
+    await throttle(client, master, 5, already=3)
+    assert master.reject_streak == 5
+    assert "throttled 8 times in a row" in master.last_reject
+
+
+async def test_an_accepted_transaction_ends_the_throttling_count(monkeypatch):
+    import bulkdn.accounts as accounts_mod
+
+    monkeypatch.setattr(accounts_mod, "THROTTLE_STREAK_LIMIT", 3)
+    client = socket_client()
+    master = session_on(client, "m1", MASTER)
+
+    await throttle(client, master, 3)
+    answer = asyncio.create_task(
+        answer_when_sent(client, 4, lambda sent: [accepted(sent[-1]["id"], "resting")])
+    )
+    await master.submit([FakeAction()])
+    await answer
+    assert master.throttle_streak == 0
+
+    await throttle(client, master, 3, already=4)
+    assert master.reject_streak == 0

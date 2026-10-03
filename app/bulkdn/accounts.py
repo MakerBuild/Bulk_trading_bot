@@ -80,7 +80,14 @@ class TransactionRejected(OrderRejected):
         self.detail = detail
 
 
-_RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "ratelimit", "too many", "throttl")
+# Phrases that say throttling and nothing else. "too many" used to be one of
+# them, and "too many open orders" -- a refusal for cause, and exactly the kind
+# the reject streak exists to catch -- read as throttling, so it was never
+# counted and the kill switch could not trip on it. "Too Many Requests" is the
+# 429 status's own reason phrase, and is matched whole.
+_RATE_LIMIT_MARKERS = (
+    "rate limit", "rate-limit", "ratelimit", "throttl", "too many requests",
+)
 # The status code on its own, not as digits inside a longer number. The
 # refusal's text carries the whole response -- ids, nonces, prices -- and a
 # bare substring match read "bad signature" with a 429 somewhere in a nonce as
@@ -92,12 +99,25 @@ def is_rate_limited(exc: BaseException) -> bool:
     """Whether a refusal is the exchange throttling us rather than saying no.
 
     Judged from the text, which is all a refusal carries: the reply has no
-    code for it that this bot has seen.
+    code for it that this bot has seen. So only phrases that cannot mean
+    anything else count, and a 429 standing on its own.
     """
     text = f"{exc} {getattr(exc, 'detail', '') or ''}".lower()
     return any(marker in text for marker in _RATE_LIMIT_MARKERS) or bool(
         _STATUS_429.search(text)
     )
+
+
+# How many throttled transactions in a row an account absorbs before each
+# further one counts toward the reject streak. Throttling is kept off the streak
+# because a burst of 429s on a shared socket reached five inside five seconds
+# of chasing, and the streak halts the run and closes every account at market
+# -- no answer to an outage of a few seconds. But throttling that never lets up
+# is an account that cannot trade, and it must still halt eventually rather than
+# chase forever. Thirty is about half a minute of nothing but refusals at the
+# chaser's pace of one re-price a second; with the default streak limit of five
+# the run halts on the thirty-fifth.
+THROTTLE_STREAK_LIMIT = 30
 
 
 class NotSent(RuntimeError):
@@ -612,6 +632,9 @@ class AccountSession:
     http: BulkHttpClient
     dry_run: bool = False
     reject_streak: int = 0
+    # Throttled transactions since the exchange last answered anything else.
+    # See THROTTLE_STREAK_LIMIT.
+    throttle_streak: int = 0
     # What the exchange said about the most recent counted rejection. The
     # streak alone says a kill switch fired; this says why, which is the part
     # anyone reading the halt an hour later actually needs.
@@ -769,15 +792,12 @@ class AccountSession:
             # asking for a position read that could only say "nothing
             # happened".
             self._settle(actions)
-            if count_rejects and not is_rate_limited(exc):
+            if count_rejects and is_rate_limited(exc):
+                self._throttled(exc)
+            elif count_rejects:
+                self.throttle_streak = 0
                 self.reject_streak += 1
                 self.last_reject = str(exc)
-            elif count_rejects:
-                # Throttled, not refused for cause. The streak halts the run
-                # and closes every account at market, and a burst of 429s on a
-                # shared socket reached five inside five seconds of chasing --
-                # an outage of a few seconds is no reason to do that.
-                log.warning("%s: throttled by the exchange: %s", self.name, describe(exc))
             raise
         except Exception:
             # No answer came back. The actions may have executed anyway, so
@@ -791,6 +811,10 @@ class AccountSession:
             raise
 
         self._settle(actions)
+        if count_rejects:
+            # Answered, and not with a throttle: whatever else this reply
+            # says, the exchange is letting us through.
+            self.throttle_streak = 0
 
         rejected = [r for r in responses if r.is_error()]
         if rejected:
@@ -809,6 +833,27 @@ class AccountSession:
             self.reject_streak = 0
             self.last_reject = ""
         return responses
+
+    def _throttled(self, exc: BaseException) -> None:
+        """Count a throttled transaction, and past the limit, count it as a reject.
+
+        Not refused for cause, so not on the streak at first: the streak halts
+        the run and closes every account at market, and a few seconds of 429s
+        is no reason to. Past THROTTLE_STREAK_LIMIT in a row it is no longer a
+        burst, and each one more is counted, so the kill switch still trips --
+        later than for a refusal, but it trips.
+        """
+        self.throttle_streak += 1
+        if self.throttle_streak <= THROTTLE_STREAK_LIMIT:
+            log.warning("%s: throttled by the exchange: %s", self.name, describe(exc))
+            return
+        self.reject_streak += 1
+        self.last_reject = f"throttled {self.throttle_streak} times in a row: {exc}"
+        log.error(
+            "%s: throttled %d times in a row -- now counted toward the reject "
+            "streak: %s",
+            self.name, self.throttle_streak, describe(exc),
+        )
 
     def _settle(self, actions: Sequence[Action]) -> None:
         """An answer came back, so these symbols are no longer in doubt."""
