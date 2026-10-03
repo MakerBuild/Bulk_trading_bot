@@ -26,6 +26,17 @@ from .retry import describe
 
 log = logging.getLogger(__name__)
 
+# How long a flatten pass waits for a read to show the closes it sent, and
+# how often it asks. A close that fully filled usually shows on the first read;
+# one that did not -- a partial fill, an account that cannot be read -- is
+# given up on after this and the next pass closes what is left.
+FLATTEN_SETTLE_S = 5.0
+FLATTEN_READ_INTERVAL_S = 0.25
+# The pause before retrying after a close the exchange refused or never
+# answered. Going again at once mostly meets the same refusal -- a throttle
+# answers every request inside its window.
+FLATTEN_RETRY_PAUSE_S = 1.0
+
 
 async def sync_positions(sessions: Sequence[AccountSession], book: PositionBook) -> None:
     """Read every account's positions over HTTP, and apply them on the loop.
@@ -173,7 +184,7 @@ async def reconcile_net(
 
 async def _read_what_can_be_read(
     sessions: dict[str, AccountSession], book: PositionBook
-) -> None:
+) -> set[str]:
     """Re-read positions for a flatten, carrying on past accounts that fail.
 
     A flatten used to stop at the first failed read: one 429 on one account
@@ -183,15 +194,73 @@ async def _read_what_can_be_read(
     from the last position known for it. Every close is reduce-only, so a
     stale size can come up short or be refused, never open anything, and the
     next pass reads again.
+
+    Returns the pubkeys whose read failed.
     """
-    try:
-        await sync_positions(list(sessions.values()), book)
-    except Exception as exc:  # noqa: BLE001 - the accounts that answered still close
+    reads, failures = await asyncio.to_thread(_read_all, list(sessions.values()))
+    for session, parsed, requested_at in reads:
+        _apply(session, parsed, requested_at, book)
+    if failures:
         log.error(
-            "flatten: could not re-read every account (%s) -- closing from the "
-            "last known positions for the rest",
-            describe(exc),
+            "flatten: could not re-read %s (%s) -- closing from the last known "
+            "positions for those",
+            ", ".join(s.name for s, _ in failures), describe(failures[0][1]),
         )
+    return {s.pubkey for s, _ in failures}
+
+
+class _Close:
+    """A close that was answered, and the position it should leave."""
+
+    __slots__ = ("session", "symbol", "expected", "lot")
+
+    def __init__(self, session: AccountSession, symbol: str, expected: float, lot: float):
+        self.session = session
+        self.symbol = symbol
+        self.expected = expected
+        self.lot = lot
+
+    def shows_in(self, book: PositionBook) -> bool:
+        held = abs(book.effective(self.session.pubkey, self.symbol))
+        return held <= self.expected + self.lot / 2
+
+
+async def _read_until_closed(
+    sessions: dict[str, AccountSession], book: PositionBook, closed: list[_Close]
+) -> None:
+    """Re-read until every answered close shows, or `FLATTEN_SETTLE_S` passes.
+
+    Every read here begins after the closes were answered, so the next pass
+    is sized from one that can include them. It used to sleep a second and
+    read once. The exchange's HTTP answer can trail its own stream, and a read
+    still showing a close that had gone through sized a second one for it --
+    refused as reduce-only and counted toward the reject streak, in the middle
+    of an emergency stop -- while a close that showed at once waited out the
+    second anyway.
+
+    `sessions` are the accounts a close went to, answered or not; the others
+    are where the last read left them. An account whose read fails is not
+    waited for: no read is going to show its close, and the next pass closes
+    it from the last position known.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + FLATTEN_SETTLE_S
+    while True:
+        unreadable = await _read_what_can_be_read(sessions, book)
+        waiting = [
+            c for c in closed
+            if c.session.pubkey not in unreadable and not c.shows_in(book)
+        ]
+        if not waiting:
+            return
+        if loop.time() >= deadline:
+            log.warning(
+                "flatten: %s not yet showing in a read after %.0fs -- going on",
+                ", ".join(f"{c.session.name} {c.symbol}" for c in waiting),
+                FLATTEN_SETTLE_S,
+            )
+            return
+        await asyncio.sleep(FLATTEN_READ_INTERVAL_S)
 
 
 def _report_dust(
@@ -233,14 +302,14 @@ async def flatten(
     Reduce-only throughout, so a stale position reading can never flip an
     account into a new position in the opposite direction. Runs a few passes
     because a close can partially fill; positions are re-read from HTTP between
-    passes rather than trusted from the local book.
+    passes rather than trusted from the local book, and each pass is sized from
+    a read that began after the previous pass's closes were answered.
     """
+    # Off the loop: this runs inside a live strategy (a group's residual
+    # sweep, the emergency stop), and a blocking read here froze every other
+    # group's hedges for a round trip per account.
+    await _read_what_can_be_read(sessions, book)
     for attempt in range(1, max_passes + 1):
-        # Off the loop: this runs inside a live strategy (a group's residual
-        # sweep, the emergency stop), and a blocking read here froze every
-        # other group's hedges for a round trip per account.
-        await _read_what_can_be_read(sessions, book)
-
         outstanding = []
         for session in sessions.values():
             for symbol in symbols:
@@ -271,9 +340,13 @@ async def flatten(
             max_passes,
             len(outstanding),
         )
+        closed: list[_Close] = []
+        touched: dict[str, AccountSession] = {}
+        failed = False
         for session, symbol, size, rounded in outstanding:
             # A long is closed by selling, a short by buying.
             is_buy = size < 0
+            touched[session.pubkey] = session
             try:
                 await session.close_market(symbol, is_buy, rounded)
                 log.info(
@@ -283,16 +356,20 @@ async def flatten(
                     rounded,
                     session.name,
                 )
+                closed.append(
+                    _Close(session, symbol, abs(size) - rounded, feed.specs[symbol].lot_size)
+                )
             except Exception as exc:  # noqa: BLE001 - the next close still goes
+                failed = True
                 log.error(
                     "flatten: failed to close %s on %s: %s",
                     symbol, session.name, describe(exc),
                 )
 
-        # Give the exchange a moment to settle before re-reading.
-        await asyncio.sleep(1.0)
+        if failed:
+            await asyncio.sleep(FLATTEN_RETRY_PAUSE_S)
+        await _read_until_closed(touched, book, closed)
 
-    await _read_what_can_be_read(sessions, book)
     leftovers = [
         f"{session.name} {symbol}={book.effective(session.pubkey, symbol):+.8f}"
         for session in sessions.values()
