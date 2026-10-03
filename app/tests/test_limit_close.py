@@ -327,7 +327,7 @@ class FakeRuntime:
 
 
 def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None,
-                    leftover=None, **kwargs):
+                    leftover=None, cancel_failures=None, **kwargs):
     from bulkdn import cli
 
     FakeRuntime.instances = []
@@ -338,7 +338,7 @@ def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None
     monkeypatch.setattr(cli, "Runtime", FakeRuntime)
 
     async def no_cancel(sessions, symbols):
-        return None
+        return cancel_failures
 
     async def fake_limit(*a, **kw):
         return closed
@@ -425,6 +425,37 @@ def test_a_live_flatten_clears_it(monkeypatch, tmp_path):
     after = store.load()
     assert after.phase == Phase.IDLE
     assert after.halted_reason is None
+
+
+def test_a_cancel_that_failed_is_not_reported_as_flat(monkeypatch, tmp_path, capsys, caplog):
+    """An order nobody could cancel may still be resting and fill after the
+    close. Resetting the state and exiting 0 told the operator to stop looking
+    at exactly the account to look at."""
+    import logging
+
+    from bulkdn.state import Phase, StateStore, StrategyState
+
+    store = StateStore(str(tmp_path / "state.json"))
+    store.save(StrategyState(phase=Phase.HALTED, halted_reason="hedge limit"))
+    account = type("S", (), {"name": "m2s1"})()
+
+    with caplog.at_level(logging.CRITICAL, logger="bulkdn"):
+        code = run_cmd_flatten(
+            monkeypatch, closed=True, dry_run=False, store=store,
+            cancel_failures=[(account, RuntimeError("timed out"))],
+        )
+
+    assert code == 1
+    assert store.load().phase == Phase.HALTED, "the state was reset over it"
+    assert "could NOT be cancelled" in capsys.readouterr().out
+    record = next(r for r in caplog.records if "m2s1" in r.getMessage())
+    assert record.levelno == logging.CRITICAL and record.alert is True
+
+
+def test_no_failures_reported_is_read_as_none_failed(monkeypatch):
+    """The older cancel_all_orders returned None."""
+    assert run_cmd_flatten(monkeypatch, closed=True, cancel_failures=None) == 0
+    assert run_cmd_flatten(monkeypatch, closed=True, cancel_failures=[]) == 0
 
 
 # -- the panic button cannot be stopped by what only trading needs -----------

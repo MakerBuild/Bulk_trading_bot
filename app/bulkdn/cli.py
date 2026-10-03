@@ -368,7 +368,7 @@ class Runtime:
         # failure is logged rather than raised: it must not become the thing
         # that stops the start either.
         if trading and not self.dry_run:
-            await cancel_all_orders(self.pool, self.symbols)
+            _report_cancel_failures(await cancel_all_orders(self.pool, self.symbols))
 
         # Before anything is placed. A gate that tripped later would abandon
         # open positions and leave the pair directional.
@@ -770,7 +770,7 @@ async def _run(runtime: Runtime, config: Config, dry_run: bool, on_strategy=None
     except Exception:
         # Logged rather than only raised, so the traceback reaches the log file
         # and not just the console window that is about to close.
-        log.exception("run failed")
+        log.exception("run failed", extra={"alert": True})
         raise
     finally:
         stopper.cancel()
@@ -786,6 +786,22 @@ async def _run(runtime: Runtime, config: Config, dry_run: bool, on_strategy=None
             # that failed to close used to skip this, and the halt alert that
             # explained the failure was cancelled unsent.
             await runtime.notifier.drain()
+
+
+def _report_cancel_failures(failures) -> bool:
+    """Say, loudly, which accounts' cancel-all failed. True when any did.
+
+    `cancel_all_orders` returns its failures as (session, exception) pairs;
+    an older build returned None, which is read as "none failed". CRITICAL
+    and marked as an alert, because a resting order nobody cancelled is an
+    unhedged fill waiting to happen.
+    """
+    for session, exc in failures or ():
+        log.critical(
+            "%s: could not cancel its orders: %s", session.name, describe(exc),
+            extra={"alert": True},
+        )
+    return bool(failures)
 
 
 async def cmd_flatten(
@@ -821,7 +837,9 @@ async def cmd_flatten(
         # pool mode those two are two of however many the keys produced --
         # leaving a resting order on the rest is leaving an unhedged fill
         # waiting to happen on an account nobody is watching any more.
-        await cancel_all_orders(runtime.pool, runtime.symbols)
+        cancel_failed = _report_cancel_failures(
+            await cancel_all_orders(runtime.pool, runtime.symbols)
+        )
         if limit:
             # From the first market switched on. `markets[0]` is whatever
             # happens to be first in the file, and it may be one switched off
@@ -857,6 +875,16 @@ async def cmd_flatten(
             for line in sorted(elsewhere):
                 print(f"    {line}")
             print("  Close these on the exchange by hand. The state is kept.")
+            return 1
+        if cancel_failed:
+            # An order that could not be cancelled may still be resting, and
+            # can fill after the close with nothing hedging it. Reporting flat
+            # -- and resetting the state that remembers the run -- would tell
+            # the operator to stop looking at exactly the account to look at.
+            print("")
+            print("  Some orders could NOT be cancelled -- see the lines above.")
+            print("  They may still be resting. Run Close All again, or cancel")
+            print("  them on the exchange by hand. The state is kept.")
             return 1
 
         state = runtime.store.load()
