@@ -33,6 +33,21 @@ class StubConfig:
     active_legs = [master_account, sub_account]
 
 
+class Loaded:
+    """A Settings that reads the same Config every time."""
+
+    path = "config.yaml"
+
+    def __init__(self, config):
+        self.config = config
+
+    def load(self):
+        return self.config
+
+    def forget_keys(self):
+        pass
+
+
 def feed(monkeypatch, answers):
     """Drive the menu from a scripted list of keystrokes."""
     it = iter(answers)
@@ -66,12 +81,12 @@ def test_confirm_treats_eof_as_refusal(monkeypatch):
 
 def test_exit_returns_immediately(monkeypatch):
     feed(monkeypatch, ["0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_unknown_choice_reprompts_then_exits(monkeypatch):
     feed(monkeypatch, ["99", "", "0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_menu_survives_an_action_that_raises(monkeypatch):
@@ -81,7 +96,7 @@ def test_menu_survives_an_action_that_raises(monkeypatch):
 
     monkeypatch.setattr(menu, "_active_strategy", boom)
     feed(monkeypatch, ["2", "", "0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_no_account_tree_is_reported_as_guidance(monkeypatch):
@@ -90,7 +105,7 @@ def test_no_account_tree_is_reported_as_guidance(monkeypatch):
 
     monkeypatch.setattr(menu, "_history", missing)
     feed(monkeypatch, ["3", "", "0"])
-    assert menu.run_menu(StubConfig(), "config.yaml") == 0
+    assert menu.run_menu(Loaded(StubConfig())) == 0
 
 
 def test_start_declined_does_not_run_the_strategy(monkeypatch):

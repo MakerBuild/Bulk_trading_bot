@@ -92,6 +92,11 @@ class _ConsoleFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
+        # For a line the screen already shows in a form of its own -- a
+        # startup error printed as a sentence, a settings problem drawn in a
+        # box -- and that is logged only so logs.txt has it too.
+        if getattr(record, "console", True) is False:
+            return False
         if record.levelno >= logging.WARNING:
             return True
         if record.name in _QUIET_ON_SCREEN:
@@ -113,6 +118,11 @@ class _StatusHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+def set_log_level(level: str) -> None:
+    """The level everything is logged at, from the settings or the flag."""
+    logging.getLogger().setLevel(getattr(logging, level.upper(), logging.INFO))
+
+
 def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     """Log to the console, and to `log_file` alongside it.
 
@@ -120,19 +130,33 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     screen the date is obvious, in a file read days later it is the point.
 
     The console also gets far less of it -- see `_ConsoleFilter`.
+
+    Called first thing, before the settings are read, so that whatever stops
+    a start is in the file too. The level is set again once the settings say
+    what it should be. Calling it twice replaces its handlers rather than
+    doubling every line.
     """
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    set_log_level(level)
 
     # basicConfig's own handler prints straight to the stream, which would
-    # scroll through the status block. Replaced rather than added to.
+    # scroll through the status block. Replaced rather than added to -- and
+    # so are this function's own, from an earlier call.
     root = logging.getLogger()
+    wanted = os.path.abspath(log_file) if log_file else None
     for handler in list(root.handlers):
-        if type(handler) is logging.StreamHandler:
+        ours = isinstance(handler, _StatusHandler) or (
+            isinstance(handler, logging.handlers.RotatingFileHandler)
+            and handler.baseFilename == wanted
+        )
+        if type(handler) is logging.StreamHandler or ours:
             root.removeHandler(handler)
+            if ours:
+                handler.close()
     console = _StatusHandler(screen_mod.SCREEN)
     console.setFormatter(
         logging.Formatter("%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
@@ -1419,9 +1443,53 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _startup_error(what: str, exc: Exception) -> None:
+    """A reason the command cannot start: on screen as a sentence, and in the file.
+
+    It used to be a bare print, before logging existed -- so it was nowhere
+    once the window closed, which on Windows it did at once.
+    """
+    print(f"\n{what}: {exc}", file=sys.stderr)
+    log.error("%s: %s", what, exc, extra={"console": False})
+
+
+def _ready(config: Config, log_level: str | None) -> None:
+    """What every command needs once the settings have been read."""
+    set_log_level(log_level or config.log_level)
+    # Before anything reads an account. See ratelimit for why every path
+    # through the transport, the SDK's included, has to share one pace.
+    ratelimit.install(config.http_url)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # First, so that anything below that stops the start is in logs.txt as
+    # well as on a screen that may be about to close. The settings' own
+    # level is applied once they have been read.
+    configure_logging(args.log_level or "INFO")
+
+    if args.command in (None, "menu"):
+        # Imported here, not at the top. `menu` is a front end over these
+        # commands and calls back into them, so importing it at module
+        # scope made the two mutually dependent -- and paid for with eight
+        # `from .cli import ...` lines hidden inside menu's functions. One
+        # deferred import in the one place that needs it costs less and
+        # says which direction the dependency actually runs.
+        from .menu import Settings, run_menu
+
+        # The menu opens whatever state the settings are in. A setting it
+        # cannot read is shown there, with a way to fix it -- refusing to
+        # open was what sent people to a command prompt to find out why the
+        # window closed.
+        return run_menu(
+            Settings(
+                args.config,
+                mode=args.mode,
+                on_load=lambda config: _ready(config, args.log_level),
+            )
+        )
 
     try:
         config = load_config(
@@ -1430,10 +1498,8 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
         )
     except ConfigError as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
+        _startup_error("configuration error", exc)
         return 1
-
-    configure_logging(args.log_level or config.log_level)
 
     # Before anything opens a socket, and after logging so the choice is on the
     # record. A bad proxy line stops the bot here rather than being ignored:
@@ -1442,12 +1508,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         proxy.configure()
     except proxy.ProxyError as exc:
-        print(f"proxy error: {exc}", file=sys.stderr)
+        _startup_error("proxy error", exc)
         return 1
 
-    # Before anything reads an account. See ratelimit for why every path
-    # through the transport, the SDK's included, has to share one pace.
-    ratelimit.install(config.http_url)
+    _ready(config, args.log_level)
 
     dry_run = not getattr(args, "live", False)
     if not dry_run:
@@ -1456,16 +1520,6 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("=" * 70)
 
     try:
-        if args.command in (None, "menu"):
-            # Imported here, not at the top. `menu` is a front end over these
-            # commands and calls back into them, so importing it at module
-            # scope made the two mutually dependent -- and paid for with eight
-            # `from .cli import ...` lines hidden inside menu's functions. One
-            # deferred import in the one place that needs it costs less and
-            # says which direction the dependency actually runs.
-            from .menu import run_menu
-
-            return run_menu(config, args.config)
         if args.command == "run":
             return asyncio.run(cmd_run(config, dry_run))
         if args.command == "flatten":
@@ -1498,7 +1552,7 @@ def main(argv: list[str] | None = None) -> int:
     except AccessDenied as exc:
         # A refusal is an expected outcome, not a crash -- say so plainly
         # rather than unwinding a traceback over it.
-        print(f"\naccess denied: {exc}", file=sys.stderr)
+        _startup_error("access denied", exc)
         print(
             "This build runs only for accounts signed up under the owner's "
             "referral code.",
@@ -1510,7 +1564,7 @@ def main(argv: list[str] | None = None) -> int:
         # exchange -- fewer than two accounts to pair, a single_master past the
         # last key, a leverage above the market's ceiling. The same plain
         # sentence as a bad file, not a traceback through asyncio.run.
-        print(f"\nconfiguration error: {exc}", file=sys.stderr)
+        _startup_error("configuration error", exc)
         return 1
     except KeyboardInterrupt:
         log.warning("interrupted")

@@ -26,4 +26,16 @@ rem The package lives in app\, which is not where Python looks by default.
 set "PYTHONPATH=%~dp0app"
 
 "%VENV_PY%" -m bulkdn %*
-exit /b %ERRORLEVEL%
+set "CODE=%ERRORLEVEL%"
+rem Kept open on a failure. A window opened by double-clicking run.bat
+rem closes the moment this script ends, and with it went the only copy
+rem of whatever stopped the bot -- the guide had to tell people to open a
+rem command prompt and run it from there just to read one line. The
+rem reason is in logs.txt as well. Exit code 0 closes as before.
+if not "%CODE%"=="0" (
+    echo.
+    echo   The bot stopped with an error ^(code %CODE%^). The reason is above,
+    echo   and in logs.txt.
+    pause
+)
+exit /b %CODE%

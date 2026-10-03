@@ -14,7 +14,6 @@ from __future__ import annotations
 import asyncio
 import codecs
 import contextlib
-import copy
 import logging
 import math
 import os
@@ -113,21 +112,6 @@ def _pause() -> None:
     # Ctrl+C here means "get me out", which is where this goes anyway.
     with contextlib.suppress(Cancelled):
         _ask("\n  [enter] to return to the menu ")
-
-
-def _fresh(config: Config) -> Config:
-    """A private copy of the settings for one run.
-
-    A run writes into the config it is given: the sizing plan replaces each
-    leg's size with what the thinnest account can carry, and a leg written as
-    a range redraws its size every cycle. That is by design inside a run --
-    but the menu held ONE config for its whole life, so a dry run's sizes
-    became the next live run's sizes, capped by whatever margin the rehearsal
-    happened to see. Each run now gets its own copy, and nothing it does
-    outlives it. The menu's own edits -- targets, markets, mode -- still land
-    on the original, which is what every later copy is taken from.
-    """
-    return copy.deepcopy(config)
 
 
 # -- helpers ----------------------------------------------------------------
@@ -305,13 +289,13 @@ def _start(config: Config) -> None:
     print("  need a second window, and you do not need to close this one.")
     choice = _ask("\n  > ")
     if choice == "1":
-        asyncio.run(cmd_run(_fresh(config), dry_run=True))
+        asyncio.run(cmd_run(config, dry_run=True))
     elif choice == "2":
         if _confirm(f"Start LIVE trading, {config.mode} mode, on "
                     f"{', '.join(leg.symbol for leg in config.active_legs)}: "
                     f"{_stop_conditions(config)}; "
                     f"{config.hold_minutes} min hold per cycle."):
-            asyncio.run(cmd_run(_fresh(config), dry_run=False))
+            asyncio.run(cmd_run(config, dry_run=False))
         else:
             print("  aborted")
     _pause()
@@ -341,14 +325,14 @@ def _telegram(config: Config) -> None:
         _pause()
         return
     try:
-        asyncio.run(serve(_fresh(config), dry_run=not live))
+        asyncio.run(serve(config, dry_run=not live))
     except KeyboardInterrupt:
         print("\n  Telegram control stopped.")
     _pause()
 
 
 def _active_strategy(config: Config) -> None:
-    asyncio.run(cmd_status(_fresh(config)))
+    asyncio.run(cmd_status(config))
     _pause()
 
 
@@ -1084,7 +1068,9 @@ def _key_state(path: str) -> str:
     return "default password"
 
 
-def _accounts_menu(config: Config, config_path: str) -> None:
+def _accounts_menu(
+    config: Config, config_path: str, settings: Settings | None = None
+) -> None:
     from .config import PRIVATE_KEY_FILE
 
     state = _key_state(PRIVATE_KEY_FILE)
@@ -1116,6 +1102,10 @@ def _accounts_menu(config: Config, config_path: str) -> None:
         elif choice == "5":
             _erase_data(config, config_path)
             state = _key_state(PRIVATE_KEY_FILE)
+            # The key may be gone: the next action reads the file again
+            # rather than trading on a copy held from before the erase.
+            if settings is not None:
+                settings.forget_keys()
         elif choice in ("6", "0"):
             return
 
@@ -1736,8 +1726,12 @@ def _add_market(config: Config, config_path: str) -> None:
         notional=notional, cap=cap, leverage=leverage, enabled=not switch_off,
     )
     print(f"\n  {symbol} added to {config_path}, copied from {template.symbol}")
-    # There is no restart item in the menu; the file is read once, at start.
-    print("  It is read when the bot starts: exit (0) and run it again to trade it.")
+    # The menu reads the file again before every action, so the next Start
+    # trades it. This screen's own list is refreshed here.
+    from .config import load_config
+
+    config.markets[:] = load_config(config_path, require_credentials=False, warn=False).markets
+    print("  The next Start trades it" + (" once it is switched on." if switch_off else "."))
 
 
 def _markets_screen(config: Config, config_path: str) -> None:
@@ -2061,10 +2055,10 @@ def _close_all(config: Config) -> None:
 
     choice = _ask("\n  > ")
     if choice == "1":
-        asyncio.run(cmd_flatten(_fresh(config), dry_run=True))
+        asyncio.run(cmd_flatten(config, dry_run=True))
     elif choice == "2":
         if _confirm("Close all positions at market."):
-            asyncio.run(cmd_flatten(_fresh(config), dry_run=False))
+            asyncio.run(cmd_flatten(config, dry_run=False))
         else:
             print("  aborted")
     elif choice == "3":
@@ -2076,7 +2070,7 @@ def _close_all(config: Config) -> None:
             print("  so it can take a while -- Ctrl+C cancels the orders and stops.")
             asyncio.run(
                 cmd_flatten(
-                    _fresh(config), dry_run=False, limit=True,
+                    config, dry_run=False, limit=True,
                     timeout_s=LIMIT_CLOSE_TIMEOUT_S,
                 )
             )
@@ -2110,17 +2104,190 @@ def main_item(label: str) -> str:
     return f"{MAIN_ITEMS.index(label) + 1}. {label}"
 
 
-def run_menu(config: Config, config_path: str) -> int:
+class Settings:
+    """settings.yaml, read again for every action, and the keys read once.
+
+    The menu used to read the file once, when it opened, and hand that one
+    Config to everything for the rest of its life. An edit made in Notepad
+    while it was open did nothing until a restart -- the add-market screen had
+    to say "exit and run again" -- and a run's sizes, written into that one
+    Config, became the next run's unless every caller remembered to copy it
+    first. Now every action gets the file as it is at that moment.
+
+    The keys are the exception. Reading them can mean typing a password, and
+    asking for it before every action would be a reason to stop encrypting the
+    key file. They are read once and kept until the key file is erased.
+    `forget_keys` drops them.
+
+    `on_load` runs after every successful read: the CLI applies the log level
+    and the request pacing there, from whatever the file now says.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        mode: str | None = None,
+        on_load: Callable[[Config], None] | None = None,
+    ):
+        self.path = path
+        self.mode = mode
+        self.on_load = on_load
+        self.keys: list[str] | None = None
+        self._proxy_version: object = None
+
+    def load(self) -> Config:
+        """The settings as they are now. Raises ConfigError or ProxyError."""
+        from .config import load_config, load_private_keys
+
+        self._apply_proxy()
+        if self.keys is None:
+            # The file first: a typo in it should be found before anyone is
+            # asked for a password it was never going to get past.
+            load_config(self.path, require_credentials=False, mode=self.mode)
+            # Kept only when there is something to keep. An empty key file is
+            # the usual first-run state, and the key pasted into it a minute
+            # later has to be read then, not after a restart.
+            self.keys = load_private_keys(required=True) or None
+        config = load_config(
+            self.path, require_credentials=True, mode=self.mode,
+            private_keys=self.keys or [],
+        )
+        if self.on_load is not None:
+            self.on_load(config)
+        return config
+
+    def forget_keys(self) -> None:
+        self.keys = None
+
+    def _apply_proxy(self) -> None:
+        """Route through proxy.local as it is now -- re-read when it changes.
+
+        Applied again only when the file changes, so an edit takes effect at
+        the next action and an unchanged file does not log the same line
+        before every one.
+        """
+        path = pathlib.Path(proxy.PROXY_FILE)
+        try:
+            stat = path.stat()
+            version: object = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            version = "absent"
+        if version != self._proxy_version:
+            proxy.configure()
+            self._proxy_version = version
+
+
+def _open_in_editor(path: str) -> None:
+    """Open a file in the editor this machine has, and wait until it is closed.
+
+    Notepad on Windows; $EDITOR, then nano, on Linux. With neither, the path
+    is printed instead -- the server case, where whoever is at the keyboard
+    already has their own way of editing a file.
+    """
+    import subprocess
+
+    if os.name == "nt":
+        command = ["notepad", path]
+    else:
+        editor = os.environ.get("EDITOR") or shutil.which("nano") or shutil.which("vi")
+        if not editor:
+            print(f"\n  No editor found. Edit this file, then choose Try again:\n    {path}")
+            return
+        command = [*editor.split(), path]
+    print(f"\n  Opening {path} -- close the editor when you have saved it.")
+    try:
+        subprocess.run(command, check=False)
+    except OSError as exc:
+        print(f"  could not open an editor ({exc}). Edit the file by hand:\n    {path}")
+
+
+def _reset_settings(config_path: str) -> None:
+    """Replace the settings with the shipped ones, keeping a copy of the old.
+
+    The copy is named `settings.yaml.bak-<time>`, beside it, so nothing the
+    operator tuned is lost -- and git ignores it.
+    """
+    import datetime
+
+    from .config import SETTINGS_TEMPLATE
+
+    template = pathlib.Path(SETTINGS_TEMPLATE)
+    if not template.exists():
+        print(f"\n  {_shown(template)} is missing, so there is nothing to reset to -- "
+              f"run {script('update')}.")
+        return
+    target = pathlib.Path(config_path)
+    if target.exists():
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = target.with_name(f"{target.name}.bak-{stamp}")
+        shutil.copyfile(target, backup)
+        print(f"\n  Your old settings are kept as {_shown(backup)}")
+    shutil.copyfile(template, target)
+    print(f"  {_shown(target)} is now the shipped defaults. Check the sizes before Start.")
+
+
+def _settings_problem(settings: Settings, problem: Exception) -> bool:
+    """Show why the settings cannot be used, and offer the ways out.
+
+    Returns False when the operator chose to leave. Every way of fixing it
+    ends back at a fresh read, so the menu opens the moment it is fixed --
+    with no restart, and no command prompt to find the message in.
+    """
+    from .config import PRIVATE_KEY_FILE, load_config
+
+    # Logged so logs.txt has it as well; drawn below, so not on screen twice.
+    log.error("cannot use the settings: %s", problem, extra={"console": False})
+
+    # Which file to send them to. The settings file loading on its own means
+    # the fault is in the key file -- or the proxy, which says so itself.
+    is_proxy = isinstance(problem, proxy.ProxyError)
+    file_ok = False
+    if not is_proxy:
+        try:
+            load_config(settings.path, require_credentials=False, warn=False)
+            file_ok = True
+        except Exception:  # noqa: BLE001 - any failure means the file is the fault
+            file_ok = False
+    culprit = proxy.PROXY_FILE if is_proxy else (PRIVATE_KEY_FILE if file_ok else settings.path)
+
+    print("\n" + _box("THE BOT CANNOT START YET", [
+        f"Something in {culprit} needs fixing.",
+        "Nothing has been sent to the exchange.",
+    ]))
+    for line in str(problem).splitlines() or [""]:
+        print(f"  {line}")
+    print(f"\n  The same message is in {LOG_FILE}.")
+    print("\n  1. Try again           -- once you have fixed it")
+    print(f"  2. Open {culprit} to fix it")
+    if culprit == settings.path:
+        print("  3. Reset to the shipped settings  -- your copy is kept")
+    print("  0. Exit")
+    try:
+        choice = _ask("\n  > ")
+    except Cancelled:
+        return False
+    if choice == "0":
+        return False
+    if choice == "2":
+        _open_in_editor(str(pathlib.Path(culprit).resolve()))
+    elif choice == "3" and culprit == settings.path:
+        _reset_settings(settings.path)
+    return True
+
+
+def run_menu(settings: Settings) -> int:
     items = [main_item(label) for label in MAIN_ITEMS] + ["0. Exit"]
-    handlers: dict[str, Callable[[], None]] = {
-        "Start": lambda: _start(config),
-        "Active Strategy": lambda: _active_strategy(config),
-        "History": lambda: _history(config),
-        "Accounts Management": lambda: _accounts_menu(config, config_path),
-        "Configuration": lambda: _configuration(config, config_path),
-        CLOSE_ALL_LABEL: lambda: _close_all(config),
-        "Logs": _logs,
-        "Telegram Control": lambda: _telegram(config),
+    # Each is handed the Config read for that choice.
+    handlers: dict[str, Callable[[Config], None]] = {
+        "Start": _start,
+        "Active Strategy": _active_strategy,
+        "History": _history,
+        "Accounts Management": lambda config: _accounts_menu(config, settings.path, settings),
+        "Configuration": lambda config: _configuration(config, settings.path),
+        CLOSE_ALL_LABEL: _close_all,
+        "Logs": lambda _config: _logs(),
+        "Telegram Control": _telegram,
     }
     actions = {
         str(number): handlers[label]
@@ -2128,6 +2295,19 @@ def run_menu(config: Config, config_path: str) -> int:
     }
 
     while True:
+        # Read again before every choice: what is shown and what an action
+        # does are what the file says now. See Settings.
+        try:
+            config = settings.load()
+        except (ConfigError, proxy.ProxyError) as exc:
+            if not _settings_problem(settings, exc):
+                return 1
+            continue
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl+C at the password prompt.
+            print()
+            return 130
+
         print("\n" + _box("DELTA-NEUTRAL BOT", items))
         print(f"  mainnet  {config.http_url}")
         try:
@@ -2143,7 +2323,7 @@ def run_menu(config: Config, config_path: str) -> int:
             print("  no such option")
             continue
         try:
-            action()
+            action(config)
         except Cancelled:
             # Whatever the prompt was about to write or send, it did not.
             print("  cancelled -- nothing was changed")
@@ -2152,9 +2332,13 @@ def run_menu(config: Config, config_path: str) -> int:
             _pause()
         except ConfigError as exc:
             print(f"\n  configuration error: {exc}")
+            log.error("configuration error: %s", exc, extra={"console": False})
             _pause()
         except KeyboardInterrupt:
             print("\n  interrupted")
         except Exception as exc:  # noqa: BLE001 - the menu must survive anything
             print(f"\n  {type(exc).__name__}: {exc}")
+            # The screen gets one line; the file gets the traceback, which is
+            # what anyone asked to help will need.
+            log.error("menu item %s failed", choice, exc_info=True, extra={"console": False})
             _pause()
