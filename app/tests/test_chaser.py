@@ -671,3 +671,40 @@ async def test_a_placement_that_never_left_is_not_tracked():
     with pytest.raises(NotConnected):
         await chaser.step(OPEN_BTC, leg)
     assert leg.oid is None
+
+
+# -- prices on the tick (API v1.0.20) ---------------------------------------
+#
+# The exchange now puts every resting order on the tick, buys down and sells
+# up. One tick short of an ask that was itself between ticks went out between
+# ticks; it would rest at the rounded price, and the order map reporting a
+# price we never asked for read as "the touch moved" on every pass.
+
+
+def _on_tick(price, tick=SPEC.tick_size):
+    return abs(price / tick - round(price / tick)) < 1e-9
+
+
+async def test_a_buy_one_tick_short_of_an_off_tick_ask_goes_out_on_the_tick():
+    quote = Quote(BTC, best_bid=100_000.0, best_ask=100_000.73, mark_price=100_000.4, age_s=0.0)
+    chaser, book, master, _s = build(quote=quote, offset_bps=0.0)
+    book.set_authoritative(MASTER, BTC, 0.0)
+
+    await chaser.step(OPEN_BTC, LegState(symbol=BTC, target_size=1.0))
+
+    price = master.placed[0]["price"]
+    assert _on_tick(price), f"{price} is between ticks"
+    assert price <= 100_000.23, "a buy is rounded down, staying passive"
+
+
+async def test_a_sell_one_tick_past_an_off_tick_bid_goes_out_on_the_tick():
+    quote = Quote(BTC, best_bid=99_999.77, best_ask=100_000.5, mark_price=100_000.1, age_s=0.0)
+    chaser, book, master, _s = build(quote=quote, offset_bps=0.0)
+    book.set_authoritative(MASTER, BTC, 0.0)
+    selling = LegRoles(BTC, maker=MASTER, taker=SUB1, maker_is_buy=False, reduce_only=False)
+
+    await chaser.step(selling, LegState(symbol=BTC, target_size=1.0))
+
+    price = master.placed[0]["price"]
+    assert _on_tick(price), f"{price} is between ticks"
+    assert price >= 100_000.27, "a sell is rounded up, staying passive"

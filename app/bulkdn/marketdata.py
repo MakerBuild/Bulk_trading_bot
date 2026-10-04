@@ -38,13 +38,37 @@ class MarketSpec:
 
     @classmethod
     def from_api(cls, data: dict[str, Any]) -> MarketSpec:
+        """Read one market from /exchangeInfo, in either API's names.
+
+        API v1.0.20 renamed `lotSize` to `sizeIncrement` and `sizePrecision`
+        to `sizeDecimals`. Both spellings are read, the new one first, so the
+        bot works on either side of the upgrade.
+
+        The steps have no defaults. `lotSize` used to fall back to 1e-8 when
+        absent -- which the rename would have made it on every market: a
+        0.0001 ETH step read as 1e-8, sizes no longer multiples of it, and
+        every order refused until the reject streak closed the run. A market
+        whose steps cannot be read is refused by name instead.
+        """
+        symbol = data["symbol"]
+
+        def step(*names: str) -> float:
+            for name in names:
+                if data.get(name) is not None:
+                    return float(data[name])
+            raise ValueError(
+                f"{symbol}: /exchangeInfo gives none of {', '.join(names)} -- "
+                "cannot round orders for this market"
+            )
+
+        decimals = data.get("sizeDecimals", data.get("sizePrecision", 8))
         return cls(
-            symbol=data["symbol"],
-            tick_size=float(data.get("tickSize", 0.01)),
-            lot_size=float(data.get("lotSize", 0.00000001)),
+            symbol=symbol,
+            tick_size=step("tickSize"),
+            lot_size=step("sizeIncrement", "lotSize"),
             min_notional=float(data.get("minNotional", 0.0)),
             price_precision=int(data.get("pricePrecision", 8)),
-            size_precision=int(data.get("sizePrecision", 8)),
+            size_precision=int(decimals),
             max_leverage=float(data.get("maxLeverage", 1.0)),
         )
 

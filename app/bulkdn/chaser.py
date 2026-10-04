@@ -46,7 +46,7 @@ from .accounts import AccountSession, NotSent, OrderRejected
 from .feed import MarketFeed
 from .hedger import LegRoles
 from .marketdata import (
-    chase_price, distance_bps, is_tradeable, min_order_size, round_size,
+    chase_price, distance_bps, is_tradeable, min_order_size, round_price, round_size,
 )
 from .retry import describe
 from .positions import PositionBook
@@ -262,6 +262,15 @@ class Chaser:
             beyond = target > own_touch if roles.maker_is_buy else target < own_touch
             if beyond:
                 target = own_touch
+
+        # Onto the tick, the way the exchange now puts every resting order
+        # (API v1.0.20): buys down, sells up. A target taken from someone
+        # else's price -- the touch joined, or one tick short of an ask that
+        # was not on a tick -- went out between ticks, which the exchange
+        # used to accept as sent. It now rests at the rounded price instead,
+        # and an order map reporting a price we did not ask for read as "the
+        # touch moved" on every pass: a replace each time, for nothing.
+        target = round_price(target, spec, roles.maker_is_buy)
 
         # Also finished when what is left is under the market's minimum at the
         # price the order goes out at. It used to be measured at the mark: a
