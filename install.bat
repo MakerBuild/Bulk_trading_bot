@@ -242,7 +242,7 @@ rem it as a broken bot rather than a bad route.
 rem
 rem The filename is pinned, like the commit below it. app\vendor\README.md says
 rem what has to move when the SDK does.
-set "SDK_WHEEL=app\vendor\bulk_client-0.1.2-py3-none-any.whl"
+set "SDK_WHEEL=app\vendor\bulk_client-0.1.2+bulkdn.1-py3-none-any.whl"
 set "SDK_OK="
 if exist "!SDK_WHEEL!" (
     rem Only when it changed. The SDK's version string does not change

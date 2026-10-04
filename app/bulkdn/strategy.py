@@ -29,11 +29,11 @@ import logging
 import random
 import time
 
-from bulk_api.common import Side, Topic
+from bulk_api.common import Side, TimeInForce, Topic
 
 from .accounts import AccountSession, SharedReconnect
 from .chaser import ChaseParams, Chaser
-from .config import Config
+from .config import Config, ConfigError
 from .feed import MarketFeed
 from .fees import burned_usd as _burned
 from .fees import realised_for_trees
@@ -4086,6 +4086,17 @@ class Strategy:
 
 
 def build_chase_params(config: Config) -> dict[str, ChaseParams]:
+    for leg in config.active_legs:
+        if leg.time_in_force not in TimeInForce.__members__:
+            # The SDK that ships with the bot (app/vendor) knows the v1.0.20
+            # values; the GitHub copy the installer falls back to does not.
+            # Said here, before the run, rather than as a refusal of the
+            # first order.
+            raise ConfigError(
+                f"{leg.symbol}: time_in_force {leg.time_in_force} needs the BULK "
+                "SDK that ships with the bot -- run the installer again "
+                "(install.bat, or ./install.sh), or set it back to ALO"
+            )
     return {
         leg.symbol: ChaseParams(
             offset_bps=leg.offset_bps,
@@ -4094,6 +4105,7 @@ def build_chase_params(config: Config) -> dict[str, ChaseParams]:
             chase_patience_s=leg.chase_patience_s,
             improve_ticks=leg.improve_ticks,
             join_depth_usd=leg.join_depth_usd,
+            time_in_force=leg.time_in_force,
         )
         for leg in config.active_legs
     }

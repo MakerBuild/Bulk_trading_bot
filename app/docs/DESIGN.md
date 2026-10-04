@@ -181,7 +181,8 @@ With no fill held, an update is written as before.
    Windows wheels). 3.12–3.14 is what has been run; newer gets a warning.
 2. creates `app/.venv` (`python -m venv app\.venv`), and uses `proxy.local` for pip when it
    holds an address.
-3. installs the SDK from the **vendored wheel** `app/vendor/bulk_client-0.1.2-py3-none-any.whl`
+3. installs the SDK from the **vendored wheel** `app/vendor/bulk_client-0.1.2+bulkdn.1-py3-none-any.whl`
+   (`3a6506e` plus upstream `96c3252`'s `ALO_SLIDE`/`ALO_JOIN`; see `app/vendor/README.md`)
    with `--no-deps --force-reinstall`, falling back to the pinned GitHub commit
    `3a6506e` only when the wheel is missing (a copy that predates it).
 4. installs everything else from **`app/docs/requirements.txt`** — the one pinned list.
@@ -637,6 +638,7 @@ parameters that shape execution:
 | `legs.*.chase_patience_s` | Unfilled for this long: give up the offset and rest on the touch. Still passive |
 | `legs.*.improve_ticks` | Ticks to post PAST the touch once tightened, clamped inside the spread. 1 = best bid/ask outright; 0 = join the queue |
 | `legs.*.join_depth_usd` | Once tightened, rest at the best level (within 1bps of the touch) where others hold at least this many dollars, our own orders not counted; keep a level while it holds half that; move when it thins. Overrides `improve_ticks`. 0 = off |
+| `legs.*.time_in_force` | `ALO` (default), `ALO_JOIN` or `ALO_SLIDE` (API v1.0.20): what the exchange does with a maker order that would cross on arrival -- refuse it, rest it at the best same-side price, or at the nearest non-crossing tick. All stay maker orders; the price held is read back from the order map |
 | `legs.*.max_order_notional_usd` | Cap on any single resting order, in dollars |
 | `legs.*.max_order_size` | The same cap, as a base quantity |
 | `hold_minutes` | Time fully open before exiting; a number or a `low-high` range drawn per cycle |

@@ -107,6 +107,8 @@ class ChaseParams:
     chase_patience_s: float = 0.0
     improve_ticks: int = 1
     join_depth_usd: float = 0.0
+    # ALO, ALO_JOIN or ALO_SLIDE. See `LegConfig.time_in_force`.
+    time_in_force: str = "ALO"
 
 
 def effective_offset_bps(
@@ -293,6 +295,12 @@ class Chaser:
         desired = round_size(min(remaining, cap), spec)
 
         resting = self._resting_order(session, leg)
+        if resting is not None and resting.price != leg.price:
+            # Where it actually rests. With ALO_JOIN or ALO_SLIDE the exchange
+            # moves a crossing order rather than refusing it, and the price
+            # sent is no longer the price held -- which the join rule and the
+            # "waiting for a fill" line both read from here.
+            leg.price = resting.price
 
         if resting is None:
             record = self._orders.get(leg.oid) if leg.oid else None
@@ -506,6 +514,7 @@ class Chaser:
                 size=size,
                 reduce_only=roles.reduce_only,
                 cancel_oid=replace_oid,
+                time_in_force=self.params[symbol].time_in_force,
             )
         except OrderRejected as exc:
             # A rejected replace leaves `leg.oid` on the original, which is

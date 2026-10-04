@@ -44,7 +44,11 @@ class FakeSession:
         self.cancelled = []
         self._counter = 0
 
-    async def place_limit(self, symbol, is_buy, price, size, reduce_only=False, cancel_oid=None):
+    async def place_limit(
+        self, symbol, is_buy, price, size, reduce_only=False, cancel_oid=None,
+        time_in_force="ALO",
+    ):
+        self.time_in_force = time_in_force
         self._counter += 1
         oid = f"oid-{self._counter}"
         self.placed.append(
@@ -708,3 +712,31 @@ async def test_a_sell_one_tick_past_an_off_tick_bid_goes_out_on_the_tick():
     price = master.placed[0]["price"]
     assert _on_tick(price), f"{price} is between ticks"
     assert price >= 100_000.27, "a sell is rounded up, staying passive"
+
+
+# -- ALO_JOIN / ALO_SLIDE (API v1.0.20) ---------------------------------------
+
+
+async def test_the_chaser_sends_the_markets_time_in_force():
+    chaser, book, master, _s = build()
+    chaser.params[BTC].time_in_force = "ALO_JOIN"
+    book.set_authoritative(MASTER, BTC, 0.0)
+
+    await chaser.step(OPEN_BTC, LegState(symbol=BTC, target_size=1.0))
+
+    assert master.time_in_force == "ALO_JOIN"
+
+
+async def test_the_price_held_is_the_one_the_order_map_reports():
+    """With ALO_JOIN the exchange may rest a crossing order somewhere other
+    than where it was sent; the leg follows where it actually rests."""
+    chaser, book, master, _s = build()
+    book.set_authoritative(MASTER, BTC, 0.0)
+    leg = LegState(symbol=BTC, target_size=1.0)
+    await chaser.step(OPEN_BTC, leg)
+
+    master.client.order_map[leg.oid].price = 99_990.0   # joined lower down
+    await chaser.step(OPEN_BTC, leg)
+
+    assert len(master.placed) == 1, "within the drift limit, so left where it rests"
+    assert leg.price == 99_990.0

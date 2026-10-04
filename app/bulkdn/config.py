@@ -85,6 +85,10 @@ SIGNATURE_DOMAIN_NAME = "MAINNET"
 MIN_LEVERAGE = 1.0
 MAX_LEVERAGE = 50.0
 
+# The maker time-in-force values a market may name, in the exchange's own
+# spelling. See `LegConfig.time_in_force`.
+MAKER_TIME_IN_FORCE = ("ALO", "ALO_JOIN", "ALO_SLIDE")
+
 
 class ConfigError(Exception):
     """Raised when the configuration is missing or internally inconsistent."""
@@ -152,6 +156,15 @@ class LegConfig:
     # with more than 1 BTC resting beside us it met our own price. Queueing
     # behind others is slower to fill, which is the price of it.
     join_depth_usd: float = 0.0
+    # What the exchange does with a maker order that would cross by the time
+    # it arrives (API v1.0.20). ALO refuses it -- `rejectedCrossing` -- and the
+    # chaser re-prices on its next pass. ALO_JOIN rests it at the best price on
+    # its own side instead, which is where the chaser was heading anyway;
+    # ALO_SLIDE at the nearest tick that does not cross. All three stay maker
+    # orders and leave a non-crossing price as sent. ALO is the default: it is
+    # what every measured run used, and a change of fill behaviour is judged by
+    # comparing runs, not assumed.
+    time_in_force: str = "ALO"
     # The per-order cap, in whichever unit suits; it defaults to the whole leg.
     max_order_size: float = 0.0
     max_order_notional_usd: float = 0.0
@@ -214,6 +227,11 @@ class LegConfig:
         if self.join_depth_usd < 0:
             raise ConfigError(
                 f"{name}.join_depth_usd must be >= 0 (0 switches it off)"
+            )
+        if self.time_in_force not in MAKER_TIME_IN_FORCE:
+            raise ConfigError(
+                f"{name}.time_in_force must be one of "
+                f"{', '.join(MAKER_TIME_IN_FORCE)}, not {self.time_in_force!r}"
             )
         if self.leverage is not None and not MIN_LEVERAGE <= self.leverage <= MAX_LEVERAGE:
             raise ConfigError(
@@ -885,8 +903,8 @@ def _renamed(old: str, new: str) -> None:
 
 _LEG_KEYS = frozenset({
     "symbol", "size", "notional_usd", "offset_bps", "max_distance_bps",
-    "chase_patience_s", "improve_ticks", "join_depth_usd", "max_order_size",
-    "max_order_notional_usd", "leverage", "enabled",
+    "chase_patience_s", "improve_ticks", "join_depth_usd", "time_in_force",
+    "max_order_size", "max_order_notional_usd", "leverage", "enabled",
 })
 _TOP_KEYS = frozenset({
     "markets", "legs", "pool", "mode", "single_master", "hold_minutes",
@@ -1033,6 +1051,11 @@ def _leg_from_dict(raw: dict[str, Any], name: str) -> LegConfig:
                 else default.improve_ticks
             ),
             join_depth_usd=number("join_depth_usd"),
+            time_in_force=(
+                _as_str(raw["time_in_force"], f"{name}.time_in_force").strip().upper()
+                if raw.get("time_in_force") is not None
+                else default.time_in_force
+            ),
             max_order_size=cap_size,
             max_order_notional_usd=cap_usd,
             leverage=(

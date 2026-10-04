@@ -985,6 +985,7 @@ class AccountSession:
         size: float,
         reduce_only: bool = False,
         cancel_oid: str | None = None,
+        time_in_force: str = "ALO",
     ) -> tuple[str, list[OrderResponse]]:
         """Place a resting limit order, optionally replacing an existing one.
 
@@ -1000,6 +1001,11 @@ class AccountSession:
         loop is 25 ms added to every reprice. The cost is that a price the
         market has already reached is rejected rather than filled as a taker --
         which is the behaviour this strategy wants.
+
+        `time_in_force` may also name ALO_JOIN or ALO_SLIDE (API v1.0.20),
+        which rest a crossing order at the best same-side price, or the
+        nearest non-crossing tick, instead of refusing it. Either way it rests
+        as a maker; the price it rests at is the one the order map reports.
         """
         order = LimitOrder(
             symbol=symbol,
@@ -1007,7 +1013,7 @@ class AccountSession:
             price=price,
             size=size,
             reduce_only=reduce_only,
-            time_in_force=TimeInForce.ALO,
+            time_in_force=TimeInForce[time_in_force],
         )
         actions: list[Action] = []
         if cancel_oid:

@@ -93,7 +93,7 @@ main() {
             "with, which is normally fine."
     fi
 
-    local sdk_wheel="app/vendor/bulk_client-0.1.2-py3-none-any.whl"
+    local sdk_wheel="app/vendor/bulk_client-0.1.2+bulkdn.1-py3-none-any.whl"
     local sdk_ok=""
     if [ -f "$sdk_wheel" ]; then
         # Only when the wheel changed -- forcing it every time replaced the SDK

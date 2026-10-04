@@ -1561,6 +1561,9 @@ def _append_market(
         # a line the template never had.
         f"join_depth_usd: {_render_number(template.join_depth_usd)}"
         if template.join_depth_usd > 0 else None,
+        # Likewise: copied only when the market it is copied from changed it.
+        f"time_in_force: {template.time_in_force}"
+        if template.time_in_force != "ALO" else None,
         # Omitted rather than written as 0 when there is no dollar cap to copy:
         # absent means "the whole leg", which is what a coin cap copied into a
         # different coin could not honestly mean anyway.
