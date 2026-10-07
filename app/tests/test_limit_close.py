@@ -339,7 +339,7 @@ class FakeRuntime:
 
 
 def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None,
-                    leftover=None, cancel_failures=None, **kwargs):
+                    leftover=None, cancel_failures=None, swept=None, **kwargs):
     from bulkdn import cli
 
     FakeRuntime.instances = []
@@ -361,6 +361,13 @@ def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None
     monkeypatch.setattr(cli, "cancel_all_orders", no_cancel)
     monkeypatch.setattr(cli, "flatten_limit", fake_limit)
     monkeypatch.setattr(cli, "flatten", fake_market)
+
+    async def fake_sweep(*a, **kw):
+        if swept is not None:
+            swept.append(True)
+        return []
+
+    monkeypatch.setattr(cli, "sweep_dust", fake_sweep)
 
     class Account:
         improve_ticks = 1
@@ -626,3 +633,16 @@ def test_a_limit_close_that_gives_up_raises_an_alert(caplog):
         assert close(sessions, book, feed, timeout_s=0.05) is False
     alerts = [r for r in caplog.records if getattr(r, "alert", False)]
     assert alerts and "gave up" in alerts[0].getMessage()
+
+
+def test_close_all_sweeps_dust_after_a_close_that_finished(monkeypatch):
+    swept = []
+    run_cmd_flatten(monkeypatch, closed=True, swept=swept)
+    assert swept, "dust under the minimum was left for good"
+
+
+def test_a_limit_close_that_ran_out_of_time_does_not_sweep(monkeypatch):
+    """Real positions are still open; growing dust then is beside the point."""
+    swept = []
+    run_cmd_flatten(monkeypatch, closed=False, limit=True, swept=swept)
+    assert not swept

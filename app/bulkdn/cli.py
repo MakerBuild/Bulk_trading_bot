@@ -47,6 +47,7 @@ from .reconcile import (
     cancel_all_orders,
     flatten,
     flatten_limit,
+    sweep_dust,
     sync_positions_http,
 )
 from .retry import describe
@@ -889,6 +890,18 @@ async def cmd_flatten(
             await flatten(
                 runtime.sessions, runtime.book, runtime.feed, runtime.symbols
             )
+        if closed:
+            # What is left under the market's minimum order: no order of its
+            # own size is accepted, so it is grown past the minimum and closed
+            # whole. Not after a limit close that ran out of time -- real
+            # positions are still open then, and dust is the least of them.
+            dust = await sweep_dust(
+                runtime.sessions, runtime.book, runtime.feed, runtime.symbols
+            )
+            if dust:
+                print("")
+                print("  Still open, under the market's minimum order: " + ", ".join(dust))
+                print("  Worth under a dollar each. Run Close All again to retry.")
 
         # A market that is not in the settings at all -- traded by hand, or
         # removed from the file -- cannot be closed from here: there is no

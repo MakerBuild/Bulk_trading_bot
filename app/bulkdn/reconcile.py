@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from .accounts import AccountSession, OrderRejected
 from .feed import MarketFeed
 from .hedger import Hedger, LegRoles
-from .marketdata import tradeable_size
+from .marketdata import min_order_size, round_size, tradeable_size
 from .positions import PositionBook
 from .retry import describe
 
@@ -434,6 +434,88 @@ async def flatten(
             ", ".join(leftovers),
             extra={"alert": True},
         )
+
+
+# How far past the market's minimum a dust position is grown before it is
+# closed. The close goes out a moment after the growing order, at whatever the
+# price is then; at exactly the minimum, a tick down would leave the close
+# under it and refused, with the position now a dollar larger than before.
+DUST_SWEEP_MARGIN = 1.5
+
+
+async def sweep_dust(
+    sessions: dict[str, AccountSession],
+    book: PositionBook,
+    feed: MarketFeed,
+    symbols: Sequence[str],
+) -> list[str]:
+    """Close positions too small for the exchange to take an order for.
+
+    A remainder under the market's minimum order -- $0.68 of BTC against a $1
+    floor, left by rounding over many hedges -- cannot be closed by any order
+    of its own size, so Close All reported every account flat and left it
+    there. It is grown instead, by a market order the same way of half again
+    the minimum, and the whole of it is then closed reduce-only in one order
+    the exchange will take. Two trades of about a dollar each; the fee is a
+    fraction of a cent.
+
+    Only for Close All, which an operator runs on purpose to be flat. Not for
+    the emergency stop: growing a position while something is wrong is not
+    what that is for, and it leaves dust as it always has.
+
+    Positions large enough to close are left alone -- that is `flatten`'s job.
+    Returns what is still open afterwards, for the caller to say.
+    """
+    await _read_what_can_be_read(sessions, book)
+    swept: list[_Close] = []
+    touched: dict[str, AccountSession] = {}
+    for session in sessions.values():
+        for symbol in symbols:
+            spec = feed.specs.get(symbol)
+            if spec is None:
+                continue
+            size = book.effective(session.pubkey, symbol)
+            if abs(size) < spec.lot_size:
+                continue
+            price = feed.reference_price(symbol)
+            if not price or tradeable_size(spec, abs(size), price):
+                continue
+            grow = round_size(min_order_size(spec, price) * DUST_SWEEP_MARGIN, spec)
+            grows_long = size > 0
+            total = round_size(abs(size) + grow, spec)
+            touched[session.pubkey] = session
+            try:
+                await session.market(symbol, grows_long, grow)
+            except Exception as exc:  # noqa: BLE001 - nothing was added, so nothing is open
+                log.error(
+                    "dust sweep: could not grow %s %+.8f on %s: %s -- left as it was",
+                    symbol, size, session.name, describe(exc),
+                )
+                continue
+            try:
+                await session.close_market(symbol, not grows_long, total)
+            except Exception as exc:  # noqa: BLE001 - said loudly below
+                log.error(
+                    "dust sweep: grew %s on %s to %+.8f but could not close it: %s "
+                    "-- MANUAL ACTION REQUIRED: run Close All again",
+                    symbol, session.name, size + (grow if grows_long else -grow),
+                    describe(exc), extra={"alert": True},
+                )
+                continue
+            log.info(
+                "dust sweep: %s %s %+.8f -- grew by %.8f, closed %.8f",
+                session.name, symbol, size, grow, total,
+            )
+            swept.append(_Close(session, symbol, 0.0, spec.lot_size))
+    if touched:
+        await _read_until_closed(touched, book, swept)
+    return [
+        f"{session.name} {symbol}={book.effective(session.pubkey, symbol):+.8f}"
+        for session in sessions.values()
+        for symbol in symbols
+        if symbol in feed.specs
+        and abs(book.effective(session.pubkey, symbol)) >= feed.specs[symbol].lot_size
+    ]
 
 
 async def flatten_limit(
