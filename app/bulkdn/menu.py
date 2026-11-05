@@ -1775,11 +1775,12 @@ def _markets_screen(config: Config, config_path: str) -> None:
         print(f"  {leg.symbol} is now {'on' if leg.enabled else 'off'}")
 
 
-MODE_CHOICES = ("multi", "single")
+MODE_CHOICES = ("multi", "single", "delta-neutral")
 
 MODE_SUMMARY = {
     "multi": "every master and every sub, in one pool",
     "single": "one master and its own sub-accounts",
+    "delta-neutral": "master + a random own sub, taker orders only",
 }
 
 
@@ -1788,6 +1789,8 @@ def _accounts_summary(config: Config) -> str:
     keys = len(config.private_keys)
     if config.mode == "single":
         return f"single -- master {config.single_master} of {keys}"
+    if config.mode == "delta-neutral":
+        return f"delta-neutral -- each master with a random sub ({keys} key(s)), taker only"
     return f"multi -- every master ({keys} key(s))"
 
 
@@ -1833,7 +1836,7 @@ def _accounts_screen(config: Config, config_path: str) -> None:
     print(f"\n  now: {_accounts_summary(config)}")
     for index, mode in enumerate(MODE_CHOICES, start=1):
         marker = "*" if mode == config.mode else " "
-        print(f"  {marker} {index}. {mode:<7} {MODE_SUMMARY[mode]}")
+        print(f"  {marker} {index}. {mode:<13} {MODE_SUMMARY[mode]}")
     print("    0. back")
 
     answer = _ask("\n  > ")

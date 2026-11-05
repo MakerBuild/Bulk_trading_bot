@@ -28,11 +28,12 @@ from .accounts import (
     verify_sub_account,
 )
 from .chaser import Chaser
+from .taking import TakerExecutor
 from .console import watch_for_stop
 from .config import Config, ConfigError, load_config
 from .feed import MarketFeed
 from .notify import AlertHandler, Notifier
-from .referral import AccessDenied
+from .referral import SIGNUP_URL, AccessDenied
 from .referral import check_access as check_referral_access
 from .window import WindowTitle
 from .impact import ImpactBook
@@ -649,13 +650,25 @@ class Runtime:
             max_impact_bps=self.config.risk.max_hedge_impact_bps,
             feed=self.feed,
         )
-        chaser = Chaser(
-            sessions=self.sessions,
-            feed=self.feed,
-            book=self.book,
-            params=build_chase_params(self.config),
-            price_stale_timeout_s=self.config.risk.price_stale_timeout_s,
-        )
+        taking = self.config.mode == "delta-neutral"
+        if taking:
+            # Nothing rests in this mode: the opener takes, the partner hedges.
+            chaser = TakerExecutor(
+                sessions=self.sessions,
+                feed=self.feed,
+                book=self.book,
+                params=build_chase_params(self.config),
+                settings=self.config.taking,
+                price_stale_timeout_s=self.config.risk.price_stale_timeout_s,
+            )
+        else:
+            chaser = Chaser(
+                sessions=self.sessions,
+                feed=self.feed,
+                book=self.book,
+                params=build_chase_params(self.config),
+                price_stale_timeout_s=self.config.risk.price_stale_timeout_s,
+            )
         risk = RiskMonitor(
             config=self.config.risk,
             book=self.book,
@@ -687,10 +700,18 @@ class Runtime:
         strategy.pairing = Pairing(
             pool=[session.pubkey for session in self.pool],
             max_groups=self.config.max_groups,
-            max_takers=self.config.max_takers,
+            # One partner per group in delta-neutral mode: a master and one sub.
+            max_takers=1 if taking else self.config.max_takers,
             # Sessions under one key share a socket, so the client is the
             # master -- the same fact Strategy._trees groups by.
             owner={session.pubkey: id(session.client) for session in self.pool},
+            own_tree=taking,
+            # The socket is opened for its master, so a session whose pubkey
+            # is its socket's account is that master.
+            tree_roots=frozenset(
+                session.pubkey for session in self.pool
+                if session.pubkey == session.client.account_pubkey
+            ),
         )
         return strategy
 
@@ -1394,11 +1415,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         # `pool` is what multi was called while it was the third of three.
         # Accepted so a script written against that name keeps running.
-        choices=("single", "multi", "pool"),
+        choices=("single", "multi", "pool", "delta-neutral"),
         help=(
             "override the settings file: single trades one master and its own "
-            "sub-accounts, multi trades every master and sub in one pool. "
-            "Which markets are traded is a separate setting"
+            "sub-accounts, multi trades every master and sub in one pool, "
+            "delta-neutral pairs each master with a random sub of its own and "
+            "only takes liquidity. Which markets are traded is a separate setting"
         ),
     )
 
@@ -1586,8 +1608,9 @@ def main(argv: list[str] | None = None) -> int:
         # rather than unwinding a traceback over it.
         _startup_error("access denied", exc)
         print(
-            "This build runs only for accounts signed up under the owner's "
-            "referral code.",
+            "This build runs only for accounts signed up through the owner's "
+            f"referral link: {SIGNUP_URL} -- open it, connect the wallet whose "
+            "key is first in private_key.local, and deposit. No code to type.",
             file=sys.stderr,
         )
         return 3

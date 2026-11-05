@@ -1078,6 +1078,39 @@ class AccountSession:
             ]
         )
 
+    async def take(
+        self,
+        symbol: str,
+        is_buy: bool,
+        price: float,
+        size: float,
+        reduce_only: bool = False,
+    ) -> list[OrderResponse]:
+        """Take liquidity up to `price`, and cancel whatever does not fill.
+
+        An IOC limit order: delta-neutral mode's opener and closer (see
+        bulkdn/taker.py). Unlike a market order it never trades past `price`,
+        so a book that moved between being read and the order landing costs
+        a smaller fill, not a worse one. Not paced like a chase: it is sent
+        only once the slice before it is hedged.
+
+        `cancelledIOC` -- the unfilled rest taken off -- is not an error, so
+        a slice that found nothing at its price is an answer like any other
+        and is not counted toward the reject streak.
+        """
+        return await self.submit(
+            [
+                LimitOrder(
+                    symbol=symbol,
+                    side=Side.BUY if is_buy else Side.SELL,
+                    price=price,
+                    size=size,
+                    reduce_only=reduce_only,
+                    time_in_force=TimeInForce.IOC,
+                )
+            ]
+        )
+
     async def hedge_market(
         self,
         symbol: str,

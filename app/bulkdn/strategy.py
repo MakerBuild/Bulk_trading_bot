@@ -33,6 +33,7 @@ from bulk_api.common import Side, TimeInForce, Topic
 
 from .accounts import AccountSession, SharedReconnect
 from .chaser import ChaseParams, Chaser
+from .taking import TakerExecutor
 from .config import Config, ConfigError
 from .feed import MarketFeed
 from .fees import burned_usd as _burned
@@ -247,7 +248,9 @@ class Strategy:
         feed: MarketFeed,
         book: PositionBook,
         hedger: Hedger,
-        chaser: Chaser,
+        # A TakerExecutor in delta-neutral mode: the same three calls, made by
+        # taking liquidity instead of resting it. See bulkdn/taking.py.
+        chaser: Chaser | TakerExecutor,
         risk: RiskMonitor,
         store: StateStore,
         state: StrategyState,
@@ -365,6 +368,12 @@ class Strategy:
         # Sides of a market a hedge is sweeping right now, as
         # (symbol, maker_is_buy) -> how many hedges. See `_hedge_leg`.
         self._sweeping: dict[tuple[str, bool], int] = {}
+        if isinstance(chaser, TakerExecutor):
+            chaser.attach(
+                is_neutral=lambda roles: self._leg_is_neutral(roles.key),
+                waiting_on_a_read=self._waiting_on_a_read,
+                mark_unread=self._mark_unread,
+            )
         # Seeded from the system clock, and held rather than using the
         # module-level generator: a run that has to be reproduced can be
         # given a seed here without reaching into every other user of
@@ -2501,10 +2510,10 @@ class Strategy:
                 if self._being_swept(roles):
                     # A hedge is taking this side right now. Anything placed
                     # here lands in its path; the next tick re-places it.
-                    await asyncio.sleep(self.config.chase_interval_s)
+                    await asyncio.sleep(self._tick_s(leg))
                     continue
                 if await self._paused_for_its_sockets(key, roles, leg):
-                    await asyncio.sleep(self.config.chase_interval_s)
+                    await asyncio.sleep(self._tick_s(leg))
                     continue
                 try:
                     await self.chaser.step(roles, leg)
@@ -2533,7 +2542,18 @@ class Strategy:
                 log.info("%s %s complete", symbol, label)
                 return
 
-            await asyncio.sleep(self.config.chase_interval_s)
+            await asyncio.sleep(self._tick_s(leg))
+
+    def _tick_s(self, leg) -> float:
+        """How long `_drive_leg` waits between two looks at a leg.
+
+        A taking leg is looked at more often than a chasing one: it sends a
+        slice only once the last is hedged, so the pace is how soon that is
+        noticed. A hold has nothing to look at either way.
+        """
+        if isinstance(self.chaser, TakerExecutor) and leg.phase != Phase.HOLD:
+            return self.chaser.interval_s
+        return self.config.chase_interval_s
 
     async def _cut_short(self, key: str, leg, limit: str) -> None:
         """End one group's overlong phase without ending the run.

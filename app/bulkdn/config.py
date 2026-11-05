@@ -437,6 +437,55 @@ class HoldTime(Span):
         return super().parse(value, name)
 
 
+MODES = ("single", "multi", "delta-neutral")
+
+
+@dataclass
+class TakerConfig:
+    """How `mode: delta-neutral` takes liquidity. See bulkdn/taking.py.
+
+    Read in every mode and used only in that one, so switching modes from the
+    menu never loses the numbers tuned for it.
+    """
+
+    # How far past its touch a slice may walk, on either side of the book.
+    # Depth further out is not counted, and the IOC's limit never goes past it.
+    max_slippage_bps: float = 2.0
+    # No slice goes out while the spread is wider than this: every slice pays
+    # it, twice over a round trip.
+    max_spread_bps: float = 3.0
+    # The largest share of the depth inside the band a slice may take -- of
+    # the thinner side, the opener's or the hedge's.
+    depth_fraction: float = 0.5
+    # The least time between two slices of one leg. A slice also waits for
+    # the one before it to be hedged, however long that takes.
+    slice_interval_s: float = 0.5
+    # How long a slice's fill may take to reach the book before the next one
+    # stops waiting for it.
+    fill_wait_s: float = 3.0
+    # How often a taking leg is looked at.
+    poll_interval_s: float = 0.2
+    # How many price levels of each side are read.
+    levels: int = 20
+
+    def validate(self) -> None:
+        if self.max_slippage_bps <= 0:
+            raise ConfigError("taking.max_slippage_bps must be above 0")
+        if self.max_spread_bps <= 0:
+            raise ConfigError("taking.max_spread_bps must be above 0")
+        if not 0.0 < self.depth_fraction <= 1.0:
+            raise ConfigError(
+                "taking.depth_fraction must be between 0 and 1 (0.5 = at most "
+                f"half the depth inside the band), got {self.depth_fraction}"
+            )
+        if self.slice_interval_s < 0 or self.fill_wait_s < 0:
+            raise ConfigError("taking.slice_interval_s and fill_wait_s must be >= 0")
+        if self.poll_interval_s <= 0:
+            raise ConfigError("taking.poll_interval_s must be above 0")
+        if self.levels < 1:
+            raise ConfigError("taking.levels must be at least 1")
+
+
 @dataclass
 class Config:
     # Every market this config knows about, in file order. Which of them
@@ -457,6 +506,11 @@ class Config:
     #            drawn from all of them, so most cycles put two masters on
     #            opposite sides of a trade -- and nothing on the exchange
     #            links those two to each other.
+    #   delta-neutral
+    #            every master, each paired with a random one of its OWN
+    #            sub-accounts. Taker orders only: the opener takes liquidity
+    #            with IOC slices sized to the book, and each fill is hedged at
+    #            once on the partner. See `taking` and bulkdn/taking.py.
     #
     # That difference is the whole reason for the setting. Self-trades inside
     # one tree earn referral volume but no fee-tier volume, because the
@@ -562,6 +616,8 @@ class Config:
     # Holding back new groups while the market moves fast, or at set hours.
     # See bulkdn/pause.py. Off unless asked for.
     pause: PauseConfig = field(default_factory=PauseConfig)
+    # How delta-neutral mode takes liquidity. Ignored by the other modes.
+    taking: TakerConfig = field(default_factory=TakerConfig)
 
     # Optional endpoint overrides. Nothing is derived: the hosts are the
     # MAINNET_* constants above, and these replace them outright when set --
@@ -641,9 +697,10 @@ class Config:
                 "`bulkdn encrypt-key`"
             )
         self.target.validate()
-        if self.mode not in ("single", "multi"):
+        if self.mode not in MODES:
             raise ConfigError(
-                f"mode must be 'single' or 'multi', got {self.mode!r}"
+                "mode must be 'single', 'multi' or 'delta-neutral', got "
+                f"{self.mode!r}"
             )
         if self.max_groups < 1:
             raise ConfigError("max_groups must be at least 1")
@@ -698,6 +755,7 @@ class Config:
             self.pause.validate()
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
+        self.taking.validate()
         if self.chase_interval_s <= 0:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
@@ -912,7 +970,11 @@ _TOP_KEYS = frozenset({
     "position_sync_interval_s", "cycles", "execution_target",
     "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
     "state_file", "log_level", "http_url", "ws_url", "telegram", "access",
-    "pause",
+    "pause", "taking",
+})
+_TAKER_KEYS = frozenset({
+    "max_slippage_bps", "max_spread_bps", "depth_fraction", "slice_interval_s",
+    "fill_wait_s", "poll_interval_s", "levels",
 })
 _PAUSE_KEYS = frozenset({"max_move_bps", "window_minutes", "calm_minutes", "schedule"})
 _POOL_KEYS = frozenset({"max_groups", "max_takers", "single_master"})
@@ -1084,6 +1146,10 @@ def _mode_from_raw(value: Any) -> str:
     if mode == "pool":
         _renamed("mode: pool", "mode: multi")
         return "multi"
+    # Spelled the way people type it. Not warned about: none of these is an
+    # old name, only another way of writing this one.
+    if mode in ("delta_neutral", "deltaneutral", "delta neutral", "dn", "taker"):
+        return "delta-neutral"
     return mode
 
 
@@ -1222,6 +1288,29 @@ def _pause_from_dict(raw: Any) -> PauseConfig:
         window_minutes=number("window_minutes"),
         calm_minutes=number("calm_minutes"),
         schedule=windows,
+    )
+
+
+def _taker_from_dict(raw: Any) -> TakerConfig:
+    """Read the `taker:` block. Absent, every number is its default."""
+    if not isinstance(raw, dict):
+        raise ConfigError("taking must be a mapping")
+    _warn_unknown(raw, _TAKER_KEYS, "taking")
+    default = TakerConfig()
+
+    def number(key: str) -> float:
+        value = raw.get(key)
+        return getattr(default, key) if value is None else _as_float(value, f"taking.{key}")
+
+    levels = raw.get("levels")
+    return TakerConfig(
+        max_slippage_bps=number("max_slippage_bps"),
+        max_spread_bps=number("max_spread_bps"),
+        depth_fraction=number("depth_fraction"),
+        slice_interval_s=number("slice_interval_s"),
+        fill_wait_s=number("fill_wait_s"),
+        poll_interval_s=number("poll_interval_s"),
+        levels=default.levels if levels is None else int(_as_float(levels, "taking.levels")),
     )
 
 
@@ -1523,6 +1612,7 @@ def _load_config(
         telegram=_telegram_from_dict(raw.get("telegram") or {}),
         access=_access_from_raw(raw.get("access")),
         pause=_pause_from_dict(raw.get("pause") or {}),
+        taking=_taker_from_dict(raw.get("taking") or {}),
         private_keys=(
             list(private_keys) if private_keys is not None
             else load_private_keys(require_credentials)

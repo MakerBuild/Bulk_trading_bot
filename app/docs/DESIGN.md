@@ -26,6 +26,9 @@ position: `m2s3` is the third sub-account of the second key.
 | `multi` (default) | every master and every sub-account |
 | `single` | one master's own tree; `single_master` picks the key by its line number |
 
+`delta-neutral` plays every key like `multi`, but draws differently and trades
+differently; see "Delta-neutral mode" below.
+
 The narrowing happens once, in `Runtime._keys_in_play`: in `single` the other masters get
 no session at all. Everything downstream — drawing, trading, accounting — is one code
 path. With one key in the file the two modes are identical. `pool` is accepted as an old
@@ -63,6 +66,45 @@ tree and every taker from another's. Up to `pool.max_groups` groups run at once.
 The group disbands at the end of its cycle and its accounts go back to the pool. The
 per-cycle draw of accounts, side, size and offset exists so that a series of trades does
 not repeat one shape.
+
+### Delta-neutral mode: taker orders only
+
+`mode: delta-neutral` changes two things and nothing else.
+
+**Who.** `Pairing(own_tree=True)`: every group is one master and a random one of
+its own sub-accounts (`tree_roots` names the masters, `owner` says whose sub is
+whose), one hedger, and a coin flip for which of the two opens. So at most one
+group per key is open at a time. Nothing of ours rests in this mode, so the two
+accounts can never match each other, and the cross-master rule has nothing to
+protect.
+
+**How.** `cli.Runtime.build_strategy` hands the strategy a `TakerExecutor`
+(`taking.py`) where the other modes get a `Chaser`. It answers the same calls
+`_drive_leg` makes -- `step`, `remaining_size`, `cancel_leg`, `may_be_resting`,
+`params` -- so the phases, the hedger, recovery, the guard, the cut-short close
+and the wind-down are the same code. Each `step`:
+
+1. waits while the last slice's fill has not reached the book (`fill_wait_s`),
+   while a read of the leg's accounts is owed, or while the leg is not neutral
+   -- so exposure is never more than one slice;
+2. reads both sides of the book (`taking.levels` deep) and plans a slice
+   (`plan_slice`, pure): no slice while the spread exceeds `max_spread_bps`;
+   depth counted out to `max_slippage_bps` past each touch; slice = at most
+   `depth_fraction` of the **thinner** of the opener's side and the hedge's
+   side, capped by the market's order cap and what is left;
+3. sends an IOC limit (`AccountSession.take`) at the deepest level the slice
+   needs. `cancelledIOC` is an answer, not a reject. A slice with no answer
+   marks its socket's accounts unread, and nothing more goes out on the leg
+   until a read settles it.
+
+The opener's fill reaches the fill handler like any maker fill and goes to the
+hedge worker, which hedges it with a market order on the partner. The hedge has
+no price cap; it is bounded by step 2's reading of its side of the book.
+`_drive_leg` steps a taking leg every `poll_interval_s` instead of
+`chase_interval_s`.
+
+Cost: both legs pay the taker fee, open and close. At tier 0 that is 3.5bps of
+all volume, twice the maker modes' floor, plus the spread per round trip.
 
 ---
 

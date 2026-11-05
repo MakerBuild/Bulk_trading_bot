@@ -51,6 +51,13 @@ pause:
   calm_minutes: 10
   schedule: []
 
+# Only for mode: delta-neutral (taker orders only). See README.
+taking:
+  max_slippage_bps: 2.0
+  max_spread_bps: 3.0
+  depth_fraction: 0.5
+  slice_interval_s: 0.5
+
 chase_interval_s: 1.0
 reconcile_interval_s: 5.0
 position_sync_interval_s: 60.0

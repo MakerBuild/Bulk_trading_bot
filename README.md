@@ -37,6 +37,13 @@ step by step, in Russian, including what to do when something fails.
 
 ## Set up
 
+**0. Your BULK account**
+
+Sign up through **<https://app.bulk.trade/ref/MAKER>** — open the link, connect
+your wallet and deposit USDC. No referral or invite code is needed: the link
+carries the referral. This build runs only for accounts that came in this way
+(see "access denied" below).
+
 **1. Your private keys**
 
 `install.bat` creates `private_key.local`. Open it and paste your BULK master
@@ -92,8 +99,9 @@ another).
 ## Which accounts trade: `mode`
 
 ```
-single   one master and its own sub-accounts (single_master: which key, by line)
-multi    every master and every sub-account, in one pool     (the default)
+single         one master and its own sub-accounts (single_master: which key, by line)
+multi          every master and every sub-account, in one pool     (the default)
+delta-neutral  each master with a random one of its own subs, taker orders only
 ```
 
 Both modes trade every market switched on; they differ only in who can be on
@@ -102,6 +110,42 @@ file, whichever mode is set. With more than one master in play, a group's maker
 comes from one master's tree and its hedgers from another's. With one key in
 the file the two modes are the same thing.
 Switch it from **Configuration → Markets & Accounts → Accounts**.
+
+### `delta-neutral`: taker orders only
+
+Every group is a master and a random one of its **own** sub-accounts; which of
+the two opens, and which way, is drawn per cycle. Nothing rests on the book.
+The opener **takes** liquidity with IOC slices, and every fill is hedged at
+once on the other account with a market order -- opening and closing alike
+(the close is reduce-only on both).
+
+Before each slice the bot reads both sides of the book: the side the opener
+takes from and the side the hedge will take from a moment later.
+
+- no slice while the spread is wider than `taking.max_spread_bps`;
+- depth is counted only out to `taking.max_slippage_bps` past each touch, and a
+  slice is at most `taking.depth_fraction` of the **thinner** side;
+- the IOC's limit price is the deepest level the slice needs, never past the
+  band -- if the book moved, it fills less, never worse;
+- the next slice waits until the last one is filled **and** hedged.
+
+Every slice is logged with the spread, the depth on both sides and the
+expected give-up. The slice is also capped by the market's
+`max_order_notional_usd`.
+
+```yaml
+mode: delta-neutral
+taking:
+  max_slippage_bps: 2.0   # how far past the touch a slice may walk
+  max_spread_bps: 3.0     # wait while the spread is wider
+  depth_fraction: 0.5     # at most this share of the depth inside the band
+  slice_interval_s: 0.5   # least time between two slices
+```
+
+**This mode pays the taker fee on every trade**, both accounts, open and
+close — at tier 0 that is 3.5bps of all volume, about twice the fee per $1M of
+the maker modes, plus the spread on every round trip. It is the fast mode,
+not the cheap one.
 
 Each cycle a group is drawn from the pool: one account that opens, and up to
 `pool.max_takers` accounts that share its hedge. Up to `pool.max_groups` groups
@@ -194,7 +238,9 @@ USDC on BULK to create one.
 least one. Create it from **Accounts Management → Create New Subaccount**.
 
 **"access denied"** — this build is limited to accounts that signed up through
-its owner's referral or invite.
+its owner's referral link, **<https://app.bulk.trade/ref/MAKER>** (no code to
+type: the link carries the referral), or an invite from the owner. The account
+checked is the master of the first key in `private_key.local`.
 
 **"is not saved as UTF-8"** — `settings.yaml` was saved in the Windows code page.
 Open it in Notepad, **Save As**, Encoding **UTF-8**.

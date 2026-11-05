@@ -139,6 +139,14 @@ SEALED_CODES: tuple[str, ...] = (
 )
 
 
+# Where a new account signs up so that this build admits it. The link sets the
+# owner's referral on the account by itself -- no invite or referral code to
+# type -- which the indexer then reports as `referred_by_code` and
+# `referred_by_wallet`, the route `check_access` matches first. Printed when
+# access is refused, so the person refused is told where to go.
+SIGNUP_URL = "https://app.bulk.trade/ref/MAKER"
+
+
 def wallet_digest(value: str) -> str:
     """How a wallet is compared. Addresses are case-sensitive base58."""
     return hashlib.sha256(value.strip().encode("utf-8")).hexdigest()

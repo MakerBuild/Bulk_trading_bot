@@ -26,6 +26,12 @@ orders are pulled out of its path first -- but when one does anyway, between
 two masters it is a trade like any other, and inside one tree it is a
 self-trade the fee tier does not count.
 
+**Delta-neutral mode pairs inside one tree instead** (`own_tree`): every group
+is a master and one of its own sub-accounts, drawn at random, and which of the
+two opens is a coin flip. Nothing rests there -- both accounts only take -- so
+the two cannot trade with each other, and the cross-master rule above has
+nothing to protect.
+
 **Concurrency is capped.** A hundred accounts allow fifty groups, which is
 fifty resting orders being chased and fifty hedges chasing them, against an
 exchange that answered 429 to two accounts polling every five seconds. The cap
@@ -134,6 +140,10 @@ class Pairing:
     # cover a maker from, and refusing would mean no groups at all.
     owner: dict[str, object] = field(default_factory=dict)
     rng: random.Random = field(default_factory=random.Random)
+    # Delta-neutral mode: a group is one master and one of its own subs.
+    # `tree_roots` names the master accounts; `owner` says whose sub is whose.
+    own_tree: bool = False
+    tree_roots: frozenset[str] = frozenset()
     busy: set[str] = field(default_factory=set)
     active: dict[int, Group] = field(default_factory=dict)
     _next_id: int = 0
@@ -156,9 +166,27 @@ class Pairing:
             if account != maker and self.owner.get(account) != mine
         ]
 
+    def _own_subs(self, master: str) -> list[str]:
+        """Free sub-accounts under this master."""
+        mine = self.owner.get(master)
+        return [
+            account for account in self.free
+            if account != master and account not in self.tree_roots
+            and self.owner.get(account) == mine
+        ]
+
+    def _free_masters(self) -> list[str]:
+        """Free masters with at least one free sub of their own."""
+        return [
+            account for account in self.free
+            if account in self.tree_roots and self._own_subs(account)
+        ]
+
     def can_draw(self, takers: int = 1) -> bool:
         if len(self.active) >= self.max_groups:
             return False
+        if self.own_tree:
+            return bool(self._free_masters())
         if not self._split:
             return len(self.free) >= takers + 1
         return any(len(self._partners(maker)) >= takers for maker in self.free)
@@ -175,6 +203,8 @@ class Pairing:
         state of a busy run, not a fault, and the caller's answer to it is to
         try again when one finishes.
         """
+        if self.own_tree:
+            return self._draw_own_tree(symbol, maker_is_buy)
         wanted = self.max_takers if takers is None else takers
         wanted = max(1, min(wanted, self.max_takers))
         # A group needs a maker and its takers, and the pool may be thin.
@@ -202,6 +232,29 @@ class Pairing:
             maker_is_buy=(
                 self.rng.random() < 0.5 if maker_is_buy is None
                 else maker_is_buy
+            ),
+        )
+        self._next_id += 1
+        self.active[self._next_id] = group
+        self.busy.update(group.accounts)
+        return self._next_id, group
+
+    def _draw_own_tree(
+        self, symbol: str, maker_is_buy: bool | None
+    ) -> tuple[int, Group] | None:
+        """A master and a random one of its subs, the opener chosen by a coin."""
+        if not self.can_draw():
+            return None
+        master = self.rng.choice(self._free_masters())
+        sub = self.rng.choice(self._own_subs(master))
+        opener, hedger = (master, sub) if self.rng.random() < 0.5 else (sub, master)
+        group = Group(
+            symbol=symbol,
+            maker=opener,
+            takers=(hedger,),
+            shares=(1.0,),
+            maker_is_buy=(
+                self.rng.random() < 0.5 if maker_is_buy is None else maker_is_buy
             ),
         )
         self._next_id += 1

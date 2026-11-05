@@ -289,6 +289,10 @@ class MarketFeed:
         side = book.get_bids(n) if is_buy else book.get_asks(n)
         return [(level.price, level.size) for level in side if level.price and level.size]
 
+    def book_age_s(self, symbol: str) -> float:
+        """Seconds since this symbol's book last changed. Never heard: inf."""
+        return self._age_s(self._books, symbol)
+
     def reference_price(self, symbol: str) -> float | None:
         return self.quote(symbol).reference_price
 
