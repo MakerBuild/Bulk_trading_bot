@@ -53,6 +53,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from . import ratelimit
+from . import tg_settings
 from .notify import AlertHandler, Notifier, telegram_proxy
 from .retry import describe
 
@@ -86,6 +87,7 @@ KEYBOARD = {
     "📜 Log": "/log",
     "💰 Margin": "/accounts",
     "🔁 Live / Dry run": "/mode",
+    "⚙️ Settings": "/settings",
     # What the margin button was called before Mode and Accounts existed. A
     # phone keeps the old keyboard until the bot sends a new one, and a press
     # on it must still do what its label said.
@@ -93,8 +95,10 @@ KEYBOARD = {
 }
 _KEYBOARD_ROWS = [
     ["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"],
-    ["🎛 Mode", "👥 Accounts"], ["📜 Log", "💰 Margin"], ["🔁 Live / Dry run"],
+    ["🎛 Mode", "👥 Accounts"], ["📜 Log", "💰 Margin"], ["⚙️ Settings", "🔁 Live / Dry run"],
 ]
+# How long a typed answer to "send the new value" is waited for.
+INPUT_TTL_S = 300.0
 
 # The trading modes, in the order the picker offers them, and what each puts
 # in play. The same three the terminal menu offers.
@@ -136,6 +140,7 @@ HELP = (
     "👥 Accounts -- switch accounts on or off for the next run\n"
     "📜 Log -- the last lines of logs.txt\n"
     "💰 Margin -- balance margin across sub-accounts, or collect it to the master\n"
+    "⚙️ Settings -- markets, sizes, targets and risk limits, saved to settings.yaml\n"
     "🔁 Live / Dry run -- switch whether runs and closes trade real funds\n\n"
     "<b>Typed</b>\n"
     "/run 250k -- a run with this volume target\n"
@@ -308,6 +313,7 @@ class Controller:
         config_path: str | None = None,
         trees_fn: Callable[[object], list] | None = None,
         write_setting: Callable[[str, str, str], None] | None = None,
+        files=None,
     ):
         self.config = config
         # Where 🎛 Mode and 👥 Accounts write their choice, so it outlives a
@@ -319,6 +325,11 @@ class Controller:
         self.trees_fn = trees_fn
         self._trees: list | None = None
         self._trees_at = 0.0
+        # The settings file's writers (bulkdn.menu, or a stand-in in tests),
+        # and the setting a typed value is awaited for: (setting, market or
+        # None, deadline).
+        self.files = files
+        self.awaiting: tuple | None = None
         # Reads the settings file again; None keeps the config given at start.
         # See `config_reloader`.
         self.reload = reload
@@ -380,11 +391,21 @@ class Controller:
             return None
         text = KEYBOARD.get(text.strip(), text)
         if not text.startswith("/"):
+            if self.awaiting is not None:
+                return self._apply_input(text)
             return Reply("Use the buttons below.", keyboard=True)
         words = text.strip().split()
         # "/status@SomeBot" is what a command looks like in a group chat.
         command = words[0].lower().split("@")[0]
         args = words[1:]
+        # Any command ends a question about a setting: a button pressed
+        # instead of an answer is a change of mind, not a value.
+        asked, self.awaiting = self.awaiting, None
+        if command == "/cancel":
+            return Reply("Kept as it was." if asked else "Nothing to cancel.")
+        if command == "/settings":
+            self._refresh_config()
+            return self._settings_home()
 
         if command in ("/help", "/start"):
             return Reply(HELP, keyboard=True)
@@ -448,6 +469,9 @@ class Controller:
             return await self._set_master(code)
         if action == "acct":
             return await self._toggle_account(code)
+        if action in ("cfg", "mkt", "edit", "mon", "madd"):
+            self.awaiting = None
+            return await self._settings_press(action, code)
         pending = self.pending
         if pending is None or code != pending.code or self.clock() > pending.expires_at:
             # Not cleared: a stale button on an old message must not cancel
@@ -770,6 +794,225 @@ class Controller:
         self.config.excluded_accounts = tuple(excluded)
         log.warning("telegram control: %d account(s) switched off", len(excluded))
         return await self._pick_menu()
+
+    # -- ⚙️ settings -----------------------------------------------------------
+
+    def _editable(self) -> str | None:
+        """None when settings can be written from here, else why not."""
+        if self.files is None or self.config_path is None:
+            return "Settings can be changed here only when control was started with its settings file."
+        return None
+
+    def _settings_home(self, note: str = "") -> Reply:
+        on = [leg for leg in self.config.markets if leg.enabled]
+        markets = ", ".join(
+            f"{leg.symbol} ${tg_settings.shown(tg_settings.MARKET_SETTINGS[0].read(leg))}"
+            for leg in on
+        ) or "none switched on"
+        rows: Buttons = [
+            [("📈 Markets and sizes", "cfg:markets")],
+            [("🎛 Mode", "cfg:mode"), ("👥 Accounts", "cfg:accounts")],
+        ]
+        names = list(tg_settings.SECTIONS)
+        for start in range(0, len(names), 2):
+            rows.append([
+                (tg_settings.SECTIONS[name][0], f"cfg:{name}") for name in names[start:start + 2]
+            ])
+        return Reply(
+            f"{note}<b>⚙️ Settings</b> -- saved to settings.yaml, used from the next Run\n"
+            f"Mode: {html.escape(self._mode_line())}\n"
+            f"Markets: {html.escape(markets)}" + self._later(),
+            rows,
+        )
+
+    def _section(self, name: str, note: str = "") -> Reply:
+        title, settings = tg_settings.SECTIONS[name]
+        lines, buttons = [], []
+        for setting in settings:
+            value = tg_settings.shown(setting.read(self.config))
+            lines.append(f"<b>{html.escape(setting.label)}</b>: {html.escape(value)} -- "
+                         f"{html.escape(setting.help)}")
+            buttons.append((f"{setting.label}: {value}", f"edit:{setting.id}"))
+        rows: Buttons = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([("⬅️ Settings", "cfg:")])
+        return Reply(
+            f"{note}<b>{html.escape(title)}</b>\n" + "\n".join(lines) +
+            "\nTap one to change it." + self._later(),
+            rows,
+        )
+
+    def _leg(self, symbol: str):
+        return next((leg for leg in self.config.markets if leg.symbol == symbol), None)
+
+    def _markets_screen(self, note: str = "") -> Reply:
+        rows: Buttons = []
+        for leg in self.config.markets:
+            size = tg_settings.shown(tg_settings.MARKET_SETTINGS[0].read(leg))
+            rows.append([(f"{'✅' if leg.enabled else '⬜'} {leg.symbol} ${size}", f"mkt:{leg.symbol}")])
+        rows.append([("➕ Add market", "madd:"), ("⬅️ Settings", "cfg:")])
+        on = sum(1 for leg in self.config.markets if leg.enabled)
+        return Reply(
+            f"{note}<b>📈 Markets</b>: {on} of {len(self.config.markets)} switched on. "
+            "Every market switched on trades at the same time.\n"
+            "Tap one for its size, leverage and order settings." + self._later(),
+            rows,
+        )
+
+    def _market_screen(self, symbol: str, note: str = "") -> Reply:
+        leg = self._leg(symbol)
+        if leg is None:
+            return self._markets_screen(f"{html.escape(symbol)} is no longer in the file.\n")
+        lines, buttons = [], []
+        for setting in tg_settings.MARKET_SETTINGS:
+            value = tg_settings.shown(setting.read(leg))
+            lines.append(f"<b>{html.escape(setting.label)}</b>: {html.escape(value)} -- "
+                         f"{html.escape(setting.help)}")
+            buttons.append((f"{setting.label}: {value}", f"edit:{setting.id}@{symbol}"))
+        if leg.size and not leg.notional_usd and leg.notional_span is None:
+            lines.insert(0, f"Sized in coins: size {tg_settings.render(leg.size)}. Delete `size:` "
+                            "in the file to size it in dollars here.")
+        rows: Buttons = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+        rows.append([
+            ("⬜ Switch off" if leg.enabled else "✅ Switch on", f"mon:{symbol}"),
+            ("⬅️ Markets", "cfg:markets"),
+        ])
+        state = "on" if leg.enabled else "off"
+        return Reply(
+            f"{note}<b>{html.escape(symbol)}</b> ({state})\n" + "\n".join(lines) + self._later(),
+            rows,
+        )
+
+    async def _settings_press(self, action: str, code: str) -> Reply:
+        if action == "cfg":
+            self._refresh_config()
+            if code == "":
+                return self._settings_home()
+            if code == "markets":
+                return self._markets_screen()
+            if code == "mode":
+                return self._mode_menu()
+            if code == "accounts":
+                return await self._pick_menu()
+            if code in tg_settings.SECTIONS:
+                return self._section(code)
+            return self._settings_home()
+        if action == "mkt":
+            self._refresh_config()
+            return self._market_screen(code)
+
+        problem = self._editable()
+        if problem is not None:
+            return Reply(problem)
+        if action == "edit":
+            return self._ask_value(code)
+        if action == "mon":
+            return self._switch_market(code)
+        return await self._add_market(code)
+
+    def _ask_value(self, code: str) -> Reply:
+        setting_id, _, symbol = code.partition("@")
+        setting = tg_settings.BY_ID.get(setting_id)
+        if setting is None:
+            return self._settings_home()
+        if setting.block == tg_settings.MARKET:
+            leg = self._leg(symbol)
+            if leg is None:
+                return self._markets_screen()
+            where, now = symbol, setting.read(leg)
+        else:
+            where, now = None, setting.read(self.config)
+        self.awaiting = (setting, where, self.clock() + INPUT_TTL_S)
+        title = f"{symbol} -- {setting.label}" if where else setting.label
+        return Reply(
+            f"<b>{html.escape(title)}</b>\n{html.escape(setting.help)}\n"
+            f"Now: <code>{html.escape(tg_settings.shown(now))}</code>\n\n"
+            f"Send the new value -- {tg_settings.example(setting)}. /cancel keeps it."
+        )
+
+    def _apply_input(self, text: str) -> Reply:
+        setting, symbol, deadline = self.awaiting
+        if self.clock() > deadline:
+            self.awaiting = None
+            return Reply("⌛ That question expired. Open ⚙️ Settings and pick the setting again.")
+        try:
+            value = tg_settings.parse(setting, text)
+        except ValueError as exc:
+            return Reply(f"⚠️ {html.escape(str(exc))}. Send {tg_settings.example(setting)}, or /cancel.")
+        leg = self._leg(symbol) if symbol else None
+        if symbol and leg is None:
+            self.awaiting = None
+            return self._markets_screen(f"{html.escape(symbol)} is no longer in the file.\n")
+        before = tg_settings.shown(setting.read(leg if symbol else self.config))
+        try:
+            if setting.block == tg_settings.MARKET:
+                self.files.write_market_setting(self.config_path, symbol, setting.key, value)
+            elif setting.block == tg_settings.TOP:
+                self.files.write_setting(self.config_path, setting.key, value)
+            else:
+                self.files.write_block_setting(self.config_path, setting.block, setting.key, value)
+        except Exception as exc:  # noqa: BLE001 - reported; the file is as it was
+            return Reply(f"⚠️ {html.escape(describe(exc))}\nSend another value, or /cancel.")
+        self.awaiting = None
+        problem = self._refresh_config()
+        where = f"{symbol} " if symbol else ""
+        log.warning("telegram control: %s%s set to %s", where, setting.key, value)
+        note = f"✅ {html.escape(where + setting.label)}: {html.escape(before)} → {html.escape(value)}\n"
+        if problem is not None:
+            note += f"⚠️ Saved, but could not be read back: {html.escape(problem)}\n"
+        if symbol:
+            return self._market_screen(symbol, note)
+        section = next(
+            name for name, (_, settings) in tg_settings.SECTIONS.items() if setting in settings
+        )
+        return self._section(section, note)
+
+    def _switch_market(self, symbol: str) -> Reply:
+        self._refresh_config()
+        leg = self._leg(symbol)
+        if leg is None:
+            return self._markets_screen()
+        if leg.enabled and sum(1 for other in self.config.markets if other.enabled) == 1:
+            return self._market_screen(
+                symbol, "That is the only market switched on -- turn another on first.\n",
+            )
+        try:
+            self.files.set_market_enabled(self.config_path, symbol, not leg.enabled)
+        except Exception as exc:  # noqa: BLE001 - reported
+            return Reply(f"⚠️ {html.escape(describe(exc))}")
+        self._refresh_config()
+        log.warning("telegram control: %s switched %s", symbol, "off" if leg.enabled else "on")
+        return self._market_screen(symbol, "✅ Saved.\n")
+
+    async def _add_market(self, symbol: str) -> Reply:
+        try:
+            listed = await asyncio.to_thread(self.files.exchange_markets, copy.deepcopy(self.config))
+        except Exception as exc:  # noqa: BLE001 - reported
+            return Reply(f"Could not read the exchange's markets: {html.escape(describe(exc))}")
+        have = {leg.symbol for leg in self.config.markets}
+        if not symbol:
+            available = sorted(name for name in listed if name not in have)
+            if not available:
+                return self._markets_screen("Every market the exchange lists is already in the file.\n")
+            buttons = [(name, f"madd:{name}") for name in available]
+            rows: Buttons = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+            rows.append([("⬅️ Markets", "cfg:markets")])
+            return Reply(
+                "<b>➕ Add market</b>\nIts sizes are copied from a market already set up; "
+                "change them after.",
+                rows,
+            )
+        if symbol in have or symbol not in listed:
+            return self._markets_screen()
+        try:
+            notes = self.files.add_market(
+                copy.deepcopy(self.config), self.config_path, symbol, listed[symbol],
+            )
+        except Exception as exc:  # noqa: BLE001 - reported; the file is as it was
+            return Reply(f"⚠️ {html.escape(describe(exc))}")
+        self._refresh_config()
+        log.warning("telegram control: %s added", symbol)
+        said = "\n".join(line.strip() for line in notes if line.strip())
+        return self._market_screen(symbol, f"<pre>{html.escape(said)}</pre>\n")
 
     async def _plan_margin(self, kind: str) -> Reply:
         """Read the balances and show what would move. Sends nothing.
@@ -1102,6 +1345,7 @@ async def serve(
 
     notifier = Notifier(telegram)
     allowed = set(telegram.user_ids)
+    from . import menu
     from .menu import account_trees, plan_balance, plan_collect, submit_plan, write_setting
 
     controller = Controller(
@@ -1114,6 +1358,7 @@ async def serve(
         config_path=config_path,
         trees_fn=account_trees,
         write_setting=write_setting,
+        files=menu,
     )
     poller = TelegramPoller(telegram.bot_token)
     strangers: set[int] = set()

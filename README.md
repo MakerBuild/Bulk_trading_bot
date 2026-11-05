@@ -230,6 +230,15 @@ apply from the next Run. A switched-off account is listed in
 `excluded_accounts:`. It is never drawn into a new cycle, but Close all still
 closes it.
 
+**⚙️ Settings** covers the rest of what used to be edited by hand. You can switch
+markets on or off and add new ones; set each market's size, max order and
+leverage; and change run targets, groups, risk limits, the delta-neutral taking
+settings and the pause on big moves. Tap a setting, then send the new value as a
+message, for example `3`, `250k` or `300-600`. The whole file is checked the way
+the bot checks it at startup before anything is saved, so a value it would refuse
+leaves the file unchanged. The `telegram:` block, the keys and the exchange
+addresses cannot be changed from the chat.
+
 ---
 
 ## If it will not start

@@ -1687,7 +1687,18 @@ def _add_market(config: Config, config_path: str) -> None:
         print("  aborted")
         return
     symbol = available[int(answer) - 1]
-    spec = listed[symbol]
+    for line in add_market(config, config_path, symbol, listed[symbol]):
+        print(line)
+
+
+def add_market(config: Config, config_path: str, symbol: str, spec: dict) -> list[str]:
+    """Add `symbol` to the file, copied from a market already set up.
+
+    Returns what to tell the operator, as the lines the terminal prints; the
+    Telegram menu sends the same lines. `config.markets` is refreshed from the
+    file afterwards.
+    """
+    notes: list[str] = []
 
     def read(key: str) -> float:
         try:
@@ -1707,12 +1718,12 @@ def _add_market(config: Config, config_path: str) -> None:
         start = max(floor, NEW_MARKET_NOTIONAL_USD)
         notional, cap = _render_number(start), None
         switch_off = True
-        print(
+        notes += [
             f"\n  !! {template.symbol} is sized in coins, which mean something else "
-            f"in {symbol}."
-        )
-        print(f"     It will be added switched off at notional_usd: {notional}.")
-        print("     Set the size you want for it, then turn it on here.")
+            f"in {symbol}.",
+            f"     It will be added switched off at notional_usd: {notional}.",
+            "     Set the size you want for it, then turn it on here.",
+        ]
     else:
         notional, cap = None, None
         smallest = (
@@ -1724,18 +1735,18 @@ def _add_market(config: Config, config_path: str) -> None:
             # Said before it is written, not discovered as a rejected order an
             # hour into a run.
             switch_off = True
-            print(
+            notes += [
                 f"\n  !! {symbol} will not accept an order under ${floor:g}, and the "
-                f"size copied from {template.symbol} starts at ${smallest:g}."
-            )
-            print("     It will be added switched off. Raise notional_usd for it,")
-            print("     then turn it on here.")
+                f"size copied from {template.symbol} starts at ${smallest:g}.",
+                "     It will be added switched off. Raise notional_usd for it,",
+                "     then turn it on here.",
+            ]
 
     leverage = template.leverage
     if leverage and ceiling and leverage > ceiling:
         # The run checks this at startup and refuses to start -- over a number
         # the menu itself wrote. Clamped here instead, and said.
-        print(
+        notes.append(
             f"\n  {template.symbol}'s leverage {_render_number(leverage)} is above "
             f"{symbol}'s maximum of {_render_number(ceiling)} -- using "
             f"{_render_number(ceiling)}."
@@ -1746,13 +1757,63 @@ def _add_market(config: Config, config_path: str) -> None:
         config_path, symbol, template,
         notional=notional, cap=cap, leverage=leverage, enabled=not switch_off,
     )
-    print(f"\n  {symbol} added to {config_path}, copied from {template.symbol}")
+    notes.append(f"\n  {symbol} added to {config_path}, copied from {template.symbol}")
     # The menu reads the file again before every action, so the next Start
     # trades it. This screen's own list is refreshed here.
     from .config import load_config
 
     config.markets[:] = load_config(config_path, require_credentials=False, warn=False).markets
-    print("  The next Start trades it" + (" once it is switched on." if switch_off else "."))
+    notes.append("  The next Start trades it" + (" once it is switched on." if switch_off else "."))
+    return notes
+
+
+def exchange_markets(config: Config) -> dict[str, dict]:
+    """Every market the exchange lists, keyed by symbol. See `_exchange_markets`."""
+    return _exchange_markets(config)
+
+
+def set_market_enabled(config_path: str, symbol: str, enabled: bool) -> None:
+    """Turn one market on or off. See `_write_market_enabled`."""
+    _write_market_enabled(config_path, symbol, enabled)
+
+
+def write_market_setting(config_path: str, symbol: str, key: str, value: str) -> None:
+    """Set one field of one market, keeping the rest of the file as it is.
+
+    Found the way the on/off switch finds its line, in a `markets:` list or a
+    `legs:` mapping; a field the market does not have yet is added right
+    under its symbol.
+    """
+    def edit(lines: list[str]) -> list[str]:
+        found = _market_item(lines, symbol)
+        if found is None:
+            raise ConfigError(f"{symbol} is not in {config_path}")
+        start, stop, column = found
+        for index in range(start, stop):
+            hit = _key_on(lines[index])
+            if hit is not None and hit.column == column and hit.key == key:
+                lines[index] = _with_value(hit, value)
+                return lines
+        named = next(i for i in range(start, stop) if _symbol_on(lines[i]) == symbol)
+        lines.insert(named + 1, f"{' ' * column}{key}: {value}")
+        return lines
+
+    _save_settings(config_path, edit)
+
+
+def write_block_setting(config_path: str, block: str, key: str, value: str) -> None:
+    """Set `key` under the top-level `block:`, adding the block when absent.
+
+    A block added here holds only this key; everything else in it keeps its
+    default, which is what an absent block meant already.
+    """
+    def edit(lines: list[str]) -> list[str]:
+        header = _top_level(lines, block)
+        if header is not None:
+            return _set_in_block(lines, header, key, value)
+        return [*lines, "", f"{block}:", f"  {key}: {value}"]
+
+    _save_settings(config_path, edit)
 
 
 def _markets_screen(config: Config, config_path: str) -> None:
