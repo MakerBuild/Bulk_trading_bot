@@ -520,6 +520,10 @@ class Config:
     # Which master trades in single mode: its line number in the key file,
     # counting from 1. Ignored in multi, where every key is in play.
     single_master: int = 1
+    # Accounts switched off: never drawn into a group, whatever the mode. By
+    # pubkey, master or sub. Close all still closes them -- this decides what
+    # opens, not what is cleaned up. Set from Telegram's 👥 Accounts button.
+    excluded_accounts: tuple[str, ...] = ()
     # How many groups may be open at once, and how many accounts may share
     # one hedge.
     #
@@ -879,6 +883,21 @@ def _as_int(value: Any, name: str) -> int:
     return int(number)
 
 
+def _pubkey_list(value: Any, name: str) -> tuple[str, ...]:
+    """A list of account pubkeys. Absent or empty is no accounts."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"{name} must be a list of account pubkeys, like [abc..., def...]")
+    out = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{name} must hold account pubkeys, got {item!r}")
+        if item.strip() not in out:
+            out.append(item.strip())
+    return tuple(out)
+
+
 def _as_str(value: Any, name: str) -> str:
     """A text setting. A number or a list here is a misplaced line, not text."""
     if not isinstance(value, str):
@@ -970,7 +989,7 @@ _TOP_KEYS = frozenset({
     "position_sync_interval_s", "cycles", "execution_target",
     "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
     "state_file", "log_level", "http_url", "ws_url", "telegram", "access",
-    "pause", "taking",
+    "pause", "taking", "excluded_accounts",
 })
 _TAKER_KEYS = frozenset({
     "max_slippage_bps", "max_spread_bps", "depth_fraction", "slice_interval_s",
@@ -1580,6 +1599,7 @@ def _load_config(
         market_names=market_names,
         mode=_mode_from_raw(mode if mode is not None else raw.get("mode") or defaults.mode),
         single_master=single_master,
+        excluded_accounts=_pubkey_list(raw.get("excluded_accounts"), "excluded_accounts"),
         max_groups=whole(pool_raw, "max_groups", defaults.max_groups, "pool"),
         max_takers=whole(pool_raw, "max_takers", defaults.max_takers, "pool"),
         hold_minutes=(

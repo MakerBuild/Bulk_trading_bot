@@ -1423,6 +1423,18 @@ def _write_mode(config_path: str, mode: str) -> None:
     _write_scalar(config_path, "mode", mode)
 
 
+def write_setting(config_path: str, key: str, value: str) -> None:
+    """Set a top-level key in the settings file. For the Telegram menu,
+    which changes the same settings as this one and must write them the
+    same way."""
+    _write_scalar(config_path, key, value)
+
+
+def account_trees(config: Config) -> list[Tree]:
+    """Every key's account tree, read from the exchange. See `_trees`."""
+    return _trees(config)
+
+
 _SYMBOL_LINE = re.compile(r"""^\s*(?:-\s+)?symbol\s*:\s*(['"]?)([^'"#\s]+)\1\s*(?:#.*)?$""")
 
 

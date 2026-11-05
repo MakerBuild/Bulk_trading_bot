@@ -81,14 +81,32 @@ KEYBOARD = {
     "▶️ Run": "/run",
     "⏹ Stop": "/stop",
     "🛑 Close all": "/close",
+    "🎛 Mode": "/tradingmode",
+    "👥 Accounts": "/pick",
     "📜 Log": "/log",
-    "💰 Accounts": "/accounts",
+    "💰 Margin": "/accounts",
     "🔁 Live / Dry run": "/mode",
+    # What the margin button was called before Mode and Accounts existed. A
+    # phone keeps the old keyboard until the bot sends a new one, and a press
+    # on it must still do what its label said.
+    "💰 Accounts": "/accounts",
 }
 _KEYBOARD_ROWS = [
     ["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"],
-    ["📜 Log", "💰 Accounts"], ["🔁 Live / Dry run"],
+    ["🎛 Mode", "👥 Accounts"], ["📜 Log", "💰 Margin"], ["🔁 Live / Dry run"],
 ]
+
+# The trading modes, in the order the picker offers them, and what each puts
+# in play. The same three the terminal menu offers.
+TRADING_MODES = {
+    "multi": "every master and every sub, in one pool",
+    "single": "one master and its own sub-accounts",
+    "delta-neutral": "a master + a random own sub, taker orders only "
+                     "(both legs pay the taker fee)",
+}
+# How long a listing of the account trees is reused between presses of the
+# account picker. Each listing is an HTTP call per key.
+TREES_TTL_S = 120.0
 
 # Spelled out down to the lines to paste: install.bat creates settings.yaml
 # once and never touches it again, so a file made before Telegram existed has
@@ -114,8 +132,10 @@ HELP = (
     "▶️ Run -- start a run with the targets in settings.yaml\n"
     "⏹ Stop -- stop the run and cancel its orders; positions stay\n"
     "🛑 Close all -- close every position at market (stops a run first)\n"
+    "🎛 Mode -- multi, single or delta-neutral, for the next run\n"
+    "👥 Accounts -- switch accounts on or off for the next run\n"
     "📜 Log -- the last lines of logs.txt\n"
-    "💰 Accounts -- balance margin across sub-accounts, or collect it to the master\n"
+    "💰 Margin -- balance margin across sub-accounts, or collect it to the master\n"
     "🔁 Live / Dry run -- switch whether runs and closes trade real funds\n\n"
     "<b>Typed</b>\n"
     "/run 250k -- a run with this volume target\n"
@@ -285,8 +305,20 @@ class Controller:
         margin: dict[str, Callable] | None = None,
         submit_transfers: Callable | None = None,
         reload: Callable[[], object] | None = None,
+        config_path: str | None = None,
+        trees_fn: Callable[[object], list] | None = None,
+        write_setting: Callable[[str, str, str], None] | None = None,
     ):
         self.config = config
+        # Where 🎛 Mode and 👥 Accounts write their choice, so it outlives a
+        # restart -- the same file and the same writer the terminal menu uses.
+        # None keeps the choice in memory only.
+        self.config_path = config_path
+        self.write_setting = write_setting
+        # config -> the account trees (menu.Tree), read from the exchange.
+        self.trees_fn = trees_fn
+        self._trees: list | None = None
+        self._trees_at = 0.0
         # Reads the settings file again; None keeps the config given at start.
         # See `config_reloader`.
         self.reload = reload
@@ -386,6 +418,12 @@ class Controller:
             return self._ask_mode()
         if command == "/accounts":
             return self._accounts_menu()
+        if command == "/tradingmode":
+            self._refresh_config()
+            return self._mode_menu()
+        if command == "/pick":
+            self._refresh_config()
+            return await self._pick_menu()
         if command == "/yes":
             return self._confirm(args)
         return Reply(f"Unknown command {html.escape(command)}.", keyboard=True)
@@ -401,6 +439,15 @@ class Controller:
         if action == "margin":
             # Only reads: the plan it shows is confirmed separately.
             return await self._plan_margin(code)
+        # Settings, not trades: what the next run trades, which its own Start
+        # button confirms. So no one-time code -- a press on an old message
+        # sets what it says, and the reply shows the result.
+        if action == "setmode":
+            return await self._set_mode(code)
+        if action == "setmaster":
+            return await self._set_master(code)
+        if action == "acct":
+            return await self._toggle_account(code)
         pending = self.pending
         if pending is None or code != pending.code or self.clock() > pending.expires_at:
             # Not cleared: a stale button on an old message must not cancel
@@ -495,9 +542,11 @@ class Controller:
         code = self._new_pending("run", volume)
         markets = ", ".join(leg.symbol for leg in self.config.active_legs)
         other = "" if volume is not None else "\nAnother target: type /run 250k"
+        off = len(self.config.excluded_accounts)
+        accounts = f", {off} account(s) switched off" if off else ""
         return Reply(
             f"Start a <b>{self.mode_word}</b> run?\n"
-            f"{html.escape(self.config.mode)} mode, {html.escape(markets)}\n"
+            f"{html.escape(self._mode_line())} mode, {html.escape(markets)}{accounts}\n"
             f"{html.escape(self._goal(volume))}{other}",
             [[("▶️ Start", f"run:{code}"), ("❌ Cancel", f"cancel:{code}")]],
         )
@@ -551,6 +600,176 @@ class Controller:
             "Each shows the plan first; nothing is sent until you confirm it.",
             [[("⚖️ Balance margin", "margin:balance"), ("⬆️ Collect to master", "margin:collect")]],
         )
+
+    # -- mode and accounts ------------------------------------------------------
+
+    def _mode_line(self) -> str:
+        if self.config.mode == "single":
+            return f"single (master {self.config.single_master})"
+        return self.config.mode
+
+    def _later(self) -> str:
+        """A note for a change made while a run is going."""
+        if self.busy and self.work_kind == "run":
+            return "\nThe run in progress keeps what it started with; this applies from the next Run."
+        return ""
+
+    def _mode_menu(self, note: str = "") -> Reply:
+        lines = "\n".join(
+            f"{'▸' if mode == self.config.mode else '·'} <b>{mode}</b> -- {html.escape(about)}"
+            for mode, about in TRADING_MODES.items()
+        )
+        buttons = [[
+            (f"{'✅ ' if mode == self.config.mode else ''}{mode}", f"setmode:{mode}")
+            for mode in TRADING_MODES
+        ]]
+        return Reply(
+            f"{note}<b>Trading mode</b>: now {html.escape(self._mode_line())}\n{lines}{self._later()}",
+            buttons,
+        )
+
+    def _save(self, key: str, value: str) -> str | None:
+        """Write one setting and re-read the file. None if done, else why not."""
+        if self.config_path is None or self.write_setting is None:
+            return None
+        try:
+            self.write_setting(self.config_path, key, value)
+        except Exception as exc:  # noqa: BLE001 - reported, nothing else changed
+            log.warning("telegram control: could not write %s: %s", key, describe(exc))
+            return describe(exc)
+        return self._refresh_config()
+
+    def _forget_cli_mode(self) -> None:
+        # A --mode on the command line would otherwise win on every re-read.
+        forget = getattr(self.reload, "forget_mode", None)
+        if forget is not None:
+            forget()
+
+    async def _set_mode(self, mode: str) -> Reply:
+        if mode not in TRADING_MODES:
+            return self._mode_menu()
+        if mode == "single":
+            return await self._master_menu()
+        self._forget_cli_mode()
+        problem = self._save("mode", mode)
+        if problem is not None:
+            return Reply(f"⚠️ Could not save the mode: {html.escape(problem)}")
+        self.config.mode = mode
+        log.warning("telegram control: trading mode set to %s", mode)
+        return self._mode_menu("✅ Saved.\n")
+
+    async def _master_menu(self) -> Reply:
+        trees, problem = await self._read_trees()
+        if problem is not None:
+            return Reply(f"Could not list the accounts: {html.escape(problem)}")
+        rows = []
+        for tree in trees:
+            current = self.config.mode == "single" and tree.index == self.config.single_master
+            rows.append([(
+                f"{'✅ ' if current else ''}master {tree.index} {_short(tree.accounts[0])} "
+                f"({len(tree.subs)} sub)",
+                f"setmaster:{tree.index}",
+            )])
+        return Reply("<b>Single mode</b>: which master trades, with its own sub-accounts?", rows)
+
+    async def _set_master(self, code: str) -> Reply:
+        trees, problem = await self._read_trees()
+        if problem is not None:
+            return Reply(f"Could not list the accounts: {html.escape(problem)}")
+        chosen = next((tree for tree in trees if str(tree.index) == code), None)
+        if chosen is None:
+            return await self._master_menu()
+        if not chosen.subs:
+            return Reply(
+                f"master {chosen.index} {_short(chosen.accounts[0])} owns no sub-accounts, so there "
+                "is nothing for it to pair with. Create one first."
+            )
+        self._forget_cli_mode()
+        # The master first: single mode with a master the file does not hold
+        # yet is a file that fails to load.
+        problem = self._save("single_master", str(chosen.index)) or self._save("mode", "single")
+        if problem is not None:
+            return Reply(f"⚠️ Could not save the mode: {html.escape(problem)}")
+        self.config.single_master = chosen.index
+        self.config.mode = "single"
+        log.warning("telegram control: trading mode set to single, master %d", chosen.index)
+        return self._mode_menu("✅ Saved.\n")
+
+    async def _read_trees(self) -> tuple[list, str | None]:
+        """The account trees, reused for a short while. (trees, problem)."""
+        if self.trees_fn is None:
+            return [], "not available here"
+        if self._trees is not None and self.clock() - self._trees_at < TREES_TTL_S:
+            return self._trees, None
+        try:
+            # Blocking HTTP, one call per key: off the loop.
+            trees = await asyncio.to_thread(self.trees_fn, copy.deepcopy(self.config))
+        except Exception as exc:  # noqa: BLE001 - reported
+            return [], describe(exc)
+        self._trees, self._trees_at = trees, self.clock()
+        return trees, None
+
+    async def _pick_menu(self, note: str = "") -> Reply:
+        """Every account under every key, each a button that switches it."""
+        trees, problem = await self._read_trees()
+        if problem is not None:
+            return Reply(f"Could not list the accounts: {html.escape(problem)}")
+        excluded = set(self.config.excluded_accounts)
+        rows: Buttons = []
+        for tree in trees:
+            row: list[tuple[str, str]] = []
+            for number, pubkey in enumerate(tree.accounts):
+                name = f"M{tree.index}" if number == 0 else f"S{tree.index}.{number}"
+                mark = "⬜" if pubkey in excluded else "✅"
+                row.append((f"{mark} {name} {_short(pubkey)}", f"acct:{pubkey[:_PICK_PREFIX]}"))
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+        if excluded:
+            rows.append([("✅ Switch all on", "acct:all")])
+        known = {pubkey for tree in trees for pubkey in tree.accounts}
+        on = len(known - excluded)
+        if self.config.mode == "single":
+            scope = f"Single mode trades master {self.config.single_master}'s accounts only."
+        elif self.config.mode == "delta-neutral":
+            scope = ("Delta-neutral pairs a master with its own subs: a master "
+                     "switched off takes its subs out too.")
+        else:
+            scope = "Multi mode pairs any accounts switched on."
+        return Reply(
+            f"{note}<b>Accounts</b>: {on} of {len(known)} on (M = master, S = its sub)\n"
+            f"{html.escape(scope)}\n"
+            "Tap one to switch it. Off = never drawn into a new cycle; "
+            "🛑 Close all still closes it." + self._later(),
+            rows,
+        )
+
+    async def _toggle_account(self, code: str) -> Reply:
+        trees, problem = await self._read_trees()
+        if problem is not None:
+            return Reply(f"Could not list the accounts: {html.escape(problem)}")
+        known = [pubkey for tree in trees for pubkey in tree.accounts]
+        excluded = list(self.config.excluded_accounts)
+        if code == "all":
+            excluded = []
+        else:
+            matches = [pubkey for pubkey in known if pubkey[:_PICK_PREFIX] == code]
+            if len(matches) != 1:
+                return await self._pick_menu("⌛ That list was out of date -- here it is again.\n")
+            pubkey = matches[0]
+            if pubkey in excluded:
+                excluded.remove(pubkey)
+            else:
+                excluded.append(pubkey)
+        value = "[" + ", ".join(f'"{pubkey}"' for pubkey in excluded) + "]"
+        problem = self._save("excluded_accounts", value)
+        if problem is not None:
+            return Reply(f"⚠️ Could not save: {html.escape(problem)}")
+        self.config.excluded_accounts = tuple(excluded)
+        log.warning("telegram control: %d account(s) switched off", len(excluded))
+        return await self._pick_menu()
 
     async def _plan_margin(self, kind: str) -> Reply:
         """Read the balances and show what would move. Sends nothing.
@@ -728,6 +947,12 @@ class Controller:
             await asyncio.wait_for(asyncio.shield(self.work), timeout_s)
 
 
+# How much of a pubkey the account picker's buttons carry. Telegram allows 64
+# bytes of callback data, and a pubkey is up to 44; 16 characters of base58 do
+# not collide between the accounts of one operator.
+_PICK_PREFIX = 16
+
+
 def _short(pubkey: str) -> str:
     return f"{pubkey[:6]}..{pubkey[-4:]}" if len(pubkey) > 12 else pubkey
 
@@ -840,11 +1065,18 @@ def config_reloader(path: str, loaded, *, mode: str | None = None) -> Callable[[
     start would be. `mode` is the command line's override, if there was one,
     which a re-read must not undo.
     """
+    override = {"mode": mode}
+
     def reload():
         from .config import load_config
 
-        return load_config(path, mode=mode, private_keys=list(loaded.private_keys))
+        return load_config(path, mode=override["mode"], private_keys=list(loaded.private_keys))
 
+    def forget_mode() -> None:
+        """Drop the command line's mode: one chosen from 🎛 Mode is newer."""
+        override["mode"] = None
+
+    reload.forget_mode = forget_mode
     return reload
 
 
@@ -870,7 +1102,7 @@ async def serve(
 
     notifier = Notifier(telegram)
     allowed = set(telegram.user_ids)
-    from .menu import plan_balance, plan_collect, submit_plan
+    from .menu import account_trees, plan_balance, plan_collect, submit_plan, write_setting
 
     controller = Controller(
         config, dry_run,
@@ -879,6 +1111,9 @@ async def serve(
         margin={"balance": plan_balance, "collect": plan_collect},
         submit_transfers=submit_plan,
         reload=config_reloader(config_path, config, mode=mode) if config_path else None,
+        config_path=config_path,
+        trees_fn=account_trees,
+        write_setting=write_setting,
     )
     poller = TelegramPoller(telegram.bot_token)
     strangers: set[int] = set()

@@ -222,6 +222,14 @@ any stop, and the final summary. Messages are sent in the background, so a slow
 Telegram never holds up trading. An http(s) proxy in `proxy.local` is used for
 them too; a SOCKS proxy is not, and the log says so.
 
+**Telegram Control** (menu, or `run.sh telegram` / `service.sh` on a server) also
+lets you run the bot from the chat. Besides Run, Stop, Close all and Status, it has
+**🎛 Mode**, which sets multi, single or delta-neutral, and **👥 Accounts**, where
+you tap an account to switch it on or off. Both are saved to `settings.yaml` and
+apply from the next Run. A switched-off account is listed in
+`excluded_accounts:`. It is never drawn into a new cycle, but Close all still
+closes it.
+
 ---
 
 ## If it will not start

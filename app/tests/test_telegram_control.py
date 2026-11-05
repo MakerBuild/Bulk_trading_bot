@@ -18,6 +18,8 @@ from bulkdn.telegram_control import Controller, PollConflict, Reply, TelegramPol
 def settings(volume=100_000.0):
     return types.SimpleNamespace(
         mode="multi",
+        single_master=1,
+        excluded_accounts=(),
         active_legs=[types.SimpleNamespace(symbol="BTC-USD")],
         target=types.SimpleNamespace(volume_usd=volume, burn_usd=0.0, cycles=0),
     )
@@ -313,7 +315,10 @@ def test_buttons_render_as_telegram_markup():
     assert inline["inline_keyboard"][0][1] == {"text": "❌ Cancel", "callback_data": "cancel:c1"}
     keyboard = Reply("x", keyboard=True).markup()
     labels = [b["text"] for row in keyboard["keyboard"] for b in row]
-    assert set(labels) == set(tc.KEYBOARD), "a keyboard button that no command answers"
+    assert set(labels) <= set(tc.KEYBOARD), "a keyboard button that no command answers"
+    # The one label answered but no longer shown: margin's old name, for a
+    # phone still showing the keyboard it was sent before the rename.
+    assert set(tc.KEYBOARD) - set(labels) == {"💰 Accounts"}
     assert Reply("x").markup() is None
 
 

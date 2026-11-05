@@ -25,6 +25,7 @@ from bulk_api.common import SignatureDomain
 from .accounts import (
     build_pool,
     market_data_session,
+    short_pubkey,
     verify_sub_account,
 )
 from .chaser import Chaser
@@ -206,6 +207,43 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     quieten_sdk_prints()
 
 
+def drop_excluded(pool: list, config: Config) -> list:
+    """The pool without the accounts switched off in `excluded_accounts`.
+
+    An account switched off while a cycle it trades is still open stays in,
+    for this run: dropping it would leave that group's position with nobody
+    signing for it, which the resume logs as exposure and then skips. It
+    finishes the cycle and is not drawn again -- the pairing only reserves
+    what the state names.
+    """
+    excluded = set(config.excluded_accounts)
+    try:
+        legs = StateStore(config.state_file).load().legs.values()
+    except RuntimeError:
+        # Unreadable state stops the run a moment later, loudly, in the
+        # strategy's own load. Nothing to keep here.
+        legs = []
+    open_phases = (Phase.OPEN, Phase.HOLD, Phase.EXIT, Phase.HALTED)
+    busy = {
+        account
+        for leg in legs
+        if leg.phase in open_phases
+        for account in (leg.maker, *leg.takers)
+        if account
+    }
+    kept = []
+    for session in pool:
+        if session.pubkey not in excluded:
+            kept.append(session)
+        elif session.pubkey in busy:
+            log.warning(
+                "%s is switched off but has a cycle open -- kept for this run "
+                "to finish it", short_pubkey(session.pubkey),
+            )
+            kept.append(session)
+    return kept
+
+
 class Runtime:
     """Wires the components together and owns their lifecycle.
 
@@ -268,14 +306,42 @@ class Runtime:
             symbols=self.symbols,
             dry_run=dry_run,
         )
+        # Switched-off accounts leave the pool of a run that opens positions
+        # only. Status and Close all still see every account: what was
+        # switched off yesterday may hold a position today.
+        switched_off = 0
+        if trading and config.excluded_accounts:
+            before = len(self.pool)
+            self.pool = drop_excluded(self.pool, config)
+            switched_off = before - len(self.pool)
         # Only a run that opens positions needs two accounts. Status, check
         # and flatten used to refuse here too, so a master whose only
         # sub-account had not been created yet could not even be closed.
         if trading and len(self.pool) < 2:
+            off = (
+                f" ({switched_off} more switched off in 👥 Accounts / "
+                "excluded_accounts)" if switched_off else ""
+            )
             raise ConfigError(
                 f"{config.mode} mode needs at least two accounts to pair, and "
-                f"the key(s) it uses produced {len(self.pool)}. Create a "
-                "sub-account from Accounts Management."
+                f"the key(s) it uses produced {len(self.pool)}{off}. Create a "
+                "sub-account from Accounts Management, or switch one back on."
+            )
+        if trading and config.mode == "delta-neutral" and not any(
+            session.pubkey == session.client.account_pubkey
+            and any(
+                other.client is session.client and other is not session
+                for other in self.pool
+            )
+            for session in self.pool
+        ):
+            # Each group is a master and its own sub. Without one master
+            # that still has a sub switched on, nothing could ever be drawn,
+            # and the run would wait forever without saying why.
+            raise ConfigError(
+                "delta-neutral mode pairs a master with one of its own subs, and "
+                "no master switched on has a sub switched on. Switch one on in "
+                "👥 Accounts."
             )
         if not self.pool:
             raise ConfigError(
