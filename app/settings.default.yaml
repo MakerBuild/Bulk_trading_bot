@@ -58,6 +58,15 @@ taking:
   depth_fraction: 0.5
   slice_interval_s: 0.5
 
+# Only for mode: auto-spread -- delta-neutral that sends every new group to
+# the market with the narrowest spread at that moment. markets: tradfi
+# (stocks, indices), crypto, or all. A market listed under markets: above
+# keeps its own size there; any other trades notional_usd at leverage.
+auto_spread:
+  markets: all
+  notional_usd: 100
+  leverage: 10
+
 chase_interval_s: 1.0
 reconcile_interval_s: 5.0
 position_sync_interval_s: 60.0

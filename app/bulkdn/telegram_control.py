@@ -58,6 +58,8 @@ import aiohttp
 from . import ratelimit
 from . import tg_settings
 from . import weekly
+from .config import AUTO_SPREAD_LABELS as KIND_LABELS
+from .config import TAKING_MODES
 from .notify import AlertHandler, Notifier, telegram_proxy
 from .retry import describe
 
@@ -113,12 +115,20 @@ WEEKLY_POINTS_WAIT = dt.timedelta(hours=6)
 INPUT_TTL_S = 300.0
 
 # The trading modes, in the order the picker offers them, and what each puts
-# in play. The same three the terminal menu offers.
+# in play. The same ones the terminal menu offers.
 TRADING_MODES = {
     "multi": "every master and every sub, in one pool",
     "single": "one master and its own sub-accounts",
     "delta-neutral": "a master + a random own sub, taker orders only "
                      "(both legs pay the taker fee)",
+    "auto-spread": "delta-neutral on whichever market has the narrowest spread "
+                   "when each new cycle opens -- TradFi, Crypto or All",
+}
+# Auto-spread's choices of market, as its buttons name them.
+AUTO_KINDS = {
+    "tradfi": "stocks and indices only (tradfi fee)",
+    "crypto": "coins only",
+    "all": "every listed market",
 }
 # How long a listing of the account trees is reused between presses of the
 # account picker. Each listing is an HTTP call per key.
@@ -148,7 +158,7 @@ HELP = (
     "▶️ Run -- start a run with the targets in settings.yaml\n"
     "⏹ Stop -- stop the run and cancel its orders; positions stay\n"
     "🛑 Close all -- close every position at market (stops a run first)\n"
-    "🎛 Mode -- multi, single or delta-neutral, for the next run\n"
+    "🎛 Mode -- multi, single, delta-neutral or auto-spread, for the next run\n"
     "👥 Accounts -- switch accounts on or off for the next run\n"
     "📜 Log -- the last lines of logs.txt\n"
     "💰 Margin -- balance margin across sub-accounts, or collect it to the master\n"
@@ -498,6 +508,8 @@ class Controller:
             return await self._set_mode(code)
         if action == "setmaster":
             return await self._set_master(code)
+        if action == "setauto":
+            return self._set_auto(code)
         if action == "acct":
             return await self._toggle_account(code)
         if action == "wk":
@@ -599,7 +611,7 @@ class Controller:
             if volume is None or volume <= 0:
                 return Reply("Usage: /run or /run 250k (volume target in $)")
         code = self._new_pending("run", volume)
-        markets = ", ".join(leg.symbol for leg in self.config.active_legs)
+        markets = self._markets_line()
         other = "" if volume is not None else "\nAnother target: type /run 250k"
         off = len(self.config.excluded_accounts)
         accounts = f", {off} account(s) switched off" if off else ""
@@ -665,7 +677,17 @@ class Controller:
     def _mode_line(self) -> str:
         if self.config.mode == "single":
             return f"single (master {self.config.single_master})"
+        if self.config.mode == "auto-spread":
+            return f"auto-spread ({KIND_LABELS[self.config.auto_spread.markets]})"
         return self.config.mode
+
+    def _markets_line(self) -> str:
+        """Which markets the next run trades, as one line."""
+        if self.config.mode == "auto-spread":
+            kind = self.config.auto_spread.markets
+            which = "market" if kind == "all" else f"{KIND_LABELS[kind]} market"
+            return f"the narrowest-spread {which} at each new cycle"
+        return ", ".join(leg.symbol for leg in self.config.active_legs)
 
     def _later(self) -> str:
         """A note for a change made while a run is going."""
@@ -678,10 +700,11 @@ class Controller:
             f"{'▸' if mode == self.config.mode else '·'} <b>{mode}</b> -- {html.escape(about)}"
             for mode, about in TRADING_MODES.items()
         )
-        buttons = [[
+        modes = [
             (f"{'✅ ' if mode == self.config.mode else ''}{mode}", f"setmode:{mode}")
             for mode in TRADING_MODES
-        ]]
+        ]
+        buttons = [modes[i:i + 2] for i in range(0, len(modes), 2)]
         return Reply(
             f"{note}<b>Trading mode</b>: now {html.escape(self._mode_line())}\n{lines}{self._later()}",
             buttons,
@@ -709,12 +732,52 @@ class Controller:
             return self._mode_menu()
         if mode == "single":
             return await self._master_menu()
+        if mode == "auto-spread":
+            return self._auto_menu()
         self._forget_cli_mode()
         problem = self._save("mode", mode)
         if problem is not None:
             return Reply(f"⚠️ Could not save the mode: {html.escape(problem)}")
         self.config.mode = mode
         log.warning("telegram control: trading mode set to %s", mode)
+        return self._mode_menu("✅ Saved.\n")
+
+    def _auto_menu(self, note: str = "") -> Reply:
+        current = self.config.auto_spread.markets if self.config.mode == "auto-spread" else None
+        lines = "\n".join(
+            f"{'▸' if kind == current else '·'} <b>{KIND_LABELS[kind]}</b> -- {html.escape(about)}"
+            for kind, about in AUTO_KINDS.items()
+        )
+        buttons = [[
+            (f"{'✅ ' if kind == current else ''}{KIND_LABELS[kind]}", f"setauto:{kind}")
+            for kind in AUTO_KINDS
+        ], [("⬅️ Modes", "cfg:mode")]]
+        spread = tg_settings.render(self.config.taking.max_spread_bps)
+        return Reply(
+            f"{note}<b>Auto-spread</b>: which markets may it pick from?\n{lines}\n"
+            f"Each new cycle goes to the one with the narrowest spread at that moment, "
+            f"and none opens while every spread is wider than {spread} bps "
+            "(⚙️ Settings → ⚡ Delta-neutral). Taker orders, a master + its own sub, as in "
+            "delta-neutral." + self._later(),
+            buttons,
+        )
+
+    def _set_auto(self, kind: str) -> Reply:
+        if kind not in AUTO_KINDS:
+            return self._auto_menu()
+        if self.config_path is None or self.files is None:
+            return Reply("There is no settings file to save this to.")
+        try:
+            self.files.write_block_setting(self.config_path, "auto_spread", "markets", kind)
+        except Exception as exc:  # noqa: BLE001 - reported, nothing else changed
+            return Reply(f"⚠️ Could not save: {html.escape(describe(exc))}")
+        self._forget_cli_mode()
+        problem = self._save("mode", "auto-spread")
+        if problem is not None:
+            return Reply(f"⚠️ Could not save the mode: {html.escape(problem)}")
+        self.config.mode = "auto-spread"
+        self.config.auto_spread.markets = kind
+        log.warning("telegram control: trading mode set to auto-spread (%s)", kind)
         return self._mode_menu("✅ Saved.\n")
 
     async def _master_menu(self) -> Reply:
@@ -792,9 +855,9 @@ class Controller:
         on = len(known - excluded)
         if self.config.mode == "single":
             scope = f"Single mode trades master {self.config.single_master}'s accounts only."
-        elif self.config.mode == "delta-neutral":
-            scope = ("Delta-neutral pairs a master with its own subs: a master "
-                     "switched off takes its subs out too.")
+        elif self.config.mode in TAKING_MODES:
+            scope = (f"{self.config.mode.capitalize()} pairs a master with its own subs: "
+                     "a master switched off takes its subs out too.")
         else:
             scope = "Multi mode pairs any accounts switched on."
         return Reply(
@@ -844,6 +907,9 @@ class Controller:
             f"{leg.symbol} ${tg_settings.shown(tg_settings.MARKET_SETTINGS[0].read(leg))}"
             for leg in on
         ) or "none switched on"
+        if self.config.mode == "auto-spread":
+            markets = (f"{self._markets_line()} -- a market listed here trades its own "
+                       "size; any other the 🔀 Auto-spread size")
         rows: Buttons = [
             [("📈 Markets and sizes", "cfg:markets")],
             [("🎛 Mode", "cfg:mode"), ("👥 Accounts", "cfg:accounts")],

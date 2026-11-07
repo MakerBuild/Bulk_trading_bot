@@ -437,7 +437,49 @@ class HoldTime(Span):
         return super().parse(value, name)
 
 
-MODES = ("single", "multi", "delta-neutral")
+MODES = ("single", "multi", "delta-neutral", "auto-spread")
+# The modes whose groups take liquidity rather than rest an order: a master
+# and one of its own subs, IOC slices sized to the book. Auto-spread is
+# delta-neutral that picks its market itself.
+TAKING_MODES = ("delta-neutral", "auto-spread")
+# Which markets auto-spread may pick from.
+AUTO_SPREAD_KINDS = ("tradfi", "crypto", "all")
+# How the menus name them.
+AUTO_SPREAD_LABELS = {"tradfi": "TradFi", "crypto": "Crypto", "all": "All"}
+
+
+@dataclass
+class AutoSpreadConfig:
+    """What `mode: auto-spread` picks from, and the size of what it picks.
+
+    Every new group goes to the listed market with the narrowest spread at
+    that moment, among `markets` -- stocks and indices (`tradfi`), coins
+    (`crypto`) or both (`all`) -- and only while that spread is within
+    `taking.max_spread_bps`. A market already in `markets:` above trades with
+    its own size and leverage there, switched on or not; any other trades
+    `notional_usd` at `leverage`, cut to what the market allows.
+    """
+
+    markets: str = "all"
+    notional_usd: Span = field(default_factory=lambda: Span(100.0, 100.0))
+    leverage: float = 10.0
+    # Symbols counted as tradfi on top of the built-in list, for a stock the
+    # exchange lists after this build: the exchange does not say which is which.
+    tradfi: tuple[str, ...] = ()
+
+    def validate(self) -> None:
+        if self.markets not in AUTO_SPREAD_KINDS:
+            raise ConfigError(
+                "auto_spread.markets must be 'tradfi', 'crypto' or 'all', got "
+                f"{self.markets!r}"
+            )
+        if self.notional_usd.low <= 0:
+            raise ConfigError("auto_spread.notional_usd must be above 0, like 100 or 800-1200")
+        if not MIN_LEVERAGE <= self.leverage <= MAX_LEVERAGE:
+            raise ConfigError(
+                f"auto_spread.leverage must be {MIN_LEVERAGE:g}-{MAX_LEVERAGE:g}, got "
+                f"{self.leverage:g}"
+            )
 
 
 @dataclass
@@ -511,6 +553,10 @@ class Config:
     #            sub-accounts. Taker orders only: the opener takes liquidity
     #            with IOC slices sized to the book, and each fill is hedged at
     #            once on the partner. See `taking` and bulkdn/taking.py.
+    #   auto-spread
+    #            delta-neutral, except that the market is not chosen here:
+    #            every new group goes to the market with the narrowest spread
+    #            at that moment. See `auto_spread` and bulkdn/autospread.py.
     #
     # That difference is the whole reason for the setting. Self-trades inside
     # one tree earn referral volume but no fee-tier volume, because the
@@ -622,6 +668,14 @@ class Config:
     pause: PauseConfig = field(default_factory=PauseConfig)
     # How delta-neutral mode takes liquidity. Ignored by the other modes.
     taking: TakerConfig = field(default_factory=TakerConfig)
+    # Which markets auto-spread picks from, and what it opens in one it was
+    # not given a size for. Ignored by the other modes.
+    auto_spread: AutoSpreadConfig = field(default_factory=AutoSpreadConfig)
+
+    @property
+    def takes_liquidity(self) -> bool:
+        """Whether this mode's groups are a master and its own sub, taking."""
+        return self.mode in TAKING_MODES
 
     # Optional endpoint overrides. Nothing is derived: the hosts are the
     # MAINNET_* constants above, and these replace them outright when set --
@@ -703,8 +757,8 @@ class Config:
         self.target.validate()
         if self.mode not in MODES:
             raise ConfigError(
-                "mode must be 'single', 'multi' or 'delta-neutral', got "
-                f"{self.mode!r}"
+                "mode must be 'single', 'multi', 'delta-neutral' or "
+                f"'auto-spread', got {self.mode!r}"
             )
         if self.max_groups < 1:
             raise ConfigError("max_groups must be at least 1")
@@ -760,6 +814,7 @@ class Config:
         except ValueError as exc:
             raise ConfigError(str(exc)) from exc
         self.taking.validate()
+        self.auto_spread.validate()
         if self.chase_interval_s <= 0:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
@@ -989,8 +1044,9 @@ _TOP_KEYS = frozenset({
     "position_sync_interval_s", "cycles", "execution_target",
     "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
     "state_file", "log_level", "http_url", "ws_url", "telegram", "access",
-    "pause", "taking", "excluded_accounts",
+    "pause", "taking", "excluded_accounts", "auto_spread",
 })
+_AUTO_SPREAD_KEYS = frozenset({"markets", "notional_usd", "leverage", "tradfi"})
 _TAKER_KEYS = frozenset({
     "max_slippage_bps", "max_spread_bps", "depth_fraction", "slice_interval_s",
     "fill_wait_s", "poll_interval_s", "levels",
@@ -1169,6 +1225,8 @@ def _mode_from_raw(value: Any) -> str:
     # old name, only another way of writing this one.
     if mode in ("delta_neutral", "deltaneutral", "delta neutral", "dn", "taker"):
         return "delta-neutral"
+    if mode in ("auto_spread", "autospread", "auto spread", "auto"):
+        return "auto-spread"
     return mode
 
 
@@ -1330,6 +1388,30 @@ def _taker_from_dict(raw: Any) -> TakerConfig:
         fill_wait_s=number("fill_wait_s"),
         poll_interval_s=number("poll_interval_s"),
         levels=default.levels if levels is None else int(_as_float(levels, "taking.levels")),
+    )
+
+
+def _auto_spread_from_dict(raw: Any) -> AutoSpreadConfig:
+    """Read the `auto_spread:` block. Absent, every value is its default."""
+    if not isinstance(raw, dict):
+        raise ConfigError("auto_spread must be a mapping")
+    _warn_unknown(raw, _AUTO_SPREAD_KEYS, "auto_spread")
+    default = AutoSpreadConfig()
+    kind = raw.get("markets")
+    tradfi = raw.get("tradfi")
+    if tradfi is not None and not isinstance(tradfi, list):
+        raise ConfigError('auto_spread.tradfi must be a list, like ["AAPL-USD"]')
+    return AutoSpreadConfig(
+        markets=default.markets if kind is None else str(kind).strip().lower(),
+        notional_usd=(
+            default.notional_usd if raw.get("notional_usd") is None
+            else Span.parse(raw["notional_usd"], "auto_spread.notional_usd")
+        ),
+        leverage=(
+            default.leverage if raw.get("leverage") is None
+            else _as_float(raw["leverage"], "auto_spread.leverage")
+        ),
+        tradfi=tuple(str(s).strip().upper() for s in tradfi or () if str(s).strip()),
     )
 
 
@@ -1633,6 +1715,7 @@ def _load_config(
         access=_access_from_raw(raw.get("access")),
         pause=_pause_from_dict(raw.get("pause") or {}),
         taking=_taker_from_dict(raw.get("taking") or {}),
+        auto_spread=_auto_spread_from_dict(raw.get("auto_spread") or {}),
         private_keys=(
             list(private_keys) if private_keys is not None
             else load_private_keys(require_credentials)

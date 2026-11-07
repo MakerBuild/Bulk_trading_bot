@@ -102,6 +102,7 @@ another).
 single         one master and its own sub-accounts (single_master: which key, by line)
 multi          every master and every sub-account, in one pool     (the default)
 delta-neutral  each master with a random one of its own subs, taker orders only
+auto-spread    delta-neutral on the market with the narrowest spread at each new cycle
 ```
 
 Both modes trade every market switched on; they differ only in who can be on
@@ -141,6 +142,46 @@ taking:
   depth_fraction: 0.5     # at most this share of the depth inside the band
   slice_interval_s: 0.5   # least time between two slices
 ```
+
+### `auto-spread`: delta-neutral on the narrowest spread
+
+Delta-neutral, except that the markets switched on do not decide where it
+trades. A run subscribes to the book of every listed market of one kind, and
+each new group goes to the one with the **narrowest spread at that moment**
+(the deeper of two equal ones):
+
+```
+auto_spread.markets: tradfi   stocks and indices only (NVDA, TSLA, MU, ...)
+                     crypto   coins only (BTC, ETH, SOL, ...)
+                     all      every listed market
+```
+
+- a market wider than `taking.max_spread_bps` is never picked; while all of
+  them are, no new group opens, and the status says which is narrowest;
+- a market too thin for one minimum order inside `taking.max_slippage_bps` is
+  passed over, and so is one paused for a big move or suspended by the exchange;
+- a market listed under `markets:` trades with its own size and leverage there,
+  switched on or not; any other trades `auto_spread.notional_usd` at
+  `auto_spread.leverage`, cut to the market's own maximum;
+- each market is sized against the margin on its own, because an account is
+  in one group at a time. A market whose minimum order the margin cannot
+  carry is left out of the run.
+
+The exchange does not say which markets are stocks, so the bot keeps a list.
+For a stock listed after this version, add it with `tradfi: [NEWCO-USD]`.
+
+```yaml
+mode: auto-spread
+auto_spread:
+  markets: tradfi       # tradfi | crypto | all
+  notional_usd: 100     # $ per cycle in a market not listed under markets:
+  leverage: 10
+```
+
+Choose it in Telegram with **🎛 Mode → auto-spread → TradFi / Crypto / All**, or
+in **Configuration → Markets & Accounts → Accounts**. Startup takes a few
+seconds longer: every candidate market is priced, and its leverage is set on
+every account.
 
 **This mode pays the taker fee on every trade**, both accounts, open and
 close — at tier 0 that is 3.5bps of all volume, about twice the fee per $1M of
@@ -224,7 +265,8 @@ them too; a SOCKS proxy is not, and the log says so.
 
 **Telegram Control** (menu, or `run.sh telegram` / `service.sh` on a server) also
 lets you run the bot from the chat. Besides Run, Stop, Close all and Status, it has
-**🎛 Mode**, which sets multi, single or delta-neutral, and **👥 Accounts**, where
+**🎛 Mode**, which sets multi, single, delta-neutral or auto-spread (then TradFi,
+Crypto or All), and **👥 Accounts**, where
 you tap an account to switch it on or off. Both are saved to `settings.yaml` and
 apply from the next Run. A switched-off account is listed in
 `excluded_accounts:`. It is never drawn into a new cycle, but Close all still
@@ -233,7 +275,7 @@ closes it.
 **⚙️ Settings** covers the rest of what used to be edited by hand. You can switch
 markets on or off and add new ones; set each market's size, max order and
 leverage; and change run targets, groups, risk limits, the delta-neutral taking
-settings and the pause on big moves. Tap a setting, then send the new value as a
+settings, auto-spread's size and leverage, and the pause on big moves. Tap a setting, then send the new value as a
 message, for example `3`, `250k` or `300-600`. The whole file is checked the way
 the bot checks it at startup before anything is saved, so a value it would refuse
 leaves the file unchanged. The `telegram:` block, the keys and the exchange

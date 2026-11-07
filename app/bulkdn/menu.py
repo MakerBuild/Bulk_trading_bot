@@ -42,7 +42,7 @@ from .cli import (
     cmd_status,
     submit_signed,
 )
-from .config import Config, ConfigError, LegConfig
+from .config import AUTO_SPREAD_KINDS, AUTO_SPREAD_LABELS, Config, ConfigError, LegConfig
 from .retry import describe
 from .scripts import script, venv_folder
 from . import lock, proxy
@@ -1848,12 +1848,13 @@ def _markets_screen(config: Config, config_path: str) -> None:
         print(f"  {leg.symbol} is now {'on' if leg.enabled else 'off'}")
 
 
-MODE_CHOICES = ("multi", "single", "delta-neutral")
+MODE_CHOICES = ("multi", "single", "delta-neutral", "auto-spread")
 
 MODE_SUMMARY = {
     "multi": "every master and every sub, in one pool",
     "single": "one master and its own sub-accounts",
     "delta-neutral": "master + a random own sub, taker orders only",
+    "auto-spread": "delta-neutral on the narrowest-spread market each cycle",
 }
 
 
@@ -1864,6 +1865,9 @@ def _accounts_summary(config: Config) -> str:
         return f"single -- master {config.single_master} of {keys}"
     if config.mode == "delta-neutral":
         return f"delta-neutral -- each master with a random sub ({keys} key(s)), taker only"
+    if config.mode == "auto-spread":
+        kind = AUTO_SPREAD_LABELS[config.auto_spread.markets]
+        return f"auto-spread {kind} -- narrowest spread each cycle ({keys} key(s)), taker only"
     return f"multi -- every master ({keys} key(s))"
 
 
@@ -1897,6 +1901,22 @@ def _pick_master(config: Config, config_path: str) -> bool:
     return True
 
 
+def _pick_auto_kind(config: Config, config_path: str) -> bool:
+    """Which markets auto-spread picks from. True when one was chosen."""
+    print("\n  auto-spread: which markets may it pick from?")
+    for index, kind in enumerate(AUTO_SPREAD_KINDS, start=1):
+        marker = "*" if kind == config.auto_spread.markets else " "
+        print(f"  {marker} {index}. {AUTO_SPREAD_LABELS[kind]}")
+    answer = _ask("\n  > ")
+    if not answer.isdigit() or not 1 <= int(answer) <= len(AUTO_SPREAD_KINDS):
+        print("  aborted")
+        return False
+    kind = AUTO_SPREAD_KINDS[int(answer) - 1]
+    write_block_setting(config_path, "auto_spread", "markets", kind)
+    config.auto_spread.markets = kind
+    return True
+
+
 def _accounts_screen(config: Config, config_path: str) -> None:
     """Which accounts trade together -- one master's, or everyone's.
 
@@ -1924,6 +1944,8 @@ def _accounts_screen(config: Config, config_path: str) -> None:
         print("\n  no keys in private_key.local -- nothing can trade yet")
         return
     if chosen == "single" and not _pick_master(config, config_path):
+        return
+    if chosen == "auto-spread" and not _pick_auto_kind(config, config_path):
         return
     if chosen != config.mode:
         _write_mode(config_path, chosen)

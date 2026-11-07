@@ -34,6 +34,7 @@ from bulk_api.common import Side, TimeInForce, Topic
 from .accounts import AccountSession, SharedReconnect
 from .chaser import ChaseParams, Chaser
 from .taking import TakerExecutor
+from . import autospread
 from .config import Config, ConfigError
 from .feed import MarketFeed
 from .fees import burned_usd as _burned
@@ -73,6 +74,8 @@ log = logging.getLogger(__name__)
 # How long after an unanswered submission a change in that symbol might still
 # be our own.
 DOUBT_WINDOW_S = 120.0
+# How often auto-spread says again that no market is narrow enough.
+AUTO_SPREAD_SAY_AGAIN_S = 60.0
 
 # A fill that reaches us this much later than its socket's usual delay says the
 # socket is running behind; the socket is then distrusted for this long, renewed
@@ -3070,9 +3073,10 @@ class Strategy:
 
                 drawn = None
                 if self.pairing is not None:
-                    symbol = self._rng.choice(self.symbols)
-                    if self._market_paused(symbol):
-                        # Fast market or a scheduled hour: no new group. Those
+                    symbol = self._next_market()
+                    if symbol is None:
+                        # Fast market, a scheduled hour, or -- in auto-spread
+                        # -- no spread narrow enough: no new group. Those
                         # already trading carry on and finish their cycle.
                         await asyncio.sleep(self.config.chase_interval_s)
                         continue
@@ -3111,6 +3115,68 @@ class Strategy:
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
+
+    def _next_market(self) -> str | None:
+        """The market the next group trades, or None to open nothing yet.
+
+        A random one of the run's markets, unless it is paused. In auto-spread
+        the one with the narrowest spread right now, of those not paused and
+        within `taking.max_spread_bps` -- see bulkdn/autospread.py.
+        """
+        if self.config.mode != "auto-spread":
+            symbol = self._rng.choice(self.symbols)
+            return None if self._market_paused(symbol) else symbol
+        taking = self.config.taking
+        specs = getattr(self.feed, "specs", None) or {}
+        seen = []
+        for symbol in self.symbols:
+            if self._market_paused(symbol):
+                continue
+            measured = autospread.measure(
+                self.feed, symbol, taking.max_slippage_bps, taking.levels
+            )
+            if measured is not None and autospread.deep_enough(
+                measured, specs.get(symbol), taking.depth_fraction
+            ):
+                seen.append(measured)
+        best = autospread.pick(seen, taking.max_spread_bps)
+        self._note_auto_pick(best, seen)
+        return best.symbol if best is not None else None
+
+    def _note_auto_pick(self, best, seen) -> None:
+        """Log auto-spread's choice when it changes, and keep it for the status."""
+        last = getattr(self, "_auto_pick", None)
+        self._auto_pick = best
+        if best is not None:
+            self._auto_waiting = None
+            if last is None or last.symbol != best.symbol:
+                log.info("auto-spread: next groups on %s, the narrowest now", best.describe())
+            return
+        narrowest = min(seen, key=lambda s: s.spread_bps, default=None)
+        why = (
+            f"narrowest is {narrowest.describe()}" if narrowest is not None
+            else "no book has been heard yet"
+        )
+        self._auto_waiting = why
+        now = time.monotonic()
+        said = getattr(self, "_auto_said_at", None)
+        if last is not None or said is None or now - said >= AUTO_SPREAD_SAY_AGAIN_S:
+            self._auto_said_at = now
+            log.info(
+                "auto-spread: no market within %gbps -- %s; opening nothing until one is",
+                self.config.taking.max_spread_bps, why,
+            )
+
+    def _auto_status(self) -> str:
+        kind = autospread.KIND_LABELS.get(self.config.auto_spread.markets, "")
+        best = getattr(self, "_auto_pick", None)
+        if best is not None:
+            return f"auto-spread {kind}: {best.describe()}"
+        waiting = getattr(self, "_auto_waiting", None)
+        if waiting:
+            return (f"auto-spread {kind}: waiting for a spread within "
+                    f"{self.config.taking.max_spread_bps:g}bps ({waiting})")
+        return f"auto-spread {kind}: {len(self.symbols)} markets, reading books"
 
     def _market_paused(self, symbol: str) -> bool:
         """Whether new groups on `symbol` are held back right now.
@@ -3406,12 +3472,15 @@ class Strategy:
             left = leg.hold_remaining_s()
             note = f" {humanise(left)} left" if left > 0 else ""
             legs.append(f"{key} {phase} cycle {leg.cycle_index}{note}")
+        auto = self.config.mode == "auto-spread"
         if not legs:
-            legs = [f"{symbol} waiting" for symbol in self.symbols]
+            legs = ["waiting"] if auto else [f"{symbol} waiting" for symbol in self.symbols]
 
         burned, volume = self._progress
         target = self.config.target
         lines = ["  " + "     ".join(legs)]
+        if auto:
+            lines.append("  " + self._auto_status())
 
         if target.volume_usd > 0:
             done = volume / target.volume_usd

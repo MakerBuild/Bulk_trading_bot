@@ -55,7 +55,8 @@ from .reconcile import (
 from .retry import describe
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
-from .sizing import plan_sizes, resolve_notionals
+from .sizing import InsufficientMargin, plan_sizes, resolve_notionals
+from .autospread import KIND_LABELS, auto_legs
 from .state import Phase, StateStore, dry_run_path
 from .ws_compat import apply_ws_compat, quieten_sdk_prints
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
@@ -207,6 +208,62 @@ def configure_logging(level: str, log_file: str | None = LOG_FILE) -> None:
     quieten_sdk_prints()
 
 
+# Between two HTTP requests of a startup step that sends one per market. Auto-
+# spread prices and sets leverage on every listed market, and the exchange
+# allows five requests a second from one address.
+PER_MARKET_PACE_S = 0.25
+
+_OPEN_PHASES = (Phase.OPEN, Phase.HOLD, Phase.EXIT, Phase.HALTED)
+
+
+def _open_legs(config: Config) -> list:
+    """The state file's legs with a cycle still open. Unreadable: none here."""
+    try:
+        legs = StateStore(config.state_file).load().legs.values()
+    except RuntimeError:
+        # Unreadable state stops the run a moment later, loudly, in the
+        # strategy's own load. Nothing to keep here.
+        return []
+    return [leg for leg in legs if leg.phase in _OPEN_PHASES]
+
+
+def listed_markets(config: Config) -> dict[str, dict]:
+    """Every market the exchange lists, keyed by symbol. One HTTP request."""
+    from bulk_api.api.bulk_http import BulkHttpClient
+
+    info = BulkHttpClient(
+        base_url=config.http_url,
+        private_key=config.private_key,
+        signature_domain=SignatureDomain[config.signature_domain_name],
+    ).get_exchange_info()
+    markets = info if isinstance(info, list) else info.get("symbols", [])
+    return {m["symbol"]: m for m in markets if isinstance(m, dict) and "symbol" in m}
+
+
+def choose_auto_markets(config: Config) -> None:
+    """Make auto-spread's candidates this run's markets, in place.
+
+    The run's private copy only: the settings file keeps the markets it had.
+    Markets with a cycle still open are added whatever their kind, so a
+    restart can finish them.
+    """
+    kind = config.auto_spread.markets
+    keep = {leg.symbol for leg in _open_legs(config)}
+    legs = auto_legs(config, listed_markets(config), keep=keep)
+    if not legs:
+        which = "" if kind == "all" else KIND_LABELS[kind] + " "
+        raise ConfigError(
+            f"auto-spread ({KIND_LABELS[kind]}): the exchange lists no "
+            f"{which}market that is trading now"
+        )
+    config.markets = legs
+    config.market_names = [f"auto_spread {leg.symbol}" for leg in legs]
+    log.info(
+        "auto-spread (%s): picks from %d market(s): %s",
+        KIND_LABELS[kind], len(legs), ", ".join(leg.symbol for leg in legs),
+    )
+
+
 def drop_excluded(pool: list, config: Config) -> list:
     """The pool without the accounts switched off in `excluded_accounts`.
 
@@ -217,17 +274,9 @@ def drop_excluded(pool: list, config: Config) -> list:
     what the state names.
     """
     excluded = set(config.excluded_accounts)
-    try:
-        legs = StateStore(config.state_file).load().legs.values()
-    except RuntimeError:
-        # Unreadable state stops the run a moment later, loudly, in the
-        # strategy's own load. Nothing to keep here.
-        legs = []
-    open_phases = (Phase.OPEN, Phase.HOLD, Phase.EXIT, Phase.HALTED)
     busy = {
         account
-        for leg in legs
-        if leg.phase in open_phases
+        for leg in _open_legs(config)
         for account in (leg.maker, *leg.takers)
         if account
     }
@@ -269,6 +318,10 @@ class Runtime:
         # copy defensively before every run -- the menu did, Telegram did --
         # and a caller that forgot ran its next run on the last one's sizes.
         config = copy.deepcopy(config)
+        # Auto-spread has no markets of its own until the exchange is asked
+        # which are listed. A closing runtime is handed its markets.
+        if trading and symbols is None and config.mode == "auto-spread":
+            choose_auto_markets(config)
         self.config = config
         self.dry_run = dry_run
         # The markets this runtime subscribes to and acts on. A trading run
@@ -327,7 +380,7 @@ class Runtime:
                 f"the key(s) it uses produced {len(self.pool)}{off}. Create a "
                 "sub-account from Accounts Management, or switch one back on."
             )
-        if trading and config.mode == "delta-neutral" and not any(
+        if trading and config.takes_liquidity and not any(
             session.pubkey == session.client.account_pubkey
             and any(
                 other.client is session.client and other is not session
@@ -339,7 +392,7 @@ class Runtime:
             # that still has a sub switched on, nothing could ever be drawn,
             # and the run would wait forever without saying why.
             raise ConfigError(
-                "delta-neutral mode pairs a master with one of its own subs, and "
+                f"{config.mode} mode pairs a master with one of its own subs, and "
                 "no master switched on has a sub switched on. Switch one on in "
                 "👥 Accounts."
             )
@@ -589,7 +642,11 @@ class Runtime:
         # Priced over HTTP, not from the feed: this runs before the WebSocket
         # is connected, so the ticker cache is still empty and every price
         # would read as zero.
-        prices = {s: self.feed.http_price(s) for s in self.symbols}
+        prices = {}
+        for symbol in self.symbols:
+            prices[symbol] = self.feed.http_price(symbol)
+            if len(self.symbols) > 5:
+                time.sleep(PER_MARKET_PACE_S)
 
         # Dollar-denominated legs become base-coin sizes here, before anything
         # weighs them against margin. After this every leg has a `size`.
@@ -604,6 +661,10 @@ class Runtime:
         for session in self.pool:
             account = session.full_account().get("margin") or {}
             margin[session.name] = float(account.get("availableMargin") or 0.0)
+
+        if self.config.mode == "auto-spread":
+            self._size_each(legs, prices, margin)
+            return
 
         plan = plan_sizes(
             legs=legs,
@@ -628,6 +689,44 @@ class Runtime:
             len(margin),
             thinnest,
             f"{margin[thinnest]:,.2f}",
+        )
+
+    def _size_each(self, legs: list, prices: dict, margin: dict) -> None:
+        """Auto-spread's sizing: every market against the margin on its own.
+
+        A group trades one market, and an account is in one group at a time,
+        so no account ever carries two of these at once -- weighing them as
+        one cycle, as the other modes weigh their markets, would cut each to
+        a twentieth. A market the margin cannot open even its minimum in is
+        switched off for this run rather than stopping it.
+        """
+        kept = []
+        for leg in legs:
+            try:
+                plan = plan_sizes(
+                    legs=[leg],
+                    specs=self.feed.specs,
+                    prices=prices,
+                    available_margin=margin,
+                    max_margin_fraction=self.config.max_margin_fraction,
+                )
+            except InsufficientMargin as exc:
+                log.warning("auto-spread: %s left out of this run -- %s", leg.symbol, describe(exc))
+                leg.enabled = False
+                continue
+            sized = plan.legs[0]
+            leg.size = sized.actual
+            leg.max_order_size = min(leg.max_order_size, sized.actual)
+            kept.append(plan.describe())
+        if not kept:
+            raise InsufficientMargin(
+                "auto-spread: the margin held cannot open the minimum order in any "
+                "of its markets -- deposit, or raise leverage"
+            )
+        thinnest = min(margin, key=margin.get)
+        log.info(
+            "sizing, each market on its own: %s  (thinnest of %d accounts: %s $%s)",
+            "; ".join(kept), len(margin), thinnest, f"{margin[thinnest]:,.2f}",
         )
 
     def _key_for(self, session) -> str:
@@ -690,6 +789,8 @@ class Runtime:
                     leverage=value,
                     account=session.pubkey,
                 )
+                if len(wanted) > 5:
+                    time.sleep(PER_MARKET_PACE_S)
                 if result.ok:
                     log.info(
                         "%s: %s leverage %s -> %s",
@@ -716,7 +817,7 @@ class Runtime:
             max_impact_bps=self.config.risk.max_hedge_impact_bps,
             feed=self.feed,
         )
-        taking = self.config.mode == "delta-neutral"
+        taking = self.config.takes_liquidity
         if taking:
             # Nothing rests in this mode: the opener takes, the partner hedges.
             chaser = TakerExecutor(
@@ -1481,12 +1582,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         # `pool` is what multi was called while it was the third of three.
         # Accepted so a script written against that name keeps running.
-        choices=("single", "multi", "pool", "delta-neutral"),
+        choices=("single", "multi", "pool", "delta-neutral", "auto-spread"),
         help=(
             "override the settings file: single trades one master and its own "
             "sub-accounts, multi trades every master and sub in one pool, "
             "delta-neutral pairs each master with a random sub of its own and "
-            "only takes liquidity. Which markets are traded is a separate setting"
+            "only takes liquidity, auto-spread does the same on whichever market "
+            "has the narrowest spread. Which markets are traded is a separate setting"
         ),
     )
 

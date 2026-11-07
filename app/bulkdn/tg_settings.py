@@ -97,6 +97,15 @@ SECTIONS: dict[str, tuple[str, list[Setting]]] = {
                 "seconds between one hedged slice and the next",
                 lambda c: c.taking.slice_interval_s),
     ]),
+    "auto": ("🔀 Auto-spread", [
+        Setting("asize", "auto_spread", "notional_usd", "Size per cycle $", "span",
+                "dollars per cycle in a market auto-spread picks that is not in "
+                "📈 Markets; a range is drawn fresh each cycle",
+                lambda c: c.auto_spread.notional_usd),
+        Setting("alev", "auto_spread", "leverage", "Leverage", "number",
+                "1-50 for those markets, capped by each market's own maximum",
+                lambda c: c.auto_spread.leverage),
+    ]),
     "pause": ("⏸ Pause on big moves", [
         Setting("move", "pause", "max_move_bps", "Pause on move, bps", "number",
                 "pause opening when the price moved this much; 0 = off",

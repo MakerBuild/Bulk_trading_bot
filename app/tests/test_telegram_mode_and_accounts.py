@@ -71,11 +71,11 @@ async def test_an_old_keyboard_accounts_button_still_opens_margin():
 # -- 🎛 Mode -------------------------------------------------------------------
 
 
-async def test_mode_menu_shows_the_three_modes_and_marks_the_current_one():
+async def test_mode_menu_shows_every_mode_and_marks_the_current_one():
     h = Settings()
     reply = await h.say("🎛 Mode")
     assert "now multi" in reply.text
-    assert labels(reply) == ["✅ multi", "single", "delta-neutral"]
+    assert labels(reply) == ["✅ multi", "single", "delta-neutral", "auto-spread"]
     assert "taker" in reply.text, "delta-neutral's fee cost is not mentioned"
 
 
