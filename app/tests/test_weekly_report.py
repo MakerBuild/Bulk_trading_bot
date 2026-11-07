@@ -80,6 +80,9 @@ def get_json(url):
         "mainnet_week9_trading": 1500 if wallet == M1 else 0,
         "mainnet_week9_maker": 20 if wallet == M1 else 0,
         "mainnet_week8_trading": 999,
+        # The Gauntlet's own week numbering: its week 3 is mainnet week 9.
+        "challenger_week_3_gauntlet": 400 if wallet == M1 else 0,
+        "challenger_week_2_gauntlet": 777,
     }}
 
 
@@ -135,16 +138,34 @@ def test_trading_after_the_week_moves_only_the_end_balance():
 
 def test_this_weeks_aura_only():
     r = report()
-    assert r.points == {M1: {"trading": 1500.0, "maker": 20.0}, M2: {"trading": 0.0, "maker": 0.0}}
-    assert r.total_points == 1520
+    assert r.points == {
+        M1: {"trading": 1500.0, "maker": 20.0, "gauntlet": 400.0},
+        M2: {"trading": 0.0, "maker": 0.0, "gauntlet": 0.0},
+    }
+    assert r.total_points == 1920
 
 
 def test_the_rendered_report():
     lines = "\n".join(weekly.render(report(), {M1: "M1", M2: "M2"}))
     assert "Week 9: Oct 31 13:00 -> Nov 07 13:00 UTC" in lines
     assert "Spent     $1.65" in lines
-    assert "AURA      1,520  (M1 1,520, M2 0)" in lines
+    assert "AURA      1,920  (M1 1,920, M2 0)" in lines
+    assert "gauntlet 400" in lines
     assert "per AURA" in lines and "-0.00" not in lines
+
+
+@pytest.mark.parametrize("week, expected", [
+    (9, {"trading": 10.0, "gauntlet": 3.0}),
+    (7, {"trading": 7.0, "gauntlet": 1.0}),
+    (6, {"trading": 6.0}),
+])
+def test_the_gauntlet_counts_in_the_mainnet_week_it_was_paid_with(week, expected):
+    categories = {
+        "mainnet_week9_trading": 10, "challenger_week_3_gauntlet": 3,
+        "mainnet_week7_trading": 7, "challenger_week_1_gauntlet": 1,
+        "mainnet_week6_trading": 6, "predeposit_week9": 99,
+    }
+    assert weekly.week_points(categories, week) == expected
 
 
 def test_history_reading_stops_at_the_week_start():

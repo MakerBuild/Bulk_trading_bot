@@ -46,6 +46,9 @@ UTC = dt.timezone.utc
 # on the week its trading happened in.
 WEEK_ONE_STARTS = dt.datetime(2026, 9, 5, 13, 0, tzinfo=UTC)
 WEEK = dt.timedelta(days=7)
+# The Challenger Series numbers its weeks from 1, and its week 1 was paid with
+# mainnet week 7 (Oct 17 to 24, 2026, the Taker Volume Gauntlet).
+CHALLENGER_OFFSET = 6
 # Pages of one history read before it is called incomplete.
 MAX_PAGES = 40
 PAGE_ROWS = 1000
@@ -264,13 +267,34 @@ def build_report(
         except Exception as exc:  # noqa: BLE001 - spend is still worth reporting
             report.caveats.append(f"{master[:6]}: AURA not read ({describe(exc)})")
             continue
-        prefix = f"mainnet_week{week}_"
-        report.points[master] = {
-            name[len(prefix):]: float(value)
-            for name, value in (body.get("categories") or {}).items()
-            if name.startswith(prefix)
-        }
+        report.points[master] = week_points(body.get("categories") or {}, week)
     return report
+
+
+def week_points(categories: dict, week: int) -> dict[str, float]:
+    """This week's AURA by kind, from an indexer wallet's categories.
+
+    Two namings pay one week. The campaign's own: `mainnet_week9_trading`,
+    `_maker`, `_boost`. And the Challenger Series' Gauntlet, counted in weeks
+    of its own: `challenger_week_3_gauntlet` is mainnet week 9, because its
+    week 1 was paid with mainnet week 7.
+    """
+    found: dict[str, float] = {}
+    mainnet = f"mainnet_week{week}_"
+    challenger = f"challenger_week_{week - CHALLENGER_OFFSET}_"
+    for name, value in categories.items():
+        try:
+            points = float(value)
+        except (TypeError, ValueError):
+            continue
+        if name.startswith(mainnet):
+            kind = name[len(mainnet):]
+        elif week > CHALLENGER_OFFSET and name.startswith(challenger):
+            kind = name[len(challenger):]
+        else:
+            continue
+        found[kind] = found.get(kind, 0.0) + points
+    return found
 
 
 def _held(account: dict, symbol: str) -> float:
