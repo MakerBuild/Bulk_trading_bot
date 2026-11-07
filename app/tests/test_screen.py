@@ -4,7 +4,7 @@ A live run printed about ninety lines of position reads, exposure sums and
 order placements every five minutes against roughly twenty worth reading, plus
 one line from the SDK on every HTTP call:
 
-    getting account info for 6r3jPT... from https://mainnet-api1.bulk.trade/...
+    getting account info for AbCd12... from https://mainnet-api1.bulk.trade/...
 
 None of it is addressed to the operator, and the number they started the bot
 for scrolled past in the middle of it. So the screen carries a status block and

@@ -303,7 +303,7 @@ def quieten_sdk_prints() -> int:
     There are 128 of them across the package, and one fires on every HTTP
     account read:
 
-        getting account info for 6r3jPT... from https://mainnet-api1...
+        getting account info for AbCd12... from https://mainnet-api1...
 
     On a run that reads positions every five seconds that is most of what is on
     screen, and none of it is addressed to the operator. They are `print`, not
