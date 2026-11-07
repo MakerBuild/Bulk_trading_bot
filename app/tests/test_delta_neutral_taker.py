@@ -77,6 +77,55 @@ def test_remaining_and_cap_bound_the_slice():
     assert plan.size == pytest.approx(0.03)
 
 
+# NVDA's spec: a $50 minimum, a 1e-8 lot; a deep book.
+NVDA = MarketSpec(symbol="NVDA-USD", tick_size=0.001, lot_size=1e-8, min_notional=50.0)
+NVDA_BIDS = [(200.0, 40.0)]
+NVDA_ASKS = [(200.01, 40.0)]
+NVDA_FLOOR = 50.0 / 200.0  # 0.25 NVDA
+
+
+def nvda_slice(remaining, cap, bids=NVDA_BIDS, asks=NVDA_ASKS):
+    return plan_slice(
+        opener_buys=False, bids=bids, asks=asks, spec=NVDA,
+        remaining=remaining, cap=cap, settings=TAKER,
+    )
+
+
+def test_the_last_slice_takes_a_remainder_under_the_minimum():
+    # 2 NVDA to close in slices of 1.9 would leave 0.1 ($20) on both
+    # accounts, which no order the exchange accepts could close.
+    plan = nvda_slice(remaining=2.0, cap=1.9)
+    assert plan.size == pytest.approx(2.0)
+
+
+def test_a_slice_leaves_a_whole_minimum_when_it_cannot_take_all():
+    # The book carries only 1.0 (half of 2.0), so taking all 1.1 is out:
+    # stop short by a minimum instead of leaving 0.1.
+    thin = [(200.0, 2.0)]
+    plan = nvda_slice(remaining=1.1, cap=5.0, bids=thin)
+    assert plan.size < 1.0
+    assert 1.1 - plan.size >= NVDA_FLOOR * 1.05
+
+
+def test_a_remainder_of_a_minimum_or_more_is_left_alone():
+    plan = nvda_slice(remaining=3.0, cap=1.0)
+    assert plan.size == pytest.approx(1.0)
+
+
+def test_slicing_never_strands_dust():
+    # Every remaining amount and cap a cycle can produce: whatever is left
+    # after a slice is zero or still a legal order.
+    rng = random.Random(7)
+    for _ in range(500):
+        remaining = rng.uniform(NVDA_FLOOR, 12.0)
+        cap = rng.uniform(NVDA_FLOOR, 3.0)
+        while remaining > 1e-8:
+            plan = nvda_slice(remaining=remaining, cap=cap)
+            assert isinstance(plan, SlicePlan), plan
+            remaining -= plan.size
+            assert remaining < 1e-8 or remaining >= NVDA_FLOOR, remaining
+
+
 def test_a_wide_spread_waits():
     asks = [(100_050.0, 5.0)]
     plan = plan_slice(

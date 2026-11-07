@@ -61,6 +61,10 @@ SAY_AGAIN_S = 30.0
 # all would size the next slice off a position about to change; the full
 # `fill_wait_s` would stall the leg after every slice that found nothing.
 NO_FILL_GRACE_S = 0.5
+# What a slice leaves behind, when it leaves anything, is at least this many
+# minimum orders: one, and a little more, because the minimum is a notional
+# and the price moves between this slice and the next.
+REMAINDER_MARGIN = 1.05
 
 _FILLED = frozenset({OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED})
 
@@ -188,6 +192,21 @@ def plan_slice(
     room = settings.depth_fraction * min(mine.size, theirs.size)
     size = round_size(min(remaining, cap, room), spec)
     floor = min_order_size(spec, mine.touch)
+    # Never leave less than one minimum order behind. A remainder under the
+    # floor can be neither opened nor closed: on the way out it stayed on
+    # both accounts as a hedged pair of dust that
+    # no order the exchange accepts could reduce. So the last slice takes
+    # it all when the book can carry it -- over the cap by under one
+    # minimum order -- and otherwise stops short by a full minimum (plus a
+    # margin for the price moving before the next slice), so the next slice
+    # is still a legal order.
+    reserve = floor * REMAINDER_MARGIN
+    left = remaining - size
+    if spec.lot_size * 1e-6 < left < reserve:
+        if remaining <= room:
+            size = round_size(remaining, spec)
+        else:
+            size = round_size(remaining - reserve, spec)
     if size < floor:
         return Wait(
             f"thin book: {settings.depth_fraction:.0%} of the depth within "
