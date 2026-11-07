@@ -239,6 +239,15 @@ the bot checks it at startup before anything is saved, so a value it would refus
 leaves the file unchanged. The `telegram:` block, the keys and the exchange
 addresses cannot be changed from the chat.
 
+**📅 Weekly report** covers one AURA week, Saturday 13:00 UTC to Saturday 13:00 UTC.
+It shows the total balance of every account at both ends of the week, money that
+came in from other wallets, what was spent (fees, spread/slippage and funding),
+volume and its cost in bps, and the week's AURA for each master. The exchange keeps
+no balance history, so the balances are worked back from today's: the bot takes
+every trade, fee, funding payment and transfer since then and subtracts them.
+**🔔 Every Saturday** sends the report on its own, about 30 minutes after the
+payout.
+
 ---
 
 ## If it will not start

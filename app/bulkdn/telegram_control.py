@@ -40,9 +40,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import datetime as dt
 import html
 import io
+import json
 import logging
+import os
 import re
 import secrets
 import sys
@@ -54,6 +57,7 @@ import aiohttp
 
 from . import ratelimit
 from . import tg_settings
+from . import weekly
 from .notify import AlertHandler, Notifier, telegram_proxy
 from .retry import describe
 
@@ -88,6 +92,7 @@ KEYBOARD = {
     "💰 Margin": "/accounts",
     "🔁 Live / Dry run": "/mode",
     "⚙️ Settings": "/settings",
+    "📅 Weekly report": "/week",
     # What the margin button was called before Mode and Accounts existed. A
     # phone keeps the old keyboard until the bot sends a new one, and a press
     # on it must still do what its label said.
@@ -96,7 +101,14 @@ KEYBOARD = {
 _KEYBOARD_ROWS = [
     ["📊 Status", "▶️ Run"], ["⏹ Stop", "🛑 Close all"],
     ["🎛 Mode", "👥 Accounts"], ["📜 Log", "💰 Margin"], ["⚙️ Settings", "🔁 Live / Dry run"],
+    ["📅 Weekly report"],
 ]
+# The automatic weekly report: how often the clock is looked at, how long
+# after the payout it waits before reading, and how long it waits for the
+# indexer to show the week's AURA before sending without it.
+WEEKLY_CHECK_S = 300.0
+WEEKLY_DELAY = dt.timedelta(minutes=30)
+WEEKLY_POINTS_WAIT = dt.timedelta(hours=6)
 # How long a typed answer to "send the new value" is waited for.
 INPUT_TTL_S = 300.0
 
@@ -141,6 +153,8 @@ HELP = (
     "📜 Log -- the last lines of logs.txt\n"
     "💰 Margin -- balance margin across sub-accounts, or collect it to the master\n"
     "⚙️ Settings -- markets, sizes, targets and risk limits, saved to settings.yaml\n"
+    "📅 Weekly report -- spend and AURA for an AURA week (Sat 13:00 UTC), and a switch "
+    "to get it every Saturday\n"
     "🔁 Live / Dry run -- switch whether runs and closes trade real funds\n\n"
     "<b>Typed</b>\n"
     "/run 250k -- a run with this volume target\n"
@@ -314,6 +328,9 @@ class Controller:
         trees_fn: Callable[[object], list] | None = None,
         write_setting: Callable[[str, str, str], None] | None = None,
         files=None,
+        report_fn: Callable | None = None,
+        weekly_path: str | None = None,
+        utcnow: Callable[[], dt.datetime] | None = None,
     ):
         self.config = config
         # Where 🎛 Mode and 👥 Accounts write their choice, so it outlives a
@@ -330,6 +347,14 @@ class Controller:
         # None, deadline).
         self.files = files
         self.awaiting: tuple | None = None
+        # (config, trees, week) -> weekly.WeekReport; blocking HTTP, so it
+        # runs in a thread. `weekly_path` keeps the Saturday switch and the
+        # last week sent across restarts.
+        self.report_fn = report_fn
+        self.weekly_path = weekly_path
+        self.utcnow = utcnow or (lambda: dt.datetime.now(dt.timezone.utc))
+        self._report: asyncio.Task | None = None
+        self.weekly = self._load_weekly()
         # Reads the settings file again; None keeps the config given at start.
         # See `config_reloader`.
         self.reload = reload
@@ -406,6 +431,12 @@ class Controller:
         if command == "/settings":
             self._refresh_config()
             return self._settings_home()
+        if command == "/week":
+            try:
+                week = int(args[0]) if args else None
+            except ValueError:
+                return Reply("Usage: /week or /week 9")
+            return self._ask_week(week)
 
         if command in ("/help", "/start"):
             return Reply(HELP, keyboard=True)
@@ -469,6 +500,10 @@ class Controller:
             return await self._set_master(code)
         if action == "acct":
             return await self._toggle_account(code)
+        if action == "wk":
+            return self._ask_week(int(code) if code.isdigit() else None)
+        if action == "wkauto":
+            return self._switch_weekly(code == "on")
         if action in ("cfg", "mkt", "edit", "mon", "madd"):
             self.awaiting = None
             return await self._settings_press(action, code)
@@ -1014,6 +1049,127 @@ class Controller:
         said = "\n".join(line.strip() for line in notes if line.strip())
         return self._market_screen(symbol, f"<pre>{html.escape(said)}</pre>\n")
 
+    # -- 📅 weekly report -----------------------------------------------------
+
+    def _load_weekly(self) -> dict:
+        state = {"enabled": False, "last_sent": 0}
+        if not self.weekly_path:
+            return state
+        try:
+            with open(self.weekly_path, encoding="utf-8") as handle:
+                state.update(json.load(handle))
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            log.warning("telegram control: %s unreadable (%s) -- weekly report off", self.weekly_path, describe(exc))
+        return state
+
+    def _save_weekly(self) -> None:
+        if not self.weekly_path:
+            return
+        temp = f"{self.weekly_path}.tmp"
+        with open(temp, "w", encoding="utf-8") as handle:
+            json.dump(self.weekly, handle)
+        os.replace(temp, self.weekly_path)
+
+    def _week_buttons(self, week: int) -> Buttons:
+        latest = weekly.last_finished_week(self.utcnow())
+        steps = []
+        if week > 1:
+            steps.append((f"◀️ Week {week - 1}", f"wk:{week - 1}"))
+        if week < latest:
+            steps.append((f"Week {week + 1} ▶️", f"wk:{week + 1}"))
+        auto = (("🔔 Every Saturday: on -- turn off", "wkauto:off") if self.weekly["enabled"]
+                else ("🔕 Every Saturday: off -- turn on", "wkauto:on"))
+        return [row for row in (steps, [auto]) if row]
+
+    def _ask_week(self, week: int | None) -> Reply:
+        if self.report_fn is None or self.trees_fn is None:
+            return Reply("The weekly report is not available here.")
+        latest = weekly.last_finished_week(self.utcnow())
+        week = latest if week is None else week
+        if not 1 <= week <= latest:
+            return Reply(f"Week {week} has not ended yet -- the last finished one is {latest}.",
+                         self._week_buttons(latest))
+        if self._report is not None and not self._report.done():
+            return Reply("A report is already being put together -- it will arrive shortly.")
+        start, end = weekly.week_window(week)
+        self._report = asyncio.get_running_loop().create_task(self._send_week(week))
+        return Reply(
+            f"⏳ Week {week}: {start:%b %d %H:%M} → {end:%b %d %H:%M} UTC. Reading every "
+            "account's history -- the report follows in a minute or less.",
+            self._week_buttons(week),
+        )
+
+    def _switch_weekly(self, on: bool) -> Reply:
+        now = self.utcnow()
+        latest = weekly.last_finished_week(now)
+        self.weekly["enabled"] = on
+        if on:
+            # Switched on within a day of a payout: that week is still sent.
+            _, end = weekly.week_window(latest)
+            recent = now - end < dt.timedelta(days=1)
+            self.weekly["last_sent"] = max(self.weekly.get("last_sent", 0), latest - 1 if recent else latest)
+        try:
+            self._save_weekly()
+        except OSError as exc:
+            return Reply(f"⚠️ Could not save the switch: {html.escape(str(exc))}")
+        log.warning("telegram control: weekly report %s", "on" if on else "off")
+        text = ("🔔 The report for each AURA week will arrive every Saturday, about 30 minutes "
+                "after the 13:00 UTC payout." if on else "🔕 No more Saturday reports.")
+        return Reply(text, self._week_buttons(latest))
+
+    async def _week_report(self, week: int):
+        trees, problem = await self._read_trees()
+        if problem is not None:
+            raise RuntimeError(f"could not list the accounts: {problem}")
+        accounts = [list(tree.accounts) for tree in trees]
+        return await asyncio.to_thread(self.report_fn, copy.deepcopy(self.config), accounts, week), trees
+
+    async def _send_week(self, week: int) -> None:
+        try:
+            report, trees = await self._week_report(week)
+        except Exception as exc:  # noqa: BLE001 - reported
+            log.warning("weekly report for week %d failed: %s", week, describe(exc))
+            await self.send(f"⚠️ Weekly report for week {week} failed: {html.escape(describe(exc))}")
+            return
+        await self._deliver(report, trees)
+
+    async def _deliver(self, report, trees) -> None:
+        names = {tree.accounts[0]: f"M{tree.index}" for tree in trees}
+        lines = weekly.render(report, names)
+        await self.send(f"📅 <b>Week {report.week}</b>", plain="\n".join(lines), pre=True)
+
+    async def weekly_loop(self) -> None:
+        """Send each finished week's report once, when the switch is on."""
+        while True:
+            await asyncio.sleep(WEEKLY_CHECK_S)
+            try:
+                await self._weekly_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - try again next tick
+                log.warning("weekly report: %s", describe(exc))
+
+    async def _weekly_tick(self) -> None:
+        if not self.weekly.get("enabled") or self.report_fn is None or self.trees_fn is None:
+            return
+        now = self.utcnow()
+        week = weekly.last_finished_week(now)
+        if week <= self.weekly.get("last_sent", 0):
+            return
+        _, end = weekly.week_window(week)
+        if now < end + WEEKLY_DELAY:
+            return
+        self._refresh_config()
+        report, trees = await self._week_report(week)
+        if report.total_points == 0 and now < end + WEEKLY_POINTS_WAIT:
+            # The indexer has not filed the week yet. Asked again next tick.
+            return
+        await self._deliver(report, trees)
+        self.weekly["last_sent"] = week
+        self._save_weekly()
+
     async def _plan_margin(self, kind: str) -> Reply:
         """Read the balances and show what would move. Sends nothing.
 
@@ -1323,6 +1479,14 @@ def config_reloader(path: str, loaded, *, mode: str | None = None) -> Callable[[
     return reload
 
 
+def _weekly_path(config) -> str | None:
+    """Where the Saturday switch is kept: beside the state file."""
+    state_file = getattr(config, "state_file", None)
+    if not state_file:
+        return None
+    return os.path.join(os.path.dirname(state_file) or ".", "weekly_report.json")
+
+
 async def serve(
     config,
     dry_run: bool,
@@ -1359,10 +1523,13 @@ async def serve(
         trees_fn=account_trees,
         write_setting=write_setting,
         files=menu,
+        report_fn=lambda cfg, trees, week: weekly.build_report(cfg.http_url, trees, week),
+        weekly_path=_weekly_path(config),
     )
     poller = TelegramPoller(telegram.bot_token)
     strangers: set[int] = set()
     backoff = 5.0
+    saturdays = asyncio.get_running_loop().create_task(controller.weekly_loop())
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -1414,5 +1581,6 @@ async def serve(
                     except Exception as exc:  # noqa: BLE001 - one bad update must not end the loop
                         log.warning("telegram update failed: %s", notifier._redacted(describe(exc)))
     finally:
+        saturdays.cancel()
         await controller.shutdown()
         await notifier.drain()
