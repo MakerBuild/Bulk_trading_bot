@@ -110,7 +110,7 @@ the other side of a trade. Closing and status always cover every key in the
 file, whichever mode is set. With more than one master in play, a group's maker
 comes from one master's tree and its hedgers from another's. With one key in
 the file the two modes are the same thing.
-Switch it from **Configuration → Markets & Accounts → Accounts**.
+Switch it from **Configuration → Mode**, or the 🎛 Mode button in Telegram.
 
 ### `delta-neutral`: taker orders only
 
@@ -179,7 +179,7 @@ auto_spread:
 ```
 
 Choose it in Telegram with **🎛 Mode → auto-spread → TradFi / Crypto / All**, or
-in **Configuration → Markets & Accounts → Accounts**. Startup takes a few
+in **Configuration → Mode**. Startup takes a few
 seconds longer: every candidate market is priced, and its leverage is set on
 every account.
 
@@ -204,7 +204,7 @@ worked out from positions and one position cannot serve two groups' sums.
 2. Active Strategy        what is open right now
 3. History                past fills
 4. Accounts Management    create/balance sub-accounts, collect to master, encrypt key, erase local data
-5. Configuration          targets, markets & accounts, progress
+5. Configuration          targets, markets, mode, accounts, settings, weekly report
 6. Close All Positions    cancel everything and flatten
 7. Logs                   the end of logs.txt, and where the file is
 0. Exit
@@ -212,6 +212,25 @@ worked out from positions and one position cannot serve two groups' sums.
 
 Nothing is submitted until you choose **Start** and confirm live trading.
 Ctrl+C at any prompt cancels that action — nothing is saved or sent.
+
+**Configuration** holds everything the Telegram buttons change, so the bot can
+be set up without Telegram:
+
+```
+1-3. Cycles, burn, volume     the execution target
+4.   Markets & Accounts       mode, and markets on/off or added
+5.   Progress
+6.   Mode                     multi / single / delta-neutral / auto-spread (TradFi, Crypto, All)
+7.   Accounts on/off          the same switch as 👥 Accounts (excluded_accounts)
+8.   Settings                 the same values as ⚙️ Settings: each market's size, max order
+                              and leverage, hold time, groups, risk, delta-neutral taking,
+                              auto-spread size and leverage, pause on big moves
+9.   Weekly report            spend and AURA for one AURA week, like 📅 Weekly report
+```
+
+A value is checked the way the bot checks it at startup before it is saved, so
+one the bot would refuse leaves the file unchanged. The automatic Saturday
+report stays a Telegram switch, since it is sent to the chat.
 
 To check the setup without trading anything, open a command window in the
 bot's folder and type:

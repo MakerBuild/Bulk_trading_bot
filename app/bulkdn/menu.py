@@ -43,6 +43,8 @@ from .cli import (
     submit_signed,
 )
 from .config import AUTO_SPREAD_KINDS, AUTO_SPREAD_LABELS, Config, ConfigError, LegConfig
+from .config import load_config
+from . import tg_settings
 from .retry import describe
 from .scripts import script, venv_folder
 from . import lock, proxy
@@ -1964,7 +1966,7 @@ def _markets(config: Config, config_path: str) -> None:
     while True:
         traded = ", ".join(leg.symbol for leg in config.active_legs) or "none"
         print("\n" + _box("MARKETS & ACCOUNTS", [
-            f"1. Accounts   [{_accounts_summary(config)}]",
+            f"1. Mode       [{_accounts_summary(config)}]",
             f"2. Markets    [{traded}]",
             "3. Back",
         ]))
@@ -2106,6 +2108,204 @@ def _target_progress(config: Config) -> None:
     _pause()
 
 
+# -- what Telegram's menu changes, from the terminal ------------------------------
+#
+# The same settings, read and written the same way: tg_settings says where each
+# one lives and how a typed value is read, and the writers above load the edited
+# file before it replaces the real one -- so a value the bot would refuse is
+# refused here too, with the reason, and the file stays as it was.
+
+
+def _reread(config: Config, config_path: str) -> None:
+    """Bring `config` up to date with the file, keys and a --mode left alone."""
+    fresh = load_config(
+        config_path, require_credentials=False, private_keys=list(config.private_keys),
+        warn=False,
+    )
+    for name in vars(fresh):
+        if name not in ("private_keys", "private_key", "mode"):
+            setattr(config, name, getattr(fresh, name))
+
+
+def _plain(title: str) -> str:
+    """A Telegram section title without its emoji: not every console draws them."""
+    head, _, rest = title.partition(" ")
+    return rest if rest and not head.isascii() else title
+
+
+def _ask_setting(config: Config, config_path: str, setting, symbol: str | None = None) -> None:
+    """Ask for one setting's new value, write it, and say what changed."""
+    leg = next((m for m in config.markets if m.symbol == symbol), None) if symbol else None
+    before = tg_settings.shown(setting.read(leg if symbol else config))
+    title = f"{symbol} -- {setting.label}" if symbol else setting.label
+    print(f"\n  {title}: {before}")
+    print(f"  {setting.help}")
+    raw = _ask(f"  new value ({tg_settings.example(setting)}; Enter keeps it): ")
+    if not raw:
+        return
+    try:
+        value = tg_settings.parse(setting, raw)
+    except ValueError as exc:
+        print(f"  {exc} -- nothing changed")
+        return
+    try:
+        if setting.block == tg_settings.MARKET:
+            write_market_setting(config_path, symbol, setting.key, value)
+        elif setting.block == tg_settings.TOP:
+            _write_scalar(config_path, setting.key, value)
+        else:
+            write_block_setting(config_path, setting.block, setting.key, value)
+    except ConfigError as exc:
+        print(f"  refused: {exc}")
+        print("  nothing changed")
+        return
+    _reread(config, config_path)
+    where = f"{symbol} " if symbol else ""
+    print(f"  {where}{setting.label}: {before} -> {value}  (saved, used from the next Start)")
+
+
+def _settings_list(config: Config, config_path: str, title: str, settings, symbol=None) -> None:
+    """A numbered list of settings; pick one to change it."""
+    while True:
+        target = next((m for m in config.markets if m.symbol == symbol), None) if symbol else config
+        if target is None:
+            print(f"\n  {symbol} is no longer in the settings file")
+            return
+        print(f"\n  {title}")
+        for index, setting in enumerate(settings, start=1):
+            value = tg_settings.shown(setting.read(target))
+            print(f"    {index}. {setting.label:<28} [{value}]")
+            print(f"         {setting.help}")
+        print("    0. back")
+        answer = _ask("\n  > ")
+        if answer in ("", "0"):
+            return
+        if not answer.isdigit() or not 1 <= int(answer) <= len(settings):
+            print("  not one of the choices")
+            continue
+        _ask_setting(config, config_path, settings[int(answer) - 1], symbol)
+
+
+def _market_settings(config: Config, config_path: str) -> None:
+    """Size, max order, leverage and maker settings, one market at a time."""
+    while True:
+        print("\n  which market?")
+        for index, leg in enumerate(config.markets, start=1):
+            size = tg_settings.shown(tg_settings.MARKET_SETTINGS[0].read(leg))
+            print(f"    {index}. {leg.symbol:<12} ${size:<12} {'on' if leg.enabled else 'off'}")
+        print("    0. back   (switch markets on or off, or add one: Markets & Accounts -> Markets)")
+        answer = _ask("\n  > ")
+        if answer in ("", "0"):
+            return
+        if not answer.isdigit() or not 1 <= int(answer) <= len(config.markets):
+            print("  not one of the choices")
+            continue
+        leg = config.markets[int(answer) - 1]
+        if leg.size and not leg.notional_usd and leg.notional_span is None:
+            print(f"\n  {leg.symbol} is sized in coins (size {tg_settings.render(leg.size)}). Delete")
+            print("  `size:` in the file to size it in dollars here.")
+        _settings_list(config, config_path, leg.symbol, tg_settings.MARKET_SETTINGS, leg.symbol)
+
+
+def _settings_screen(config: Config, config_path: str) -> None:
+    """Everything Telegram's Settings button changes."""
+    sections = list(tg_settings.SECTIONS.items())
+    while True:
+        lines = ["1. Markets and sizes"]
+        lines += [f"{i}. {_plain(title)}" for i, (_, (title, _s)) in enumerate(sections, start=2)]
+        print("\n" + _box("SETTINGS", [*lines, "0. Back"]))
+        print("  saved to settings.yaml, used from the next Start")
+        answer = _ask("\n  > ")
+        if answer in ("", "0"):
+            return
+        if answer == "1":
+            _market_settings(config, config_path)
+        elif answer.isdigit() and 2 <= int(answer) <= len(sections) + 1:
+            title, settings = sections[int(answer) - 2][1]
+            _settings_list(config, config_path, _plain(title), settings)
+        else:
+            print("  not one of the choices")
+
+
+def _mode_line(config: Config) -> str:
+    if config.mode == "single":
+        return f"single, master {config.single_master}"
+    if config.mode == "auto-spread":
+        return f"auto-spread {AUTO_SPREAD_LABELS[config.auto_spread.markets]}"
+    return config.mode
+
+
+def _excluded_summary(config: Config) -> str:
+    off = len(config.excluded_accounts)
+    return f"{off} switched off" if off else "all on"
+
+
+def _accounts_on_off(config: Config, config_path: str) -> None:
+    """Switch accounts on or off for the next Start: `excluded_accounts`."""
+    trees = _trees(config)
+    while True:
+        excluded = list(config.excluded_accounts)
+        listed: list[str] = []
+        print("\n  accounts (off = never drawn into a new cycle; Close All still closes it):")
+        for tree in trees:
+            for number, pubkey in enumerate(tree.accounts):
+                listed.append(pubkey)
+                name = f"M{tree.index}" if number == 0 else f"S{tree.index}.{number}"
+                state = "off" if pubkey in excluded else "on "
+                print(f"    {len(listed):>2}. [{state}] {name:<6} {short_pubkey(pubkey)}")
+        if config.mode in ("delta-neutral", "auto-spread"):
+            print(f"\n  {config.mode} pairs a master with its own subs: a master")
+            print("  switched off takes its subs out too.")
+        print("\n  1-N  switch one     a  switch all on     0  back")
+        answer = _ask("\n  > ").strip().lower()
+        if answer in ("", "0"):
+            return
+        if answer == "a":
+            excluded = []
+        elif answer.isdigit() and 1 <= int(answer) <= len(listed):
+            pubkey = listed[int(answer) - 1]
+            if pubkey in excluded:
+                excluded.remove(pubkey)
+            else:
+                excluded.append(pubkey)
+        else:
+            print("  not one of the choices")
+            continue
+        _write_scalar(config_path, "excluded_accounts",
+                      "[" + ", ".join(f'"{pubkey}"' for pubkey in excluded) + "]")
+        config.excluded_accounts = tuple(excluded)
+        print(f"  saved: {_excluded_summary(config)}")
+
+
+def _weekly_report(config: Config) -> None:
+    """Spend and AURA for one AURA week (Sat 13:00 UTC to Sat 13:00 UTC)."""
+    import datetime as dt
+
+    from . import weekly
+
+    latest = weekly.last_finished_week(dt.datetime.now(dt.timezone.utc))
+    start, end = weekly.week_window(latest)
+    print(f"\n  last finished AURA week: {latest}  ({start:%b %d %H:%M} -> {end:%b %d %H:%M} UTC)")
+    print("  (the automatic Saturday report is a switch in Telegram -> Weekly report)")
+    answer = _ask(f"  week number (Enter = {latest}, 0 = back): ").strip()
+    if answer == "0":
+        return
+    if answer and (not answer.isdigit() or not 1 <= int(answer) <= latest):
+        print(f"  week {answer} has not ended yet -- the last finished one is {latest}")
+        _pause()
+        return
+    week = int(answer) if answer else latest
+    print("  reading every account's history -- this takes up to a minute...")
+    trees = _trees(config)
+    report = weekly.build_report(config.http_url, [list(t.accounts) for t in trees], week)
+    names = {tree.accounts[0]: f"M{tree.index}" for tree in trees}
+    print(f"\n  Week {week}")
+    for line in weekly.render(report, names):
+        print(f"  {line}")
+    _pause()
+
+
+
 def _configuration(config: Config, config_path: str) -> None:
     while True:
         target = config.target
@@ -2120,7 +2320,13 @@ def _configuration(config: Config, config_path: str) -> None:
             f"4. Markets & Accounts    [{config.mode}]",
             f"     {', '.join(leg.symbol for leg in config.active_legs)}",
             "5. Progress",
-            "6. Back",
+            "",
+            f"6. Mode                  [{_mode_line(config)}]",
+            f"7. Accounts on/off       [{_excluded_summary(config)}]",
+            "8. Settings              sizes, hold, groups, risk,",
+            "                          taking, auto-spread, pause",
+            "9. Weekly report         spend and AURA for a week",
+            "0. Back",
         ]))
         choice = _ask("\n  > ")
         if choice == "1":
@@ -2133,7 +2339,15 @@ def _configuration(config: Config, config_path: str) -> None:
             _markets(config, config_path)
         elif choice == "5":
             _target_progress(config)
-        elif choice in ("6", "0"):
+        elif choice == "6":
+            _accounts_screen(config, config_path)
+        elif choice == "7":
+            _accounts_on_off(config, config_path)
+        elif choice == "8":
+            _settings_screen(config, config_path)
+        elif choice == "9":
+            _weekly_report(config)
+        elif choice in ("0", ""):
             return
 
 

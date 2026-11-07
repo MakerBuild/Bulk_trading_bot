@@ -782,7 +782,7 @@ class Config:
             raise ConfigError(
                 f"single_master is {self.single_master} but {PRIVATE_KEY_FILE} "
                 f"holds {len(self.private_keys)} key(s). Pick one of them from "
-                "Configuration -> Markets & Accounts."
+                "Configuration -> Mode."
             )
         if not self.markets:
             raise ConfigError("config must define at least one market")
