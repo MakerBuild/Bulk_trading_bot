@@ -14,8 +14,10 @@ is, no group opens until one comes back inside it. Groups already trading
 finish where they started.
 
 The exchange does not say which of its markets are stocks, so the split is a
-list kept here (`TRADFI_BASES`), and `auto_spread.tradfi` adds to it for a
-stock listed after this build.
+list kept here (`TRADFI_BASES`). `auto_spread.tradfi` and `auto_spread.crypto`,
+when written, narrow each kind to the tickers they name -- one commented out
+is not traded -- and a ticker in `tradfi` counts as a stock, for one listed
+after this build.
 """
 
 from __future__ import annotations
@@ -54,8 +56,24 @@ def asset_class(symbol: str, extra: Iterable[str] = ()) -> str:
     return "crypto"
 
 
+def named(symbol: str, tickers: Iterable[str]) -> bool:
+    """Whether `symbol` is one of `tickers`, written `NVDA` or `NVDA-USD`."""
+    names = {name.upper() for name in tickers}
+    return symbol.upper() in names or base_of(symbol) in names
+
+
 def wanted(symbol: str, settings: AutoSpreadConfig) -> bool:
-    return settings.markets == "all" or asset_class(symbol, settings.tradfi) == settings.markets
+    kind = asset_class(symbol, settings.tradfi or ())
+    if settings.markets not in ("all", kind):
+        return False
+    tickers = settings.tradfi if kind == "tradfi" else settings.crypto
+    return tickers is None or named(symbol, tickers)
+
+
+def not_listed(listed: dict[str, dict], settings: AutoSpreadConfig) -> list[str]:
+    """Tickers written in the settings that match no market the exchange lists."""
+    written = [*(settings.tradfi or ()), *(settings.crypto or ())]
+    return [ticker for ticker in written if not any(named(s, [ticker]) for s in listed)]
 
 
 def candidates(listed: dict[str, dict], settings: AutoSpreadConfig) -> list[str]:

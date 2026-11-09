@@ -339,8 +339,12 @@ class FakeRuntime:
 
 
 def run_cmd_flatten(monkeypatch, closed, dry_run=False, store=None, markets=None,
-                    leftover=None, cancel_failures=None, swept=None, **kwargs):
+                    leftover=None, cancel_failures=None, swept=None, open_elsewhere=(),
+                    **kwargs):
     from bulkdn import cli
+
+    # What the read before the close finds open: {symbol}.
+    monkeypatch.setattr(cli, "open_markets", lambda runtime: set(open_elsewhere))
 
     FakeRuntime.instances = []
     FakeRuntime.leftover = leftover or {}
@@ -646,3 +650,52 @@ def test_a_limit_close_that_ran_out_of_time_does_not_sweep(monkeypatch):
     swept = []
     run_cmd_flatten(monkeypatch, closed=False, limit=True, swept=swept)
     assert not swept
+
+
+# -- markets not in the settings: auto-spread's ---------------------------------
+
+
+def test_a_market_open_but_not_in_the_settings_is_closed_too(monkeypatch):
+    """Auto-spread trades markets the settings never name. Close all left
+    them open and told the operator to close them on the exchange by hand."""
+    code = run_cmd_flatten(monkeypatch, closed=True, open_elsewhere={"SNDK-USD", BTC})
+    assert code == 0
+    assert FakeRuntime.instances[-1].symbols == [BTC, "SNDK-USD"]
+
+
+def test_nothing_open_elsewhere_builds_one_runtime(monkeypatch):
+    run_cmd_flatten(monkeypatch, closed=True)
+    assert len(FakeRuntime.instances) == 1
+
+
+class _Account:
+    def __init__(self, name, orders=None, fails=False):
+        self.name = name
+        self.pubkey = name
+        self._orders = orders or []
+        self._fails = fails
+
+    def open_orders(self):
+        if self._fails:
+            raise RuntimeError("429")
+        return self._orders
+
+
+def test_open_markets_are_positions_and_orders_and_a_failed_read_is_not_fatal(monkeypatch):
+    from bulkdn import cli
+
+    book = PositionBook()
+    book.set_authoritative("m1", "TSLA-USD", 0.5)
+    book.set_authoritative("m1", "NVDA-USD", 0.0)
+
+    def read(pool, _book):
+        raise RuntimeError("one account timed out")
+
+    monkeypatch.setattr(cli, "sync_positions_http", read)
+    runtime = type("R", (), {})()
+    runtime.book = book
+    runtime.pool = [
+        _Account("m1", orders=[{"symbol": "SNDK-USD"}, {"no": "symbol"}]),
+        _Account("m2", fails=True),
+    ]
+    assert cli.open_markets(runtime) == {"TSLA-USD", "SNDK-USD"}

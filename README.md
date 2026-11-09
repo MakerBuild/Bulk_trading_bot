@@ -167,8 +167,12 @@ auto_spread.markets: tradfi   stocks and indices only (NVDA, TSLA, MU, ...)
   in one group at a time. A market whose minimum order the margin cannot
   carry is left out of the run.
 
-The exchange does not say which markets are stocks, so the bot keeps a list.
-For a stock listed after this version, add it with `tradfi: [NEWCO-USD]`.
+`tradfi:` and `crypto:` are the tickers it may pick from. Put `#` in front of
+one to leave it out; add a line for a new listing (a ticker in `tradfi:` also
+counts as a stock -- the exchange does not say which markets are). Delete a
+whole list to trade every market of that kind the exchange lists, new ones
+included. A ticker the exchange does not list is named in the log and skipped.
+Size and leverage for one ticker go under `markets:`, as for any market.
 
 ```yaml
 mode: auto-spread
@@ -176,7 +180,17 @@ auto_spread:
   markets: tradfi       # tradfi | crypto | all
   notional_usd: 100     # $ per cycle in a market not listed under markets:
   leverage: 10
+  tradfi:
+    - NVDA
+    - TSLA
+#   - SPACEX            # left out
+  crypto:
+    - BTC
+    - ETH
 ```
+
+**Close all** and **Status** cover every market an account has a position or an
+order in, so auto-spread's markets are closed with the rest.
 
 Choose it in Telegram with **🎛 Mode → auto-spread → TradFi / Crypto / All**, or
 in **Configuration → Mode**. Startup takes a few

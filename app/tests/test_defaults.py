@@ -30,6 +30,12 @@ def markets_only(tmp_path) -> Config:
     falls through to the loader's defaults."""
     raw = yaml.safe_load(SHIPPED.read_text(encoding="utf-8"))
     kept = {key: raw[key] for key in ("markets", "legs") if key in raw}
+    # Auto-spread's ticker lists are markets too: the shipped file names what
+    # the exchange lists today, which is the operator's to trim.
+    auto = raw.get("auto_spread") or {}
+    tickers = {key: auto[key] for key in ("tradfi", "crypto") if key in auto}
+    if tickers:
+        kept["auto_spread"] = tickers
     path = tmp_path / "settings.yaml"
     path.write_text(yaml.safe_dump(kept), encoding="utf-8")
     return load_config(str(path), require_credentials=False)
@@ -51,6 +57,8 @@ def test_the_shipped_file_says_what_the_code_defaults_to(tmp_path):
 def test_the_loader_takes_its_defaults_from_the_dataclasses(tmp_path):
     loaded = markets_only(tmp_path)
     built = Config(markets=loaded.markets)
+    built.auto_spread.tradfi = loaded.auto_spread.tradfi
+    built.auto_spread.crypto = loaded.auto_spread.crypto
     assert comparable(loaded) == comparable(built)
 
 

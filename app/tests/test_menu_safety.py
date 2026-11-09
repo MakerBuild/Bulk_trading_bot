@@ -447,6 +447,7 @@ def test_status_covers_switched_off_markets(monkeypatch, capsys):
 
     monkeypatch.setattr(cli, "Runtime", Status)
     monkeypatch.setattr(cli, "sync_positions_http", lambda pool, book: None)
+    monkeypatch.setattr(cli, "open_markets", lambda runtime: set())
 
     assert asyncio.run(cli.cmd_status(config)) == 0
     assert made == [["BTC-USD", "ETH-USD"]]

@@ -56,7 +56,7 @@ from .retry import describe
 from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
 from .sizing import InsufficientMargin, plan_sizes, resolve_notionals
-from .autospread import KIND_LABELS, auto_legs
+from .autospread import KIND_LABELS, auto_legs, not_listed
 from .state import Phase, StateStore, dry_run_path
 from .ws_compat import apply_ws_compat, quieten_sdk_prints
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
@@ -249,12 +249,20 @@ def choose_auto_markets(config: Config) -> None:
     """
     kind = config.auto_spread.markets
     keep = {leg.symbol for leg in _open_legs(config)}
-    legs = auto_legs(config, listed_markets(config), keep=keep)
+    listed = listed_markets(config)
+    unknown = not_listed(listed, config.auto_spread)
+    if unknown:
+        log.warning(
+            "auto-spread: the exchange lists no market for %s -- skipped",
+            ", ".join(unknown),
+        )
+    legs = auto_legs(config, listed, keep=keep)
     if not legs:
         which = "" if kind == "all" else KIND_LABELS[kind] + " "
         raise ConfigError(
             f"auto-spread ({KIND_LABELS[kind]}): the exchange lists no "
-            f"{which}market that is trading now"
+            f"{which}market that is trading now among the tickers in "
+            "auto_spread (tradfi: / crypto:)"
         )
     config.markets = legs
     config.market_names = [f"auto_spread {leg.symbol}" for leg in legs]
@@ -262,6 +270,51 @@ def choose_auto_markets(config: Config) -> None:
         "auto-spread (%s): picks from %d market(s): %s",
         KIND_LABELS[kind], len(legs), ", ".join(leg.symbol for leg in legs),
     )
+
+
+def open_markets(runtime) -> set[str]:
+    """Every market any account of `runtime` holds a position or an order in.
+
+    Read over HTTP, before anything connects. Nothing is raised: this only
+    widens what Close all and Status look at, and a read that failed must not
+    become the thing that stops the panic button.
+    """
+    found: set[str] = set()
+    try:
+        sync_positions_http(runtime.pool, runtime.book)
+    except Exception as exc:
+        log.warning("could not read every account's positions: %s", describe(exc))
+    for held in runtime.book.snapshot().values():
+        found.update(symbol for symbol, size in held.items() if size)
+    for session in runtime.pool:
+        try:
+            orders = session.open_orders()
+        except Exception as exc:
+            log.warning("%s: could not list its open orders: %s", session.name, describe(exc))
+            continue
+        found.update(
+            str(order["symbol"]) for order in orders or ()
+            if isinstance(order, dict) and order.get("symbol")
+        )
+    return found
+
+
+def closing_runtime(config: Config, dry_run: bool) -> Runtime:
+    """The runtime Close all and Status act through: every key, every market.
+
+    Every market in the settings, switched on or not -- and every other market
+    an account has a position or an order in. Auto-spread trades markets that
+    are not in the settings at all, and Close all used to tell the operator to
+    close those on the exchange by hand.
+    """
+    every_market = list(dict.fromkeys(market.symbol for market in config.markets))
+    runtime = Runtime(config, dry_run, symbols=every_market, trading=False)
+    extra = sorted(open_markets(runtime) - set(every_market))
+    if not extra:
+        return runtime
+    log.info("also open, not in the settings: %s", ", ".join(extra))
+    # Nothing has connected yet, so this is a second discovery and no more.
+    return Runtime(config, dry_run, symbols=every_market + extra, trading=False)
 
 
 def drop_excluded(pool: list, config: Config) -> list:
@@ -1039,17 +1092,15 @@ async def cmd_flatten(
     command is the panic button, and something scripted on top of it would
     otherwise read a timeout as success and stop watching.
     """
-    # Every market in the settings, switched on or not. It took the enabled
-    # ones only and then reset the state, so a market turned off with a
-    # position still open was left on the exchange and forgotten.
-    every_market = list(dict.fromkeys(market.symbol for market in config.markets))
+    # Every market in the settings, switched on or not, and every other one
+    # with something open. It took the enabled ones only and then reset the
+    # state, so a market turned off with a position still open was left on
+    # the exchange and forgotten; auto-spread's markets were left the same way.
     # Every key, whatever the mode. In single mode the trading runtime holds
     # one master's accounts only, and closing through it left every other
     # master's positions open -- and then reset the state to IDLE as if they
     # were not there.
-    runtime = await asyncio.to_thread(
-        Runtime, config, dry_run, symbols=every_market, trading=False
-    )
+    runtime = await asyncio.to_thread(closing_runtime, config, dry_run)
     await runtime.start(verify=False, trading=False)
     closed = True
     try:
@@ -1091,8 +1142,8 @@ async def cmd_flatten(
                 print("  Still open, under the market's minimum order: " + ", ".join(dust))
                 print("  Worth under a dollar each. Run Close All again to retry.")
 
-        # A market that is not in the settings at all -- traded by hand, or
-        # removed from the file -- cannot be closed from here: there is no
+        # A market this runtime could not take on -- delisted, or opened
+        # after the read above -- cannot be closed from here: there is no
         # spec for it to size an order with. Said loudly, and the state is
         # kept, rather than reporting flat over a position that is not.
         elsewhere = {
@@ -1103,7 +1154,7 @@ async def cmd_flatten(
         }
         if elsewhere:
             print("")
-            print("  STILL OPEN in markets that are not in settings.yaml:")
+            print("  STILL OPEN in markets this could not close:")
             for line in sorted(elsewhere):
                 print(f"    {line}")
             print("  Close these on the exchange by hand. The state is kept.")
@@ -1166,16 +1217,11 @@ async def cmd_flatten(
 
 async def cmd_status(config: Config) -> int:
     """Read-only: print positions, open orders, and persisted state."""
-    # Every market in the settings, switched on or not -- the same set
-    # `flatten` closes. A market turned off with a position still open is
-    # exactly what someone reading `status` needs to see, and it was the one
-    # thing this left out.
-    every_market = list(dict.fromkeys(market.symbol for market in config.markets))
-    # Every key too, for the same reason as `flatten`: a status that answers
-    # for one master in single mode says nothing about the others.
-    runtime = await asyncio.to_thread(
-        Runtime, config, dry_run=True, symbols=every_market, trading=False
-    )
+    # The same markets and keys `flatten` closes. A market turned off with a
+    # position still open, or one auto-spread picked, is exactly what someone
+    # reading `status` needs to see. Every key too: a status that answers for
+    # one master in single mode says nothing about the others.
+    runtime = await asyncio.to_thread(closing_runtime, config, True)
     # Not strict: one delisted or misspelled market must not hide the rest.
     await asyncio.to_thread(runtime.load_specs, strict=False)
     switched_off = {m.symbol for m in config.markets if not m.enabled}

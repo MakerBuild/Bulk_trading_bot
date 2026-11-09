@@ -319,3 +319,85 @@ def test_the_terminal_menu_writes_the_kind(settings_file, monkeypatch):  # noqa:
     monkeypatch.setattr(menu, "_ask", lambda _prompt: "2")
     assert menu._pick_auto_kind(config, str(settings_file))
     assert load_config(str(settings_file), require_credentials=False).auto_spread.markets == "crypto"
+
+
+# -- the ticker lists ------------------------------------------------------------
+
+
+def test_the_lists_are_read_as_tickers(tmp_path):
+    config = write(tmp_path, "auto_spread:\n  tradfi:\n    - nvda\n    - TSLA-USD\n"
+                             "    - NVDA\n  crypto: [btc]\n")
+    assert config.auto_spread.tradfi == ("NVDA", "TSLA-USD")
+    assert config.auto_spread.crypto == ("BTC",)
+
+
+def test_a_list_left_out_is_every_market_and_one_commented_out_is_none(tmp_path):
+    config = write(tmp_path, "auto_spread:\n  markets: tradfi\n  tradfi:\n#    - NVDA\n")
+    assert config.auto_spread.tradfi == ()
+    assert config.auto_spread.crypto is None
+
+
+def test_a_list_that_is_not_one_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="auto_spread.crypto"):
+        write(tmp_path, "auto_spread:\n  crypto:\n    btc: 1\n")
+
+
+@pytest.mark.parametrize("kind, tradfi, crypto, expected", [
+    # A ticker commented out of the list is not traded.
+    ("tradfi", ("NVDA",), None, ["NVDA-USD"]),
+    ("crypto", None, ("ETH-USD",), ["ETH-USD"]),
+    # All is both lists; a kind without a list is every market of it.
+    ("all", ("TSLA",), ("BTC",), ["BTC-USD", "TSLA-USD"]),
+    ("all", ("TSLA",), None, ["BTC-USD", "ETH-USD", "TSLA-USD"]),
+    # A stock left out of the stock list does not turn into a coin.
+    ("crypto", ("NVDA",), None, ["BTC-USD", "ETH-USD"]),
+    # Every line commented out: nothing of that kind.
+    ("tradfi", (), None, []),
+    # A suspended market in the list is still not picked.
+    ("tradfi", ("US500", "NVDA"), None, ["NVDA-USD"]),
+])
+def test_candidates_are_the_tickers_listed(kind, tradfi, crypto, expected):
+    settings = AutoSpreadConfig(markets=kind, tradfi=tradfi, crypto=crypto)
+    assert autospread.candidates(LISTED, settings) == expected
+
+
+def test_a_new_stock_named_in_the_list_is_traded_as_one():
+    listed = {**LISTED, "NEWCO-USD": {"symbol": "NEWCO-USD", "status": "TRADING"}}
+    tradfi = AutoSpreadConfig(markets="tradfi", tradfi=("NVDA", "NEWCO"))
+    crypto = AutoSpreadConfig(markets="crypto", tradfi=("NVDA", "NEWCO"))
+    assert autospread.candidates(listed, tradfi) == ["NEWCO-USD", "NVDA-USD"]
+    assert "NEWCO-USD" not in autospread.candidates(listed, crypto)
+
+
+def test_a_ticker_the_exchange_does_not_list_is_named(tmp_path, monkeypatch, caplog):
+    config = config_for("tradfi")
+    config.auto_spread.tradfi = ("NVDA", "AAPL")
+    config.state_file = str(tmp_path / "state.json")
+    monkeypatch.setattr(cli, "listed_markets", lambda _config: LISTED)
+    with caplog.at_level("WARNING"):
+        cli.choose_auto_markets(config)
+    assert [leg.symbol for leg in config.markets] == ["NVDA-USD"]
+    assert "AAPL" in caplog.text
+
+
+def test_nothing_listed_among_the_tickers_stops_the_start(tmp_path, monkeypatch):
+    config = config_for("tradfi")
+    config.auto_spread.tradfi = ("AAPL",)
+    config.state_file = str(tmp_path / "state.json")
+    monkeypatch.setattr(cli, "listed_markets", lambda _config: LISTED)
+    with pytest.raises(ConfigError, match="tradfi:"):
+        cli.choose_auto_markets(config)
+
+
+def test_the_shipped_lists_name_only_whole_tickers():
+    import pathlib
+    import yaml
+
+    shipped = pathlib.Path(__file__).resolve().parents[1] / "settings.default.yaml"
+    block = yaml.safe_load(shipped.read_text(encoding="utf-8"))["auto_spread"]
+    for kind in ("tradfi", "crypto"):
+        assert block[kind] and all(isinstance(t, str) and t.isupper() for t in block[kind])
+    for ticker in block["tradfi"]:
+        assert autospread.asset_class(ticker + "-USD") == "tradfi", ticker
+    for ticker in block["crypto"]:
+        assert autospread.asset_class(ticker + "-USD") == "crypto", ticker

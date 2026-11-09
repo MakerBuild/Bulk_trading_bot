@@ -458,14 +458,18 @@ class AutoSpreadConfig:
     `taking.max_spread_bps`. A market already in `markets:` above trades with
     its own size and leverage there, switched on or not; any other trades
     `notional_usd` at `leverage`, cut to what the market allows.
+
+    `tradfi` and `crypto` are the tickers of each kind it may pick, written
+    `NVDA` or `NVDA-USD`. None (the key absent) is every listed market of
+    that kind. A ticker in `tradfi` also counts as a stock, for one the
+    exchange lists after this build: the exchange does not say which is which.
     """
 
     markets: str = "all"
     notional_usd: Span = field(default_factory=lambda: Span(100.0, 100.0))
     leverage: float = 10.0
-    # Symbols counted as tradfi on top of the built-in list, for a stock the
-    # exchange lists after this build: the exchange does not say which is which.
-    tradfi: tuple[str, ...] = ()
+    tradfi: tuple[str, ...] | None = None
+    crypto: tuple[str, ...] | None = None
 
     def validate(self) -> None:
         if self.markets not in AUTO_SPREAD_KINDS:
@@ -1046,7 +1050,7 @@ _TOP_KEYS = frozenset({
     "state_file", "log_level", "http_url", "ws_url", "telegram", "access",
     "pause", "taking", "excluded_accounts", "auto_spread",
 })
-_AUTO_SPREAD_KEYS = frozenset({"markets", "notional_usd", "leverage", "tradfi"})
+_AUTO_SPREAD_KEYS = frozenset({"markets", "notional_usd", "leverage", "tradfi", "crypto"})
 _TAKER_KEYS = frozenset({
     "max_slippage_bps", "max_spread_bps", "depth_fraction", "slice_interval_s",
     "fill_wait_s", "poll_interval_s", "levels",
@@ -1398,9 +1402,6 @@ def _auto_spread_from_dict(raw: Any) -> AutoSpreadConfig:
     _warn_unknown(raw, _AUTO_SPREAD_KEYS, "auto_spread")
     default = AutoSpreadConfig()
     kind = raw.get("markets")
-    tradfi = raw.get("tradfi")
-    if tradfi is not None and not isinstance(tradfi, list):
-        raise ConfigError('auto_spread.tradfi must be a list, like ["AAPL-USD"]')
     return AutoSpreadConfig(
         markets=default.markets if kind is None else str(kind).strip().lower(),
         notional_usd=(
@@ -1411,8 +1412,27 @@ def _auto_spread_from_dict(raw: Any) -> AutoSpreadConfig:
             default.leverage if raw.get("leverage") is None
             else _as_float(raw["leverage"], "auto_spread.leverage")
         ),
-        tradfi=tuple(str(s).strip().upper() for s in tradfi or () if str(s).strip()),
+        tradfi=_ticker_list(raw, "tradfi"),
+        crypto=_ticker_list(raw, "crypto"),
     )
+
+
+def _ticker_list(raw: dict, key: str) -> tuple[str, ...] | None:
+    """`auto_spread.tradfi` or `.crypto`: None when the key is absent.
+
+    Present with every line commented out, YAML reads it as nothing -- which
+    is an empty list here, not "every market": that is what it looks like.
+    """
+    if key not in raw:
+        return None
+    value = raw[key]
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    if not isinstance(value, list):
+        raise ConfigError(f"auto_spread.{key} must be a list of tickers, like [NVDA, TSLA]")
+    return tuple(dict.fromkeys(str(s).strip().upper() for s in value if str(s).strip()))
 
 
 def _access_from_raw(raw: Any) -> AccessConfig:

@@ -62,10 +62,48 @@ taking:
 # the market with the narrowest spread at that moment. markets: tradfi
 # (stocks, indices), crypto, or all. A market listed under markets: above
 # keeps its own size there; any other trades notional_usd at leverage.
+#
+# tradfi: and crypto: are the tickers it may pick. Put # in front of one to
+# skip it, add a line to trade a new listing. Delete a whole list to trade
+# every market of that kind the exchange lists, new ones included.
 auto_spread:
   markets: all
   notional_usd: 100
   leverage: 10
+  tradfi:
+    - CRCL
+    - MSTR
+    - MU
+    - NVDA
+    - SKHYNIX
+    - SNDK
+    - SPACEX
+    - TSLA
+    - US500
+  crypto:
+    - AAVE
+    - BNB
+    - BTC
+    - DOGE
+    - ENA
+    - ETH
+    - FARTCOIN
+    - HYPE
+    - JTO
+    - JUP
+    - LIT
+    - MEGA
+    - MON
+    - NEAR
+    - PAPER
+    - PAXG
+    - PUMP
+    - SOL
+    - SUI
+    - TAO
+    - XPL
+    - XRP
+    - ZEC
 
 chase_interval_s: 1.0
 reconcile_interval_s: 5.0
