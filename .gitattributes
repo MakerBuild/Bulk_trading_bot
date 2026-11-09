@@ -8,6 +8,7 @@
 # its first line with an error that shows nothing wrong -- whatever the
 # checkout settings of the Windows machine they were last committed from.
 *.sh text eol=lf
+*.command text eol=lf
 
 # The vendored SDK. Git detects binary content on its own, but a wheel is a zip
 # and a single byte of line-ending conversion would produce an archive that

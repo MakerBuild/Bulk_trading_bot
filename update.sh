@@ -19,9 +19,18 @@ main() {
 
     say() { printf '  %s\n' "$@"; }
     fail() { echo; say "$@"; echo; exit 1; }
+    on_mac() { [ "$(uname -s)" = Darwin ]; }
 
-    command -v git >/dev/null 2>&1 || fail \
-        "git is not installed:" "" "    sudo apt update && sudo apt install -y git"
+    # `git --version`, not `command -v git`: a Mac without Apple's command
+    # line tools has a /usr/bin/git that only offers to install them.
+    if ! git --version >/dev/null 2>&1; then
+        if on_mac; then
+            fail "git is not installed. Install Apple's command line tools -- a" \
+                 "window may already have offered to; otherwise:" "" \
+                 "    xcode-select --install" "" "then run this again."
+        fi
+        fail "git is not installed:" "" "    sudo apt update && sudo apt install -y git"
+    fi
 
     # The bot's own package answers the questions below; see bulkdn/scripts.py.
     export PYTHONPATH="$PWD/app"
@@ -146,7 +155,7 @@ main() {
         rm -f release.bat settings.default.yaml
     fi
 
-    chmod +x install.sh run.sh update.sh service.sh 2>/dev/null
+    chmod +x install.sh run.sh update.sh service.sh ./*.command 2>/dev/null
     echo
     say "Updating dependencies..."
     if ! ./install.sh; then

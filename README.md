@@ -30,6 +30,15 @@ on in `settings.yaml`; the defaults are BTC-USD and ETH-USD.
    everything, and signs and verifies a test transaction to prove signing works.
    Safe to re-run; it refuses while the bot is running from the folder.
 
+**On a Mac:** install Python 3.12+ from python.org and git
+(`xcode-select --install`), unzip, then double-click
+**`Mac - Install or Update.command`** — the same file installs and, later,
+updates. The first time, macOS asks for **System Settings → Privacy & Security
+→ Open Anyway**. In a freshly unzipped folder it offers to copy the settings,
+keys and state of a bot folder already on the Mac: drag that folder into its
+window. **`Mac - Start.command`** opens the menu and keeps the Mac awake while
+the bot runs (on power; a closed lid still sleeps it).
+
 Never done this before? **[ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md](ГАЙД_ПЕРЕД_ПЕРВЫМ_ЗАПУСКОМ.md)** walks through it
 step by step, in Russian, including what to do when something fails.
 
@@ -360,7 +369,9 @@ Open it in Notepad, **Save As**, Encoding **UTF-8**.
 | `install.bat` | one-time setup |
 | `update.bat` | fetch the latest version; leaves your settings and keys alone |
 | `run.bat` | start the bot |
-| `install.sh`, `update.sh`, `run.sh` | the same three on Linux (Ubuntu 24.04) |
+| `install.sh`, `update.sh`, `run.sh` | the same three on Linux (Ubuntu 24.04) and macOS |
+| `Mac - Install or Update.command` | macOS, double-click: install, and every update after |
+| `Mac - Start.command` | macOS, double-click: start the bot, keeping the Mac awake |
 | `service.sh` | Linux: keep Telegram control running across reboots (systemd) |
 | `settings.yaml` | everything you can change |
 | `private_key.local` | your master key(s), one per line |

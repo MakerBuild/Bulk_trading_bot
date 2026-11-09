@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# First-time setup on Linux (Ubuntu 24.04 and the like): builds the virtualenv
-# and installs everything. Safe to re-run; it upgrades an existing install in
+# First-time setup on Linux (Ubuntu 24.04 and the like) and macOS: builds the
+# virtualenv and installs everything. On a Mac, "Mac - Install or Update.command"
+# runs this, through update.sh. Safe to re-run; it upgrades an existing install in
 # place. The Linux twin of install.bat -- the comments there say why each step
 # is the way it is; the ones here are only about what differs.
 #
@@ -13,6 +14,7 @@ main() {
 
     say() { printf '  %s\n' "$@"; }
     fail() { echo; say "$@"; echo; exit 1; }
+    on_mac() { [ "$(uname -s)" = Darwin ]; }
     suitable() {
         "$@" -c 'import sys, struct; sys.exit(0 if sys.version_info >= (3, 12) and struct.calcsize("P") == 8 else 1)' >/dev/null 2>&1
     }
@@ -41,6 +43,14 @@ main() {
                 break
             fi
         done
+        if [ -z "$py_new" ] && on_mac; then
+            # The python3 macOS comes with is 3.9.
+            fail "This needs Python 3.12 or newer. Install it from" \
+                 "" \
+                 "    https://www.python.org/downloads/" \
+                 "" \
+                 "(the macOS installer), then run this again."
+        fi
         if [ -z "$py_new" ]; then
             fail "This needs 64-bit Python 3.12 or newer." \
                  "On Ubuntu 24.04 it is already there; on anything older:" \
@@ -49,10 +59,19 @@ main() {
         fi
     fi
 
-    command -v git >/dev/null 2>&1 || fail \
-        "git is not installed. It is needed to fetch updates:" \
-        "" \
-        "    sudo apt update && sudo apt install -y git"
+    # `git --version`, not `command -v git`: a Mac without Apple's command
+    # line tools has a /usr/bin/git that only offers to install them.
+    if ! git --version >/dev/null 2>&1; then
+        if on_mac; then
+            fail "git is not installed. It is needed to fetch updates. Install" \
+                 "Apple's command line tools -- a window may already have offered" \
+                 "to; otherwise:" "" "    xcode-select --install" "" \
+                 "then run this again."
+        fi
+        fail "git is not installed. It is needed to fetch updates:" \
+             "" \
+             "    sudo apt update && sudo apt install -y git"
+    fi
 
     if [ ! -x "$venv_py" ]; then
         echo
@@ -161,7 +180,7 @@ main() {
     # Owner-only. The key, the proxy's password and the Telegram token are in
     # these, and on a server other accounts may exist.
     chmod 600 private_key.local proxy.local settings.yaml 2>/dev/null
-    chmod +x run.sh update.sh service.sh 2>/dev/null
+    chmod +x run.sh update.sh service.sh ./*.command 2>/dev/null
 
     echo
     # A real check: a test transaction signed, its domain byte checked, the
@@ -174,7 +193,11 @@ main() {
     say "Done. Next:"
     say "  1. Put your base58 private key on one line in private_key.local"
     say "  2. Edit settings.yaml -- the only settings file you touch"
-    say "  3. Run ./run.sh"
+    if on_mac; then
+        say "  3. Double-click \"Mac - Start.command\" (or run ./run.sh)"
+    else
+        say "  3. Run ./run.sh"
+    fi
     echo
     return 0
 }
