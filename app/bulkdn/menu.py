@@ -44,6 +44,7 @@ from .cli import (
 )
 from .config import AUTO_SPREAD_KINDS, AUTO_SPREAD_LABELS, Config, ConfigError, LegConfig
 from .config import load_config
+from . import autospread
 from . import tg_settings
 from .retry import describe
 from .scripts import script, venv_folder
@@ -1919,6 +1920,167 @@ def _pick_auto_kind(config: Config, config_path: str) -> bool:
     return True
 
 
+# A ticker switched off is written as a comment, so the file still shows it:
+# `#   - SPACEX`. Read back the same way, to be rewritten rather than doubled.
+_TICKER_ITEM = re.compile(r"^(?P<indent>[ ]*)-[ ]+(?P<ticker>[^\s#]+)")
+_TICKER_OFF = re.compile(r"^[ ]*#[ ]*-[ ]+(?P<ticker>[^\s#]+)")
+
+
+def write_ticker_list(
+    config_path: str, kind: str, on: list[str] | None, off: list[str] | tuple[str, ...] = (),
+) -> None:
+    """Write `auto_spread.<kind>:` as the tickers `on`, and `off` commented out.
+
+    `on` None takes the list out, which means every listed market of that
+    kind. The rest of the file, `auto_spread:`'s other keys included, stays as
+    it was.
+    """
+    def item_lines(column: int) -> list[str]:
+        if on is None:
+            return []
+        pad = " " * column
+        return [
+            f"{pad}{kind}:",
+            *(f"{pad}  - {ticker}" for ticker in on),
+            *(f"#{' ' * (column + 1)}- {ticker}" for ticker in off),
+        ]
+
+    def edit(lines: list[str]) -> list[str]:
+        header = _top_level(lines, "auto_spread")
+        if header is None:
+            return [*lines, "", "auto_spread:", *item_lines(2)] if on is not None else lines
+        opened = _key_on(lines[header])
+        if opened is not None and _is_content(opened.rest):
+            raise ConfigError(
+                "`auto_spread:` is written on one line. Write it as a block, one "
+                "setting per line, to change it from the menu."
+            )
+        end = _block_end(lines, header)
+        children = [i for i in range(header + 1, end) if _is_content(lines[i])]
+        column = _indent(lines[children[0]]) if children else 2
+        start = next(
+            (i for i in children
+             if (hit := _key_on(lines[i])) is not None
+             and hit.column == column and not hit.dash and hit.key == kind),
+            None,
+        )
+        if start is None:
+            where = _end_of_block(lines, header)
+            return [*lines[:where], *item_lines(column), *lines[where:]]
+        stop = start + 1
+        while stop < end and (
+            ((item := _TICKER_ITEM.match(lines[stop])) and len(item["indent"]) >= column)
+            or _TICKER_OFF.match(lines[stop])
+        ):
+            stop += 1
+        return [*lines[:start], *item_lines(column), *lines[stop:]]
+
+    _save_settings(config_path, edit)
+
+
+def _ticker_universe(config: Config, kind: str) -> list[str]:
+    """Every ticker of `kind` to offer: what the exchange lists, and the list's own.
+
+    Without the exchange, the shipped file's list stands in for it.
+    """
+    settings = config.auto_spread
+    written = list(getattr(settings, kind) or ())
+    try:
+        listed = _exchange_markets(config)
+    except Exception as exc:
+        print(f"  could not ask the exchange which markets it lists ({describe(exc)})")
+        print("  showing the tickers in the settings and the shipped list")
+        shipped = load_config(str(_shipped_settings()), require_credentials=False, warn=False)
+        listed = {f"{t}-USD": {} for t in getattr(shipped.auto_spread, kind) or ()}
+    found = [
+        autospread.base_of(symbol) for symbol in listed
+        if autospread.asset_class(symbol, settings.tradfi or ()) == kind
+    ]
+    return sorted(dict.fromkeys([*found, *(autospread.base_of(t) for t in written)]))
+
+
+def _shipped_settings() -> pathlib.Path:
+    return pathlib.Path(__file__).resolve().parents[1] / "settings.default.yaml"
+
+
+def _ticker_summary(config: Config, kind: str) -> str:
+    tickers = getattr(config.auto_spread, kind)
+    if tickers is None:
+        return "every listed"
+    return f"{len(tickers)} ticker(s)" if tickers else "none"
+
+
+def _auto_tickers_screen(config: Config, config_path: str) -> None:
+    """Which tickers auto-spread may pick from: `auto_spread.tradfi` / `.crypto`."""
+    kinds = ("tradfi", "crypto")
+    while True:
+        print(f"\n  auto-spread picks from: {AUTO_SPREAD_LABELS[config.auto_spread.markets]}")
+        for index, kind in enumerate(kinds, start=1):
+            print(f"    {index}. {AUTO_SPREAD_LABELS[kind]:<7} [{_ticker_summary(config, kind)}]")
+        print("    0. back")
+        answer = _ask("\n  > ").strip()
+        if answer in ("", "0"):
+            return
+        if answer in ("1", "2"):
+            _ticker_list_screen(config, config_path, kinds[int(answer) - 1])
+        else:
+            print("  not one of the choices")
+
+
+def _ticker_list_screen(config: Config, config_path: str, kind: str) -> None:
+    """Switch one kind's tickers on and off; add one the exchange lists later."""
+    label = AUTO_SPREAD_LABELS[kind]
+    universe = _ticker_universe(config, kind)
+    while True:
+        written = getattr(config.auto_spread, kind)
+        on = (
+            list(universe) if written is None
+            else [t for t in universe if autospread.named(f"{t}-USD", written)]
+        )
+        print(f"\n  {label} tickers (on = auto-spread may pick it):")
+        for index, ticker in enumerate(universe, start=1):
+            print(f"    {index:>2}. [{'on ' if ticker in on else 'off'}] {ticker}")
+        if written is None:
+            print("\n  no list in the file: every listed market, new listings included")
+        print("\n  1-N  switch one     a  all on     n  add a ticker")
+        print("  x    no list: every listed market, new ones too     0  back")
+        answer = _ask("\n  > ").strip().lower()
+        if answer in ("", "0"):
+            return
+        if answer == "x":
+            new_on = None
+        elif answer == "a":
+            new_on = list(universe)
+        elif answer == "n":
+            typed = _ask("  ticker, like AAPL: ").strip().upper()
+            ticker = autospread.base_of(typed) if typed else ""
+            if not re.fullmatch(r"[A-Z0-9]+", ticker):
+                print("  not a ticker")
+                continue
+            if ticker not in universe:
+                universe = sorted([*universe, ticker])
+            new_on = sorted(dict.fromkeys([*on, ticker]))
+        elif answer.isdigit() and 1 <= int(answer) <= len(universe):
+            ticker = universe[int(answer) - 1]
+            if ticker in on and len(on) == 1:
+                print(f"\n  {ticker} is the last {label} ticker switched on. To leave")
+                print(f"  {label} out, pick the other kind in Configuration -> Mode.")
+                continue
+            new_on = [t for t in on if t != ticker] if ticker in on else [*on, ticker]
+            new_on = [t for t in universe if t in new_on]
+        else:
+            print("  not one of the choices")
+            continue
+        off = [] if new_on is None else [t for t in universe if t not in new_on]
+        try:
+            write_ticker_list(config_path, kind, new_on, off)
+        except ConfigError as exc:
+            print(f"  not saved: {exc}")
+            continue
+        setattr(config.auto_spread, kind, None if new_on is None else tuple(new_on))
+        print("  saved -- used from the next Start")
+
+
 def _accounts_screen(config: Config, config_path: str) -> None:
     """Which accounts trade together -- one master's, or everyone's.
 
@@ -1965,10 +2127,16 @@ def _markets(config: Config, config_path: str) -> None:
     """
     while True:
         traded = ", ".join(leg.symbol for leg in config.active_legs) or "none"
+        tickers = ", ".join(
+            f"{AUTO_SPREAD_LABELS[kind]} {_ticker_summary(config, kind)}"
+            for kind in ("tradfi", "crypto")
+        )
         print("\n" + _box("MARKETS & ACCOUNTS", [
             f"1. Mode       [{_accounts_summary(config)}]",
             f"2. Markets    [{traded}]",
-            "3. Back",
+            "3. Auto-spread tickers",
+            f"     {tickers}",
+            "0. Back",
         ]))
         print(f"  up to {config.max_groups} group(s) at once, "
               f"{config.max_takers} account(s) per hedge")
@@ -1977,7 +2145,9 @@ def _markets(config: Config, config_path: str) -> None:
             _accounts_screen(config, config_path)
         elif choice == "2":
             _markets_screen(config, config_path)
-        elif choice in ("3", "0", ""):
+        elif choice == "3":
+            _auto_tickers_screen(config, config_path)
+        elif choice in ("0", ""):
             return
 
 

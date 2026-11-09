@@ -16,7 +16,7 @@ import builtins
 import pytest
 
 from bulkdn import menu
-from bulkdn.config import LegConfig, Span
+from bulkdn.config import AutoSpreadConfig, LegConfig, Span
 
 SETTINGS = """\
 # ===========================================================================
@@ -91,6 +91,7 @@ class StubConfig:
         self.markets = markets or [market("BTC-USD"), market("ETH-USD")]
         self.private_keys = list(keys)
         self.single_master = 1
+        self.auto_spread = AutoSpreadConfig()
 
     @property
     def active_legs(self):
@@ -335,7 +336,7 @@ def test_a_number_that_is_not_a_mode_is_refused(monkeypatch, capsys, settings):
 
 def test_the_top_screen_says_what_is_traded_and_by_whom(monkeypatch, capsys):
     config = StubConfig(markets=[market("BTC-USD"), market("ETH-USD", enabled=False)])
-    feed(monkeypatch, ["3"])
+    feed(monkeypatch, ["0"])
 
     menu._markets(config, "settings.yaml")
 

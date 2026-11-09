@@ -189,6 +189,10 @@ auto_spread:
     - ETH
 ```
 
+The same lists can be switched from the terminal menu: **Configuration →
+Markets & Accounts → Auto-spread tickers**. A ticker switched off there stays in
+the file as a comment (`#   - SPACEX`).
+
 **Close all** and **Status** cover every market an account has a position or an
 order in, so auto-spread's markets are closed with the rest.
 
@@ -232,7 +236,7 @@ be set up without Telegram:
 
 ```
 1-3. Cycles, burn, volume     the execution target
-4.   Markets & Accounts       mode, and markets on/off or added
+4.   Markets & Accounts       mode, markets on/off or added, auto-spread tickers
 5.   Progress
 6.   Mode                     multi / single / delta-neutral / auto-spread (TradFi, Crypto, All)
 7.   Accounts on/off          the same switch as 👥 Accounts (excluded_accounts)
