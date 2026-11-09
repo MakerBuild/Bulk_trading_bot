@@ -70,6 +70,22 @@ def wanted(symbol: str, settings: AutoSpreadConfig) -> bool:
     return tickers is None or named(symbol, tickers)
 
 
+def ticker_universe(symbols: Iterable[str], settings: AutoSpreadConfig, kind: str) -> list[str]:
+    """Every ticker of `kind` to offer for switching: those among `symbols`
+    (what the exchange lists) and those in the list itself, in name order."""
+    found = [base_of(s) for s in symbols if asset_class(s, settings.tradfi or ()) == kind]
+    written = [base_of(t) for t in getattr(settings, kind) or ()]
+    return sorted(dict.fromkeys([*found, *written]))
+
+
+def tickers_on(universe: Iterable[str], written: Iterable[str] | None) -> list[str]:
+    """Which of `universe` a list switches on. No list switches on all of them."""
+    if written is None:
+        return list(universe)
+    written = list(written)
+    return [ticker for ticker in universe if named(f"{ticker}-USD", written)]
+
+
 def not_listed(listed: dict[str, dict], settings: AutoSpreadConfig) -> list[str]:
     """Tickers written in the settings that match no market the exchange lists."""
     written = [*(settings.tradfi or ()), *(settings.crypto or ())]

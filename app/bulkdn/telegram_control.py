@@ -55,6 +55,7 @@ from dataclasses import dataclass
 
 import aiohttp
 
+from . import autospread
 from . import ratelimit
 from . import tg_settings
 from . import weekly
@@ -130,6 +131,8 @@ AUTO_KINDS = {
     "crypto": "coins only",
     "all": "every listed market",
 }
+# The two lists of 🔀 Auto-spread tickers, `auto_spread.tradfi` and `.crypto`.
+AUTO_TICKER_KINDS = ("tradfi", "crypto")
 # How long a listing of the account trees is reused between presses of the
 # account picker. Each listing is an HTTP call per key.
 TREES_TTL_S = 120.0
@@ -352,6 +355,10 @@ class Controller:
         self.trees_fn = trees_fn
         self._trees: list | None = None
         self._trees_at = 0.0
+        # The exchange's market list for 🔀 Auto-spread tickers, reused for
+        # a while: every press of a ticker redraws the screen.
+        self._listed: dict | None = None
+        self._listed_at = 0.0
         # The settings file's writers (bulkdn.menu, or a stand-in in tests),
         # and the setting a typed value is awaited for: (setting, market or
         # None, deadline).
@@ -516,7 +523,7 @@ class Controller:
             return self._ask_week(int(code) if code.isdigit() else None)
         if action == "wkauto":
             return self._switch_weekly(code == "on")
-        if action in ("cfg", "mkt", "edit", "mon", "madd"):
+        if action in ("cfg", "mkt", "edit", "mon", "madd", "tick", "tickt", "ticka", "tickx"):
             self.awaiting = None
             return await self._settings_press(action, code)
         pending = self.pending
@@ -751,7 +758,7 @@ class Controller:
         buttons = [[
             (f"{'✅ ' if kind == current else ''}{KIND_LABELS[kind]}", f"setauto:{kind}")
             for kind in AUTO_KINDS
-        ], [("⬅️ Modes", "cfg:mode")]]
+        ], [("🔀 Tickers", "tick:"), ("⬅️ Modes", "cfg:mode")]]
         spread = tg_settings.render(self.config.taking.max_spread_bps)
         return Reply(
             f"{note}<b>Auto-spread</b>: which markets may it pick from?\n{lines}\n"
@@ -913,6 +920,7 @@ class Controller:
         rows: Buttons = [
             [("📈 Markets and sizes", "cfg:markets")],
             [("🎛 Mode", "cfg:mode"), ("👥 Accounts", "cfg:accounts")],
+            [("🔀 Auto-spread tickers", "tick:")],
         ]
         names = list(tg_settings.SECTIONS)
         for start in range(0, len(names), 2):
@@ -1000,10 +1008,17 @@ class Controller:
         if action == "mkt":
             self._refresh_config()
             return self._market_screen(code)
+        if action == "tick":
+            self._refresh_config()
+            if code in AUTO_TICKER_KINDS:
+                return await self._tickers_screen(code)
+            return self._tickers_home()
 
         problem = self._editable()
         if problem is not None:
             return Reply(problem)
+        if action in ("tickt", "ticka", "tickx"):
+            return await self._switch_tickers(action, code)
         if action == "edit":
             return self._ask_value(code)
         if action == "mon":
@@ -1114,6 +1129,107 @@ class Controller:
         log.warning("telegram control: %s added", symbol)
         said = "\n".join(line.strip() for line in notes if line.strip())
         return self._market_screen(symbol, f"<pre>{html.escape(said)}</pre>\n")
+
+    # -- 🔀 auto-spread tickers -------------------------------------------------
+
+    def _ticker_summary(self, kind: str) -> str:
+        tickers = getattr(self.config.auto_spread, kind)
+        if tickers is None:
+            return "every listed"
+        return f"{len(tickers)} on" if tickers else "none"
+
+    def _tickers_home(self, note: str = "") -> Reply:
+        rows: Buttons = [
+            [(f"{KIND_LABELS[kind]}: {self._ticker_summary(kind)}", f"tick:{kind}")
+             for kind in AUTO_TICKER_KINDS],
+            [("⬅️ Settings", "cfg:")],
+        ]
+        picks = KIND_LABELS[self.config.auto_spread.markets]
+        return Reply(
+            f"{note}<b>🔀 Auto-spread tickers</b>: which markets auto-spread may pick "
+            f"from. It picks from: {html.escape(picks)} (🎛 Mode → auto-spread).\n"
+            "Tap TradFi or Crypto to switch its tickers on and off." + self._later(),
+            rows,
+        )
+
+    async def _ticker_universe(self, kind: str) -> tuple[list[str], str]:
+        """(the tickers to offer, a note). Without the exchange, the shipped list."""
+        if self._listed is None or self.clock() - self._listed_at >= TREES_TTL_S:
+            try:
+                listed = await asyncio.to_thread(
+                    self.files.exchange_markets, copy.deepcopy(self.config),
+                )
+            except Exception as exc:  # noqa: BLE001 - reported, the shipped list shown
+                written = getattr(self.config.auto_spread, kind) or ()
+                universe = sorted(dict.fromkeys([
+                    *self.files.shipped_tickers(kind), *map(autospread.base_of, written),
+                ]))
+                return universe, (f"⚠️ Could not read the exchange's markets "
+                                  f"({html.escape(describe(exc))}): the shipped list is shown.\n")
+            self._listed, self._listed_at = listed, self.clock()
+        return autospread.ticker_universe(self._listed, self.config.auto_spread, kind), ""
+
+    async def _tickers_screen(self, kind: str, note: str = "") -> Reply:
+        universe, problem = await self._ticker_universe(kind)
+        written = getattr(self.config.auto_spread, kind)
+        on = autospread.tickers_on(universe, written)
+        buttons = [
+            (f"{'✅' if ticker in on else '⬜'} {ticker}", f"tickt:{kind}.{ticker}")
+            for ticker in universe
+        ]
+        rows: Buttons = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+        rows.append([("✅ All on", f"ticka:{kind}"), ("♾ Every listed", f"tickx:{kind}")])
+        rows.append([("⬅️ Tickers", "tick:")])
+        label = KIND_LABELS[kind]
+        if written is None:
+            scope = "No list in settings.yaml: every listed market, new listings included."
+        else:
+            scope = "A ticker switched off stays in settings.yaml as a comment."
+        return Reply(
+            f"{note}{problem}<b>🔀 {label} tickers</b>: {len(on)} of {len(universe)} on\n"
+            f"{scope}\nTap one to switch it. ♾ Every listed takes the list out, so new "
+            "listings are picked from too." + self._later(),
+            rows,
+        )
+
+    async def _switch_tickers(self, action: str, code: str) -> Reply:
+        kind, _, ticker = code.partition(".")
+        if kind not in AUTO_TICKER_KINDS:
+            return self._tickers_home()
+        self._refresh_config()
+        universe, problem = await self._ticker_universe(kind)
+        on = autospread.tickers_on(universe, getattr(self.config.auto_spread, kind))
+        label = KIND_LABELS[kind]
+        if action == "tickx":
+            new_on = None
+        elif action == "ticka":
+            new_on = list(universe)
+        elif ticker not in universe:
+            return await self._tickers_screen(kind, "⌛ That list was out of date -- here it is again.\n")
+        elif ticker in on and len(on) == 1:
+            return await self._tickers_screen(
+                kind, f"{html.escape(ticker)} is the last {label} ticker switched on. To leave "
+                      f"{label} out, pick the other kind in 🎛 Mode → auto-spread.\n",
+            )
+        else:
+            new_on = [t for t in universe if (t in on) != (t == ticker)]
+        off = [] if new_on is None else [t for t in universe if t not in new_on]
+        try:
+            self.files.write_ticker_list(self.config_path, kind, new_on, off)
+        except Exception as exc:  # noqa: BLE001 - reported; the file is as it was
+            return Reply(f"⚠️ Could not save: {html.escape(describe(exc))}")
+        problem = self._refresh_config()
+        if new_on is None:
+            said = f"✅ {label}: every listed market.\n"
+        elif action == "ticka":
+            said = f"✅ {label}: all {len(new_on)} on.\n"
+        else:
+            said = f"✅ Saved: {html.escape(ticker)} switched {'off' if ticker in on else 'on'}.\n"
+        log.warning("telegram control: auto-spread %s tickers: %s", kind,
+                    "every listed" if new_on is None else ", ".join(new_on))
+        if problem is not None:
+            said += f"⚠️ Saved, but could not be read back: {html.escape(problem)}\n"
+        return await self._tickers_screen(kind, said)
 
     # -- 📅 weekly report -----------------------------------------------------
 

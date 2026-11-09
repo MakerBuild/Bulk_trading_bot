@@ -1983,24 +1983,24 @@ def _ticker_universe(config: Config, kind: str) -> list[str]:
 
     Without the exchange, the shipped file's list stands in for it.
     """
-    settings = config.auto_spread
-    written = list(getattr(settings, kind) or ())
     try:
         listed = _exchange_markets(config)
     except Exception as exc:
         print(f"  could not ask the exchange which markets it lists ({describe(exc)})")
         print("  showing the tickers in the settings and the shipped list")
-        shipped = load_config(str(_shipped_settings()), require_credentials=False, warn=False)
-        listed = {f"{t}-USD": {} for t in getattr(shipped.auto_spread, kind) or ()}
-    found = [
-        autospread.base_of(symbol) for symbol in listed
-        if autospread.asset_class(symbol, settings.tradfi or ()) == kind
-    ]
-    return sorted(dict.fromkeys([*found, *(autospread.base_of(t) for t in written)]))
+        written = getattr(config.auto_spread, kind) or ()
+        return sorted(dict.fromkeys([*shipped_tickers(kind), *map(autospread.base_of, written)]))
+    return autospread.ticker_universe(listed, config.auto_spread, kind)
 
 
 def _shipped_settings() -> pathlib.Path:
     return pathlib.Path(__file__).resolve().parents[1] / "settings.default.yaml"
+
+
+def shipped_tickers(kind: str) -> tuple[str, ...]:
+    """The shipped settings' auto-spread list of `kind`: BULK's markets of the day."""
+    shipped = load_config(str(_shipped_settings()), require_credentials=False, warn=False)
+    return tuple(getattr(shipped.auto_spread, kind) or ())
 
 
 def _ticker_summary(config: Config, kind: str) -> str:
@@ -2033,10 +2033,7 @@ def _ticker_list_screen(config: Config, config_path: str, kind: str) -> None:
     universe = _ticker_universe(config, kind)
     while True:
         written = getattr(config.auto_spread, kind)
-        on = (
-            list(universe) if written is None
-            else [t for t in universe if autospread.named(f"{t}-USD", written)]
-        )
+        on = autospread.tickers_on(universe, written)
         print(f"\n  {label} tickers (on = auto-spread may pick it):")
         for index, ticker in enumerate(universe, start=1):
             print(f"    {index:>2}. [{'on ' if ticker in on else 'off'}] {ticker}")
