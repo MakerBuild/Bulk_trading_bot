@@ -1078,21 +1078,6 @@ class AccountSession:
             ]
         )
 
-    async def basket(self, orders: Sequence[Action]) -> tuple[list[OrderResponse], dict]:
-        """Send several market orders as one transaction; return it, signed.
-
-        The signed transaction is what the Basket Gauntlet is sent afterwards
-        (bulkdn/baskets.py), and it must be the one the exchange took: the
-        same actions, nonce and account, signed again. An ed25519 signature
-        of the same bytes is the same signature.
-
-        Raises as `submit` does, and then nothing goes to the Gauntlet.
-        """
-        nonce = time.time_ns()
-        responses = await self.submit(list(orders), nonce=nonce)
-        tx = self.client.signed_transaction(list(orders), self.pubkey, nonce)
-        return responses, tx
-
     async def take(
         self,
         symbol: str,

@@ -104,26 +104,19 @@ def candidates(listed: dict[str, dict], settings: AutoSpreadConfig) -> list[str]
     )
 
 
-def auto_legs(
-    config: Config,
-    listed: dict[str, dict],
-    keep: Iterable[str] = (),
-    settings: AutoSpreadConfig | None = None,
-    own_numbers: bool = True,
-) -> list[LegConfig]:
+def auto_legs(config: Config, listed: dict[str, dict], keep: Iterable[str] = ()) -> list[LegConfig]:
     """One market entry per candidate, as the run's `markets` list.
 
     A market the settings file already has keeps its own numbers there --
-    switched on here whether or not it is there -- unless `own_numbers` is
-    False, as for baskets, whose legs are all one size. Any other is sized
-    from `settings` (auto-spread's own by default), at its leverage cut to
-    the market's own ceiling. `keep` are markets with a cycle still open,
-    which this run must be able to finish whatever the choice of kind.
+    switched on here whether or not it is there. Any other is sized from
+    `auto_spread`, at its leverage cut to the market's own ceiling. `keep`
+    are markets with a cycle still open, which this run must be able to
+    finish whatever the choice of kind.
     """
-    settings = settings or config.auto_spread
+    settings = config.auto_spread
     symbols = candidates(listed, settings)
     symbols += sorted(set(keep) - set(symbols))
-    configured = {leg.symbol: leg for leg in config.markets} if own_numbers else {}
+    configured = {leg.symbol: leg for leg in config.markets}
     legs = []
     for symbol in symbols:
         ceiling = float((listed.get(symbol) or {}).get("maxLeverage") or MAX_LEVERAGE)

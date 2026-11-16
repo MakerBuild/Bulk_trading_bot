@@ -112,7 +112,6 @@ single         one master and its own sub-accounts (single_master: which key, by
 multi          every master and every sub-account, in one pool     (the default)
 delta-neutral  each master with a random one of its own subs, taker orders only
 auto-spread    delta-neutral on the market with the narrowest spread at each new cycle
-baskets        a master and its own sub open a basket and its mirror (Basket Gauntlet)
 ```
 
 Both modes trade every market switched on; they differ only in who can be on
@@ -212,50 +211,6 @@ in **Configuration → Mode**. Startup takes a few
 seconds longer: every candidate market is priced, and its leverage is set on
 every account.
 
-### `baskets`: a basket and its mirror, for the Basket Gauntlet
-
-A basket is one transaction of market orders on one account: some tickers
-bought and as many sold, the dollars split evenly, so it is dollar-neutral.
-Every group is a master and a random one of its own subs. One of them opens a
-basket and the other opens its **mirror** at the same moment, so between the
-two nothing is held. Both transactions go to the exchange, and then the same
-signed transactions go to the Basket Gauntlet
-(`app.bulk.trade/api/basket-gauntlet/batches`), which records them -- the
-same two steps the website takes. After `hold_minutes` both accounts close
-with a basket of reduce-only market orders. Only the opening baskets are
-registered: the website registers a basket's open, not its close.
-
-- the tickers are drawn at random every cycle from the **auto-spread ticker
-  lists** (`auto_spread.tradfi:` / `crypto:`), of the kind in
-  `baskets.markets`;
-- only markets within `taking.max_spread_bps`, whose book inside
-  `taking.max_slippage_bps` can take the leg (times `taking.depth_fraction`),
-  and not paused for a big move; with too few, no basket opens and the status
-  says why;
-- whatever the market orders leave uneven between the two accounts is
-  evened out by the hedger once both baskets have answered, and whatever the
-  close leaves is swept at market;
-- a basket bigger than the thinnest account can carry is cut to what it can
-  for that run, and the log says so.
-
-```yaml
-mode: baskets
-baskets:
-  markets: tradfi       # tradfi | crypto | all
-  notional_usd: 1000    # the whole basket on one account: half long, half short
-  leverage: 10
-  per_side: 1           # tickers long, and as many short: 1-4
-```
-
-The status shows the last basket and how the Gauntlet answered:
-`Gauntlet: 12 registered`. A refusal is logged with what the endpoint said,
-and the first one is sent to Telegram. A basket the exchange refused is not
-registered.
-
-Choose it in Telegram with **🎛 Mode → baskets → TradFi / Crypto / All**; size,
-leverage and tickers per side are in **⚙️ Settings → 🧺 Baskets**. In the
-terminal: **Configuration → Mode** and **Configuration → Settings**.
-
 **This mode pays the taker fee on every trade**, both accounts, open and
 close — at tier 0 that is 3.5bps of all volume, about twice the fee per $1M of
 the maker modes, plus the spread on every round trip. It is the fast mode,
@@ -293,12 +248,11 @@ be set up without Telegram:
 1-3. Cycles, burn, volume     the execution target
 4.   Markets & Accounts       mode, markets on/off or added, auto-spread tickers
 5.   Progress
-6.   Mode                     multi / single / delta-neutral / auto-spread / baskets
-                              (the last two: TradFi, Crypto, All)
+6.   Mode                     multi / single / delta-neutral / auto-spread (TradFi, Crypto, All)
 7.   Accounts on/off          the same switch as 👥 Accounts (excluded_accounts)
 8.   Settings                 the same values as ⚙️ Settings: each market's size, max order
                               and leverage, hold time, groups, risk, delta-neutral taking,
-                              auto-spread size and leverage, baskets, pause on big moves
+                              auto-spread size and leverage, pause on big moves
 9.   Weekly report            spend and AURA for one AURA week, like 📅 Weekly report
 ```
 
@@ -358,8 +312,8 @@ them too; a SOCKS proxy is not, and the log says so.
 
 **Telegram Control** (menu, or `run.sh telegram` / `service.sh` on a server) also
 lets you run the bot from the chat. Besides Run, Stop, Close all and Status, it has
-**🎛 Mode**, which sets multi, single, delta-neutral, auto-spread or baskets (the
-last two then ask TradFi, Crypto or All), and **👥 Accounts**, where
+**🎛 Mode**, which sets multi, single, delta-neutral or auto-spread (then TradFi,
+Crypto or All), and **👥 Accounts**, where
 you tap an account to switch it on or off. Both are saved to `settings.yaml` and
 apply from the next Run. A switched-off account is listed in
 `excluded_accounts:`. It is never drawn into a new cycle, but Close all still
@@ -368,8 +322,7 @@ closes it.
 **⚙️ Settings** covers the rest of what used to be edited by hand. You can switch
 markets on or off and add new ones; set each market's size, max order and
 leverage; and change run targets, groups, risk limits, the delta-neutral taking
-settings, auto-spread's size and leverage, baskets' size, leverage and tickers per
-side, and the pause on big moves. Tap a setting, then send the new value as a
+settings, auto-spread's size and leverage, and the pause on big moves. Tap a setting, then send the new value as a
 message, for example `3`, `250k` or `300-600`. The whole file is checked the way
 the bot checks it at startup before anything is saved, so a value it would refuse
 leaves the file unchanged. The `telegram:` block, the keys and the exchange

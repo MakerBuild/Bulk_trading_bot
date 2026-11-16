@@ -31,7 +31,7 @@ from .accounts import (
 from .chaser import Chaser
 from .taking import TakerExecutor
 from .console import watch_for_stop
-from .config import Config, ConfigError, Span, load_config
+from .config import Config, ConfigError, load_config
 from .feed import MarketFeed
 from .notify import AlertHandler, Notifier
 from .referral import SIGNUP_URL, AccessDenied
@@ -57,7 +57,6 @@ from .risk import RiskMonitor
 from .settings import current_leverage, set_leverage
 from .sizing import InsufficientMargin, plan_sizes, resolve_notionals
 from .autospread import KIND_LABELS, auto_legs, not_listed
-from . import baskets
 from .state import Phase, StateStore, dry_run_path
 from .ws_compat import apply_ws_compat, quieten_sdk_prints
 from .strategy import Halted, Strategy, build_chase_params, build_hedge_ceilings
@@ -242,38 +241,34 @@ def listed_markets(config: Config) -> dict[str, dict]:
 
 
 def choose_auto_markets(config: Config) -> None:
-    """Make auto-spread's -- or baskets' -- candidates this run's markets, in place.
+    """Make auto-spread's candidates this run's markets, in place.
 
     The run's private copy only: the settings file keeps the markets it had.
     Markets with a cycle still open are added whatever their kind, so a
-    restart can finish them. Baskets read the same ticker lists through
-    `baskets.settings_view`, with every leg one size.
+    restart can finish them.
     """
-    basket = config.mode == "baskets"
-    settings = baskets.settings_view(config) if basket else config.auto_spread
-    label = "baskets" if basket else "auto-spread"
-    kind = settings.markets
+    kind = config.auto_spread.markets
     keep = {leg.symbol for leg in _open_legs(config)}
     listed = listed_markets(config)
-    unknown = not_listed(listed, settings)
+    unknown = not_listed(listed, config.auto_spread)
     if unknown:
         log.warning(
-            "%s: the exchange lists no market for %s -- skipped",
-            label, ", ".join(unknown),
+            "auto-spread: the exchange lists no market for %s -- skipped",
+            ", ".join(unknown),
         )
-    legs = auto_legs(config, listed, keep=keep, settings=settings, own_numbers=not basket)
+    legs = auto_legs(config, listed, keep=keep)
     if not legs:
         which = "" if kind == "all" else KIND_LABELS[kind] + " "
         raise ConfigError(
-            f"{label} ({KIND_LABELS[kind]}): the exchange lists no "
+            f"auto-spread ({KIND_LABELS[kind]}): the exchange lists no "
             f"{which}market that is trading now among the tickers in "
             "auto_spread (tradfi: / crypto:)"
         )
     config.markets = legs
-    config.market_names = [f"{label} {leg.symbol}" for leg in legs]
+    config.market_names = [f"auto_spread {leg.symbol}" for leg in legs]
     log.info(
-        "%s (%s): picks from %d market(s): %s",
-        label, KIND_LABELS[kind], len(legs), ", ".join(leg.symbol for leg in legs),
+        "auto-spread (%s): picks from %d market(s): %s",
+        KIND_LABELS[kind], len(legs), ", ".join(leg.symbol for leg in legs),
     )
 
 
@@ -378,7 +373,7 @@ class Runtime:
         config = copy.deepcopy(config)
         # Auto-spread has no markets of its own until the exchange is asked
         # which are listed. A closing runtime is handed its markets.
-        if trading and symbols is None and config.mode in ("auto-spread", "baskets"):
+        if trading and symbols is None and config.mode == "auto-spread":
             choose_auto_markets(config)
         self.config = config
         self.dry_run = dry_run
@@ -723,9 +718,6 @@ class Runtime:
         if self.config.mode == "auto-spread":
             self._size_each(legs, prices, margin)
             return
-        if self.config.mode == "baskets":
-            self._size_baskets(legs, margin)
-            return
 
         plan = plan_sizes(
             legs=legs,
@@ -788,39 +780,6 @@ class Runtime:
         log.info(
             "sizing, each market on its own: %s  (thinnest of %d accounts: %s $%s)",
             "; ".join(kept), len(margin), thinnest, f"{margin[thinnest]:,.2f}",
-        )
-
-    def _size_baskets(self, legs: list, margin: dict) -> None:
-        """Baskets' sizing: one whole basket against the thinnest account.
-
-        Every leg of a basket is open at once on one account, so the margin
-        it ties up is the basket's dollars over the lowest leverage any of its
-        markets allows. A basket bigger than the thinnest account can carry
-        is cut to what it can, for this run.
-        """
-        settings = self.config.baskets
-        leverage = min((leg.leverage or settings.leverage for leg in legs), default=settings.leverage)
-        thinnest = min(margin, key=margin.get)
-        room = margin[thinnest] * self.config.max_margin_fraction * leverage
-        if room <= 0:
-            raise InsufficientMargin(
-                f"baskets: {thinnest} has no margin to open a basket -- deposit, or "
-                "raise leverage"
-            )
-        if settings.notional_usd.high > room:
-            wanted = settings.notional_usd.high
-            settings.notional_usd = Span(min(settings.notional_usd.low, room), room)
-            log.warning(
-                "baskets: a $%s basket does not fit the thinnest account (%s, $%s at "
-                "%gx and margin fraction %g) -- cut to $%s for this run",
-                f"{wanted:,.0f}", thinnest, f"{margin[thinnest]:,.2f}", leverage,
-                self.config.max_margin_fraction, f"{room:,.0f}",
-            )
-        log.info(
-            "sizing: baskets of $%s, %d ticker(s) a side, from %d market(s)  "
-            "(thinnest of %d accounts: %s $%s)",
-            settings.notional_usd, settings.per_side, len(legs),
-            len(margin), thinnest, f"{margin[thinnest]:,.2f}",
         )
 
     def _key_for(self, session) -> str:
@@ -1669,7 +1628,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         # `pool` is what multi was called while it was the third of three.
         # Accepted so a script written against that name keeps running.
-        choices=("single", "multi", "pool", "delta-neutral", "auto-spread", "baskets"),
+        choices=("single", "multi", "pool", "delta-neutral", "auto-spread"),
         help=(
             "override the settings file: single trades one master and its own "
             "sub-accounts, multi trades every master and sub in one pool, "
