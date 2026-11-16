@@ -1851,13 +1851,14 @@ def _markets_screen(config: Config, config_path: str) -> None:
         print(f"  {leg.symbol} is now {'on' if leg.enabled else 'off'}")
 
 
-MODE_CHOICES = ("multi", "single", "delta-neutral", "auto-spread")
+MODE_CHOICES = ("multi", "single", "delta-neutral", "auto-spread", "baskets")
 
 MODE_SUMMARY = {
     "multi": "every master and every sub, in one pool",
     "single": "one master and its own sub-accounts",
     "delta-neutral": "master + a random own sub, taker orders only",
     "auto-spread": "delta-neutral on the narrowest-spread market each cycle",
+    "baskets": "master + own sub: a basket and its mirror, for the Basket Gauntlet",
 }
 
 
@@ -1871,6 +1872,10 @@ def _accounts_summary(config: Config) -> str:
     if config.mode == "auto-spread":
         kind = AUTO_SPREAD_LABELS[config.auto_spread.markets]
         return f"auto-spread {kind} -- narrowest spread each cycle ({keys} key(s)), taker only"
+    if config.mode == "baskets":
+        kind = AUTO_SPREAD_LABELS[config.baskets.markets]
+        return (f"baskets {kind} -- each master with a random sub, a basket and its "
+                f"mirror ({keys} key(s)), market orders")
     return f"multi -- every master ({keys} key(s))"
 
 
@@ -1904,19 +1909,24 @@ def _pick_master(config: Config, config_path: str) -> bool:
     return True
 
 
-def _pick_auto_kind(config: Config, config_path: str) -> bool:
-    """Which markets auto-spread picks from. True when one was chosen."""
-    print("\n  auto-spread: which markets may it pick from?")
+def _pick_auto_kind(config: Config, config_path: str, block: str = "auto_spread") -> bool:
+    """Which markets auto-spread -- or baskets -- picks from. True when chosen."""
+    settings = getattr(config, block)
+    name = "baskets" if block == "baskets" else "auto-spread"
+    print(f"\n  {name}: which markets may it pick from?")
     for index, kind in enumerate(AUTO_SPREAD_KINDS, start=1):
-        marker = "*" if kind == config.auto_spread.markets else " "
+        marker = "*" if kind == settings.markets else " "
         print(f"  {marker} {index}. {AUTO_SPREAD_LABELS[kind]}")
+    if block == "baskets":
+        print("  (the tickers are the auto-spread lists: Markets & Accounts ->")
+        print("  Auto-spread tickers)")
     answer = _ask("\n  > ")
     if not answer.isdigit() or not 1 <= int(answer) <= len(AUTO_SPREAD_KINDS):
         print("  aborted")
         return False
     kind = AUTO_SPREAD_KINDS[int(answer) - 1]
-    write_block_setting(config_path, "auto_spread", "markets", kind)
-    config.auto_spread.markets = kind
+    write_block_setting(config_path, block, "markets", kind)
+    settings.markets = kind
     return True
 
 
@@ -2107,6 +2117,8 @@ def _accounts_screen(config: Config, config_path: str) -> None:
     if chosen == "single" and not _pick_master(config, config_path):
         return
     if chosen == "auto-spread" and not _pick_auto_kind(config, config_path):
+        return
+    if chosen == "baskets" and not _pick_auto_kind(config, config_path, "baskets"):
         return
     if chosen != config.mode:
         _write_mode(config_path, chosen)
@@ -2399,6 +2411,8 @@ def _mode_line(config: Config) -> str:
         return f"single, master {config.single_master}"
     if config.mode == "auto-spread":
         return f"auto-spread {AUTO_SPREAD_LABELS[config.auto_spread.markets]}"
+    if config.mode == "baskets":
+        return f"baskets {AUTO_SPREAD_LABELS[config.baskets.markets]}"
     return config.mode
 
 
@@ -2420,7 +2434,7 @@ def _accounts_on_off(config: Config, config_path: str) -> None:
                 name = f"M{tree.index}" if number == 0 else f"S{tree.index}.{number}"
                 state = "off" if pubkey in excluded else "on "
                 print(f"    {len(listed):>2}. [{state}] {name:<6} {short_pubkey(pubkey)}")
-        if config.mode in ("delta-neutral", "auto-spread"):
+        if config.mode in ("delta-neutral", "auto-spread", "baskets"):
             print(f"\n  {config.mode} pairs a master with its own subs: a master")
             print("  switched off takes its subs out too.")
         print("\n  1-N  switch one     a  switch all on     0  back")

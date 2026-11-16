@@ -310,7 +310,7 @@ async def test_the_settings_have_an_auto_spread_section(settings_file):  # noqa:
 
 
 def test_the_modes_are_the_same_in_both_menus():
-    assert list(tc.TRADING_MODES) == ["multi", "single", "delta-neutral", "auto-spread"]
+    assert list(tc.TRADING_MODES) == ["multi", "single", "delta-neutral", "auto-spread", "baskets"]
     assert set(menu.MODE_CHOICES) == set(tc.TRADING_MODES)
 
 

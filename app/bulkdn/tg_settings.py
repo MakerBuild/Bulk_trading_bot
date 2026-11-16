@@ -106,6 +106,18 @@ SECTIONS: dict[str, tuple[str, list[Setting]]] = {
                 "1-50 for those markets, capped by each market's own maximum",
                 lambda c: c.auto_spread.leverage),
     ]),
+    "baskets": ("🧺 Baskets", [
+        Setting("bsize", "baskets", "notional_usd", "Basket size $", "span",
+                "dollars per basket on one account, half long and half short; "
+                "a range is drawn fresh each cycle",
+                lambda c: c.baskets.notional_usd),
+        Setting("blev", "baskets", "leverage", "Leverage", "number",
+                "1-50 for the basket's markets, capped by each market's own maximum",
+                lambda c: c.baskets.leverage),
+        Setting("bside", "baskets", "per_side", "Tickers per side", "int",
+                "how many tickers long, and as many short: 1-4",
+                lambda c: c.baskets.per_side),
+    ]),
     "pause": ("⏸ Pause on big moves", [
         Setting("move", "pause", "max_move_bps", "Pause on move, bps", "number",
                 "pause opening when the price moved this much; 0 = off",

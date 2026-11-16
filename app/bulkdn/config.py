@@ -437,11 +437,13 @@ class HoldTime(Span):
         return super().parse(value, name)
 
 
-MODES = ("single", "multi", "delta-neutral", "auto-spread")
+MODES = ("single", "multi", "delta-neutral", "auto-spread", "baskets")
 # The modes whose groups take liquidity rather than rest an order: a master
-# and one of its own subs, IOC slices sized to the book. Auto-spread is
-# delta-neutral that picks its market itself.
-TAKING_MODES = ("delta-neutral", "auto-spread")
+# and one of its own subs. Auto-spread is delta-neutral that picks its market
+# itself; baskets opens several markets at once, a basket and its mirror.
+TAKING_MODES = ("delta-neutral", "auto-spread", "baskets")
+# The most tickers a basket holds on one side.
+MAX_BASKET_SIDE = 4
 # Which markets auto-spread may pick from.
 AUTO_SPREAD_KINDS = ("tradfi", "crypto", "all")
 # How the menus name them.
@@ -483,6 +485,47 @@ class AutoSpreadConfig:
             raise ConfigError(
                 f"auto_spread.leverage must be {MIN_LEVERAGE:g}-{MAX_LEVERAGE:g}, got "
                 f"{self.leverage:g}"
+            )
+
+
+@dataclass
+class BasketsConfig:
+    """What `mode: baskets` opens. See bulkdn/baskets.py.
+
+    Every group is a master and one of its own subs. One of the two opens a
+    basket -- `per_side` tickers long and as many short, `notional_usd` split
+    evenly between them, so the basket is dollar-neutral -- and the other
+    opens its mirror at the same moment. Both are market orders, sent to the
+    exchange and registered with the Basket Gauntlet; after the hold both
+    close with reduce-only market orders, which are not registered. The tickers are drawn at random each cycle from the
+    markets of kind `markets` (tradfi, crypto or all) in `auto_spread`'s
+    ticker lists, among those whose spread and depth pass `taking`.
+    """
+
+    markets: str = "tradfi"
+    # The whole basket on one account: half of it long, half short.
+    notional_usd: Span = field(default_factory=lambda: Span(1000.0, 1000.0))
+    leverage: float = 10.0
+    # Tickers on each side: 1 is one long and one short.
+    per_side: int = 1
+
+    def validate(self) -> None:
+        if self.markets not in AUTO_SPREAD_KINDS:
+            raise ConfigError(
+                "baskets.markets must be 'tradfi', 'crypto' or 'all', got "
+                f"{self.markets!r}"
+            )
+        if self.notional_usd.low <= 0:
+            raise ConfigError("baskets.notional_usd must be above 0, like 1000 or 800-1200")
+        if not MIN_LEVERAGE <= self.leverage <= MAX_LEVERAGE:
+            raise ConfigError(
+                f"baskets.leverage must be {MIN_LEVERAGE:g}-{MAX_LEVERAGE:g}, got "
+                f"{self.leverage:g}"
+            )
+        if not 1 <= self.per_side <= MAX_BASKET_SIDE:
+            raise ConfigError(
+                f"baskets.per_side must be 1-{MAX_BASKET_SIDE} (tickers long, and as "
+                f"many short), got {self.per_side}"
             )
 
 
@@ -561,6 +604,9 @@ class Config:
     #            delta-neutral, except that the market is not chosen here:
     #            every new group goes to the market with the narrowest spread
     #            at that moment. See `auto_spread` and bulkdn/autospread.py.
+    #   baskets  a master and its own sub open a dollar-neutral basket and its
+    #            mirror -- several markets at once, market orders, registered
+    #            with the Basket Gauntlet. See `baskets` and bulkdn/baskets.py.
     #
     # That difference is the whole reason for the setting. Self-trades inside
     # one tree earn referral volume but no fee-tier volume, because the
@@ -675,6 +721,8 @@ class Config:
     # Which markets auto-spread picks from, and what it opens in one it was
     # not given a size for. Ignored by the other modes.
     auto_spread: AutoSpreadConfig = field(default_factory=AutoSpreadConfig)
+    # What baskets mode opens. Ignored by the other modes.
+    baskets: BasketsConfig = field(default_factory=BasketsConfig)
 
     @property
     def takes_liquidity(self) -> bool:
@@ -761,8 +809,8 @@ class Config:
         self.target.validate()
         if self.mode not in MODES:
             raise ConfigError(
-                "mode must be 'single', 'multi', 'delta-neutral' or "
-                f"'auto-spread', got {self.mode!r}"
+                "mode must be 'single', 'multi', 'delta-neutral', "
+                f"'auto-spread' or 'baskets', got {self.mode!r}"
             )
         if self.max_groups < 1:
             raise ConfigError("max_groups must be at least 1")
@@ -819,6 +867,7 @@ class Config:
             raise ConfigError(str(exc)) from exc
         self.taking.validate()
         self.auto_spread.validate()
+        self.baskets.validate()
         if self.chase_interval_s <= 0:
             raise ConfigError("chase_interval_s must be > 0")
         if self.reconcile_interval_s <= 0:
@@ -1048,9 +1097,10 @@ _TOP_KEYS = frozenset({
     "position_sync_interval_s", "cycles", "execution_target",
     "hedge_tolerance_lots", "overlay_ttl_ms", "max_margin_fraction", "risk",
     "state_file", "log_level", "http_url", "ws_url", "telegram", "access",
-    "pause", "taking", "excluded_accounts", "auto_spread",
+    "pause", "taking", "excluded_accounts", "auto_spread", "baskets",
 })
 _AUTO_SPREAD_KEYS = frozenset({"markets", "notional_usd", "leverage", "tradfi", "crypto"})
+_BASKETS_KEYS = frozenset({"markets", "notional_usd", "leverage", "per_side"})
 _TAKER_KEYS = frozenset({
     "max_slippage_bps", "max_spread_bps", "depth_fraction", "slice_interval_s",
     "fill_wait_s", "poll_interval_s", "levels",
@@ -1231,6 +1281,8 @@ def _mode_from_raw(value: Any) -> str:
         return "delta-neutral"
     if mode in ("auto_spread", "autospread", "auto spread", "auto"):
         return "auto-spread"
+    if mode in ("basket", "basket-gauntlet"):
+        return "baskets"
     return mode
 
 
@@ -1414,6 +1466,32 @@ def _auto_spread_from_dict(raw: Any) -> AutoSpreadConfig:
         ),
         tradfi=_ticker_list(raw, "tradfi"),
         crypto=_ticker_list(raw, "crypto"),
+    )
+
+
+def _baskets_from_dict(raw: Any) -> BasketsConfig:
+    """Read the `baskets:` block. Absent, every value is its default."""
+    if not isinstance(raw, dict):
+        raise ConfigError("baskets must be a mapping")
+    _warn_unknown(raw, _BASKETS_KEYS, "baskets")
+    default = BasketsConfig()
+    kind = raw.get("markets")
+    per_side = raw.get("per_side")
+    if per_side is not None:
+        number = _as_float(per_side, "baskets.per_side")
+        if not number.is_integer():
+            raise ConfigError(f"baskets.per_side must be a whole number, got {per_side!r}")
+    return BasketsConfig(
+        markets=default.markets if kind is None else str(kind).strip().lower(),
+        notional_usd=(
+            default.notional_usd if raw.get("notional_usd") is None
+            else Span.parse(raw["notional_usd"], "baskets.notional_usd")
+        ),
+        leverage=(
+            default.leverage if raw.get("leverage") is None
+            else _as_float(raw["leverage"], "baskets.leverage")
+        ),
+        per_side=default.per_side if per_side is None else int(number),
     )
 
 
@@ -1736,6 +1814,7 @@ def _load_config(
         pause=_pause_from_dict(raw.get("pause") or {}),
         taking=_taker_from_dict(raw.get("taking") or {}),
         auto_spread=_auto_spread_from_dict(raw.get("auto_spread") or {}),
+        baskets=_baskets_from_dict(raw.get("baskets") or {}),
         private_keys=(
             list(private_keys) if private_keys is not None
             else load_private_keys(require_credentials)

@@ -35,6 +35,7 @@ from .accounts import AccountSession, SharedReconnect
 from .chaser import ChaseParams, Chaser
 from .taking import TakerExecutor
 from . import autospread
+from . import baskets as basket_rules
 from .config import Config, ConfigError
 from .feed import MarketFeed
 from .fees import burned_usd as _burned
@@ -76,6 +77,13 @@ log = logging.getLogger(__name__)
 DOUBT_WINDOW_S = 120.0
 # How often auto-spread says again that no market is narrow enough.
 AUTO_SPREAD_SAY_AGAIN_S = 60.0
+# How often a basket waiting to be even between its two accounts is looked at.
+BASKET_POLL_S = 0.5
+# How long the end of a run waits for the Gauntlet to hear of its last baskets.
+REGISTER_WAIT_S = 15.0
+# How long after a basket and its mirror have answered the exposure limit
+# still lets them be uneven: the hedger's time to even them out.
+BASKET_RISK_GRACE_S = 10.0
 
 # A fill that reaches us this much later than its socket's usual delay says the
 # socket is running behind; the socket is then distrusted for this long, renewed
@@ -382,6 +390,18 @@ class Strategy:
         # given a seed here without reaching into every other user of
         # `random` in the process.
         self._rng = random.Random()
+        # Basket legs whose two transactions are on their way. The hedger
+        # leaves them alone until both have answered. See `_send_baskets`.
+        self._basket_flight: set[str] = set()
+        # Until when the exposure limit leaves just-sent baskets alone.
+        self._basket_grace_until = 0.0
+        # Gauntlet registrations still being sent, and how those sent went.
+        self._registering: set[asyncio.Task] = set()
+        self._gauntlet = {"ok": 0, "refused": 0, "failed": 0}
+        # For the status line: the last basket drawn, or why none can be.
+        self._basket_last: str | None = None
+        self._basket_waiting: str | None = None
+        self._basket_said_at: float | None = None
 
     @property
     def all_sessions(self) -> list[AccountSession]:
@@ -1366,6 +1386,10 @@ class Strategy:
             # The liquidation guard is deciding whether this leg was broken,
             # and it queues the leg again when it lets go.
             return HedgeResult(roles.symbol, 0.0, 0.0, False, "held by the liquidation guard")
+        if roles.key in self._basket_flight:
+            # Its basket and the mirror are on their way. Both are queued
+            # here again once they have answered.
+            return HedgeResult(roles.symbol, 0.0, 0.0, False, "basket in flight")
 
         def suspended() -> bool:
             # Asked again once the hedger holds the leg's lock: the guard may
@@ -2266,6 +2290,13 @@ class Strategy:
                         raise RuntimeError("the reconciler stopped on its own")
                     return
                 violations = self.risk.check()
+                if self._basket_settling():
+                    # A basket and its mirror land a moment apart, so for that
+                    # moment one account holds a whole leg the other does not
+                    # yet. Halting on it would flatten everything over two
+                    # orders a few milliseconds apart; the hedger evens them,
+                    # and a gap left after the grace halts as any other.
+                    violations = [v for v in violations if v.kind != "net_exposure"]
                 if any(v.kind not in SOCKET_FAULTS for v in violations):
                     self._trigger_halt("; ".join(str(v) for v in violations))
                     return
@@ -3038,9 +3069,17 @@ class Strategy:
         if restored is None:
             restored = self.restore_groups()
         self._forget_finished_groups({key for _i, _g, key in restored})
-        for group_id, group, _key in restored:
-            size = self.state.leg(self.group_key(group_id, group.symbol)).target_size
-            running.add(asyncio.create_task(self._run_group(group_id, group, size)))
+        if getattr(self.config, "mode", None) == "baskets":
+            # A basket is several legs under one id, and they resume together.
+            open_baskets: dict[int, dict[str, Group]] = {}
+            for group_id, group, key in restored:
+                open_baskets.setdefault(group_id, {})[key] = group
+            for group_id, legs in open_baskets.items():
+                running.add(asyncio.create_task(self._run_basket(group_id, legs, {})))
+        else:
+            for group_id, group, _key in restored:
+                size = self.state.leg(self.group_key(group_id, group.symbol)).target_size
+                running.add(asyncio.create_task(self._run_group(group_id, group, size)))
         # Groups this run has started, resumed ones included. `cycles` is
         # counted here because a drawn group lives for exactly one cycle under
         # a key of its own: the per-leg count in `_run_leg` never passed 1,
@@ -3070,6 +3109,13 @@ class Strategy:
                         started, self.config.cycles,
                     )
                     break
+
+                if self.pairing is not None and getattr(self.config, "mode", None) == "baskets":
+                    if await self._draw_basket(running, started):
+                        started += 1
+                    else:
+                        await asyncio.sleep(self.config.chase_interval_s)
+                    continue
 
                 drawn = None
                 if self.pairing is not None:
@@ -3115,6 +3161,36 @@ class Strategy:
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
+            registering = self._registering
+            if registering:
+                # The last baskets traded; give the Gauntlet a moment to hear.
+                await asyncio.wait(set(registering), timeout=REGISTER_WAIT_S)
+
+    async def _draw_basket(self, running: set, started: int) -> bool:
+        """Draw the next basket and start it. False when none can open yet."""
+        if not self.pairing.can_draw():
+            return False
+        picked = self._next_basket()
+        drawn = None if picked is None else self.pairing.draw(picked[0].symbol)
+        if drawn is None:
+            return False
+        group_id, group = drawn
+        self.state.groups_started = started + 1
+        self._persist()
+        self._basket_last = basket_rules.describe_basket(picked)
+        legs = {
+            self.group_key(group_id, p.symbol): Group(
+                symbol=p.symbol,
+                maker=group.maker,
+                takers=group.takers,
+                shares=group.shares,
+                maker_is_buy=p.opener_buys,
+            )
+            for p in picked
+        }
+        sizes = {self.group_key(group_id, p.symbol): p.size for p in picked}
+        running.add(asyncio.create_task(self._run_basket(group_id, legs, sizes)))
+        return True
 
     def _next_market(self) -> str | None:
         """The market the next group trades, or None to open nothing yet.
@@ -3209,6 +3285,402 @@ class Strategy:
         # As plain text: the reason is the gate's own words, and as HTML a
         # "<" in it made Telegram refuse the whole message.
         self.notifier.send_soon(self.notifier.send(prefix=prefix, plain=text))
+
+    # -- baskets -------------------------------------------------------------
+
+    def _next_basket(self) -> list | None:
+        """The next basket's tickers, sides and sizes, or None to wait.
+
+        Every market of the run is measured, as auto-spread measures them,
+        and `bulkdn.baskets.choose` draws the basket from those that pass.
+        A paused market is left out like any other that cannot open.
+        """
+        settings = self.config.baskets
+        taking = self.config.taking
+        specs = getattr(self.feed, "specs", None) or {}
+        seen = []
+        for symbol in self.symbols:
+            if self._market_paused(symbol):
+                continue
+            measured = autospread.measure(
+                self.feed, symbol, taking.max_slippage_bps, taking.levels
+            )
+            if measured is not None:
+                seen.append(measured)
+        leg_usd = settings.notional_usd.pick() / basket_rules.legs_per_basket(settings)
+        picked = basket_rules.choose(
+            seen, specs, settings.per_side, leg_usd,
+            max_spread_bps=taking.max_spread_bps,
+            depth_fraction=taking.depth_fraction,
+            rng=self._rng,
+        )
+        self._note_basket(picked, seen, leg_usd)
+        return picked
+
+    def _note_basket(self, picked, seen, leg_usd: float) -> None:
+        """Keep why no basket can open, for the status, and log it now and then."""
+        if picked is not None:
+            self._basket_waiting = None
+            return
+        taking = self.config.taking
+        needed = basket_rules.legs_per_basket(self.config.baskets)
+        inside = sum(1 for s in seen if s.spread_bps <= taking.max_spread_bps + 1e-9)
+        why = (
+            f"{inside} of {len(seen)} markets within {taking.max_spread_bps:g}bps, "
+            f"{needed} needed with ${leg_usd:,.0f} of depth each"
+            if seen else "no book has been heard yet"
+        )
+        self._basket_waiting = why
+        now = time.monotonic()
+        said = self._basket_said_at
+        if said is None or now - said >= AUTO_SPREAD_SAY_AGAIN_S:
+            self._basket_said_at = now
+            log.info("baskets: cannot open one yet -- %s", why)
+
+    def _basket_status(self) -> str:
+        kind = autospread.KIND_LABELS.get(self.config.baskets.markets, "")
+        tally = self._gauntlet
+        gauntlet = f"Gauntlet: {tally.get('ok', 0)} registered"
+        if tally.get("refused"):
+            gauntlet += f", {tally['refused']} refused"
+        if tally.get("failed"):
+            gauntlet += f", {tally['failed']} unanswered"
+        waiting = self._basket_waiting
+        last = self._basket_last
+        if waiting:
+            head = f"baskets {kind}: waiting -- {waiting}"
+        elif last:
+            head = f"baskets {kind}: last {last}"
+        else:
+            head = f"baskets {kind}: {len(self.symbols)} markets, reading books"
+        return f"{head}   |   {gauntlet}"
+
+    def _basket_text(self, keys: list[str]) -> str:
+        groups = [self._groups[key] for key in keys if key in self._groups]
+        longs = "+".join(g.symbol.split("-")[0] for g in groups if g.maker_is_buy)
+        shorts = "+".join(g.symbol.split("-")[0] for g in groups if not g.maker_is_buy)
+        return f"long {longs} / short {shorts}"
+
+    async def _run_basket(
+        self, group_id: int, legs: dict[str, Group], sizes: dict[str, float]
+    ) -> None:
+        """One basket cycle for one drawn group, then give the accounts back.
+
+        `legs` is one group per ticker, all on the same two accounts and filed
+        the way any group's leg is. So the hedger, the reconciler, the
+        liquidation guard, Close all and a restart see each ticker exactly as
+        they see a delta-neutral leg; only the orders differ -- each phase
+        sends one basket per account. `sizes` is empty for a basket resumed
+        after a restart, whose sizes are in the state file.
+
+        The accounts are released the way `_run_group` releases them: only
+        once every leg has finished its cycle.
+        """
+        keys = list(legs)
+        for key, group in legs.items():
+            self._groups[key] = group
+            self._group_ids[key] = group_id
+            leg = self.state.leg(key, group.symbol)
+            leg.group_id = group_id
+            leg.maker = group.maker
+            leg.takers = list(group.takers)
+            leg.shares = list(group.shares)
+            leg.maker_is_buy = group.maker_is_buy
+            if key in sizes:
+                leg.target_size = sizes[key]
+        self._persist()
+        first = next(iter(legs.values()))
+        log.info(
+            "=== basket g%d drawn: %s on %s, the mirror on %s ===",
+            group_id, self._basket_text(keys),
+            self._name_of(first.maker), self._name_of(first.takers[0]),
+        )
+        try:
+            await self._basket_cycle(group_id, keys)
+        finally:
+            mid_cycle = any(
+                (leg := self.state.legs.get(key)) is not None
+                and leg.phase not in (Phase.IDLE, Phase.COMPLETE)
+                for key in keys
+            )
+            if mid_cycle:
+                # Still holding: it stays registered, as `_run_group` explains.
+                log.info("=== basket g%d ended mid-cycle ===", group_id)
+            else:
+                if self.pairing is not None:
+                    self.pairing.release(group_id)
+                for key in keys:
+                    self._groups.pop(key, None)
+                    self._group_ids.pop(key, None)
+                log.info("=== basket g%d released ===", group_id)
+
+    async def _basket_cycle(self, group_id: int, keys: list[str]) -> None:
+        """OPEN -> HOLD -> EXIT for every leg of one basket, in step.
+
+        A restart lands mid-cycle, so each phase is entered only if the
+        basket has not already passed it -- read off its first leg, since the
+        legs move together and are saved together.
+        """
+        legs = [self.state.leg(key) for key in keys]
+        if legs[0].phase in (Phase.IDLE, Phase.COMPLETE):
+            if self._stop.is_set():
+                return
+            for leg in legs:
+                leg.cycle_index += 1
+            await self._basket_open(group_id, keys)
+        if self._stop.is_set():
+            return
+        if legs[0].phase == Phase.OPEN:
+            await self._basket_hold(group_id, keys)
+        if self._stop.is_set():
+            return
+        if legs[0].phase in (Phase.HOLD, Phase.EXIT):
+            await self._basket_exit(group_id, keys)
+        if self._stop.is_set():
+            return
+        for leg in legs:
+            leg.phase = Phase.COMPLETE
+            leg.hold_until = 0.0
+        self.state.cycle_index += 1
+        self.title.set_cycle(self.state.cycle_index)
+        self._persist()
+        log.info("=== basket g%d complete ===", group_id)
+        for key, leg in zip(keys, legs, strict=True):
+            roles = self._roles_for_key(key)
+            self.guard.reset_symbol(leg.symbol, accounts=roles.accounts if roles else None)
+        self.notifier.send_soon(self._cycle_report(f"g{group_id} basket", self.state.cycle_index))
+
+    async def _basket_open(self, group_id: int, keys: list[str]) -> None:
+        legs = [self.state.leg(key) for key in keys]
+        groups = [self._groups[key] for key in keys]
+        for leg in legs:
+            leg.phase = Phase.OPEN
+            leg.complete = False
+            leg.oid = None
+            leg.hold_until = 0.0
+        self._persist()
+        opener, partner = groups[0].maker, groups[0].takers[0]
+        log.info(
+            "=== basket g%d OPEN: %s on %s, the mirror on %s ===",
+            group_id, self._basket_text(keys), self._name_of(opener), self._name_of(partner),
+        )
+        orders = {
+            opener: basket_rules.market_orders(
+                ((g.symbol, g.maker_is_buy, leg.target_size) for g, leg in zip(groups, legs, strict=True)),
+                reduce_only=False,
+            ),
+            partner: basket_rules.market_orders(
+                ((g.symbol, not g.maker_is_buy, leg.target_size) for g, leg in zip(groups, legs, strict=True)),
+                reduce_only=False,
+            ),
+        }
+        await self._send_baskets(group_id, keys, orders, "open")
+        await self._settle_basket(group_id, keys, "open")
+        for leg in legs:
+            leg.complete = True
+        self._persist()
+
+    async def _basket_hold(self, group_id: int, keys: list[str]) -> None:
+        """One hold for the whole basket: its legs close in one transaction."""
+        legs = [self.state.leg(key) for key in keys]
+        until = max(leg.hold_until for leg in legs) or (
+            time.time() + self.config.hold_minutes.pick() * 60
+        )
+        for leg in legs:
+            leg.hold_until = until
+            leg.phase = Phase.HOLD
+        self._persist()
+        log.info("=== basket g%d HOLD: %.1f minutes ===", group_id, legs[0].hold_remaining_s() / 60)
+        while not self._stop.is_set():
+            left = legs[0].hold_remaining_s()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(1.0, left))
+
+    async def _basket_exit(self, group_id: int, keys: list[str]) -> None:
+        """Close each account's side of the basket with one basket of its own.
+
+        Sized from what each account holds once its positions are read again,
+        reduce-only, so a close that already went out before a restart cannot
+        become a new position the other way. What a market order leaves is
+        swept at market after, as `_leg_exit` sweeps a delta-neutral leg.
+        """
+        legs = [self.state.leg(key) for key in keys]
+        for leg in legs:
+            leg.phase = Phase.EXIT
+            leg.complete = False
+        self._persist()
+        first = self._groups[keys[0]]
+        accounts = [pubkey for pubkey in first.accounts if pubkey in self.sessions]
+        try:
+            await self._sync_positions(
+                max_age_s=0.0, sessions=[self.sessions[pubkey] for pubkey in accounts]
+            )
+        except Exception as exc:  # noqa: BLE001 - closed from what is known
+            log.warning(
+                "basket g%d: could not re-read positions before the close (%s) -- "
+                "closing what the book holds", group_id, describe(exc),
+            )
+        orders = {}
+        for pubkey in accounts:
+            trades = []
+            for leg in legs:
+                spec = self.feed.specs.get(leg.symbol)
+                if spec is None:
+                    continue
+                held = self.book.effective(pubkey, leg.symbol)
+                size = tradeable_size(
+                    spec, abs(held), self._taking_price(leg.symbol, buying=held < 0)
+                )
+                if size:
+                    trades.append((leg.symbol, held < 0, size))
+            if trades:
+                orders[pubkey] = basket_rules.market_orders(trades, reduce_only=True)
+        for leg in legs:
+            leg.target_size = abs(self.book.effective(first.maker, leg.symbol))
+        self._persist()
+        log.info("=== basket g%d EXIT: %s ===", group_id, self._basket_text(keys))
+        if orders:
+            await self._send_baskets(group_id, keys, orders, "close")
+        for key, leg in zip(keys, legs, strict=True):
+            if self._stop.is_set():
+                return
+            if not self._leg_is_flat(key):
+                log.info("%s: closing residual left after the basket close", key)
+                await flatten(
+                    {pubkey: self.sessions[pubkey] for pubkey in accounts},
+                    self.book,
+                    self.feed,
+                    [leg.symbol],
+                )
+        for leg in legs:
+            leg.complete = True
+        self._persist()
+
+    async def _send_baskets(
+        self, group_id: int, keys: list[str], orders: dict[str, list], label: str
+    ) -> None:
+        """Send each account's basket at the same moment, and register them.
+
+        The hedger leaves these legs alone meanwhile (`_basket_flight`), and
+        the accounts are read again before it may look. A hedge worked out
+        from the opener's fills before the mirror's had landed would be
+        undone by the mirror a moment later, paying the spread twice over.
+        Once both have answered, each leg is queued for the hedger, which
+        evens out whatever the two market orders left apart.
+        """
+        flight = self._basket_flight
+        flight.update(keys)
+        try:
+            await asyncio.gather(*(
+                self._send_basket(group_id, pubkey, actions, label)
+                for pubkey, actions in orders.items()
+            ))
+            try:
+                await self._sync_positions(
+                    max_age_s=0.0,
+                    sessions=[self.sessions[p] for p in orders if p in self.sessions],
+                )
+            except Exception as exc:  # noqa: BLE001 - the reconciler reads again
+                log.warning(
+                    "basket g%d: could not re-read positions after the %s: %s",
+                    group_id, label, describe(exc),
+                )
+        finally:
+            flight.difference_update(keys)
+            self._basket_grace_until = time.monotonic() + BASKET_RISK_GRACE_S
+            for key in keys:
+                self._hedge_queue.put_nowait(key)
+
+    def _basket_settling(self) -> bool:
+        """Whether a basket is on its way, or answered within the grace."""
+        return bool(self._basket_flight) or time.monotonic() < self._basket_grace_until
+
+    async def _send_basket(
+        self, group_id: int, pubkey: str, actions: list, label: str
+    ) -> bool:
+        """One account's basket. True when the exchange took it.
+
+        An opening basket the exchange took is registered with the Gauntlet;
+        one it refused, or never answered, is not -- what did trade of it is
+        evened out by the hedger. A close is never registered.
+        """
+        session = self.sessions[pubkey]
+        try:
+            _responses, tx = await session.basket(actions)
+        except Exception as exc:  # noqa: BLE001 - the hedger evens out what traded
+            log.error(
+                "basket g%d: the %s on %s failed: %s -- whatever did trade is "
+                "evened out by the hedger", group_id, label, session.name, describe(exc),
+            )
+            return False
+        log.info(
+            "basket g%d: %s sent on %s: %s", group_id, label, session.name,
+            ", ".join(
+                f"{'buy' if action.side == Side.BUY else 'sell'} {action.size:g} {action.symbol}"
+                for action in actions
+            ),
+        )
+        # Only the opening basket: the website registers the open and not the
+        # close, and a run should leave the Gauntlet what the website does.
+        if label == "open" and not getattr(session, "dry_run", False):
+            tasks = self._registering
+            task = asyncio.create_task(self._register_basket(group_id, session.name, tx, label))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        return True
+
+    async def _register_basket(self, group_id: int, name: str, tx: dict, label: str) -> None:
+        """Tell the Basket Gauntlet about a basket the exchange already took."""
+        tally = self._gauntlet
+        try:
+            status, body = await asyncio.to_thread(basket_rules.register, tx)
+        except Exception as exc:  # noqa: BLE001 - the basket traded either way
+            tally["failed"] += 1
+            log.warning(
+                "basket g%d: the %s on %s traded, but the Gauntlet did not answer: %s",
+                group_id, label, name, describe(exc),
+            )
+            return
+        if 200 <= status < 300:
+            tally["ok"] += 1
+            log.info(
+                "basket g%d: %s on %s registered with the Gauntlet: %s",
+                group_id, label, name, str(body)[:200],
+            )
+            return
+        tally["refused"] += 1
+        log.warning(
+            "basket g%d: the Gauntlet refused the %s on %s: HTTP %d %s",
+            group_id, label, name, status, str(body)[:300],
+            # The first one only: if the endpoint refuses one it likely refuses
+            # every one, and the operator needs to hear it once, not per cycle.
+            extra={"alert": True} if tally["refused"] == 1 else None,
+        )
+
+    async def _settle_basket(self, group_id: int, keys: list[str], label: str) -> None:
+        """Wait until every ticker of the basket is even between the accounts.
+
+        Confirmed against a fresh read, as any phase is. If the hedger cannot
+        even them out within `max_phase_minutes`, the run halts: two accounts
+        holding opposite baskets that do not cancel are real exposure.
+        """
+        budget = phase_budget_s(Phase.OPEN, self.config.max_phase_minutes)
+        started = time.monotonic()
+
+        def even() -> bool:
+            return all(self._leg_is_neutral(key) for key in keys)
+
+        while not self._stop.is_set():
+            if even() and await self._confirm_done(even, f"basket g{group_id} {label}", keys[0]):
+                return
+            if budget and time.monotonic() - started > budget:
+                self._trigger_halt(
+                    f"basket g{group_id} {label}: the two accounts are still uneven "
+                    f"after {self.config.max_phase_minutes:g} minutes"
+                )
+                return
+            await asyncio.sleep(BASKET_POLL_S)
 
     async def _run_leg(self, key: str, configured_size: float, once: bool = False) -> None:
         """OPEN -> HOLD -> EXIT for one leg on its own clock.
@@ -3473,14 +3945,20 @@ class Strategy:
             note = f" {humanise(left)} left" if left > 0 else ""
             legs.append(f"{key} {phase} cycle {leg.cycle_index}{note}")
         auto = self.config.mode == "auto-spread"
+        basket = self.config.mode == "baskets"
         if not legs:
-            legs = ["waiting"] if auto else [f"{symbol} waiting" for symbol in self.symbols]
+            legs = (
+                ["waiting"] if auto or basket
+                else [f"{symbol} waiting" for symbol in self.symbols]
+            )
 
         burned, volume = self._progress
         target = self.config.target
         lines = ["  " + "     ".join(legs)]
         if auto:
             lines.append("  " + self._auto_status())
+        if basket:
+            lines.append("  " + self._basket_status())
 
         if target.volume_usd > 0:
             done = volume / target.volume_usd

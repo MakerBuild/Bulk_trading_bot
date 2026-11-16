@@ -105,6 +105,17 @@ auto_spread:
     - XRP
     - ZEC
 
+# Only for mode: baskets -- a master and its own sub open a dollar-neutral
+# basket and its mirror with market orders, for the Basket Gauntlet. The
+# tickers are drawn at random each cycle from the auto_spread lists above, of
+# the kind in markets: (tradfi, crypto or all). notional_usd is the whole
+# basket on one account: half long, half short. per_side: tickers each way.
+baskets:
+  markets: tradfi
+  notional_usd: 1000
+  leverage: 10
+  per_side: 1
+
 chase_interval_s: 1.0
 reconcile_interval_s: 5.0
 position_sync_interval_s: 60.0

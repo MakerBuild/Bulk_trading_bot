@@ -124,6 +124,8 @@ TRADING_MODES = {
                      "(both legs pay the taker fee)",
     "auto-spread": "delta-neutral on whichever market has the narrowest spread "
                    "when each new cycle opens -- TradFi, Crypto or All",
+    "baskets": "a master + its own sub open a dollar-neutral basket and its mirror "
+               "with market orders, registered with the Basket Gauntlet",
 }
 # Auto-spread's choices of market, as its buttons name them.
 AUTO_KINDS = {
@@ -517,6 +519,8 @@ class Controller:
             return await self._set_master(code)
         if action == "setauto":
             return self._set_auto(code)
+        if action == "setbskt":
+            return self._set_baskets(code)
         if action == "acct":
             return await self._toggle_account(code)
         if action == "wk":
@@ -686,6 +690,8 @@ class Controller:
             return f"single (master {self.config.single_master})"
         if self.config.mode == "auto-spread":
             return f"auto-spread ({KIND_LABELS[self.config.auto_spread.markets]})"
+        if self.config.mode == "baskets":
+            return f"baskets ({KIND_LABELS[self.config.baskets.markets]})"
         return self.config.mode
 
     def _markets_line(self) -> str:
@@ -694,6 +700,10 @@ class Controller:
             kind = self.config.auto_spread.markets
             which = "market" if kind == "all" else f"{KIND_LABELS[kind]} market"
             return f"the narrowest-spread {which} at each new cycle"
+        if self.config.mode == "baskets":
+            kind = self.config.baskets.markets
+            which = "markets" if kind == "all" else f"{KIND_LABELS[kind]} markets"
+            return f"random {which} from the auto-spread tickers, a new basket each cycle"
         return ", ".join(leg.symbol for leg in self.config.active_legs)
 
     def _later(self) -> str:
@@ -741,6 +751,8 @@ class Controller:
             return await self._master_menu()
         if mode == "auto-spread":
             return self._auto_menu()
+        if mode == "baskets":
+            return self._baskets_menu()
         self._forget_cli_mode()
         problem = self._save("mode", mode)
         if problem is not None:
@@ -785,6 +797,46 @@ class Controller:
         self.config.mode = "auto-spread"
         self.config.auto_spread.markets = kind
         log.warning("telegram control: trading mode set to auto-spread (%s)", kind)
+        return self._mode_menu("✅ Saved.\n")
+
+    def _baskets_menu(self, note: str = "") -> Reply:
+        current = self.config.baskets.markets if self.config.mode == "baskets" else None
+        lines = "\n".join(
+            f"{'▸' if kind == current else '·'} <b>{KIND_LABELS[kind]}</b> -- {html.escape(about)}"
+            for kind, about in AUTO_KINDS.items()
+        )
+        buttons = [[
+            (f"{'✅ ' if kind == current else ''}{KIND_LABELS[kind]}", f"setbskt:{kind}")
+            for kind in AUTO_KINDS
+        ], [("🧺 Size", "cfg:baskets"), ("🔀 Tickers", "tick:")], [("⬅️ Modes", "cfg:mode")]]
+        settings = self.config.baskets
+        spread = tg_settings.render(self.config.taking.max_spread_bps)
+        return Reply(
+            f"{note}<b>Baskets</b>: which markets may a basket hold?\n{lines}\n"
+            f"Each cycle a master and one of its subs open a ${html.escape(str(settings.notional_usd))} "
+            f"basket -- {settings.per_side} ticker(s) long and as many short, drawn at random "
+            f"from the 🔀 Auto-spread tickers among those within {spread} bps -- and its "
+            "mirror. Market orders, sent to the exchange and registered with the Basket "
+            "Gauntlet; closed with market orders after the hold." + self._later(),
+            buttons,
+        )
+
+    def _set_baskets(self, kind: str) -> Reply:
+        if kind not in AUTO_KINDS:
+            return self._baskets_menu()
+        if self.config_path is None or self.files is None:
+            return Reply("There is no settings file to save this to.")
+        try:
+            self.files.write_block_setting(self.config_path, "baskets", "markets", kind)
+        except Exception as exc:  # noqa: BLE001 - reported, nothing else changed
+            return Reply(f"⚠️ Could not save: {html.escape(describe(exc))}")
+        self._forget_cli_mode()
+        problem = self._save("mode", "baskets")
+        if problem is not None:
+            return Reply(f"⚠️ Could not save the mode: {html.escape(problem)}")
+        self.config.mode = "baskets"
+        self.config.baskets.markets = kind
+        log.warning("telegram control: trading mode set to baskets (%s)", kind)
         return self._mode_menu("✅ Saved.\n")
 
     async def _master_menu(self) -> Reply:
@@ -917,6 +969,8 @@ class Controller:
         if self.config.mode == "auto-spread":
             markets = (f"{self._markets_line()} -- a market listed here trades its own "
                        "size; any other the 🔀 Auto-spread size")
+        if self.config.mode == "baskets":
+            markets = f"{self._markets_line()} -- sized in 🧺 Baskets"
         rows: Buttons = [
             [("📈 Markets and sizes", "cfg:markets")],
             [("🎛 Mode", "cfg:mode"), ("👥 Accounts", "cfg:accounts")],
